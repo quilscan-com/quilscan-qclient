@@ -1,0 +1,56 @@
+# https://taskfile.dev
+
+version: "3"
+
+dotenv:
+  - ".env"
+
+env:
+  DOCKER_BUILDKIT: '1'
+
+vars:
+  VERSION:
+    sh: cat config/version.go | grep -A 1 "func GetVersion() \\[\\]byte {" | grep -Eo '0x[0-9a-fA-F]+' | xargs printf "%d.%d.%d"
+  GIT_REPO:
+    sh: git config --get remote.origin.url | sed 's/\\.git$//'
+  GIT_BRANCH:
+    sh: git rev-parse --abbrev-ref HEAD
+  GIT_COMMIT:
+    sh: git log -1 --format=%h
+
+tasks:
+  status:
+    desc: Display qclient build configuration.
+    cmds:
+      - echo -n "Version:" && echo " {{.VERSION}}"
+      - echo -n "Repo   :" && echo " {{.GIT_REPO}}"
+      - echo -n "Branch :" && echo " {{.GIT_BRANCH}}"
+      - echo -n "Commit :" && echo " {{.GIT_COMMIT}}"
+    silent: true
+
+  build_qclient_arm64_macos:
+    desc: Build qclient for macOS ARM64. Outputs to client/build.
+    cmds:
+      - vdf/generate.sh
+      - bls48581/generate.sh
+      - verenc/generate.sh
+      - bulletproofs/generate.sh
+      - ferret/generate.sh
+      - channel/generate.sh
+      - rpm/generate.sh
+      - client/build.sh -o build/arm64_macos/qclient
+
+  build_qclient_arm64_linux:
+    desc: Build qclient for Linux ARM64. Outputs to client/build.
+    cmds:
+      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output client/build/arm64_linux --target=qclient .
+
+  build_qclient_amd64_linux:
+    desc: Build qclient for Linux AMD64. Outputs to client/build.
+    cmds:
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output client/build/amd64_linux --target=qclient .
+
+  test:qclient:
+    desc: Run qclient tests.
+    cmds:
+      - client/test/run_tests.sh -d 'ubuntu' -v '24.04'

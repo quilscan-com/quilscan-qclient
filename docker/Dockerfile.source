@@ -1,0 +1,303 @@
+# syntax=docker.io/docker/dockerfile:1.7-labs
+FROM --platform=${TARGETPLATFORM} ubuntu:24.04 AS base
+
+# Common environment variables
+ENV PATH="${PATH}:/root/.cargo/bin/"
+ARG TARGETOS
+ARG TARGETARCH
+ARG GO_VERSION=1.23.5
+
+# Install basics
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    cmake \
+    libgmp-dev \
+    libmpfr-dev \
+    libmpfr6 \
+    wget \
+    m4 \
+    pkg-config \
+    gcc \
+    g++ \
+    make \
+    autoconf \
+    automake \
+    libtool \
+    libssl-dev \
+    libflint-dev \
+    protobuf-compiler \
+    clang \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# Stage: gmp-builder
+# Purpose: Build GMP from source as a static, PIC archive. FLINT's static
+# code references internal `__gmpn_*` symbols that aren't guaranteed to be
+# exported by every distro's libgmp.so — users running the binary on a
+# host whose libgmp differs from our build image hit runtime
+# `symbol lookup error: undefined symbol: __gmpn_modexact_1_odd` failures.
+# Bundling GMP into the static link removes that dependency entirely.
+# -----------------------------------------------------------------------------
+FROM base AS gmp-builder
+
+ARG GMP_VERSION=6.3.0
+RUN wget https://ftp.gnu.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz && \
+    tar -xf gmp-${GMP_VERSION}.tar.xz && \
+    cd gmp-${GMP_VERSION} && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-static \
+        --disable-shared \
+        --with-pic \
+        CFLAGS="-O3" && \
+    make -j$(nproc) && \
+    make install
+
+# -----------------------------------------------------------------------------
+# Stage: flint-builder
+# Purpose: Build FLINT library (slowest component). Inherits the static GMP
+# from gmp-builder so FLINT's static archive links against the same GMP we
+# bundle into the final binary.
+# -----------------------------------------------------------------------------
+FROM gmp-builder AS flint-builder
+
+RUN git clone --branch flint-3.0 --depth 1 https://github.com/flintlib/flint.git && \
+    cd flint && \
+    ./bootstrap.sh && \
+    ./configure \
+    --prefix=/usr/local \
+    --with-gmp=/usr/local \
+    --with-mpfr=/usr/local \
+    --enable-static \
+    --disable-shared \
+    CFLAGS="-O3 -fPIC" && \
+    make -j$(nproc) && \
+    make install
+
+# -----------------------------------------------------------------------------
+# Stage: emp-builder
+# Purpose: Build EMP-toolkit libraries
+# -----------------------------------------------------------------------------
+FROM base AS emp-builder
+
+WORKDIR /opt/ceremonyclient
+# Copy the necessary script and source directories
+COPY install-emp.sh .
+COPY emp-tool emp-tool
+COPY emp-ot emp-ot
+
+RUN bash install-emp.sh
+
+# Fix emp-tool to be static and install
+RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && rm -rf build && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make -j$(nproc) && make install
+
+# Install emp-ot
+RUN cd emp-ot && rm -rf build && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make -j$(nproc) && make install
+
+# -----------------------------------------------------------------------------
+# Stage: go-base
+# Purpose: Install Go
+# -----------------------------------------------------------------------------
+FROM base AS go-base
+
+ARG TARGETARCH
+ARG GO_VERSION
+
+RUN apt update && apt install -y wget && \
+    ARCH=$(dpkg --print-architecture) && \
+    case ${ARCH} in \
+    amd64) GOARCH=amd64 ;; \
+    arm64) GOARCH=arm64 ;; \
+    *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    wget https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz && \
+    rm -rf /usr/local/go && \
+    tar -C /usr/local -xzf go${GO_VERSION}.linux-${GOARCH}.tar.gz && \
+    rm go${GO_VERSION}.linux-${GOARCH}.tar.gz
+
+ENV PATH=$PATH:/usr/local/go/bin
+ENV GOPROXY=direct
+
+# -----------------------------------------------------------------------------
+# Stage: rust-base
+# Purpose: Install Rust and bindgen tools
+# -----------------------------------------------------------------------------
+FROM base AS rust-base
+
+COPY docker/rustup-init.sh /opt/rustup-init.sh
+RUN /opt/rustup-init.sh -y --profile minimal
+
+RUN cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v0.4.0+v0.28.3
+
+# -----------------------------------------------------------------------------
+# Stage: libs-context
+# Purpose: Aggregate built libraries (Flint + EMP)
+# -----------------------------------------------------------------------------
+FROM base AS libs-context
+# flint-builder inherits from gmp-builder, so copying its /usr/local brings
+# both libflint.a and libgmp.a along in one shot.
+COPY --from=flint-builder /usr/local /usr/local
+COPY --from=emp-builder /usr/local /usr/local
+
+# -----------------------------------------------------------------------------
+# Stage: common-context
+# Purpose: Base for generation steps, includes libs, go, and rust
+# -----------------------------------------------------------------------------
+FROM libs-context AS common-context
+
+COPY --from=go-base /usr/local/go /usr/local/go
+ENV PATH=$PATH:/usr/local/go/bin
+ENV GOPROXY=https://proxy.golang.org,direct
+
+COPY --from=rust-base /root/.cargo /root/.cargo
+COPY --from=rust-base /root/.rustup /root/.rustup
+ENV PATH="${PATH}:/root/.cargo/bin/"
+
+ENV GOEXPERIMENT=arenas
+ENV QUILIBRIUM_SIGNATURE_CHECK=true
+
+# Install grpcurl (common tool)
+RUN go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+
+WORKDIR /opt/ceremonyclient
+
+# Rust workspace files (rarely change)
+COPY Cargo.toml Cargo.lock ./
+
+# Rust crate sources (needed by cargo build in gen-rust below).
+# BuildKit normalizes mtimes on COPY, so cargo's mtime-based fingerprint
+# check inside the target/ cache mount may over-rebuild. The cache mount
+# still provides value for the registry/git caches and for cargo's
+# content-derived intermediate artifacts; full mtime-based incrementality
+# would require a host-side mtime normalization step (e.g. git restore-mtime).
+COPY crates crates
+
+# Gen-* module directories (Go wrappers + generate.sh scripts)
+COPY channel channel
+COPY vdf vdf
+COPY ferret ferret
+COPY bls48581 bls48581
+COPY rpm rpm
+COPY verenc verenc
+COPY bulletproofs bulletproofs
+
+# go.mod/go.sum stubs for replace directive targets across all gen-* modules.
+# Only module metadata is needed for go mod download; full Go source is deferred
+# to build-context so that source changes don't bust gen-* stage caches.
+COPY nekryptology/go.mod nekryptology/go.sum nekryptology/
+COPY protobufs/go.mod protobufs/go.sum protobufs/
+COPY consensus/go.mod consensus/go.sum consensus/
+COPY types/go.mod types/go.sum types/
+COPY utils/go.mod utils/go.sum utils/
+COPY config/go.mod config/go.sum config/
+COPY lifecycle/go.mod lifecycle/go.sum lifecycle/
+COPY go-multiaddr/go.mod go-multiaddr/go.sum go-multiaddr/
+COPY go-multiaddr-dns/go.mod go-multiaddr-dns/go.sum go-multiaddr-dns/
+COPY go-libp2p/go.mod go-libp2p/go.sum go-libp2p/
+COPY go-libp2p-kad-dht/go.mod go-libp2p-kad-dht/go.sum go-libp2p-kad-dht/
+COPY go-libp2p-blossomsub/go.mod go-libp2p-blossomsub/go.sum go-libp2p-blossomsub/
+
+# -----------------------------------------------------------------------------
+# Stage: gen-rust
+# Purpose: Single cargo invocation that builds all seven leaf crates plus
+# their uniffi-generated Go bindings. Shared workspace dependencies (quil-types,
+# ed448-rust, classgroup, etc.) compile exactly once instead of seven times
+# across parallel stages.
+#
+# Three cache mounts:
+# - cargo-registry / cargo-git: shared across all stages and across the
+#   non-avx512 + avx512 Dockerfiles (pure function of Cargo.lock, identical
+#   downloaded source for both).
+# - cargo-target-rust: per-stage; sharing the target dir with stages that
+#   have a different -p set would cause cargo fingerprint thrash.
+#
+# The cache-mounted /opt/ceremonyclient/target is NOT part of this stage's
+# filesystem, so the .a artifacts are copied to /out/ before the mount
+# unmounts. Downstream stages COPY --from=gen-rust /out/*.a instead.
+# -----------------------------------------------------------------------------
+FROM common-context AS gen-rust
+WORKDIR /opt/ceremonyclient
+RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target-rust,target=/opt/ceremonyclient/target \
+    cargo build --release \
+        -p channel -p vdf -p ferret -p bls48581 \
+        -p rpm -p verenc -p ed448-bulletproofs && \
+    mkdir -p /out && \
+    cp target/release/libchannel.a \
+       target/release/libvdf.a \
+       target/release/libferret.a \
+       target/release/libbls48581.a \
+       target/release/librpm.a \
+       target/release/libverenc.a \
+       target/release/libbulletproofs.a \
+       /out/ && \
+    for d in channel vdf ferret bls48581 rpm verenc bulletproofs; do \
+        uniffi-bindgen-go "crates/$d/src/lib.udl" -o "/opt/ceremonyclient/$d/generated"; \
+    done
+
+# -----------------------------------------------------------------------------
+# Stage: build-context
+# Purpose: Aggregate all generated bindings and static libraries
+# -----------------------------------------------------------------------------
+FROM common-context AS build-context
+
+# Copy full source tree for Go builds. Changes here only bust build-context
+# cache, not the expensive gen-* stages above.
+COPY --exclude=node \
+    --exclude=client . .
+
+# Copy generated artifacts back (overwrites source dirs with generated bindings).
+# The .a files come from /out/ because gen-rust's target/ is a cache mount,
+# not part of its filesystem.
+COPY --from=gen-rust /opt/ceremonyclient/channel /opt/ceremonyclient/channel
+COPY --from=gen-rust /opt/ceremonyclient/vdf /opt/ceremonyclient/vdf
+COPY --from=gen-rust /opt/ceremonyclient/ferret /opt/ceremonyclient/ferret
+COPY --from=gen-rust /opt/ceremonyclient/bls48581 /opt/ceremonyclient/bls48581
+COPY --from=gen-rust /opt/ceremonyclient/rpm /opt/ceremonyclient/rpm
+COPY --from=gen-rust /opt/ceremonyclient/verenc /opt/ceremonyclient/verenc
+COPY --from=gen-rust /opt/ceremonyclient/bulletproofs /opt/ceremonyclient/bulletproofs
+COPY --from=gen-rust /out/ /opt/ceremonyclient/target/release/
+
+# -----------------------------------------------------------------------------
+# Stage: build-qclient
+# Go cache mounts persist /root/.cache/go-build (compiled object cache) and
+# /root/go/pkg/mod (module download cache) across docker builds. Without
+# them, any invalidation of build-context (e.g., a file added to crates/)
+# triggers a full from-scratch Go rebuild here.
+# -----------------------------------------------------------------------------
+FROM build-context AS build-qclient
+ARG TARGETOS
+ARG TARGETARCH
+
+COPY ./node /opt/ceremonyclient/node
+WORKDIR /opt/ceremonyclient/node
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
+    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
+    go mod download
+
+COPY ./client /opt/ceremonyclient/client
+WORKDIR /opt/ceremonyclient/client
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
+    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
+    go mod download
+
+ARG BINARIES_DIR=/opt/ceremonyclient/target/release
+RUN --mount=type=cache,id=go-build,target=/root/.cache/go-build,sharing=locked \
+    --mount=type=cache,id=go-mod,target=/root/go/pkg/mod,sharing=locked \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} ./build.sh -o qclient
+RUN cp qclient /usr/bin
+
+# -----------------------------------------------------------------------------
+# Stage: exports (Scratch)
+# -----------------------------------------------------------------------------
+FROM scratch AS qclient-unix
+COPY --from=build-qclient /usr/bin/qclient /qclient
+ENTRYPOINT [ "/qclient" ]
+
+FROM qclient-unix AS qclient-linux
+FROM qclient-unix AS qclient-darwin
+FROM qclient-${TARGETOS} AS qclient

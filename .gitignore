@@ -1,0 +1,20 @@
+.idea/
+node/node
+node/lunchtime-*
+vouchers/
+ceremony-client
+.config*
+.DS_Store
+*.mprof
+.env
+.env.signers
+.task
+node-tmp-*
+build
+cover.out
+
+# Rust
+target
+
+# Build outputs
+vdf-test*
