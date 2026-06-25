@@ -20,9 +20,9 @@ var globalDomain = bytes.Repeat([]byte{0xff}, 32)
 // corresponding tea command forever and the user would see no
 // feedback at all. Set generously — VDF-bearing operations like
 // RequestJoin can legitimately take a while on the server side.
-const rpcTimeout = 15 * time.Second
+const rpcTimeout = 120 * time.Second
 
-// joinRpcTimeout is the longer ceiling specifically for RequestJoin,
+// joinRpcTimeout is the dedicated ceiling specifically for RequestJoin,
 // which includes VDF computation on the node side.
 const joinRpcTimeout = 90 * time.Second
 
@@ -38,7 +38,7 @@ func withTimeoutD(d time.Duration) (context.Context, context.CancelFunc) {
 
 // doJoin sends a RequestJoin RPC with one or more filters.
 // VDF computation happens on the node side and may take a long time,
-// so a longer dedicated timeout applies (vs the default `rpcTimeout`).
+// so a dedicated timeout applies.
 //
 // The returned `actionResultMsg` carries the raw filters so the
 // caller can hook the await-confirm loop just like Leave/Confirm/etc.
