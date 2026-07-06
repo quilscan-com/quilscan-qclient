@@ -237,22 +237,36 @@ func validateAllocationAction(m manageModel, action string, row allocationRow) e
 		if status != 1 && status != 4 {
 			return fmt.Errorf("confirm requires Joining or Leaving status; filter %s is %s", row.filterHex, statusName)
 		}
-		openFrame, closeFrame, ok := confirmWindow(row)
+		window, ok := allocationRowConfirmWindow(row, m.epochLength)
 		if !ok {
 			return fmt.Errorf("confirm window unavailable for filter %s", row.filterHex)
 		}
-		if m.frameNumber < openFrame || m.frameNumber >= closeFrame {
+		currentFrame := m.epochFrame()
+		if window.state(currentFrame, m.epochLength) != windowOpen {
 			return fmt.Errorf(
 				"confirm not available for filter %s at frame %d; window is [%d, %d)",
 				row.filterHex,
-				m.frameNumber,
-				openFrame,
-				closeFrame,
+				currentFrame,
+				window.startFrame,
+				window.endFrame,
 			)
 		}
 	case "reject":
 		if status != 1 && status != 4 {
 			return fmt.Errorf("reject requires Joining or Leaving status; filter %s is %s", row.filterHex, statusName)
+		}
+		window, ok := allocationRowConfirmWindow(row, m.epochLength)
+		if ok {
+			currentFrame := m.epochFrame()
+			if window.state(currentFrame, m.epochLength) != windowOpen {
+				return fmt.Errorf(
+					"reject not available for filter %s at frame %d; window is [%d, %d)",
+					row.filterHex,
+					currentFrame,
+					window.startFrame,
+					window.endFrame,
+				)
+			}
 		}
 	case "pause":
 		if status != 2 {
@@ -522,20 +536,20 @@ func normalizeWorkerIDs(ids []uint) ([]uint32, error) {
 	return workers, nil
 }
 
-func confirmWindow(row allocationRow) (uint64, uint64, bool) {
+func allocationRowConfirmWindow(row allocationRow, epochLength uint64) (confirmWindow, bool) {
 	switch row.status {
 	case 1:
 		if row.joinFrame == 0 {
-			return 0, 0, false
+			return confirmWindow{}, false
 		}
-		return row.joinFrame + ACTION_FRAME_DELAY, row.joinFrame + ACTION_FRAME_DELAY*2, true
+		return joinConfirmWindow(row.joinFrame, epochLength), true
 	case 4:
 		if row.leaveFrame == 0 {
-			return 0, 0, false
+			return confirmWindow{}, false
 		}
-		return row.leaveFrame + ACTION_FRAME_DELAY, row.leaveFrame + ACTION_FRAME_DELAY*2, true
+		return leaveConfirmWindow(row.leaveFrame, epochLength), true
 	default:
-		return 0, 0, false
+		return confirmWindow{}, false
 	}
 }
 
