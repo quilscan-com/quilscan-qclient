@@ -35,6 +35,24 @@ fi
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
+private_key_raw="${DEV_NODE_SIGNING_PRIVATE_KEY:-${AGENT_SIGNING_PRIVATE_KEY:-}}"
+raw_key="$tmp_dir/ed25519-private.raw"
+private_key="$tmp_dir/ed25519-private.pem"
+
+printf '%s' "$private_key_raw" | openssl base64 -d -A > "$raw_key"
+if [[ "$(wc -c < "$raw_key" | tr -d ' ')" != "64" ]]; then
+  echo "Ed25519 private key must decode to 64 bytes" >&2
+  exit 1
+fi
+
+# OpenSSL expects a PKCS#8 Ed25519 key containing the 32-byte seed. The
+# release secret uses Go's 64-byte private-key format (seed followed by public
+# key), so retain only the seed when writing the DER structure.
+printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x70\x04\x22\x04\x20' > "$private_key"
+head -c 32 "$raw_key" >> "$private_key"
+openssl pkey -inform DER -in "$private_key" -out "$private_key.pem"
+private_key="$private_key.pem"
+
 binaries_file="$tmp_dir/qclient-binaries"
 find "$dist_dir" -maxdepth 1 -type f \
   -name "qclient-${version}-*" \
@@ -75,7 +93,8 @@ while IFS= read -r binary; do
   platform="${binary_name#qclient-${version}-}"
 
   openssl sha3-256 -out "$digest" "$binary"
-  go run ./scripts/sign-qclient-artifacts.go "$binary"
+  openssl pkeyutl -sign -rawin -inkey "$private_key" -in "$binary" -out "$tmp_dir/signature"
+  openssl base64 -A -in "$tmp_dir/signature" > "$signature"
   sha3_256="$(sed 's/^.*= //' "$digest" | tr -d '\r\n')"
 
   if [[ "$count" -gt 0 ]]; then

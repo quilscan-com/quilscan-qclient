@@ -7,7 +7,7 @@ generated release bundle.
 
 Push to `main` or run the `qclient release` workflow manually.
 
-The workflow version defaults to `config/version.go`. Manual runs can override
+The workflow version defaults to `crates/quil-config/src/version.rs`. Manual runs can override
 it with a numeric dotted value such as `2.1.0.23`. Do not use a `v` prefix,
 because the agent qclient manifest parser only discovers numeric dotted
 versions.
@@ -52,7 +52,7 @@ The binary itself is then signed with the same Ed25519 signing format used by
 the Quilscan agent updater:
 
 ```sh
-go run ./scripts/sign-qclient-artifacts.go qclient-<version>-<platform>
+scripts/sign-qclient-artifacts.sh <version> <dist-dir>
 ```
 
 The agent verifies the `.sig` file against its built-in public key before

@@ -10,7 +10,7 @@ env:
 
 vars:
   VERSION:
-    sh: cat config/version.go | grep -A 1 "func GetVersion() \\[\\]byte {" | grep -Eo '0x[0-9a-fA-F]+' | xargs printf "%d.%d.%d"
+    sh: sed -n 's/^pub const VERSION_STRING: &str = "\\(.*\\)";/\\1/p' crates/quil-config/src/version.rs
   GIT_REPO:
     sh: git config --get remote.origin.url | sed 's/\\.git$//'
   GIT_BRANCH:
@@ -29,28 +29,23 @@ tasks:
     silent: true
 
   build_qclient_arm64_macos:
-    desc: Build qclient for macOS ARM64. Outputs to client/build.
+    desc: Build the Rust qclient for macOS ARM64. Outputs to crates/quil-client/build.
     cmds:
-      - vdf/generate.sh
-      - bls48581/generate.sh
-      - verenc/generate.sh
-      - bulletproofs/generate.sh
-      - ferret/generate.sh
-      - channel/generate.sh
-      - rpm/generate.sh
-      - client/build.sh -o build/arm64_macos/qclient
+      - mkdir -p crates/quil-client/build/arm64_macos
+      - cargo build --release -p quil-client --bin qclient
+      - install -m 0755 target/release/qclient crates/quil-client/build/arm64_macos/qclient
 
   build_qclient_arm64_linux:
-    desc: Build qclient for Linux ARM64. Outputs to client/build.
+    desc: Build the Rust qclient for Linux ARM64. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output client/build/arm64_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/arm64 -f docker/Dockerfile.source --output crates/quil-client/build/arm64_linux --target=qclient .
 
   build_qclient_amd64_linux:
-    desc: Build qclient for Linux AMD64. Outputs to client/build.
+    desc: Build the Rust qclient for Linux AMD64. Outputs to crates/quil-client/build.
     cmds:
-      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output client/build/amd64_linux --target=qclient .
+      - docker build --ulimit stack=-1:-1 --platform linux/amd64 -f docker/Dockerfile.source --output crates/quil-client/build/amd64_linux --target=qclient .
 
   test:qclient:
-    desc: Run qclient tests.
+    desc: Run Rust qclient tests.
     cmds:
-      - client/test/run_tests.sh -d 'ubuntu' -v '24.04'
+      - cargo test -p quil-client

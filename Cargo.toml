@@ -36,6 +36,7 @@ members = [
     "crates/quil-crypto",
     "crates/quil-tries",
     "crates/quil-tries-ffi",
+    "crates/quil-lattice-ct",
     "crates/quil-store",
     "crates/quil-hypergraph",
     "crates/quil-keys",
@@ -49,6 +50,7 @@ members = [
     "crates/quil-node",
     "crates/quil-compiler",
     "crates/quil-wallet",
+    "crates/quil-client",
     "crates/libp2p-identity",
 ]
 
@@ -73,7 +75,7 @@ libp2p-autonat = { path = "crates/libp2p-autonat" }
 libp2p-kad = { path = "crates/libp2p-kad" }
 
 [profile.release]
-# rpath = false is important to make Go bindings work
+# Keep release binaries relocatable.
 rpath = false
 lto   = true
 debug = false

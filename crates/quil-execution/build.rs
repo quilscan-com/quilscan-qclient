@@ -1,7 +1,7 @@
-//! Preprocess the Go-embedded seniority JSON files into compact binary
+//! Preprocess the embedded seniority JSON files into compact binary
 //! tables so the runtime crate can zero-copy load them via `include_bytes!`.
 //!
-//! The inputs live under `node/execution/intrinsics/global/compat/`.
+//! The inputs live under this crate's `compat/` directory.
 //! `mainnet_244200_seniority.json` alone is 210 MB; parsing it at every
 //! startup is unacceptable, so we serialize once at build-time as:
 //!
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-const COMPAT_DIR_FROM_CRATE: &str = "../../node/execution/intrinsics/global/compat";
+const COMPAT_DIR_FROM_CRATE: &str = "compat";
 
 #[derive(Deserialize)]
 struct RawMap(std::collections::BTreeMap<String, u64>);
@@ -46,12 +46,10 @@ fn main() {
 }
 
 fn preprocess_mainnet_seniority(json_path: &PathBuf, bin_path: &PathBuf) {
-    let bytes = fs::read(json_path).unwrap_or_else(|e| {
-        panic!("failed to read {}: {}", json_path.display(), e)
-    });
-    let map: RawMap = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-        panic!("failed to parse {}: {}", json_path.display(), e)
-    });
+    let bytes = fs::read(json_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", json_path.display(), e));
+    let map: RawMap = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {}", json_path.display(), e));
 
     // BTreeMap already iterates in sorted ascending key order, which
     // matches the ordering we want for binary search. Convert hex keys
@@ -81,7 +79,8 @@ fn preprocess_mainnet_seniority(json_path: &PathBuf, bin_path: &PathBuf) {
     }
 
     let mut out = fs::File::create(bin_path).unwrap();
-    out.write_all(&(entries.len() as u64).to_be_bytes()).unwrap();
+    out.write_all(&(entries.len() as u64).to_be_bytes())
+        .unwrap();
     for (addr, s) in &entries {
         out.write_all(addr).unwrap();
         out.write_all(&s.to_be_bytes()).unwrap();
