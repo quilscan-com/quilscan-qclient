@@ -102,6 +102,7 @@ WORKDIR /opt/quilscan-qclient
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
+COPY node/execution/intrinsics/global/compat node/execution/intrinsics/global/compat
 COPY protobufs protobufs
 
 FROM qclient-context AS build-qclient

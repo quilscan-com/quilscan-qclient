@@ -120,7 +120,7 @@ fn format_once(model: &Model) -> String {
             row.ring,
             format_size_mb(&row.shard_size),
             row.data_shards,
-            super::super::format_quil_reward(&row.estimated_reward),
+            super::format_quil_reward(&row.estimated_reward),
             worker,
             row.status_name,
             mode,
@@ -140,7 +140,7 @@ fn format_once(model: &Model) -> String {
             row.ring,
             format_size_mb(&row.shard_size),
             row.data_shards,
-            super::super::format_quil_reward(&row.estimated_reward),
+            super::format_quil_reward(&row.estimated_reward),
         ));
     }
 
