@@ -35,7 +35,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", seniority_json.display());
 
-    if seniority_json.exists() {
+    if seniority_json.exists() && !is_lfs_pointer(&seniority_json) {
         preprocess_mainnet_seniority(&seniority_json, &seniority_bin);
     } else {
         // Data file absent (e.g. minimal checkout) — emit an empty table
@@ -43,6 +43,12 @@ fn main() {
         // until the file is restored.
         emit_empty_table(&seniority_bin);
     }
+}
+
+fn is_lfs_pointer(path: &PathBuf) -> bool {
+    fs::read(path)
+        .map(|bytes| bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n"))
+        .unwrap_or(false)
 }
 
 fn preprocess_mainnet_seniority(json_path: &PathBuf, bin_path: &PathBuf) {
