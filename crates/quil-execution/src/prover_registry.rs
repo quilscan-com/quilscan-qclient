@@ -8,23 +8,23 @@
 //!
 //! - `prover_cache: HashMap<Vec<u8>, ProverInfo>` — address → info
 //! - `filter_cache: HashMap<Vec<u8>, Vec<Vec<u8>>>` — confirmation
-//!   filter → sorted list of prover addresses with an active
-//!   allocation under that filter
+//! filter → sorted list of prover addresses with an active
+//! allocation under that filter
 //! - `address_to_filters: HashMap<Vec<u8>, Vec<Vec<u8>>>` — reverse
-//!   index from prover address to the filters it's allocated under
+//! index from prover address to the filters it's allocated under
 //!
 //! Differences from Go:
 //!
 //! 1. We don't yet implement the `RollingFrecencyCritbitTrie` that Go
-//!    uses for `FindNearestAndApproximateNeighbors`. For now we store
-//!    filter → sorted `Vec<Vec<u8>>` and do a linear scan. Fine up to
-//!    ~10 K provers per filter.
+//! uses for `FindNearestAndApproximateNeighbors`. For now we store
+//! filter → sorted `Vec<Vec<u8>>` and do a linear scan. Fine up to
+//! ~10 K provers per filter.
 //! 2. We iterate the persisted blob cache
-//!    (`RocksHypergraphStore::for_each_vertex_underlying`), not a
-//!    live hypergraph iterator.
+//! (`RocksHypergraphStore::for_each_vertex_underlying`), not a
+//! live hypergraph iterator.
 //! 3. No locking — the registry is rebuilt from scratch on each
-//!    `refresh()` and is read-only after that. Concurrent readers can
-//!    wrap in an `Arc<RwLock<_>>` at the call site if needed.
+//! `refresh()` and is read-only after that. Concurrent readers can
+//! wrap in an `Arc<RwLock<_>>` at the call site if needed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -56,9 +56,24 @@ use crate::global_schema::{
 
 /// In-memory cache of every prover and their allocations on the global
 /// prover shard, built by walking the persisted vertex store.
+/// A member's registered storage root for one leaf, as recorded by its
+/// `ProverConfirm` (the leaf-root vertex written at confirm time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafRootRecord {
+    pub leaf_root: Vec<u8>,
+    pub num_blocks: u64,
+    /// The storage epoch this leaf root was registered for. The storage
+    /// attestation verifier checks this equals the active epoch.
+    pub epoch: u64,
+}
+
 pub struct InMemoryProverRegistry {
     /// prover_address (32 bytes) → full ProverInfo with allocations
     prover_cache: HashMap<Vec<u8>, ProverInfo>,
+    /// (member_address, leaf_id) → registered leaf-root record. `leaf_id` is
+    /// `leaf_id_bytes(shard_filter, prefix)`. Populated from
+    /// `leafroot:LeafRootRegistration` vertices written by ProverConfirm.
+    leaf_root_cache: HashMap<(Vec<u8>, Vec<u8>), LeafRootRecord>,
     /// confirmation_filter → sorted list of prover addresses with at
     /// least one allocation under that filter. Sorted lexicographically
     /// by address bytes.
@@ -73,6 +88,8 @@ pub struct InMemoryProverRegistry {
     prover_vertex_count: usize,
     /// `allocation:ProverAllocation` vertices seen during the last refresh.
     allocation_vertex_count: usize,
+    /// `leafroot:LeafRootRegistration` vertices seen during the last refresh.
+    leaf_root_vertex_count: usize,
     /// Vertices whose type hash wasn't in `TYPE_HASH_TABLE`.
     unknown_vertex_count: usize,
 }
@@ -87,11 +104,13 @@ impl InMemoryProverRegistry {
     pub fn new() -> Self {
         Self {
             prover_cache: HashMap::new(),
+            leaf_root_cache: HashMap::new(),
             filter_cache: HashMap::new(),
             address_to_filters: HashMap::new(),
             reward_vertex_count: 0,
             prover_vertex_count: 0,
             allocation_vertex_count: 0,
+            leaf_root_vertex_count: 0,
             unknown_vertex_count: 0,
         }
     }
@@ -99,12 +118,27 @@ impl InMemoryProverRegistry {
     /// Clear all state. Called from the start of `refresh`.
     pub fn clear(&mut self) {
         self.prover_cache.clear();
+        self.leaf_root_cache.clear();
         self.filter_cache.clear();
         self.address_to_filters.clear();
         self.reward_vertex_count = 0;
         self.prover_vertex_count = 0;
         self.allocation_vertex_count = 0;
+        self.leaf_root_vertex_count = 0;
         self.unknown_vertex_count = 0;
+    }
+
+    /// The registered leaf-root record for `(member, leaf_id)`, or `None`.
+    /// `leaf_id` = `leaf_id_bytes(shard_filter, prefix)`. Used by the storage
+    /// attestation verifier to cross-check an opening's claimed `leaf_root`.
+    pub fn get_leaf_root(&self, member: &[u8], leaf_id: &[u8]) -> Option<&LeafRootRecord> {
+        self.leaf_root_cache
+            .get(&(member.to_vec(), leaf_id.to_vec()))
+    }
+
+    /// Total registered leaf roots across all members (diagnostics).
+    pub fn leaf_root_count(&self) -> usize {
+        self.leaf_root_cache.len()
     }
 
     /// Walk every persisted `vertex/adds` vertex and rebuild the
@@ -175,6 +209,12 @@ impl InMemoryProverRegistry {
                 }
                 Some("reward:ProverReward") => {
                     self.reward_vertex_count += 1;
+                }
+                Some("leafroot:LeafRootRegistration") => {
+                    self.leaf_root_vertex_count += 1;
+                    if let Some((key, rec)) = decode_leaf_root(&root) {
+                        self.leaf_root_cache.insert(key, rec);
+                    }
                 }
                 Some("allocation:ProverAllocation") => {
                     // Handled in pass 2.
@@ -264,21 +304,35 @@ impl InMemoryProverRegistry {
             .collect()
     }
 
-    pub fn get_active_provers(&self, filter: &[u8]) -> Vec<&ProverInfo> {
+    pub fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Vec<&ProverInfo> {
         let Some(addrs) = self.filter_cache.get(filter) else {
             return Vec::new();
         };
-        addrs
-            .iter()
-            .filter_map(|a| self.prover_cache.get(a))
-            .filter(|p| {
-                p.status == ProverStatus::Active
-                    && p.allocations.iter().any(|alloc| {
-                        alloc.status == ProverStatus::Active
-                            && alloc.confirmation_filter == filter
-                    })
-            })
-            .collect()
+        let members = |lenient: bool| -> Vec<&ProverInfo> {
+            addrs
+                .iter()
+                .filter_map(|a| self.prover_cache.get(a))
+                .filter(|p| p.allocations.iter().any(|alloc| {
+                    alloc.confirmation_filter == filter
+                        && committee_eligible(alloc, frame_number, lenient)
+                }))
+                .collect()
+        };
+        let strict = members(false);
+        // Empty-committee guard: a non-empty (app-shard) committee must never
+        // vanish just because every member was demoted by `effective_status`
+        // (a sole freshly-joined prover in its deferred window, or every member
+        // transiently stale mid-re-confirm) — that would strand an otherwise-
+        // live shard. Fall back to the raw-`Active` floor. Applied identically
+        // by producer + verifier (same `frame_number`), so it can't fork; only
+        // ever LOOSENS the set, never below the old raw-Active set. The global
+        // (empty) filter never needs it — its allocations are never demoted —
+        // so `strict` there already equals the full set.
+        if !strict.is_empty() || filter.is_empty() {
+            strict
+        } else {
+            members(true)
+        }
     }
 
     pub fn get_prover_count(&self, filter: &[u8]) -> usize {
@@ -299,28 +353,27 @@ impl InMemoryProverRegistry {
     /// which it cannot produce proposals (the consensus event loop
     /// is intentionally not activated for non-global provers) and
     /// the chain stalls timing out for the rest of its rank window.
-    pub fn get_ordered_provers(&self, input: &[u8], filter: &[u8]) -> Vec<Vec<u8>> {
+    pub fn get_ordered_provers(&self, input: &[u8], filter: &[u8], frame_number: u64) -> Vec<Vec<u8>> {
         let modulus = bn254_modulus();
         let target = BigInt::from_bytes_be(num_bigint::Sign::Plus, input);
 
-        // Eligibility for leader rotation is determined by *allocation*
-        // status, not the prover's aggregate `status` field. The prover
-        // record's status is a derived rollup whose freshness depends
-        // on the materializer ordering — relying on it here causes a
-        // newly-confirmed prover (allocation just flipped Joining→Active
-        // but the per-filter Confirm hasn't yet refreshed the prover
-        // rollup) to be excluded from leader rotation, stalling the
-        // shard until the rollup catches up.
+        // Eligibility for leader rotation is the SAME committee set as
+        // `get_active_provers` (they MUST agree — the leader at a rank must be a
+        // member others count toward quorum), including the same empty-committee
+        // guard. Determined by allocation `effective_status` via
+        // `committee_eligible` at `frame_number`, not the prover's aggregate
+        // `status` rollup (whose freshness lags the materializer).
         let candidates: Vec<Vec<u8>> = if filter.is_empty() {
-            // Global view: provers with at least one Active allocation
-            // under the empty (global) filter — the genesis allocation.
+            // Global view: provers with a live allocation under the empty
+            // (global) filter — the genesis allocation. Empty-filter
+            // allocations are never ExpiredEpoch, so `lenient` is irrelevant.
             let mut all: Vec<Vec<u8>> = self
                 .prover_cache
                 .iter()
                 .filter(|(_, p)| {
                     p.allocations.iter().any(|a| {
-                        a.status == ProverStatus::Active
-                            && a.confirmation_filter.is_empty()
+                        a.confirmation_filter.is_empty()
+                            && committee_eligible(a, frame_number, false)
                     })
                 })
                 .map(|(addr, _)| addr.clone())
@@ -328,26 +381,37 @@ impl InMemoryProverRegistry {
             all.sort();
             all
         } else {
-            // Per-filter view: provers with an Active allocation under
-            // this filter — not Joining/Leaving/Rejected/Kicked.
+            // Per-filter view: committee members under this filter at
+            // `frame_number` — Active or Leaving-within-grace; not Joining
+            // (incl. deferred-activation), ExpiredLeaving, or terminal. Falls
+            // back to the raw-Active floor if the strict set is empty (same
+            // empty-committee guard as `get_active_provers`).
             let Some(addrs) = self.filter_cache.get(filter) else {
                 return Vec::new();
             };
-            addrs
-                .iter()
-                .filter(|a| {
-                    self.prover_cache
-                        .get(*a)
-                        .map(|p| {
-                            p.allocations.iter().any(|alloc| {
-                                alloc.status == ProverStatus::Active
-                                    && alloc.confirmation_filter == filter
+            let pick = |lenient: bool| -> Vec<Vec<u8>> {
+                addrs
+                    .iter()
+                    .filter(|a| {
+                        self.prover_cache
+                            .get(*a)
+                            .map(|p| {
+                                p.allocations.iter().any(|alloc| {
+                                    alloc.confirmation_filter == filter
+                                        && committee_eligible(alloc, frame_number, lenient)
+                                })
                             })
-                        })
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect()
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            let strict = pick(false);
+            if strict.is_empty() {
+                pick(true)
+            } else {
+                strict
+            }
         };
 
         let mut scored: Vec<(BigInt, BigInt, Vec<u8>)> = candidates
@@ -368,8 +432,8 @@ impl InMemoryProverRegistry {
     /// Return the single closest prover address to `input` under
     /// `filter`, or `None` if the filter has no provers. Mirrors Go's
     /// `GetNextProver`.
-    pub fn get_next_prover(&self, input: &[u8], filter: &[u8]) -> Option<Vec<u8>> {
-        self.get_ordered_provers(input, filter).into_iter().next()
+    pub fn get_next_prover(&self, input: &[u8], filter: &[u8], frame_number: u64) -> Option<Vec<u8>> {
+        self.get_ordered_provers(input, filter, frame_number).into_iter().next()
     }
 
     pub fn get_all_active_app_shard_provers(&self) -> Vec<&ProverInfo> {
@@ -510,18 +574,89 @@ impl InMemoryProverRegistry {
         shard_halt_durations: &HashMap<Vec<u8>, u64>,
     ) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = Vec::new();
+
+        // Per-shard census of effectively-active allocations at this frame.
+        // A shard with fewer than `MIN_SHARD_CONSENSUS_PROVERS` active provers
+        // cannot run its consensus (it is under a coverage halt), so NO shard
+        // frame can be produced and its provers cannot advance
+        // `last_active_frame_number` — evicting them for inactivity would
+        // punish a shortfall they can't fix and spiral the shard to zero.
+        // Counted exactly like the coverage monitor (`effective_status ==
+        // Active`, ignoring the parent prover byte) so the two agree, and
+        // derived from the same committed registry state the eviction pass
+        // reads below — deterministic across the fleet, independent of the
+        // per-node coverage monitor / shard-size source.
+        let mut active_by_filter: HashMap<Vec<u8>, u64> = HashMap::new();
         for info in self.prover_cache.values() {
-            if info.status != ProverStatus::Active {
+            for alloc in &info.allocations {
+                if alloc.confirmation_filter.is_empty() {
+                    continue;
+                }
+                if alloc.effective_status(frame_number) == EffectiveStatus::Active {
+                    *active_by_filter
+                        .entry(alloc.confirmation_filter.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+
+        for info in self.prover_cache.values() {
+            // Consider Active provers (normal eviction) AND `Unknown`
+            // stubs. A stub is synthesized by `refresh` (pass 2) when an
+            // allocation's parent prover vertex is absent/undecodable —
+            // which is exactly the orphan state left when an earlier
+            // eviction kicked the PROVER vertex (Status=4 → decode_prover
+            // returns None) but NOT its allocation vertices. Those stubs
+            // keep their still-Active allocations counted in shard
+            // summaries forever, yet were skipped here (so they never
+            // returned to the eviction set). Including `Unknown` lets the
+            // per-allocation checks below re-select them so their lingering
+            // active allocations get kicked and drop out of the count.
+            // Other lifecycle states (Joining/Paused/Leaving/Rejected) are
+            // still skipped — only genuine orphans look like `Unknown`.
+            if info.status != ProverStatus::Active
+                && info.status != ProverStatus::Unknown
+            {
                 continue;
             }
             let mut should_evict = false;
             for alloc in &info.allocations {
-                if alloc.status != ProverStatus::Active {
+                // Frame-aware: only an allocation that is EFFECTIVELY Active for
+                // this frame accrues inactivity. Gating on the RAW `alloc.status`
+                // wrongly evicted epoch-EXPIRED allocations — the raw status
+                // stays `Active` after the epoch ends, but `effective_status`
+                // returns `ExpiredEpoch`. Such allocations are already excluded
+                // from the committee and the shard summaries (both go through
+                // `live_allocation_status`), so evicting them for "inactivity"
+                // when they aren't even expected to be active was inconsistent
+                // (the "up for eviction but no active shards" contradiction).
+                // This matches the committee filter's frame-aware gating; an
+                // epoch-expired prover is handled by the epoch lifecycle, not
+                // inactivity eviction. Orphan (`Unknown`-prover) allocations
+                // whose epoch is still valid remain `Active` here and are still
+                // kicked.
+                if alloc.effective_status(frame_number) != EffectiveStatus::Active {
                     continue;
                 }
                 // Global provers (empty confirmation filter) are never
                 // evicted.
                 if alloc.confirmation_filter.is_empty() {
+                    continue;
+                }
+                // Coverage-halt / under-provisioned exemption: if this shard
+                // has fewer than the consensus minimum of active provers it
+                // cannot run consensus, so no shard frame is produced and this
+                // prover cannot possibly submit a proof — inactivity here is
+                // not its fault. Skip (do not accrue inactivity, do not evict).
+                // Subsumes the coverage-halt case and the "not enough provers
+                // to run consensus" case the coverage `shard_halt_durations`
+                // map handled inconsistently (it dropped empty under-covered
+                // shards, which then evicted their provers anyway).
+                let shard_active = active_by_filter
+                    .get(&alloc.confirmation_filter)
+                    .copied()
+                    .unwrap_or(0);
+                if shard_active < quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS {
                     continue;
                 }
                 let halt_duration = shard_halt_durations
@@ -531,12 +666,19 @@ impl InMemoryProverRegistry {
                 if halt_duration == u64::MAX {
                     continue;
                 }
+                // The inactivity clock does not start until the network is
+                // considered live for eviction. A prover accrues no
+                // inactivity before then, so count from
+                // max(last_active, EVICTION_INACTIVITY_START_FRAME).
+                let inactivity_start = alloc
+                    .last_active_frame_number
+                    .max(quil_types::consensus::EVICTION_INACTIVITY_START_FRAME);
                 if alloc.last_active_frame_number == 0
-                    || frame_number <= alloc.last_active_frame_number
+                    || frame_number <= inactivity_start
                 {
                     continue;
                 }
-                let total_inactive = frame_number - alloc.last_active_frame_number;
+                let total_inactive = frame_number - inactivity_start;
                 let effective_inactive = if halt_duration == 0 {
                     total_inactive
                 } else if halt_duration < total_inactive {
@@ -596,8 +738,16 @@ impl InMemoryProverRegistry {
 /// - `Paused` → `Some(Paused)`
 /// - `Leaving` (within grace) → `Some(Leaving)`
 /// - `ExpiredLeaving` (leave attempt never confirmed/rejected) →
-///   `Some(Active)` — the leave failed silently; allocation reverts
-///   to its pre-leave Active state and remains in the cache.
+/// `None` (excluded). The prover socially left the shard even
+/// though the LeaveConfirm never landed — they stopped proving
+/// when they submitted the Leave. Counting them as Active would
+/// inflate every shard's live coverage by the number of stuck
+/// leaves, which hides real halt-risk shards from the proposer
+/// and coverage monitor. Observed in the wild 2026-06-05: 147
+/// halt-risk shards (active ≤ 3) on the network were invisible
+/// to a node that classified every one of them as ≥4 active
+/// because each had 1+ ExpiredLeaving allocations bumping the
+/// count.
 /// - `ExpiredJoining`, `Rejected`, `Kicked` → `None` (excluded)
 /// - `Unknown` → `None`
 ///
@@ -613,11 +763,54 @@ fn live_allocation_status(
         EffectiveStatus::Active => Some(ProverStatus::Active),
         EffectiveStatus::Paused => Some(ProverStatus::Paused),
         EffectiveStatus::Leaving => Some(ProverStatus::Leaving),
-        EffectiveStatus::ExpiredLeaving => Some(ProverStatus::Active),
         EffectiveStatus::ExpiredJoining
+        | EffectiveStatus::ExpiredLeaving
+        | EffectiveStatus::ExpiredEpoch
         | EffectiveStatus::Rejected
         | EffectiveStatus::Kicked
         | EffectiveStatus::Unknown => None,
+    }
+}
+
+/// Is `alloc` a member of the epoch-aligned consensus committee at
+/// `frame_number`? SHARED predicate behind both `get_active_provers`
+/// (quorum membership) and `get_ordered_provers` (leader rotation) — they
+/// must agree on the set or a leader could be picked from outside the
+/// quorum. Aligns the committee with the `effective_status` view the rest
+/// of the node (coverage, lifecycle buckets, worker allocator) already
+/// uses; the committee filter was the last holdout on raw `status`.
+///
+/// Included: `Active`, and `Leaving`-within-grace (a departing prover
+/// keeps serving notice — still proving, still counted — and stays in the
+/// FROZEN committee until the E+2 boundary).
+///
+/// Excluded: `Joining` — including a just-confirmed prover still inside
+/// its deferred-activation window (raw `Active` byte but pre-E+2; it is
+/// NOT running its consensus loop yet, so counting it inflated the quorum
+/// denominator and could pick it as a leader that can't produce);
+/// `ExpiredLeaving` (socially left); terminal (kicked/rejected).
+///
+/// The `lenient` flag is the EMPTY-COMMITTEE FLOOR (see the guard in
+/// `get_active_provers`/`get_ordered_provers`). When the strict pass would
+/// leave a non-empty (app-shard) filter with NO members, the lenient pass
+/// re-admits any allocation whose RAW status is still `Active` but which
+/// `effective_status` demoted — i.e. a deferred-activation prover
+/// (raw `Active`, reads `Joining`) or a stale-epoch prover (reads
+/// `ExpiredEpoch`). This guarantees a live shard's committee never vanishes
+/// (a sole freshly-joined prover can still bootstrap its shard; a shard
+/// mid-re-confirm never stalls) — never worse than the old raw-`Active`
+/// filter. It does NOT re-admit never-confirmed joins (raw `Joining`),
+/// `ExpiredLeaving`, or terminal allocations — those genuinely aren't
+/// members. The empty/global filter can never be demoted (`effective_status`
+/// exempts it), so GLOBAL consensus is completely unaffected either way.
+fn committee_eligible(alloc: &ProverAllocationInfo, frame_number: u64, lenient: bool) -> bool {
+    match alloc.effective_status(frame_number) {
+        EffectiveStatus::Active | EffectiveStatus::Leaving => true,
+        // Demoted-but-raw-Active: re-admitted only by the empty-committee floor.
+        EffectiveStatus::Joining | EffectiveStatus::ExpiredEpoch => {
+            lenient && alloc.status == ProverStatus::Active
+        }
+        _ => false,
     }
 }
 
@@ -637,12 +830,10 @@ impl SharedProverRegistry {
     /// Rebuild the cache from the given hypergraph store. Takes a
     /// write lock for the duration of the refresh.
     ///
-    /// Emits a temporary diagnostic `info!("local prover allocations changed", ...)`
-    /// whenever any field of the LOCAL prover (the one whose address
-    /// matches `LOCAL_PROVER_ADDRESS`) or any of its allocations
-    /// changes across a refresh. Useful for diagnosing why a ProverJoin
-    /// never converts to a Confirm — we should see the allocation
-    /// appear as `status=Joining` here after the join materializes.
+    /// Logs an `info!` whenever any field of the LOCAL prover (the one whose
+    /// address matches `LOCAL_PROVER_ADDRESS`) or any of its allocations changes
+    /// across a refresh, giving operators visibility into the join → confirm
+    /// lifecycle (e.g. a freshly-materialized join appearing as `status=Joining`).
     pub fn refresh_from_store(&self, hg_store: &Arc<RocksHypergraphStore>) {
         // Snapshot the local prover BEFORE we take the write lock for
         // the refresh; we'll snapshot again after and diff.
@@ -667,11 +858,40 @@ impl SharedProverRegistry {
         guard.get_prover_info(&addr).cloned()
     }
 
+    /// The registered leaf-root record for `(member, leaf_id)`, cloned out from
+    /// under the lock. `leaf_id = leaf_id_bytes(shard_filter, prefix)`. Used by
+    /// the storage attestation verifier to cross-check an opening's leaf root.
+    pub fn get_leaf_root(&self, member: &[u8], leaf_id: &[u8]) -> Option<LeafRootRecord> {
+        let guard = self.inner.read().ok()?;
+        guard.get_leaf_root(member, leaf_id).cloned()
+    }
+
     /// Find inactive provers AND apply the kick mutations (Status=4,
     /// KickFrameNumber=frame_number, Seniority=0) to the supplied
     /// HypergraphState. Returns the addresses of the provers that were
     /// successfully evicted.
     ///
+    /// Read-only view of which provers WOULD be evicted right now, with
+    /// no state mutation. Same selection logic the mutating
+    /// `evict_inactive_provers` uses internally — exposed so callers can
+    /// surface the would-be set (eviction-risk endpoint, pre-activation
+    /// logging) before eviction actually runs.
+    pub fn find_eviction_candidates(
+        &self,
+        frame_number: u64,
+        inactivity_threshold: u64,
+        shard_halt_durations: &HashMap<Vec<u8>, u64>,
+    ) -> Vec<Vec<u8>> {
+        match self.inner.read() {
+            Ok(guard) => guard.find_eviction_candidates(
+                frame_number,
+                inactivity_threshold,
+                shard_halt_durations,
+            ),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Mirrors Go `ProverRegistry.EvictInactiveProvers` at
     /// `node/consensus/provers/prover_registry.go:2110-2201`. This is
     /// the mutation half of the eviction flow that the trait method
@@ -688,88 +908,157 @@ impl SharedProverRegistry {
         inactivity_threshold: u64,
         shard_halt_durations: &HashMap<Vec<u8>, u64>,
         state: &crate::hypergraph_state::HypergraphState,
+        store: Option<&Arc<RocksHypergraphStore>>,
     ) -> QuilResult<Vec<Vec<u8>>> {
-        // Read phase: find candidates under read lock.
-        let candidates = {
+        // Read phase: find candidates AND capture each candidate's
+        // allocation vertex addresses from the registry cache, under one
+        // read lock. The registry knows every allocation's exact vertex
+        // address (`ProverAllocationInfo.vertex_address`), so we kick them
+        // directly instead of relying on a hyperedge walk that silently
+        // returns nothing if the hyperedge blob is missing.
+        // Cap evictions per frame so a large backlog (e.g. the one-time
+        // orphan-stub cleanup) drains GRADUALLY instead of overwhelming the
+        // eviction + commit path in a single materialize. Evicting 733 at
+        // once wedged the materializer (no frame completed). find_eviction_
+        // candidates returns a deterministically SORTED list, so taking the
+        // first N yields the same set on every archive.
+        const EVICTION_MAX_PER_FRAME: usize = 25;
+        let candidates: Vec<(Vec<u8>, Vec<Vec<u8>>)> = {
             let guard = self
                 .inner
                 .read()
                 .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-            guard.find_eviction_candidates(
-                frame_number,
-                inactivity_threshold,
-                shard_halt_durations,
-            )
+            guard
+                .find_eviction_candidates(frame_number, inactivity_threshold, shard_halt_durations)
+                .into_iter()
+                .take(EVICTION_MAX_PER_FRAME)
+                .map(|addr| {
+                    let allocs = guard
+                        .prover_cache
+                        .get(&addr)
+                        .map(|info| {
+                            info.allocations
+                                .iter()
+                                .filter(|a| a.vertex_address.len() == 32)
+                                .map(|a| a.vertex_address.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    (addr, allocs)
+                })
+                .collect()
         };
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Mutation phase: kick each prover via the existing materialize
-        // helper. We load the prover vertex tree, apply the kick
-        // mutations, and write back via state.set. For each prover we
-        // also walk its hyperedge to find allocation vertices and apply
-        // `materialize_prover_kick_allocation` to each — mirroring Go's
-        // `evictProver` at `prover_registry.go:2281-2354`. Without
-        // kicking allocations the registry leaves stale Active
-        // allocations behind for the kicked prover, breaking
-        // shard-summary counts and decide_joins arithmetic.
+        // Mutation phase: kick the prover vertex AND every one of its
+        // allocation vertices. CRITICAL: shard summaries are computed
+        // purely from ALLOCATION status (`live_allocation_status` ignores
+        // the prover's status), so kicking only the prover vertex leaves it
+        // fully visible in shard data. Allocation addresses come from the
+        // registry; we also union in the legacy hyperedge-walk result as a
+        // fallback in case `vertex_address` was unset for some allocation.
         let domain = &crate::domains::GLOBAL[..];
         let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
         let global_app: [u8; 32] = crate::global_schema::GLOBAL_INTRINSIC_ADDRESS;
+        // Flat per-vertex keyspace shard for all global vertices — the same
+        // (l1=0, l2=0xFF*32) shard `refresh_from_store` reads candidates from.
+        let global_shard = ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
+        // Read a vertex's raw blob, preferring the CRDT (`state.get`) but
+        // falling back to the authoritative flat per-vertex keyspace. The
+        // CRDT's in-memory tree can be missing a vertex that hypergraph SYNC
+        // wrote straight into the flat keyspace (sync does not insert into the
+        // running CRDT tree), which is exactly why find_eviction_candidates —
+        // sourced from `refresh_from_store` over that same flat keyspace —
+        // selects a prover the CRDT can't load. Writing back via `state.set`
+        // then inserts/updates the kicked blob into the CRDT tree on commit.
+        let read_vertex = |addr: &[u8]| -> QuilResult<Option<Vec<u8>>> {
+            if let Some(b) = state.get(domain, addr, &va_disc)? {
+                return Ok(Some(b));
+            }
+            if let Some(s) = store {
+                if addr.len() == 32 {
+                    let mut vk = Vec::with_capacity(64);
+                    vk.extend_from_slice(&global_app);
+                    vk.extend_from_slice(addr);
+                    return s
+                        .load_vertex_underlying("vertex", "adds", &global_shard, &vk)
+                        .map_err(|e| {
+                            QuilError::Internal(format!("evict: flat-store read: {e}"))
+                        });
+                }
+            }
+            Ok(None)
+        };
         let mut evicted: Vec<Vec<u8>> = Vec::new();
 
-        for prover_addr in candidates {
-            let blob = match state.get(domain, &prover_addr, &va_disc)? {
+        for (prover_addr, mut alloc_addrs) in candidates {
+            let blob = match read_vertex(&prover_addr)? {
                 Some(b) => b,
-                None => continue,
+                None => {
+                    // Vertex is absent from BOTH the CRDT and the flat
+                    // keyspace — genuinely missing, not a cache/CRDT seam.
+                    tracing::warn!(
+                        prover = %hex::encode(&prover_addr),
+                        allocs_known = alloc_addrs.len(),
+                        "eviction: candidate vertex not found in CRDT or flat store — skipping"
+                    );
+                    continue;
+                }
             };
             let mut prover_tree = rebuild_vertex_tree_from_blob(&blob);
             crate::global_intrinsic::materialize::materialize_prover_kick(
                 &mut prover_tree,
                 frame_number,
             )?;
-            let new_blob = vertex_tree_to_blob(&prover_tree);
-            state.set(domain, &prover_addr, &va_disc, frame_number, new_blob)?;
+            state.set(domain, &prover_addr, &va_disc, frame_number, vertex_tree_to_blob(&prover_tree))?;
 
-            // Kick every allocation belonging to this prover. The
-            // hyperedge ID is `(GLOBAL_INTRINSIC_ADDRESS, prover_addr)`
-            // — the same convention used by `materialize_prover_join`
-            // when building the hyperedge. Each leaf key is a 64-byte
-            // atom ID `(app_addr, allocation_addr)`.
-            let mut prover_loc_id = [0u8; 64];
-            prover_loc_id[..32].copy_from_slice(&global_app);
-            if prover_addr.len() == 32 {
+            // Fallback: only when the registry supplied NO allocation
+            // addresses do we walk the prover's hyperedge
+            // `(GLOBAL_INTRINSIC_ADDRESS, prover_addr)`. Doing this walk
+            // unconditionally cost one hyperedge traversal per evicted prover
+            // — a large per-frame backlog made that a dominant, redundant
+            // cost since `vertex_address` already covers the normal case.
+            if alloc_addrs.is_empty() && prover_addr.len() == 32 {
+                let mut prover_loc_id = [0u8; 64];
+                prover_loc_id[..32].copy_from_slice(&global_app);
                 prover_loc_id[32..].copy_from_slice(&prover_addr);
-            }
-            let prover_location =
-                quil_hypergraph::addressing::Location::from_id(&prover_loc_id);
-            let alloc_ids = state
-                .crdt()
-                .get_hyperedge_extrinsic_ids(&prover_location);
-            for alloc_id in alloc_ids {
-                if alloc_id[..32] != global_app {
-                    continue;
+                let prover_location =
+                    quil_hypergraph::addressing::Location::from_id(&prover_loc_id);
+                for alloc_id in state.crdt().get_hyperedge_extrinsic_ids(&prover_location) {
+                    if alloc_id[..32] == global_app {
+                        let a = alloc_id[32..].to_vec();
+                        if !alloc_addrs.contains(&a) {
+                            alloc_addrs.push(a);
+                        }
+                    }
                 }
-                let alloc_addr = alloc_id[32..].to_vec();
-                let alloc_blob = match state.get(domain, &alloc_addr, &va_disc)? {
+            }
+
+            let mut kicked_allocs = 0usize;
+            for alloc_addr in &alloc_addrs {
+                let alloc_blob = match read_vertex(alloc_addr)? {
                     Some(b) => b,
                     None => continue,
                 };
                 let mut alloc_tree = rebuild_vertex_tree_from_blob(&alloc_blob);
-                if let Err(e) =
-                    crate::global_intrinsic::materialize::materialize_prover_kick_allocation(
-                        &mut alloc_tree,
-                        frame_number,
-                    )
-                {
-                    return Err(QuilError::Internal(format!(
-                        "evict: kick allocation: {e}"
-                    )));
-                }
-                let new_alloc_blob = vertex_tree_to_blob(&alloc_tree);
-                state.set(domain, &alloc_addr, &va_disc, frame_number, new_alloc_blob)?;
+                crate::global_intrinsic::materialize::materialize_prover_kick_allocation(
+                    &mut alloc_tree,
+                    frame_number,
+                )
+                .map_err(|e| QuilError::Internal(format!("evict: kick allocation: {e}")))?;
+                state.set(domain, alloc_addr, &va_disc, frame_number, vertex_tree_to_blob(&alloc_tree))?;
+                kicked_allocs += 1;
             }
+            tracing::debug!(
+                allocs_kicked = kicked_allocs,
+                allocs_known = alloc_addrs.len(),
+                "eviction kicked prover + allocations"
+            );
 
             evicted.push(prover_addr);
         }
@@ -813,9 +1102,8 @@ impl Default for SharedProverRegistry {
 /// `status_change` event when archives finally materialize the
 /// confirm.
 ///
-/// This is a **temporary diagnostic** for the join-never-confirms
-/// investigation. Remove once the lifecycle's
-/// "registry never sees self" bug is fixed.
+/// Gives operators visibility into whether the local prover's join eventually
+/// converges to a confirmed, active allocation.
 fn log_local_prover_diff(before: Option<&ProverInfo>, after: Option<&ProverInfo>) {
     match (before, after) {
         (None, None) => {}
@@ -996,13 +1284,13 @@ impl ProverRegistryTrait for SharedProverRegistry {
             .cloned())
     }
 
-    fn get_next_prover(&self, input: &[u8; 32], filter: &[u8]) -> QuilResult<Vec<u8>> {
+    fn get_next_prover(&self, input: &[u8; 32], filter: &[u8], frame_number: u64) -> QuilResult<Vec<u8>> {
         let guard = self
             .inner
             .read()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
         guard
-            .get_next_prover(input, filter)
+            .get_next_prover(input, filter, frame_number)
             .ok_or_else(|| QuilError::NotFound("shard trie empty".into()))
     }
 
@@ -1010,20 +1298,21 @@ impl ProverRegistryTrait for SharedProverRegistry {
         &self,
         input: &[u8; 32],
         filter: &[u8],
+        frame_number: u64,
     ) -> QuilResult<Vec<Vec<u8>>> {
         let guard = self
             .inner
             .read()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-        Ok(guard.get_ordered_provers(input, filter))
+        Ok(guard.get_ordered_provers(input, filter, frame_number))
     }
 
-    fn get_active_provers(&self, filter: &[u8]) -> QuilResult<Vec<ProverInfo>> {
+    fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> QuilResult<Vec<ProverInfo>> {
         let guard = self
             .inner
             .read()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-        Ok(guard.get_active_provers(filter).into_iter().cloned().collect())
+        Ok(guard.get_active_provers(filter, frame_number).into_iter().cloned().collect())
     }
 
     fn get_prover_count(&self, filter: &[u8]) -> QuilResult<usize> {
@@ -1040,6 +1329,20 @@ impl ProverRegistryTrait for SharedProverRegistry {
             .read()
             .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
         Ok(guard.get_provers(filter).into_iter().cloned().collect())
+    }
+
+    fn get_leaf_root(
+        &self,
+        member: &[u8],
+        leaf_id: &[u8],
+    ) -> QuilResult<Option<(Vec<u8>, u64, u64)>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
+        Ok(guard
+            .get_leaf_root(member, leaf_id)
+            .map(|r| (r.leaf_root.clone(), r.num_blocks, r.epoch)))
     }
 
     fn get_provers_by_status(
@@ -1253,9 +1556,38 @@ fn decode_allocation(
         leave_confirm_frame_number: read_u64_be(root, "allocation:ProverAllocation", "LeaveConfirmFrameNumber"),
         leave_reject_frame_number: read_u64_be(root, "allocation:ProverAllocation", "LeaveRejectFrameNumber"),
         last_active_frame_number: read_u64_be(root, "allocation:ProverAllocation", "LastActiveFrameNumber"),
+        epoch: read_u64_be(root, "allocation:ProverAllocation", "Epoch"),
+        ring: read_bytes(root, "allocation:ProverAllocation", "Ring")
+            .first()
+            .copied()
+            .unwrap_or(0),
         vertex_address: vertex_key[32..64].to_vec(),
     };
     Some((prover_ref, alloc))
+}
+
+/// Decode a `leafroot:LeafRootRegistration` vertex into
+/// `((member, leaf_id), record)`. `leaf_id = leaf_id_bytes(shard_filter,
+/// prefix)`. Returns `None` if required fields are missing.
+fn decode_leaf_root(
+    root: &VectorCommitmentNode,
+) -> Option<((Vec<u8>, Vec<u8>), LeafRootRecord)> {
+    let cls = "leafroot:LeafRootRegistration";
+    let member = read_bytes(root, cls, "Member");
+    let shard_filter = read_bytes(root, cls, "ShardFilter");
+    let leaf_root = read_bytes(root, cls, "LeafRoot");
+    if member.is_empty() || leaf_root.is_empty() {
+        return None;
+    }
+    let prefix_bytes = read_bytes(root, cls, "Prefix");
+    let prefix = crate::global_intrinsic::materialize::unpack_prefix(&prefix_bytes);
+    let leaf_id = crate::global_intrinsic::leaf_id_bytes(&shard_filter, &prefix);
+    let rec = LeafRootRecord {
+        leaf_root,
+        num_blocks: read_u64_be(root, cls, "NumBlocks"),
+        epoch: read_u64_be(root, cls, "Epoch"),
+    };
+    Some(((member, leaf_id), rec))
 }
 
 // =====================================================================
@@ -1301,6 +1633,55 @@ mod tests {
         let mut key = vec![0xFFu8; 32];
         key.extend_from_slice(&[address_byte; 32]);
         key
+    }
+
+    #[test]
+    fn decode_leaf_root_recovers_member_leaf_and_record() {
+        let member = [0x9Au8; 32];
+        let filter = vec![0xAB; 32];
+        let prefix = vec![42u32, 7];
+        let tree = crate::global_intrinsic::materialize::create_leaf_root_vertex_tree(
+            &member, &filter, &prefix, 19, &vec![0x11; 74], 1234, 900_000,
+        )
+        .unwrap();
+        // Through the same blob path refresh uses.
+        let blob = vertex_tree_to_blob(&tree);
+        let root = deserialize_go_tree(&blob).unwrap().unwrap();
+
+        let ((m, leaf_id), rec) = super::decode_leaf_root(&root).expect("decode");
+        assert_eq!(m, member.to_vec());
+        assert_eq!(
+            leaf_id,
+            crate::global_intrinsic::leaf_id_bytes(&filter, &prefix)
+        );
+        assert_eq!(rec.leaf_root, vec![0x11; 74]);
+        assert_eq!(rec.num_blocks, 1234);
+        assert_eq!(rec.epoch, 19);
+    }
+
+    #[test]
+    fn refresh_populates_leaf_root_cache() {
+        let member = [0x9Au8; 32];
+        let filter = vec![0xCD; 32];
+        let prefix = vec![3u32];
+        let tree = crate::global_intrinsic::materialize::create_leaf_root_vertex_tree(
+            &member, &filter, &prefix, 5, &vec![0x22; 74], 64, 100,
+        )
+        .unwrap();
+        let mut reg = InMemoryProverRegistry::new();
+        // Drive the same pass-1 dispatch refresh uses.
+        let blob = vertex_tree_to_blob(&tree);
+        let root = deserialize_go_tree(&blob).unwrap().unwrap();
+        if let Some((key, recd)) = super::decode_leaf_root(&root) {
+            reg.leaf_root_cache.insert(key, recd);
+        }
+        let leaf_id = crate::global_intrinsic::leaf_id_bytes(&filter, &prefix);
+        let got = reg.get_leaf_root(&member, &leaf_id).expect("cached");
+        assert_eq!(got.leaf_root, vec![0x22; 74]);
+        assert_eq!(got.epoch, 5);
+        assert_eq!(reg.leaf_root_count(), 1);
+        // Unknown member/leaf → None.
+        assert!(reg.get_leaf_root(&[0u8; 32], &leaf_id).is_none());
     }
 
     fn type_hash_leaf(class: &str) -> LeafNode {
@@ -1354,6 +1735,121 @@ mod tests {
         (tmp, store)
     }
 
+    /// Seed one freshly-active prover + allocation on `filter` so a shard can
+    /// reach `MIN_SHARD_CONSENSUS_PROVERS` and its real eviction target stays
+    /// evictable. The filler is effectively Active at `frame` (current epoch,
+    /// last_active = frame), so it counts toward the shard's active census but
+    /// is never itself an eviction candidate. `addr_byte` must be distinct per
+    /// filler; its allocation vertex is keyed `addr_byte ^ 0x80` to avoid
+    /// colliding with the prover vertex key.
+    fn seed_active_filler(
+        store: &RocksHypergraphStore,
+        shard: &ShardKey,
+        filter: &[u8],
+        frame: u64,
+        addr_byte: u8,
+    ) {
+        let cur_epoch = quil_types::consensus::epoch_for_frame(frame);
+        let prover = build_sub_tree(vec![
+            type_hash_leaf("prover:Prover"),
+            field_leaf("prover:Prover", "PublicKey", vec![0xCD; 57]),
+            field_leaf("prover:Prover", "Status", vec![1u8]),
+            field_leaf("prover:Prover", "AvailableStorage", 0u64.to_be_bytes().to_vec()),
+            field_leaf("prover:Prover", "Seniority", 0u64.to_be_bytes().to_vec()),
+            field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+        ]);
+        let alloc = build_sub_tree(vec![
+            type_hash_leaf("allocation:ProverAllocation"),
+            field_leaf("allocation:ProverAllocation", "Prover", vec![addr_byte; 32]),
+            field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+            field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.to_vec()),
+            field_leaf(
+                "allocation:ProverAllocation",
+                "LastActiveFrameNumber",
+                frame.to_be_bytes().to_vec(),
+            ),
+            field_leaf(
+                "allocation:ProverAllocation",
+                "Epoch",
+                cur_epoch.to_be_bytes().to_vec(),
+            ),
+        ]);
+        store
+            .save_vertex_underlying("vertex", "adds", shard, &make_vertex_key(addr_byte), &prover)
+            .unwrap();
+        store
+            .save_vertex_underlying(
+                "vertex",
+                "adds",
+                shard,
+                &make_vertex_key(addr_byte ^ 0x80),
+                &alloc,
+            )
+            .unwrap();
+    }
+
+    /// Top a shard up to `MIN_SHARD_CONSENSUS_PROVERS` active provers assuming
+    /// it already holds `existing` of them, so its target(s) clear the
+    /// consensus-quorum eviction exemption. Fillers use address bytes from
+    /// `base_byte` upward.
+    fn top_up_shard_quorum(
+        store: &RocksHypergraphStore,
+        shard: &ShardKey,
+        filter: &[u8],
+        frame: u64,
+        existing: u64,
+        base_byte: u8,
+    ) {
+        let need = quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS.saturating_sub(existing);
+        for i in 0..need {
+            seed_active_filler(store, shard, filter, frame, base_byte.wrapping_add(i as u8));
+        }
+    }
+
+    /// Integration: a leaf-root vertex written to a REAL store is decoded by
+    /// `refresh_from_store` (via the type-hash dispatch) and surfaced through
+    /// `get_leaf_root` — the persistence path the unit test stubs. This is the
+    /// bridge the storage-attestation verifier relies on (confirm materializes
+    /// the vertex → registry refresh → verifier cross-checks the opening).
+    #[test]
+    fn leaf_root_vertex_round_trips_through_real_store_refresh() {
+        use crate::global_intrinsic::leaf_id_bytes;
+        use crate::global_intrinsic::materialize::{
+            create_leaf_root_vertex_tree, leaf_root_address,
+        };
+        let member = [0x9Au8; 32];
+        let filter = vec![0xABu8; 32];
+        let prefix = vec![42u32, 7];
+        let epoch = 19u64;
+        let leaf_root = vec![0x11u8; 74];
+        let num_blocks = 1234u64;
+
+        let tree = create_leaf_root_vertex_tree(
+            &member, &filter, &prefix, epoch, &leaf_root, num_blocks, 900_000,
+        )
+        .unwrap();
+        let addr = leaf_root_address(&member, &leaf_id_bytes(&filter, &prefix)).unwrap();
+
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        // Vertex key = GLOBAL_INTRINSIC_ADDRESS (domain) ++ address.
+        let mut vk = Vec::with_capacity(64);
+        vk.extend_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
+        vk.extend_from_slice(&addr);
+        store
+            .save_vertex_underlying("vertex", "adds", &shard, &vk, &vertex_tree_to_blob(&tree))
+            .unwrap();
+
+        let shared = SharedProverRegistry::new();
+        shared.refresh_from_store(&store);
+
+        let leaf_id = leaf_id_bytes(&filter, &prefix);
+        let got = shared.get_leaf_root(&member, &leaf_id).expect("registered");
+        assert_eq!(got, LeafRootRecord { leaf_root, num_blocks, epoch });
+        // Unknown leaf → None.
+        assert!(shared.get_leaf_root(&member, b"nope").is_none());
+    }
+
     #[test]
     fn decode_prover_fixture() {
         // Build a prover:Prover vertex sub-tree with status=Active (1),
@@ -1384,6 +1880,31 @@ mod tests {
         assert_eq!(got.seniority, 42);
         assert_eq!(got.public_key, vec![0xAA; 57]);
         assert!(got.allocations.is_empty());
+    }
+
+    /// A kicked prover vertex (Status byte 4) is DROPPED from the registry —
+    /// `map_prover_status(4) → None`. Eviction zeroes Seniority before encode;
+    /// the disambiguating `KickFrameNumber` is set. (Gap coverage 2026-06-28.)
+    #[test]
+    fn decode_prover_kicked_byte4_is_excluded() {
+        let leaves = vec![
+            type_hash_leaf("prover:Prover"),
+            field_leaf("prover:Prover", "PublicKey", vec![0xAA; 57]),
+            field_leaf("prover:Prover", "Status", vec![4u8]), // kicked/left
+            field_leaf("prover:Prover", "AvailableStorage", 1024u64.to_be_bytes().to_vec()),
+            field_leaf("prover:Prover", "Seniority", 0u64.to_be_bytes().to_vec()),
+            field_leaf("prover:Prover", "KickFrameNumber", 700u64.to_be_bytes().to_vec()),
+        ];
+        let bytes = build_sub_tree(leaves);
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        let vk = make_vertex_key(0x02);
+        store.save_vertex_underlying("vertex", "adds", &shard, &vk, &bytes).unwrap();
+
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(&store);
+        assert_eq!(reg.distinct_provers(), 0, "kicked prover (byte 4) excluded from cache");
+        assert!(reg.get_prover_info(&[0x02; 32]).is_none());
     }
 
     #[test]
@@ -1445,7 +1966,7 @@ mod tests {
         assert_eq!(prov_list[0].address, prover_addr);
 
         // Active-filter query too.
-        let active = reg.get_active_provers(&filter);
+        let active = reg.get_active_provers(&filter, 0);
         assert_eq!(active.len(), 1);
     }
 
@@ -1551,13 +2072,13 @@ mod tests {
         // (all zeros), and addr[2] (lowest non-zero bit) should come
         // next.
         let zero = [0u8; 32];
-        let order = reg.get_ordered_provers(&zero, &filter);
+        let order = reg.get_ordered_provers(&zero, &filter, 0);
         assert_eq!(order[0], addrs[0]);
         assert_eq!(order[1], addrs[2]);
         assert_eq!(order.len(), 4);
 
         // get_next_prover returns the single nearest.
-        let next = reg.get_next_prover(&zero, &filter).unwrap();
+        let next = reg.get_next_prover(&zero, &filter, 0).unwrap();
         assert_eq!(next, addrs[0]);
     }
 
@@ -1636,6 +2157,13 @@ mod tests {
                 field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
             ])
         };
+        // `Epoch` must satisfy `epoch >= epoch_for_frame(frame)` so the
+        // frame-aware eviction gate reads these as effectively Active (a fresh,
+        // re-confirmed member). Without it the allocation would read as
+        // ExpiredEpoch and be (correctly) exempt from inactivity eviction.
+        let cur_epoch = quil_types::consensus::epoch_for_frame(
+            quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900,
+        );
         let mk_alloc = |prover: &[u8; 32], filter: &[u8]| {
             build_sub_tree(vec![
                 type_hash_leaf("allocation:ProverAllocation"),
@@ -1646,6 +2174,11 @@ mod tests {
                     "allocation:ProverAllocation",
                     "LastActiveFrameNumber",
                     100u64.to_be_bytes().to_vec(),
+                ),
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "Epoch",
+                    cur_epoch.to_be_bytes().to_vec(),
                 ),
             ])
         };
@@ -1658,17 +2191,240 @@ mod tests {
         store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x82), &mk_prover(prover_2)).unwrap();
         store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x92), &mk_alloc(&prover_2, &filter_halted)).unwrap();
 
+        let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900;
+        // Both shards carry only ONE real active prover, which is below the
+        // consensus quorum and would exempt them via the under-provisioned
+        // rule. Top BOTH up to quorum with fresh active fillers so the ONLY
+        // thing sparing prover_2 is the `u64::MAX` halt (the behavior under
+        // test), and prover_1 stays a genuine inactivity candidate.
+        top_up_shard_quorum(&store, &shard, &filter_normal, frame, 1, 0xE0);
+        top_up_shard_quorum(&store, &shard, &filter_halted, frame, 1, 0xF0);
+
         let mut reg = InMemoryProverRegistry::new();
         reg.refresh(&store);
 
-        // Frame 1000 → 900 frames inactive. Threshold = 500. Both
-        // would hit it, but filter_halted is fully exempt.
+        // Frame is past the inactivity start; last_active (100) predates
+        // it, so inactivity counts from EVICTION_INACTIVITY_START_FRAME:
+        // 900 frames inactive. Threshold = 500. Both would hit it, but
+        // filter_halted is fully exempt.
         let mut halts: HashMap<Vec<u8>, u64> = HashMap::new();
         halts.insert(filter_halted.clone(), u64::MAX);
 
-        let evict = reg.find_eviction_candidates(1000, 500, &halts);
+        let evict = reg.find_eviction_candidates(frame, 500, &halts);
         assert_eq!(evict.len(), 1);
         assert_eq!(evict[0], prover_1);
+    }
+
+    #[test]
+    fn find_eviction_candidates_exempts_under_provisioned_shard() {
+        // A shard with fewer than MIN_SHARD_CONSENSUS_PROVERS effectively-active
+        // provers cannot run its consensus (it's under a coverage halt), so no
+        // shard frame is produced and its provers physically cannot submit a
+        // proof — NONE may be evicted for inactivity, however long they've been
+        // idle. The moment the shard reaches quorum its idle provers become
+        // evictable. This is the "not enough provers to run consensus / coverage
+        // halt" exemption, computed from committed registry state so every
+        // archive agrees (no dependence on the per-node coverage monitor).
+        let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 5000;
+        let cur_epoch = quil_types::consensus::epoch_for_frame(frame);
+        let filter = vec![0x44u8; 64];
+
+        // Build `n` effectively-active but long-INACTIVE provers on one shard
+        // and return the eviction candidate set.
+        let candidates_for = |n: u8| -> Vec<Vec<u8>> {
+            let (_tmp, store) = temp_store();
+            let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+            for i in 0..n {
+                let addr = [0x10u8 + i; 32];
+                let prover = build_sub_tree(vec![
+                    type_hash_leaf("prover:Prover"),
+                    field_leaf("prover:Prover", "PublicKey", vec![0xCD; 57]),
+                    field_leaf("prover:Prover", "Status", vec![1u8]),
+                    field_leaf("prover:Prover", "AvailableStorage", 0u64.to_be_bytes().to_vec()),
+                    field_leaf("prover:Prover", "Seniority", 0u64.to_be_bytes().to_vec()),
+                    field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+                ]);
+                let alloc = build_sub_tree(vec![
+                    type_hash_leaf("allocation:ProverAllocation"),
+                    field_leaf("allocation:ProverAllocation", "Prover", addr.to_vec()),
+                    field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+                    field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
+                    // Idle since before the inactivity-start frame → past threshold.
+                    field_leaf("allocation:ProverAllocation", "LastActiveFrameNumber", 100u64.to_be_bytes().to_vec()),
+                    field_leaf("allocation:ProverAllocation", "Epoch", cur_epoch.to_be_bytes().to_vec()),
+                ]);
+                store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x10 + i), &prover).unwrap();
+                store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x90 + i), &alloc).unwrap();
+            }
+            let mut reg = InMemoryProverRegistry::new();
+            reg.refresh(&store);
+            let halts: HashMap<Vec<u8>, u64> = HashMap::new();
+            reg.find_eviction_candidates(frame, 500, &halts)
+        };
+
+        let min = quil_types::consensus::MIN_SHARD_CONSENSUS_PROVERS as u8;
+
+        // One prover below quorum: the shard can't run consensus → all exempt,
+        // even though every prover is long past the inactivity threshold.
+        let below = candidates_for(min - 1);
+        assert!(
+            below.is_empty(),
+            "an under-provisioned shard (below consensus quorum) must not evict anyone"
+        );
+
+        // At quorum: the shard can run consensus, so idle provers are no longer
+        // excused and all become eviction candidates.
+        let at = candidates_for(min);
+        assert_eq!(
+            at.len(),
+            min as usize,
+            "at consensus quorum the shard's idle provers become evictable"
+        );
+    }
+
+    #[test]
+    fn find_eviction_candidates_is_insertion_order_independent() {
+        // The eviction set MUST be a pure function of the committed vertex set,
+        // NOT of the order vertices were written to the store / iterated out of
+        // the prover_cache HashMap. Two archives with the same state but
+        // different insert order must select the identical set — otherwise they
+        // mutate the prover tree differently and their prover roots diverge
+        // (the "prover root MISMATCH" class). The output is sorted, and the new
+        // per-shard active census is order-free; this locks both.
+        let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 5000;
+        let cur_epoch = quil_types::consensus::epoch_for_frame(frame);
+        let filter = vec![0x44u8; 64];
+
+        // 6 idle active provers on one well-covered shard (above quorum) → all
+        // 6 are candidates regardless of order.
+        let mk = |i: u8| -> (Vec<u8>, Vec<u8>) {
+            let addr = [0x20u8 + i; 32];
+            let prover = build_sub_tree(vec![
+                type_hash_leaf("prover:Prover"),
+                field_leaf("prover:Prover", "PublicKey", vec![0xCD; 57]),
+                field_leaf("prover:Prover", "Status", vec![1u8]),
+                field_leaf("prover:Prover", "AvailableStorage", 0u64.to_be_bytes().to_vec()),
+                field_leaf("prover:Prover", "Seniority", 0u64.to_be_bytes().to_vec()),
+                field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+            ]);
+            let alloc = build_sub_tree(vec![
+                type_hash_leaf("allocation:ProverAllocation"),
+                field_leaf("allocation:ProverAllocation", "Prover", addr.to_vec()),
+                field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+                field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
+                field_leaf("allocation:ProverAllocation", "LastActiveFrameNumber", 100u64.to_be_bytes().to_vec()),
+                field_leaf("allocation:ProverAllocation", "Epoch", cur_epoch.to_be_bytes().to_vec()),
+            ]);
+            (prover, alloc)
+        };
+
+        let candidates_for_order = |order: &[u8]| -> Vec<Vec<u8>> {
+            let (_tmp, store) = temp_store();
+            let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+            for &i in order {
+                let (prover, alloc) = mk(i);
+                store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x20 + i), &prover).unwrap();
+                store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xA0 + i), &alloc).unwrap();
+            }
+            let mut reg = InMemoryProverRegistry::new();
+            reg.refresh(&store);
+            let halts: HashMap<Vec<u8>, u64> = HashMap::new();
+            reg.find_eviction_candidates(frame, 500, &halts)
+        };
+
+        let forward: Vec<u8> = (0..6).collect();
+        let reversed: Vec<u8> = (0..6).rev().collect();
+        let shuffled: Vec<u8> = vec![3, 0, 5, 1, 4, 2];
+
+        let a = candidates_for_order(&forward);
+        let b = candidates_for_order(&reversed);
+        let c = candidates_for_order(&shuffled);
+
+        assert_eq!(a.len(), 6, "all six above-quorum idle provers are candidates");
+        assert_eq!(a, b, "eviction set must not depend on insert order (fwd vs rev)");
+        assert_eq!(a, c, "eviction set must not depend on insert order (fwd vs shuffled)");
+    }
+
+    #[test]
+    fn committee_is_epoch_stable_changes_only_at_boundary() {
+        // The app-shard committee (`get_active_provers`) must be CONSTANT within
+        // an epoch and change ONLY across a boundary — the invariant that lets a
+        // worker refresh its registry once per epoch without ever running a stale
+        // committee, and that keeps every node's committee agreeing frame to
+        // frame. It holds because `committee_eligible` is a pure function of
+        // `effective_status`, which is epoch-quantized.
+        let filter = vec![0x33u8; 64];
+        let e = quil_types::consensus::EPOCH_LENGTH_FRAMES; // 720
+
+        let a = [0xA0u8; 32]; // plain Active — in committee every frame
+        let b = [0xB0u8; 32]; // deferred activation at the epoch-1 boundary
+        let confirm_frame = 100u64; // epoch 0 → activation_epoch 1 (frame 720)
+
+        let mk_prover = |pk: u8| {
+            build_sub_tree(vec![
+                type_hash_leaf("prover:Prover"),
+                field_leaf("prover:Prover", "PublicKey", vec![pk; 57]),
+                field_leaf("prover:Prover", "Status", vec![1u8]),
+                field_leaf("prover:Prover", "Seniority", 0u64.to_be_bytes().to_vec()),
+                field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+            ])
+        };
+        let mk_alloc = |prover: &[u8; 32], confirm: u64| {
+            let mut leaves = vec![
+                type_hash_leaf("allocation:ProverAllocation"),
+                field_leaf("allocation:ProverAllocation", "Prover", prover.to_vec()),
+                field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+                field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
+                // High epoch → never ExpiredEpoch across the test's frame range.
+                field_leaf("allocation:ProverAllocation", "Epoch", 9999u64.to_be_bytes().to_vec()),
+            ];
+            if confirm > 0 {
+                leaves.push(field_leaf(
+                    "allocation:ProverAllocation",
+                    "JoinConfirmFrameNumber",
+                    confirm.to_be_bytes().to_vec(),
+                ));
+            }
+            build_sub_tree(leaves)
+        };
+
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xA0), &mk_prover(0xAA)).unwrap();
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xA1), &mk_alloc(&a, 0)).unwrap();
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xB0), &mk_prover(0xBB)).unwrap();
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xB1), &mk_alloc(&b, confirm_frame)).unwrap();
+
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(&store);
+
+        let committee = |frame: u64| -> Vec<Vec<u8>> {
+            let mut v: Vec<Vec<u8>> = reg
+                .get_active_provers(&filter, frame)
+                .iter()
+                .map(|p| p.address.clone())
+                .collect();
+            v.sort();
+            v
+        };
+
+        // Epoch 0 [0, 720): B is deferred (Joining) → committee = {A}, constant.
+        let e0_lo = committee(200);
+        let e0_hi = committee(e - 1); // 719
+        assert_eq!(e0_lo, e0_hi, "committee constant within epoch 0");
+        assert_eq!(e0_lo, vec![a.to_vec()], "epoch 0: only A (B's activation deferred)");
+
+        // Epoch 1 [720, 1440): B activated at the boundary → committee = {A, B},
+        // constant across the whole epoch.
+        let e1_lo = committee(e); // 720
+        let e1_mid = committee(e + 300);
+        let e1_hi = committee(2 * e - 1); // 1439
+        assert_eq!(e1_lo, e1_mid, "committee constant within epoch 1 (lo vs mid)");
+        assert_eq!(e1_lo, e1_hi, "committee constant within epoch 1 (lo vs hi)");
+        assert_eq!(e1_lo.len(), 2, "epoch 1: both A and B active");
+
+        // The set changes EXACTLY at the boundary (719 → 720), nowhere else.
+        assert_ne!(committee(e - 1), committee(e), "committee changes across the boundary");
     }
 
     #[test]
@@ -1751,7 +2507,7 @@ mod tests {
 
         assert_eq!(trait_obj.get_prover_count(&filter).unwrap(), 1);
         assert_eq!(trait_obj.get_provers(&filter).unwrap().len(), 1);
-        assert_eq!(trait_obj.get_active_provers(&filter).unwrap().len(), 1);
+        assert_eq!(trait_obj.get_active_provers(&filter, 0).unwrap().len(), 1);
         assert_eq!(
             trait_obj
                 .get_provers_by_status(&filter, ProverStatus::Active)
@@ -1797,6 +2553,9 @@ mod tests {
             field_leaf("prover:Prover", "Seniority", 0u64.to_be_bytes().to_vec()),
             field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
         ]);
+        // Frame past the inactivity start; last_active (100) predates it,
+        // so 900 inactive frames > 500 threshold → eviction candidate.
+        let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900;
         let alloc_bytes = build_sub_tree(vec![
             type_hash_leaf("allocation:ProverAllocation"),
             field_leaf("allocation:ProverAllocation", "Prover", prover_addr.to_vec()),
@@ -1807,6 +2566,12 @@ mod tests {
                 "LastActiveFrameNumber",
                 100u64.to_be_bytes().to_vec(),
             ),
+            // Current epoch → effective_status == Active (else ExpiredEpoch → exempt).
+            field_leaf(
+                "allocation:ProverAllocation",
+                "Epoch",
+                quil_types::consensus::epoch_for_frame(frame).to_be_bytes().to_vec(),
+            ),
         ]);
 
         let (_tmp, store) = temp_store();
@@ -1814,6 +2579,9 @@ mod tests {
 
         store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x55), &prover_bytes).unwrap();
         store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xA5), &alloc_bytes).unwrap();
+        // The target shard otherwise holds one active prover, below quorum;
+        // top it up so the under-provisioned exemption doesn't spare it.
+        top_up_shard_quorum(&store, &shard, &filter, frame, 1, 0xE0);
 
         let shared = SharedProverRegistry::new();
         shared.refresh_from_store(&store);
@@ -1836,18 +2604,266 @@ mod tests {
 
         let halts: HashMap<Vec<u8>, u64> = HashMap::new();
         let evicted = shared
-            .evict_inactive_provers(1000, 500, &halts, &state)
+            .evict_inactive_provers(frame, 500, &halts, &state, None)
             .unwrap();
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0], prover_addr.to_vec());
 
-        // Re-read the prover tree and confirm Status=4, KickFrameNumber=1000.
+        // Re-read the prover tree and confirm Status=4, KickFrameNumber=frame.
         let blob = state.get(&crate::domains::GLOBAL, &prover_addr, &va_disc).unwrap().unwrap();
         let tree = rebuild_vertex_tree_from_blob(&blob);
         let status = crate::global_schema::read_field(&tree, "prover:Prover", "Status").unwrap();
         assert_eq!(status, vec![4u8]);
         let kick_frame = crate::global_schema::read_field(&tree, "prover:Prover", "KickFrameNumber").unwrap();
-        assert_eq!(kick_frame, 1000u64.to_be_bytes().to_vec());
+        assert_eq!(kick_frame, frame.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn evict_falls_back_to_flat_store_when_crdt_misses() {
+        // Mirrors the production seam that caused "evictions never happen":
+        // hypergraph SYNC writes prover/alloc vertices straight into the
+        // flat per-vertex keyspace (what `refresh_from_store` reads), but
+        // the running CRDT's in-memory tree never receives them.
+        // `find_eviction_candidates` (registry, from the flat store) selects
+        // the prover, yet `state.get` (CRDT) misses it. Without the
+        // flat-store fallback, nothing is kicked; WITH it (store = Some),
+        // the kick succeeds. This is the exact wiring that broke in the
+        // field and had no regression test.
+        use std::sync::Arc;
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_hypergraph::testing::MemStore;
+        use quil_types::crypto::NoopInclusionProver;
+
+        let prover_addr = [0x55u8; 32];
+        let filter = vec![0x33u8; 64];
+        let prover_bytes = build_sub_tree(vec![
+            type_hash_leaf("prover:Prover"),
+            field_leaf("prover:Prover", "PublicKey", vec![0xCD; 57]),
+            field_leaf("prover:Prover", "Status", vec![1u8]),
+            field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+        ]);
+        let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900;
+        let alloc_bytes = build_sub_tree(vec![
+            type_hash_leaf("allocation:ProverAllocation"),
+            field_leaf("allocation:ProverAllocation", "Prover", prover_addr.to_vec()),
+            field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+            field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
+            field_leaf("allocation:ProverAllocation", "LastActiveFrameNumber", 100u64.to_be_bytes().to_vec()),
+            // Current epoch → effective_status == Active (else ExpiredEpoch → exempt).
+            field_leaf(
+                "allocation:ProverAllocation",
+                "Epoch",
+                quil_types::consensus::epoch_for_frame(frame).to_be_bytes().to_vec(),
+            ),
+        ]);
+
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x55), &prover_bytes).unwrap();
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0xA5), &alloc_bytes).unwrap();
+        // Top the (flat-store) shard up to quorum so the under-provisioned
+        // exemption doesn't spare the target; fillers are fresh-active, so
+        // they're never candidates and the flat-store-vs-CRDT seam under test
+        // is unaffected.
+        top_up_shard_quorum(&store, &shard, &filter, frame, 1, 0xE0);
+
+        let shared = SharedProverRegistry::new();
+        shared.refresh_from_store(&store);
+
+        // The CRDT is EMPTY — the synced vertices are absent (the seam).
+        let crdt = Arc::new(HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(NoopInclusionProver),
+        ));
+        let state = crate::hypergraph_state::HypergraphState::new(crdt);
+        let halts: HashMap<Vec<u8>, u64> = HashMap::new();
+
+        // store = None → CRDT miss → nothing kicked (reproduces the bug).
+        let none: Option<&Arc<RocksHypergraphStore>> = None;
+        let evicted_none = shared
+            .evict_inactive_provers(frame, 500, &halts, &state, none)
+            .unwrap();
+        assert!(
+            evicted_none.is_empty(),
+            "without the flat-store fallback a CRDT miss yields no eviction (the bug)"
+        );
+
+        // store = Some → fallback reads from the flat keyspace → kicked.
+        let evicted = shared
+            .evict_inactive_provers(frame, 500, &halts, &state, Some(&store))
+            .unwrap();
+        assert_eq!(
+            evicted,
+            vec![prover_addr.to_vec()],
+            "flat-store fallback must kick the candidate the CRDT couldn't load"
+        );
+        // And the kick landed in the CRDT (written via state.set): Status=4.
+        let va_disc = crate::hypergraph_state::vertex_adds_discriminator().unwrap();
+        let blob = state.get(&crate::domains::GLOBAL, &prover_addr, &va_disc).unwrap().unwrap();
+        let tree = rebuild_vertex_tree_from_blob(&blob);
+        assert_eq!(
+            crate::global_schema::read_field(&tree, "prover:Prover", "Status").unwrap(),
+            vec![4u8]
+        );
+    }
+
+    #[test]
+    fn find_eviction_candidates_exempts_expired_epoch() {
+        // A raw-Active allocation whose recorded `Epoch` is STALE (missed its
+        // per-epoch re-confirm) reads as `ExpiredEpoch` via `effective_status`.
+        // It's already excluded from the committee / shard summaries, so it must
+        // NOT be evicted for inactivity — this is the "up for eviction but no
+        // active shards" fix. Identical to the evictable case except the epoch
+        // is old; would evict under the prior raw-`alloc.status` gate.
+        let prover = [0x71u8; 32];
+        let filter = vec![0x33u8; 64];
+        let mk_prover = build_sub_tree(vec![
+            type_hash_leaf("prover:Prover"),
+            field_leaf("prover:Prover", "PublicKey", vec![0xCD; 57]),
+            field_leaf("prover:Prover", "Status", vec![1u8]),
+            field_leaf("prover:Prover", "AvailableStorage", 0u64.to_be_bytes().to_vec()),
+            field_leaf("prover:Prover", "Seniority", 0u64.to_be_bytes().to_vec()),
+            field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+        ]);
+        let alloc = build_sub_tree(vec![
+            type_hash_leaf("allocation:ProverAllocation"),
+            field_leaf("allocation:ProverAllocation", "Prover", prover.to_vec()),
+            field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+            field_leaf("allocation:ProverAllocation", "ConfirmationFilter", filter.clone()),
+            field_leaf("allocation:ProverAllocation", "LastActiveFrameNumber", 100u64.to_be_bytes().to_vec()),
+            // STALE epoch (0) → effective_status == ExpiredEpoch at the test frame.
+            field_leaf("allocation:ProverAllocation", "Epoch", 0u64.to_be_bytes().to_vec()),
+        ]);
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x71), &mk_prover).unwrap();
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x72), &alloc).unwrap();
+
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(&store);
+
+        let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900;
+        let halts: HashMap<Vec<u8>, u64> = HashMap::new();
+        let evict = reg.find_eviction_candidates(frame, 500, &halts);
+        assert!(
+            evict.is_empty(),
+            "epoch-expired prover must not be evicted for inactivity"
+        );
+    }
+
+    #[test]
+    fn find_eviction_candidates_selects_unknown_stub() {
+        // After a prover vertex is kicked (Status byte 4 → decode_prover
+        // returns None), refresh synthesizes an `Unknown` stub from the
+        // prover's still-active allocations. The gate must select that stub
+        // so the lingering active allocations get cleaned — otherwise they
+        // inflate shard coverage forever (the live "31653 active / unknown
+        // provers" symptom).
+        let prover_addr = [0x66u8; 32];
+        // No decodable prover vertex (byte-4 kicked → None); only an active,
+        // long-inactive allocation. refresh → Unknown stub carrying it.
+        let alloc_bytes = build_sub_tree(vec![
+            type_hash_leaf("allocation:ProverAllocation"),
+            field_leaf("allocation:ProverAllocation", "Prover", prover_addr.to_vec()),
+            field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+            field_leaf("allocation:ProverAllocation", "ConfirmationFilter", vec![0x77u8; 64]),
+            field_leaf("allocation:ProverAllocation", "LastActiveFrameNumber", 100u64.to_be_bytes().to_vec()),
+            // Current epoch so the frame-aware gate reads it as effectively
+            // Active (the orphan's allocation is still live, just its parent
+            // prover vertex was kicked).
+            field_leaf(
+                "allocation:ProverAllocation",
+                "Epoch",
+                quil_types::consensus::epoch_for_frame(
+                    quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900,
+                ).to_be_bytes().to_vec(),
+            ),
+        ]);
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(0x66), &alloc_bytes).unwrap();
+        // The stub's shard (filter 0x77) otherwise holds a single active
+        // allocation, below quorum — top it up so the under-provisioned
+        // exemption doesn't mask the orphan-stub selection under test.
+        top_up_shard_quorum(
+            &store,
+            &shard,
+            &vec![0x77u8; 64],
+            quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900,
+            1,
+            0xE0,
+        );
+
+        let mut reg = InMemoryProverRegistry::new();
+        reg.refresh(&store);
+        // Confirm it's an Unknown stub.
+        let info = reg.get_prover_info(&prover_addr).expect("stub synthesized");
+        assert_eq!(info.status, ProverStatus::Unknown);
+
+        let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900;
+        let halts: HashMap<Vec<u8>, u64> = HashMap::new();
+        let candidates = reg.find_eviction_candidates(frame, 500, &halts);
+        assert!(
+            candidates.iter().any(|a| a == &prover_addr.to_vec()),
+            "Unknown stub with an active, inactive allocation must be an eviction candidate"
+        );
+    }
+
+    #[test]
+    fn evict_caps_candidates_per_frame() {
+        // A large orphan/eviction backlog must drain gradually, not all at
+        // once (evicting 733 in one materialize wedged the worker). Verify
+        // at most EVICTION_MAX_PER_FRAME (25) are processed per call.
+        use std::sync::Arc;
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_hypergraph::testing::MemStore;
+        use quil_types::crypto::NoopInclusionProver;
+
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey { l1: [0; 3], l2: [0xFF; 32] };
+        // 40 distinct active, long-inactive provers all on ONE well-covered
+        // shard → 40 candidates (the shard is far above the consensus-quorum
+        // exemption, so none is spared for under-provisioning). Shared filter
+        // (was per-prover) so the shard clears MIN_SHARD_CONSENSUS_PROVERS; the
+        // test only asserts the per-frame cap, not per-shard summaries.
+        let cur_epoch = quil_types::consensus::epoch_for_frame(
+            quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900,
+        );
+        let shared_filter = vec![0x99u8; 64];
+        for i in 0u8..40 {
+            let prover_addr = [i; 32];
+            let prover_bytes = build_sub_tree(vec![
+                type_hash_leaf("prover:Prover"),
+                field_leaf("prover:Prover", "PublicKey", vec![0xCD; 57]),
+                field_leaf("prover:Prover", "Status", vec![1u8]),
+                field_leaf("prover:Prover", "KickFrameNumber", 0u64.to_be_bytes().to_vec()),
+            ]);
+            let alloc_bytes = build_sub_tree(vec![
+                type_hash_leaf("allocation:ProverAllocation"),
+                field_leaf("allocation:ProverAllocation", "Prover", prover_addr.to_vec()),
+                field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+                field_leaf("allocation:ProverAllocation", "ConfirmationFilter", shared_filter.clone()),
+                field_leaf("allocation:ProverAllocation", "LastActiveFrameNumber", 100u64.to_be_bytes().to_vec()),
+                // Current epoch → effective_status == Active (not ExpiredEpoch).
+                field_leaf("allocation:ProverAllocation", "Epoch", cur_epoch.to_be_bytes().to_vec()),
+            ]);
+            store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(i), &prover_bytes).unwrap();
+            store.save_vertex_underlying("vertex", "adds", &shard, &make_vertex_key(i.wrapping_add(128)), &alloc_bytes).unwrap();
+        }
+
+        let shared = SharedProverRegistry::new();
+        shared.refresh_from_store(&store);
+        let crdt = Arc::new(HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(NoopInclusionProver),
+        ));
+        let state = crate::hypergraph_state::HypergraphState::new(crdt);
+        let frame = quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900;
+        let halts: HashMap<Vec<u8>, u64> = HashMap::new();
+        let evicted = shared
+            .evict_inactive_provers(frame, 500, &halts, &state, Some(&store))
+            .unwrap();
+        assert_eq!(evicted.len(), 25, "must cap evictions at EVICTION_MAX_PER_FRAME per call");
     }
 
     #[test]
@@ -1885,32 +2901,35 @@ mod tests {
     /// each scenario.
     ///
     /// Scenarios (10 provers each):
-    ///   1. Join only → Joining
-    ///   2. Join + Confirm → Active
-    ///   3. Join + Reject → excluded
-    ///   4. Join + Expire (grace elapsed) → excluded
-    ///   5. Join + Confirm + Leave → Leaving
-    ///   6. Join + Confirm + Leave + ConfirmLeave (Kicked) → excluded
-    ///   7. Join + Confirm + Leave + RejectLeave → Active again
-    ///   8. Join + Confirm + Leave + ExpireLeave → Active (leave failed)
-    ///   9. Join + Confirm + Pause → Paused
-    ///  10. Join + Confirm + Pause + Resume → Active
+    /// 1. Join only → Joining
+    /// 2. Join + Confirm → Active
+    /// 3. Join + Reject → excluded
+    /// 4. Join + Expire (grace elapsed) → excluded
+    /// 5. Join + Confirm + Leave → Leaving
+    /// 6. Join + Confirm + Leave + ConfirmLeave (Kicked) → excluded
+    /// 7. Join + Confirm + Leave + RejectLeave → Active again
+    /// 8. Join + Confirm + Leave + ExpireLeave → Active (leave failed)
+    /// 9. Join + Confirm + Pause → Paused
+    /// 10. Join + Confirm + Pause + Resume → Active
     ///
     /// Expected counts at frame=1000 with grace=720:
-    ///   Active = 40 (scenarios 2, 7, 8, 10)
-    ///   Joining = 10 (scenario 1)
-    ///   Leaving = 10 (scenario 5)
-    ///   Paused = 10 (scenario 9)
-    ///   excluded = 30 (scenarios 3, 4, 6)
+    /// Active = 40 (scenarios 2, 7, 8, 10)
+    /// Joining = 10 (scenario 1)
+    /// Leaving = 10 (scenario 5)
+    /// Paused = 10 (scenario 9)
+    /// excluded = 30 (scenarios 3, 4, 6)
     #[test]
     fn lifecycle_scenarios_produce_correct_live_summary() {
         use crate::global_intrinsic::materialize::allocation_address;
-        use quil_types::consensus::ALLOCATION_GRACE_FRAMES;
 
+        // Epoch-aligned lifecycle (EPOCH_LENGTH_FRAMES = 720). To exhibit
+        // epoch-based expiry of a join/leave we need current_epoch >=
+        // proposed_epoch + 2, so the harness runs at epoch 2.
         let filter = vec![0x55u8; 32];
-        let current_frame: u64 = 1000;
-        let recent_frame: u64 = current_frame - 50; // within grace
-        let stale_frame: u64 = current_frame - ALLOCATION_GRACE_FRAMES - 100; // past grace
+        let current_frame: u64 = 2000;            // epoch 2 (C)
+        let recent_frame: u64 = current_frame - 50; // 1950, epoch 2 — current-epoch events
+        let prior_frame: u64 = 1000;              // epoch 1 — confirmed last epoch → active now
+        let stale_frame: u64 = 100;               // epoch 0 — proposed long ago, never settled
 
         #[derive(Clone, Copy)]
         enum Scenario {
@@ -1992,9 +3011,11 @@ mod tests {
                 }
                 Scenario::ConfirmedActive => {
                     status_byte = 1; // Active
-                    join_frame = recent_frame - 100;
+                    // Confirmed in the PRIOR epoch → activated by the current
+                    // epoch (deferred activation gate satisfied).
+                    join_frame = prior_frame - 100;
                     leave_frame = 0;
-                    join_confirm_frame = recent_frame;
+                    join_confirm_frame = prior_frame;
                     leave_confirm_frame = 0;
                     pause_frame = 0;
                     resume_frame = 0;
@@ -2050,9 +3071,11 @@ mod tests {
                 }
                 Scenario::LeaveRejectedReturnsActive => {
                     status_byte = 1; // back to Active
-                    join_frame = recent_frame - 300;
+                    // Confirmed in the prior epoch (activated), then proposed a
+                    // leave that was rejected → stays Active.
+                    join_frame = prior_frame - 200;
                     leave_frame = recent_frame - 100;
-                    join_confirm_frame = recent_frame - 250;
+                    join_confirm_frame = prior_frame;
                     leave_confirm_frame = 0;
                     pause_frame = 0;
                     resume_frame = 0;
@@ -2063,7 +3086,9 @@ mod tests {
                     // Status still Leaving (no on-chain confirm/reject),
                     // but leave_frame is old → effective_status returns
                     // ExpiredLeaving → live_allocation_status maps to
-                    // Active per the user's rule.
+                    // None (excluded). The prover socially left when
+                    // they submitted the Leave; the absence of a
+                    // confirm doesn't put them back into active duty.
                     status_byte = 3; // Leaving
                     join_frame = recent_frame - 800;
                     leave_frame = stale_frame;
@@ -2087,9 +3112,9 @@ mod tests {
                 }
                 Scenario::PausedThenResumed => {
                     status_byte = 1; // back to Active
-                    join_frame = recent_frame - 400;
+                    join_frame = prior_frame - 300;
                     leave_frame = 0;
-                    join_confirm_frame = recent_frame - 350;
+                    join_confirm_frame = prior_frame;
                     leave_confirm_frame = 0;
                     pause_frame = recent_frame - 100;
                     resume_frame = recent_frame;
@@ -2119,6 +3144,15 @@ mod tests {
                 type_hash_leaf("allocation:ProverAllocation"),
                 field_leaf("allocation:ProverAllocation", "Prover", prover_addr.clone()),
                 field_leaf("allocation:ProverAllocation", "Status", vec![status_byte]),
+                // Confirmed for the current storage epoch — this test exercises
+                // join/leave/pause lifecycle, not epoch expiry (which is now
+                // always-on and would otherwise read every epoch-0 alloc as
+                // ExpiredEpoch at frame 1000).
+                field_leaf(
+                    "allocation:ProverAllocation",
+                    "Epoch",
+                    quil_types::consensus::epoch_for_frame(current_frame).to_be_bytes().to_vec(),
+                ),
                 field_leaf(
                     "allocation:ProverAllocation",
                     "ConfirmationFilter",
@@ -2209,8 +3243,10 @@ mod tests {
         let kicked = summary.status_counts.get(&ProverStatus::Kicked).copied().unwrap_or(0);
         let rejected = summary.status_counts.get(&ProverStatus::Rejected).copied().unwrap_or(0);
 
-        // Active = scenarios 2, 7, 8, 10 = 40
-        assert_eq!(active, 40, "Active count");
+        // Active = scenarios 2, 7, 10 = 30. Scenario 8
+        // (LeaveExpiredReturnsActive) no longer counts as Active —
+        // a stuck Leave is treated as "not on the shard."
+        assert_eq!(active, 30, "Active count");
         // Joining = scenario 1 = 10
         assert_eq!(joining, 10, "Joining count");
         // Leaving = scenario 5 = 10
@@ -2223,8 +3259,9 @@ mod tests {
 
         let total_live: u32 = active + joining + leaving + paused;
         assert_eq!(
-            total_live, 70,
-            "70 live allocations (30 must be excluded: Rejected, ExpiredJoining, Kicked)"
+            total_live, 60,
+            "60 live allocations (40 excluded: Rejected, ExpiredJoining, \
+             ExpiredLeaving, Kicked × 10 each)"
         );
     }
 }

@@ -12,6 +12,11 @@ pub enum KeyType {
     Secp256k1Sha256 = 5,
     Secp256k1Sha3 = 6,
     Ed25519 = 7,
+    /// Falcon / FN-DSA-512 post-quantum signatures (consensus).
+    Falcon512 = 8,
+    /// Streamlined NTRU Prime (sntrup761) post-quantum KEM — key agreement for
+    /// onion routing and config read keys (replaces X448).
+    Sntrup761 = 9,
 }
 
 /// A cryptographic signer that can produce signatures over messages.
@@ -47,11 +52,60 @@ pub trait BlsConstructor: Send + Sync {
         messages: &[&[u8]],
         context: &[u8],
     ) -> bool;
+
+    /// Verify an aggregate signature where signer `j` signed a DISTINCT
+    /// message `messages[j]` under public key `public_keys_g2[j]`, i.e.
+    /// `e(sig, g) == Π_j e(pk_j, H(context||m_j))`. This is the correct
+    /// multi-signer/multi-message BLS verify — NOT reducible to a single
+    /// aggregate pubkey (that only works when every signer signs the same
+    /// message). `public_keys_g2.len()` MUST equal `messages.len()`. Default
+    /// impl is unsupported; curve-backed constructors override it.
+    fn verify_multi_pubkey_multi_message_raw(
+        &self,
+        _public_keys_g2: &[&[u8]],
+        _signature_g1: &[u8],
+        _messages: &[&[u8]],
+        _context: &[u8],
+    ) -> bool {
+        false
+    }
+
+    /// Batch-verify many independent signatures at once. Each item is
+    /// `(public_key_g2, signature_g1, message, context)`, with the same
+    /// meaning as [`verify_signature_raw`]. Returns `true` iff EVERY
+    /// signature verifies.
+    ///
+    /// All-or-nothing: a `false` result only means "at least one is
+    /// invalid" — callers must fall back to per-signature
+    /// [`verify_signature_raw`] to find which. The default implementation
+    /// IS that per-signature loop; curves with a batched pairing check
+    /// (BLS48-581) override it with a random-linear-combination verify
+    /// that collapses N final exponentiations into one.
+    fn verify_signatures_batch(
+        &self,
+        items: &[(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)],
+    ) -> bool {
+        items
+            .iter()
+            .all(|(pk, sig, msg, ctx)| self.verify_signature_raw(pk, sig, msg, ctx))
+    }
     fn aggregate(
         &self,
         public_keys: &[&[u8]],
         signatures: &[&[u8]],
     ) -> Result<BlsAggregateOutput>;
+
+    /// Aggregate G2 public keys ONLY into a single aggregate public key —
+    /// the pubkey half of [`aggregate`], with no signatures involved. Used to
+    /// reconstruct a committee's aggregate pubkey from a participation bitmask
+    /// for consistency checks (e.g. FrameHeader verification), without the
+    /// wasteful throwaway-signature dance that abusing [`aggregate`] required.
+    /// Default impl is unsupported; curve-backed constructors override it.
+    fn aggregate_public_keys(&self, _public_keys: &[&[u8]]) -> Result<Vec<u8>> {
+        Err(crate::error::QuilError::Internal(
+            "aggregate_public_keys not supported by this BlsConstructor".into(),
+        ))
+    }
 }
 
 /// Multiproof output from inclusion proving.
@@ -134,10 +188,14 @@ pub trait FrameProver: Send + Sync {
     /// Build a new app-shard `FrameHeader` for `previous_frame_output`'s
     /// successor. The VDF challenge is `sha3(address || frame_number ||
     /// timestamp || difficulty || fee_multiplier_vote || parent ||
-    /// requests_root || state_roots... || prover)` where `parent =
-    /// poseidon(previous_frame_output[:516])`. Including timestamp +
-    /// fee_multiplier ensures distinct ranks within the same frame
-    /// produce distinct VDF outputs and therefore distinct identities.
+    /// requests_root || state_roots... || prover || storage_attestation_root ||
+    /// global_frame_number)` where `parent = poseidon(previous_frame_output[:516])`.
+    /// Including timestamp + fee_multiplier ensures distinct ranks within the
+    /// same frame produce distinct VDF outputs and therefore distinct
+    /// identities. The trailing `storage_attestation_root` (committee digest
+    /// over the per-member proof-of-storage openings carried with the frame) and
+    /// `global_frame_number` (the global VDF beacon anchor) bind the storage
+    /// attestation into the VDF output so neither can be altered post-solve.
     fn prove_frame_header(
         &self,
         previous_frame_output: &[u8],
@@ -149,6 +207,8 @@ pub trait FrameProver: Send + Sync {
         difficulty: u32,
         fee_multiplier_vote: u64,
         frame_number: u64,
+        storage_attestation_root: &[u8],
+        global_frame_number: u64,
     ) -> Result<crate::proto::global::FrameHeader>;
 
     fn verify_frame_header(
@@ -160,16 +220,20 @@ pub trait FrameProver: Send + Sync {
     /// Mirrors Go's `WesolowskiFrameProver.ProveGlobalFrameHeader` at
     /// `vdf/wesolowski_frame_prover.go:397-493` exactly:
     ///
-    ///   parent     = poseidon(previous_frame.output[:516])
-    ///   challenge  = sha3(frame#||timestamp||difficulty||parent||
-    ///                     commitments...||prover_root||request_root)
-    ///   output     = WesolowskiSolve(challenge, difficulty)
-    ///   signature  = signer.SignWithDomain(challenge||output, "global")
+    ///   parent = poseidon(previous_frame.output[:516])
+    ///   challenge = sha3(frame#||timestamp||difficulty||parent||
+    /// commitments...||prover_root||request_root)
+    ///   output = WesolowskiSolve(challenge, difficulty)
+    ///   signature = signer.SignWithDomain(challenge||output, "global")
     fn prove_global_frame_header(
         &self,
         previous_frame: &crate::proto::global::GlobalFrameHeader,
         commitments: &[Vec<u8>],
         prover_root: &[u8],
+        // Prover shard phase 1/2/3 roots (vertex-removes, hyperedge-adds,
+        // hyperedge-removes), bound into the VDF challenge alongside
+        // `prover_root` (phase 0) and carried in `prover_tree_aux_roots`.
+        prover_aux_roots: &[Vec<u8>],
         request_root: &[u8],
         signer: &dyn Signer,
         timestamp: i64,
@@ -204,9 +268,13 @@ pub trait FrameProver: Send + Sync {
     /// `vdf/wesolowski_frame_prover.go:327-395`.
     ///
     /// Returns `Ok(true)` when the signature verifies against the
-    /// signers' aggregated pubkey. If `ids` is `Some`, additionally
-    /// verifies the multi-proof carried in the signature bytes past
-    /// offset 74.
+    /// signers' aggregated pubkey. When `ids` is `Some`, it is the FULL
+    /// active committee (the deterministic universe the multiproof's
+    /// challenge prime is bound to); the implementation re-derives the
+    /// PRESENT signer subset from the header bitmask and verifies only
+    /// their VDF multi-proofs against the committee-bound prime — partial
+    /// attendance is expected and accepted. `None` means single-signer
+    /// (74-byte aggregate) or BLS-only verification with no multi-proof.
     ///
     /// Default implementation returns an error — callers should use a
     /// real `WesolowskiFrameProver` when BLS verify is required.
@@ -220,6 +288,29 @@ pub trait FrameProver: Send + Sync {
             "FrameProver::verify_frame_header_signature not implemented".into(),
         ))
     }
+
+    /// Batch-verify the BLS aggregate signatures of many shard
+    /// `FrameHeader`s at once (one multi-pairing + one final
+    /// exponentiation instead of N). On success, the prover records each
+    /// verified signature so a subsequent per-header
+    /// [`verify_frame_header_signature`] skips the (now-redundant) BLS
+    /// pairing — it still runs the VDF multiproof and structural checks.
+    /// Returns `true` iff EVERY header's BLS signature verified; on
+    /// `false` (at least one invalid) nothing is recorded and callers
+    /// fall back to per-header verification. The default does nothing and
+    /// returns `false` (no batching → per-header path runs as before).
+    fn verify_frame_header_signatures_batch(
+        &self,
+        _headers: &[&crate::proto::global::FrameHeader],
+        _bls: &dyn BlsConstructor,
+    ) -> bool {
+        false
+    }
+
+    /// Drop all recorded batch-preverified signatures. Called by the
+    /// materializer after each frame so the set can't grow or leak across
+    /// frames. Default no-op.
+    fn clear_bls_preverified(&self) {}
 
     /// Verify the BLS aggregate signature on a `GlobalFrameHeader`.
     /// Mirrors Go `WesolowskiFrameProver.VerifyGlobalHeaderSignature`

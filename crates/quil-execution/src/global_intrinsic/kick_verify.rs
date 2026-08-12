@@ -80,9 +80,9 @@ pub fn verify_equivocation_structural(kick: &ProverKick) -> Result<bool> {
 /// 1. Structural equivocation check (`verify_equivocation_structural`).
 /// 2. BLS aggregate signature verify on both conflicting frames.
 /// 3. Traversal-proof check against the prover tree at `frame N-1`
-///    (loaded from the `ClockStore`).
+/// (loaded from the `ClockStore`).
 /// 4. Multiproof verify of `[PublicKey, Status]` for the kicked prover
-///    against the supplied `proof`.
+/// against the supplied `proof`.
 ///
 /// The multi-message multiproof check (Go `rdfMultiprover.VerifyWithType`)
 /// is a best-effort call through the supplied `InclusionProver`; the
@@ -156,65 +156,107 @@ pub fn verify_prover_kick_full(
         ));
     }
 
-    // Parse the kick's traversal proof bytes via the same Go-format
-    // decoder used by mint PoMW.
-    let traversal = crate::token_intrinsic::mint::parse_go_traversal_proof(
-        &kick.traversal_proof,
-    )?;
-    let traversal_ok = crate::traversal_proof::verify_traversal_proof(
-        inclusion_prover,
-        &reward_root,
-        &traversal,
-    )?;
-    if !traversal_ok || kick.proof.is_empty() {
-        return Err(QuilError::InvalidArgument(
-            "prover kick: traversal proof invalid".into(),
-        ));
-    }
+    // 3+4. Prove the kicked prover's vertex exists in the prover tree
+    //      (`reward_root` = frame N-1's ProverTreeCommitment) AND that its
+    //      PublicKey/Status fields carry the kicked prover's key + active
+    //      status. On a migrated node the prover tree is the forest
+    //      GLOBAL_INTRINSIC-shard vertex-adds JMT — the traversal chain and
+    //      the field multiproof collapse into per-field JMT existence proofs;
+    //      the legacy KZG path keeps the two-level check.
+    let use_forest = hypergraph.has_forest();
+    if !use_forest {
+        // Parse the kick's traversal proof bytes via the same Go-format
+        // decoder used by mint PoMW.
+        let traversal = crate::token_intrinsic::mint::parse_go_traversal_proof(
+            &kick.traversal_proof,
+        )?;
+        let traversal_ok = crate::traversal_proof::verify_traversal_proof(
+            inclusion_prover,
+            &reward_root,
+            &traversal,
+        )?;
+        if !traversal_ok || kick.proof.is_empty() {
+            return Err(QuilError::InvalidArgument(
+                "prover kick: traversal proof invalid".into(),
+            ));
+        }
 
-    // 4. Multiproof verify: the kicked prover's PublicKey + Status=1
-    //    must verify against the kick's commitment + proof.
-    //    Full `rdfMultiprover.VerifyWithType` parity requires the RDF
-    //    schema + class/index encoding; we stand on the inclusion
-    //    prover's batch verify for now, exercising the wire layout
-    //    (commitment bytes, proof bytes, evaluations).
-    let evals: Vec<Vec<u8>> = vec![
-        kick.kicked_prover_public_key.clone(),
-        vec![1u8],
-    ];
-    // No per-commit split yet — we use the full commitment for each
-    // evaluation, matching the output of `RdfMultiprover.VerifyWithType`
-    // when called with a single aggregated commitment (Go path uses a
-    // [][]byte with one entry since commitment is the multiproof root).
-    let commit_refs: Vec<&[u8]> = vec![&kick.commitment, &kick.commitment];
-    let eval_refs: Vec<&[u8]> = evals.iter().map(|e| e.as_slice()).collect();
-    // Schema-driven field-order lookup. Hardcoding the indices
-    // `[0, 1]` would mean a future RDF schema reorder (PublicKey or
-    // Status moving) breaks consensus between Rust and Go nodes since
-    // each side picks its own ordering. Reading from
-    // `crate::global_schema::field_tag` keeps the indices in lockstep
-    // with the source-of-truth schema definition that every other
-    // lookup in the codebase uses.
-    let pk_tag = crate::global_schema::field_tag("prover:Prover", "PublicKey")
-        .ok_or_else(|| QuilError::Internal(
-            "ProverKick: prover:Prover.PublicKey missing from schema".into(),
+        // Multiproof verify: the kicked prover's PublicKey + Status=1 must
+        // verify against the kick's commitment + proof.
+        let evals: Vec<Vec<u8>> = vec![
+            kick.kicked_prover_public_key.clone(),
+            vec![1u8],
+        ];
+        let commit_refs: Vec<&[u8]> = vec![&kick.commitment, &kick.commitment];
+        let eval_refs: Vec<&[u8]> = evals.iter().map(|e| e.as_slice()).collect();
+        // Schema-driven field-order lookup keeps indices in lockstep with the
+        // source-of-truth schema (a reorder must not silently diverge nodes).
+        let pk_tag = crate::global_schema::field_tag("prover:Prover", "PublicKey")
+            .ok_or_else(|| QuilError::Internal(
+                "ProverKick: prover:Prover.PublicKey missing from schema".into(),
+            ))?;
+        let status_tag = crate::global_schema::field_tag("prover:Prover", "Status")
+            .ok_or_else(|| QuilError::Internal(
+                "ProverKick: prover:Prover.Status missing from schema".into(),
+            ))?;
+        let indices: [u64; 2] = [pk_tag.order as u64, status_tag.order as u64];
+        if !inclusion_prover.verify_multiple(
+            &commit_refs,
+            &eval_refs,
+            &indices,
+            /* poly_size */ 64,
+            &kick.commitment,
+            &kick.proof,
+        ) {
+            return Err(QuilError::InvalidArgument(
+                "prover kick: multiproof verify failed".into(),
+            ));
+        }
+    } else {
+        // Forest: one JMT membership proof for the kicked prover's vertex.
+        // The vertex address is its L3 id: GLOBAL_INTRINSIC ‖ poseidon(pubkey)
+        // (= `Location::to_id`). The PublicKey and Status fields flatten to
+        // `l3_leaf_key(vertex_id, field_key)` under the vertex-adds phase.
+        let root32: [u8; 32] = reward_root.as_slice().try_into().map_err(|_| {
+            QuilError::InvalidArgument(
+                "prover kick: prover_tree_commitment is not a 32-byte forest root".into(),
+            )
+        })?;
+        let prover_addr = quil_crypto::poseidon::hash_bytes_to_32(
+            &kick.kicked_prover_public_key,
+        )?;
+        let mut vertex_id = [0u8; 64];
+        vertex_id[..32].copy_from_slice(&crate::global_schema::GLOBAL_INTRINSIC_ADDRESS);
+        vertex_id[32..].copy_from_slice(&prover_addr);
+        let pk_key = crate::global_schema::field_key("prover:Prover", "PublicKey")
+            .ok_or_else(|| QuilError::Internal(
+                "ProverKick: prover:Prover.PublicKey missing from schema".into(),
+            ))?;
+        let status_key = crate::global_schema::field_key("prover:Prover", "Status")
+            .ok_or_else(|| QuilError::Internal(
+                "ProverKick: prover:Prover.Status missing from schema".into(),
+            ))?;
+        let expected = vec![
+            (pk_key, kick.kicked_prover_public_key.clone()),
+            (status_key, vec![1u8]),
+        ];
+        let mp = quil_forest::MembershipProof::from_bytes(&kick.traversal_proof)
+            .map_err(|e| QuilError::InvalidArgument(format!(
+                "prover kick: decode forest membership proof: {}", e
+            )))?;
+        let vertex = mp.inputs.first().ok_or_else(|| QuilError::InvalidArgument(
+            "prover kick: forest membership proof has no vertex".into(),
         ))?;
-    let status_tag = crate::global_schema::field_tag("prover:Prover", "Status")
-        .ok_or_else(|| QuilError::Internal(
-            "ProverKick: prover:Prover.Status missing from schema".into(),
-        ))?;
-    let indices: [u64; 2] = [pk_tag.order as u64, status_tag.order as u64];
-    if !inclusion_prover.verify_multiple(
-        &commit_refs,
-        &eval_refs,
-        &indices,
-        /* poly_size */ 64,
-        &kick.commitment,
-        &kick.proof,
-    ) {
-        return Err(QuilError::InvalidArgument(
-            "prover kick: multiproof verify failed".into(),
-        ));
+        if vertex.vertex_address != vertex_id {
+            return Err(QuilError::InvalidArgument(
+                "prover kick: forest proof vertex address != kicked prover's vertex".into(),
+            ));
+        }
+        quil_forest::verify_vertex_membership(&root32, vertex, &expected).map_err(|e| {
+            QuilError::InvalidArgument(format!(
+                "prover kick: forest membership failed (prover not present/active): {}", e
+            ))
+        })?;
     }
 
     // Double-tap: ensure the kicked prover vertex actually exists in
@@ -272,7 +314,7 @@ pub fn verify_prover_kick_full(
                 "ProverKick: conflicting frames have different filters/addresses".into(),
             ));
         }
-        verify_kick_bitmask_overlap(kick, &filter1, &bitmask1, &bitmask2, pr)?;
+        verify_kick_bitmask_overlap(kick, &filter1, &bitmask1, &bitmask2, pr, frame_number)?;
     }
 
     Ok(())
@@ -285,12 +327,12 @@ pub fn verify_prover_kick_full(
 /// kick any prover.
 ///
 /// Steps:
-///   1. Extract each frame's BLS aggregate signature bitmask.
-///   2. Compute the kicked prover's address = `poseidon(pubkey)`.
-///   3. Look up active provers for the frame's filter/address via
-///      `prover_registry.get_active_provers`.
-///   4. Find the kicked prover's index in that set.
-///   5. Check both bitmasks have that bit set.
+/// 1. Extract each frame's BLS aggregate signature bitmask.
+/// 2. Compute the kicked prover's address = `poseidon(pubkey)`.
+/// 3. Look up active provers for the frame's filter/address via
+/// `prover_registry.get_active_provers`.
+/// 4. Find the kicked prover's index in that set.
+/// 5. Check both bitmasks have that bit set.
 ///
 /// Returns `Ok(())` only when the overlap is confirmed. `prover_filter`
 /// is the filter or shard address that both conflicting frames
@@ -301,12 +343,13 @@ pub fn verify_kick_bitmask_overlap(
     bitmask1: &[u8],
     bitmask2: &[u8],
     prover_registry: &dyn quil_types::consensus::ProverRegistry,
+    frame_number: u64,
 ) -> Result<()> {
     let prover_addr = quil_crypto::poseidon::hash_bytes_to_32(
         &kick.kicked_prover_public_key,
     )?;
     let active = prover_registry
-        .get_active_provers(prover_filter)
+        .get_active_provers(prover_filter, frame_number)
         .map_err(|e| QuilError::InvalidArgument(format!(
             "ProverKick: get_active_provers failed: {e}"
         )))?;
@@ -435,6 +478,9 @@ fn local_global_header_to_proto(
         parent_selector: h.parent_selector.clone(),
         global_commitments: h.global_commitments.clone(),
         prover_tree_commitment: h.prover_tree_commitment.clone(),
+        // Signature-only verify path (poseidon(output)) — aux roots aren't
+        // needed here; the local execution header doesn't carry them.
+        prover_tree_aux_roots: Vec::new(),
         requests_root: h.requests_root.clone(),
         prover: h.prover.clone(),
         public_key_signature_bls48581: decode_aggregate_signature_to_proto(
@@ -461,6 +507,9 @@ fn local_app_header_to_proto(
         public_key_signature_bls48581: decode_aggregate_signature_to_proto(
             &h.public_key_signature_bls48581,
         )?,
+        storage_attestation_root: h.storage_attestation_root.clone(),
+        global_frame_number: h.global_frame_number,
+        storage_attestation: h.storage_attestation.clone(),
     })
 }
 
@@ -768,4 +817,170 @@ mod tests {
     // are installed. The structural-rejection path is exercised by the
     // existing `no_equivocation_*` tests above, which run before any
     // external dependency is touched inside `verify_prover_kick_full`.
+
+    // -----------------------------------------------------------------
+    // extract_kick_frame_filter_and_bitmask
+    // -----------------------------------------------------------------
+
+    use crate::hypergraph_intrinsic::canonical::AggregateSignature;
+    use crate::global_intrinsic::frame_header::FrameHeader;
+
+    fn agg_sig_bytes(bitmask: &[u8]) -> Vec<u8> {
+        AggregateSignature {
+            signature: vec![0xABu8; 666],
+            public_key: None,
+            bitmask: bitmask.to_vec(),
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    fn app_frame_bytes(address: &[u8], bitmask: &[u8]) -> Vec<u8> {
+        let header = FrameHeader {
+            address: address.to_vec(),
+            frame_number: 42,
+            rank: 0,
+            timestamp: 0,
+            difficulty: 50_000,
+            output: vec![0x01u8; 8],
+            parent_selector: vec![],
+            requests_root: vec![],
+            state_roots: vec![],
+            prover: vec![],
+            fee_multiplier_vote: 0,
+            public_key_signature_bls48581: agg_sig_bytes(bitmask),
+            storage_attestation_root: Vec::new(),
+            global_frame_number: 0,
+            storage_attestation: Vec::new(),
+        };
+        header.to_canonical_bytes().unwrap()
+    }
+
+    #[test]
+    fn extract_app_frame_filter_and_bitmask() {
+        let addr = vec![0xCDu8; 32];
+        let bitmask = vec![0b0000_0101u8];
+        let bytes = app_frame_bytes(&addr, &bitmask);
+        let (filter, mask) = extract_kick_frame_filter_and_bitmask(&bytes).unwrap();
+        assert_eq!(filter, addr);
+        assert_eq!(mask, bitmask);
+    }
+
+    #[test]
+    fn extract_rejects_short_frame() {
+        assert!(extract_kick_frame_filter_and_bitmask(&[0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn extract_rejects_unknown_type_prefix() {
+        let mut bytes = app_frame_bytes(&vec![0xCDu8; 32], &[0x01]);
+        bytes[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        assert!(extract_kick_frame_filter_and_bitmask(&bytes).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // verify_kick_bitmask_overlap
+    // -----------------------------------------------------------------
+
+    use quil_types::consensus::{
+        ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus,
+    };
+
+    struct FixedRegistry {
+        active: Vec<ProverInfo>,
+    }
+
+    fn fake_prover_info(addr: [u8; 32]) -> ProverInfo {
+        ProverInfo {
+            public_key: vec![0u8; 585],
+            address: addr.to_vec(),
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![],
+            available_storage: 0,
+            seniority: 0,
+            delegate_address: vec![],
+        }
+    }
+
+    impl ProverRegistry for FixedRegistry {
+        fn get_prover_info(&self, _: &[u8]) -> Result<Option<ProverInfo>> { Ok(None) }
+        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<Vec<u8>>> { Ok(vec![]) }
+        fn get_active_provers(&self, _: &[u8], _: u64) -> Result<Vec<ProverInfo>> {
+            Ok(self.active.clone())
+        }
+        fn get_prover_count(&self, _: &[u8]) -> Result<usize> { Ok(self.active.len()) }
+        fn get_provers(&self, _: &[u8]) -> Result<Vec<ProverInfo>> { Ok(self.active.clone()) }
+        fn get_provers_by_status(&self, _: &[u8], _: ProverStatus) -> Result<Vec<ProverInfo>> {
+            Ok(vec![])
+        }
+        fn get_prover_shard_summaries(&self, _: u64) -> Result<Vec<ProverShardSummary>> {
+            Ok(vec![])
+        }
+    }
+
+    fn kick_for_pubkey(pubkey: Vec<u8>) -> ProverKick {
+        ProverKick {
+            frame_number: 100,
+            kicked_prover_public_key: pubkey,
+            conflicting_frame_1: vec![],
+            conflicting_frame_2: vec![],
+            commitment: vec![],
+            proof: vec![],
+            traversal_proof: vec![],
+        }
+    }
+
+    #[test]
+    fn bitmask_overlap_accepts_when_both_frames_include_signer() {
+        let pubkey = vec![0x55u8; 585];
+        let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
+        // Put the kicked prover at index 0.
+        let reg = FixedRegistry { active: vec![fake_prover_info(addr)] };
+        let kick = kick_for_pubkey(pubkey);
+        // bit 0 set in both bitmasks.
+        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b1], &reg, 0);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn bitmask_overlap_rejects_when_one_frame_misses_signer() {
+        let pubkey = vec![0x55u8; 585];
+        let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
+        let reg = FixedRegistry { active: vec![fake_prover_info(addr)] };
+        let kick = kick_for_pubkey(pubkey);
+        // frame 1 has bit 0; frame 2 does not.
+        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b0], &reg, 0);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn bitmask_overlap_rejects_when_signer_not_in_active_set() {
+        let pubkey = vec![0x55u8; 585];
+        // Active set contains a DIFFERENT prover.
+        let other_addr = [0x99u8; 32];
+        let reg = FixedRegistry { active: vec![fake_prover_info(other_addr)] };
+        let kick = kick_for_pubkey(pubkey);
+        let r = verify_kick_bitmask_overlap(&kick, &[], &[0b1], &[0b1], &reg, 0);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn bitmask_overlap_handles_index_beyond_first_byte() {
+        // Place the kicked prover at index 9 → byte 1, bit 1.
+        let pubkey = vec![0x55u8; 585];
+        let addr = quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap();
+        let mut active: Vec<ProverInfo> =
+            (0..9).map(|i| fake_prover_info([i as u8; 32])).collect();
+        active.push(fake_prover_info(addr)); // index 9
+        let reg = FixedRegistry { active };
+        let kick = kick_for_pubkey(pubkey);
+        // index 9 → byte_index=1, bit_index=1 → mask byte [_, 0b10].
+        let bitmask = vec![0x00u8, 0b10u8];
+        assert!(verify_kick_bitmask_overlap(&kick, &[], &bitmask, &bitmask, &reg, 0).is_ok());
+        // Missing bit in second frame → reject.
+        let no_bit = vec![0x00u8, 0x00u8];
+        assert!(verify_kick_bitmask_overlap(&kick, &[], &bitmask, &no_bit, &reg, 0).is_err());
+    }
 }

@@ -117,8 +117,8 @@ impl RocksClockStore {
         // Pre-compute all writes.
         let latest_key = encoding::clock_global_latest_index();
         let earliest_key = encoding::clock_global_earliest_index();
-        let current_latest = self.get_latest_frame_number();
-        let current_earliest = self.get_earliest_frame_number();
+        let current_latest = self.read_u64_index_checked(&latest_key)?;
+        let current_earliest = self.read_u64_index_checked(&earliest_key)?;
         // Mirror the earliest check: if no frames are stored yet, this
         // IS the latest; otherwise compare. The previous form
         // `frame_number > unwrap_or(0)` collapsed "no frames" to "latest
@@ -300,12 +300,92 @@ impl RocksClockStore {
         self.read_u64_index(&key)
     }
 
+    /// Scan the global frame-record keyspace and return every internal gap as
+    /// an inclusive `(lo, hi)` missing range. Key-only prefix scan — it does
+    /// NOT decode frame values, so it is cheap even over a full chain. Only
+    /// gaps BETWEEN stored frames are returned (holes left by prior restarts);
+    /// the open range above the highest stored frame is not a "gap" here. An
+    /// empty or fully-contiguous store returns `[]`.
+    pub fn find_global_frame_record_gaps(&self) -> Vec<(u64, u64)> {
+        // Frame record key = [CLOCK_FRAME, CLOCK_GLOBAL_FRAME, frame(8 BE)];
+        // take the 2-byte type prefix so the scan covers exactly the frame
+        // records (request/candidate keys use different second bytes).
+        let full = encoding::clock_global_frame_key(0);
+        let prefix = &full[..2];
+        let mut gaps = Vec::new();
+        let mut prev: Option<u64> = None;
+        for item in self.db.prefix_iterator(prefix) {
+            let (k, _) = match item {
+                Ok(kv) => kv,
+                Err(_) => break,
+            };
+            if !k.starts_with(prefix) || k.len() < 10 {
+                break;
+            }
+            let n = u64::from_be_bytes(k[2..10].try_into().unwrap());
+            if let Some(p) = prev {
+                if n > p + 1 {
+                    gaps.push((p + 1, n - 1));
+                }
+            }
+            prev = Some(n);
+        }
+        gaps
+    }
+
+    /// Durable GLOBAL materialization cursor: the highest global frame whose
+    /// `requests` have been committed into the hypergraph CRDT. `None` when
+    /// absent (fresh store → treat as 0). This key is written atomically
+    /// inside the CRDT commit batch (see
+    /// [`crate::encoding::global_materialized_cursor_key`]); the global store
+    /// (clock + hypergraph) shares one RocksDB, so the write staged by the
+    /// hypergraph txn is visible here. Read at startup to seed the
+    /// materializer and drive the crash-gap re-materialize `[cursor+1..=head]`.
+    pub fn get_global_materialized_cursor(&self) -> Option<u64> {
+        let key = encoding::global_materialized_cursor_key();
+        self.read_u64_index(&key)
+    }
+
+    /// Advance the durable global materialized cursor to `frame_number`.
+    /// Normally the cursor is written atomically inside the CRDT commit batch
+    /// (one frame at a time); a state-jump syncs the CRDT state WHOLESALE from
+    /// a peer snapshot (bypassing per-frame materialize), so it uses this to
+    /// move the cursor straight to the synced head — otherwise the startup
+    /// re-materialize would try (and fail) to replay `[old_cursor+1..=synced]`.
+    /// Monotonic: never regresses the cursor (a stale/lower value is ignored),
+    /// mirroring the `update_latest` guard on the frame index.
+    pub fn put_global_materialized_cursor(&self, frame_number: u64) -> Result<()> {
+        if let Some(existing) = self.get_global_materialized_cursor() {
+            if existing >= frame_number {
+                return Ok(());
+            }
+        }
+        let key = encoding::global_materialized_cursor_key();
+        self.db
+            .put(&key, frame_number.to_be_bytes())
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+
     fn read_u64_index(&self, key: &[u8]) -> Option<u64> {
         self.db
             .get(key)
             .ok()?
             .filter(|v| v.len() == 8)
             .map(|v| u64::from_be_bytes(v[..8].try_into().unwrap()))
+    }
+
+    /// Like `read_u64_index` but distinguishes a genuine absence (`Ok(None)`)
+    /// from a DB read error (`Err`). Write paths that decide whether to
+    /// overwrite the latest/earliest cursor MUST use this: swallowing a
+    /// transient read error as `None` makes `update_latest` true and
+    /// overwrites the index with a lower frame number, regressing the cursor.
+    fn read_u64_index_checked(&self, key: &[u8]) -> Result<Option<u64>> {
+        Ok(self
+            .db
+            .get(key)
+            .map_err(|e| QuilError::Store(e.to_string()))?
+            .filter(|v| v.len() == 8)
+            .map(|v| u64::from_be_bytes(v[..8].try_into().unwrap())))
     }
 
     fn read_frame_requests(&self, frame_number: u64) -> Result<Vec<global::MessageBundle>> {
@@ -350,6 +430,34 @@ mod tests {
     }
 
     #[test]
+    fn test_global_materialized_cursor_getter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = Arc::new(rocksdb::DB::open(&opts, tmp.path()).unwrap());
+        let store = RocksClockStore::new(db.clone());
+
+        // Absent → None (fresh store; materializer treats as 0).
+        assert_eq!(store.get_global_materialized_cursor(), None);
+
+        // A raw 8-byte BE value at the single global key round-trips. In
+        // production this value is staged into the hypergraph CRDT commit's
+        // own batch (same shared DB); here we write it directly to isolate
+        // the getter.
+        let key = encoding::global_materialized_cursor_key();
+        db.put(&key, 1234u64.to_be_bytes()).unwrap();
+        assert_eq!(store.get_global_materialized_cursor(), Some(1234));
+
+        // Overwrite reflects the latest value (single global key).
+        db.put(&key, 5678u64.to_be_bytes()).unwrap();
+        assert_eq!(store.get_global_materialized_cursor(), Some(5678));
+
+        // A malformed (wrong-length) value is ignored (treated as absent).
+        db.put(&key, [0u8; 3]).unwrap();
+        assert_eq!(store.get_global_materialized_cursor(), None);
+    }
+
+    #[test]
     fn test_put_get_global_frame() {
         let store = test_db();
 
@@ -363,6 +471,7 @@ mod tests {
                 parent_selector: vec![0u8; 32],
                 global_commitments: Vec::new(),
                 prover_tree_commitment: Vec::new(),
+                prover_tree_aux_roots: Vec::new(),
                 requests_root: Vec::new(),
                 prover: vec![0u8; 32],
                 public_key_signature_bls48581: None,
@@ -381,6 +490,79 @@ mod tests {
             loaded.header.as_ref().unwrap().difficulty,
             200000
         );
+    }
+
+    /// The committed head must SURVIVE a restart. Mimics the CW `on_finalized`
+    /// durable write (`put_global_clock_frame(&frame, &NoopTxn)` → falls to
+    /// `put_global_frame(frame, None)` → `self.db.write` + `latest_index`),
+    /// then closes and reopens the DB at the SAME path (a node restart). If the
+    /// head reverts to the migration frame, the write path is not durable; if
+    /// it survives here, the field revert-to-669975 is a STARTUP reset, not the
+    /// write.
+    #[test]
+    fn committed_head_survives_reopen() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let make_frame = |n: u64| global::GlobalFrame {
+            header: Some(global::GlobalFrameHeader {
+                frame_number: n,
+                output: vec![0u8; 516],
+                parent_selector: vec![0u8; 32],
+                prover: vec![0u8; 32],
+                ..Default::default()
+            }),
+            requests: Vec::new(),
+        };
+
+        // Session 1: migration head 669975, then finalize 669976 + 669977.
+        {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            let db = Arc::new(rocksdb::DB::open(&opts, &path).unwrap());
+            let store = RocksClockStore::new(db.clone());
+            store.put_global_frame(&make_frame(669975), None).unwrap();
+            assert_eq!(store.get_latest_frame_number(), Some(669975));
+            store.put_global_frame(&make_frame(669976), None).unwrap();
+            store.put_global_frame(&make_frame(669977), None).unwrap();
+            assert_eq!(store.get_latest_frame_number(), Some(669977));
+            drop(store);
+            drop(db); // close (shutdown)
+        }
+
+        // Session 2: reopen SAME path (restart). Head must still be 669977.
+        {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            let db = Arc::new(rocksdb::DB::open(&opts, &path).unwrap());
+            let store = RocksClockStore::new(db);
+            assert_eq!(
+                store.get_latest_frame_number(),
+                Some(669977),
+                "committed head must survive restart (not revert to migration head)"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_outcomes_round_trip() {
+        use store::{ClockStore, RequestOutcome, RequestStatus};
+        let s = test_db();
+        // Absent → empty.
+        assert!(s.get_global_clock_frame_outcomes(7).unwrap().is_empty());
+        let outcomes = vec![
+            RequestOutcome { status: RequestStatus::Succeeded, error: String::new() },
+            RequestOutcome { status: RequestStatus::Rejected, error: "bad signature".into() },
+            RequestOutcome { status: RequestStatus::Failed, error: "insufficient balance".into() },
+            RequestOutcome { status: RequestStatus::Skipped, error: "encoded payload < 4 bytes (no type prefix)".into() },
+        ];
+        s.put_global_clock_frame_outcomes(7, &outcomes).unwrap();
+        assert_eq!(s.get_global_clock_frame_outcomes(7).unwrap(), outcomes);
+        // Distinct frames are independent.
+        assert!(s.get_global_clock_frame_outcomes(8).unwrap().is_empty());
+        // Overwrite replaces.
+        let one = vec![RequestOutcome { status: RequestStatus::Succeeded, error: String::new() }];
+        s.put_global_clock_frame_outcomes(7, &one).unwrap();
+        assert_eq!(s.get_global_clock_frame_outcomes(7).unwrap(), one);
     }
 
     #[test]
@@ -607,6 +789,65 @@ impl store::ClockStore for RocksClockStore {
             header: Some(header),
             requests,
         })
+    }
+    fn put_global_clock_frame_outcomes(
+        &self,
+        frame_number: u64,
+        outcomes: &[store::RequestOutcome],
+    ) -> Result<()> {
+        // [count u32][ (status u8)(err_len u32)(err utf8) ]*
+        let mut buf = Vec::with_capacity(4 + outcomes.len() * 8);
+        buf.extend_from_slice(&(outcomes.len() as u32).to_be_bytes());
+        for o in outcomes {
+            buf.push(o.status.as_u8());
+            let e = o.error.as_bytes();
+            buf.extend_from_slice(&(e.len() as u32).to_be_bytes());
+            buf.extend_from_slice(e);
+        }
+        let key = encoding::clock_global_frame_outcomes_key(frame_number);
+        self.db
+            .put(&key, &buf)
+            .map_err(|e| QuilError::Store(e.to_string()))
+    }
+    fn get_global_clock_frame_outcomes(
+        &self,
+        frame_number: u64,
+    ) -> Result<Vec<store::RequestOutcome>> {
+        let key = encoding::clock_global_frame_outcomes_key(frame_number);
+        let bytes = match self
+            .db
+            .get(&key)
+            .map_err(|e| QuilError::Store(e.to_string()))?
+        {
+            Some(b) => b,
+            None => return Ok(Vec::new()),
+        };
+        let rd_u32 = |b: &[u8], c: &mut usize| -> Option<u32> {
+            if *c + 4 > b.len() {
+                return None;
+            }
+            let v = u32::from_be_bytes([b[*c], b[*c + 1], b[*c + 2], b[*c + 3]]);
+            *c += 4;
+            Some(v)
+        };
+        let mut c = 0usize;
+        let count = rd_u32(&bytes, &mut c).unwrap_or(0) as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            if c >= bytes.len() {
+                break;
+            }
+            let status = store::RequestStatus::from_u8(bytes[c]);
+            c += 1;
+            let elen = rd_u32(&bytes, &mut c).unwrap_or(0) as usize;
+            if c + elen > bytes.len() {
+                break;
+            }
+            let error = String::from_utf8_lossy(&bytes[c..c + elen]).into_owned();
+            c += elen;
+            out.push(store::RequestOutcome { status, error });
+        }
+        Ok(out)
     }
     fn delete_global_clock_frame_range(&self, min_frame: u64, max_frame: u64) -> Result<()> {
         let lower = encoding::clock_global_frame_key(min_frame);
@@ -872,6 +1113,7 @@ impl store::ClockStore for RocksClockStore {
         // Go's GetShardClockFrame already accepts a non-pointer value
         // at the canonical key (the `else` branch at clock.go:1290).
         let staged_key = encoding::clock_shard_staged_key(selector, frame_number);
+        let mut have_frame = false;
         if let Some(staged_bytes) = self
             .db
             .get(&staged_key)
@@ -883,11 +1125,28 @@ impl store::ClockStore for RocksClockStore {
                     .put(&canonical_key, &staged_bytes)
                     .map_err(|e| QuilError::Store(e.to_string()))?;
             }
+            have_frame = true;
+        } else {
+            // Staged frame absent (e.g. a re-commit after restart where the
+            // frame is already canonical). Only treat this frame_number as
+            // real if the canonical frame actually exists on disk.
+            let canonical_key = encoding::clock_shard_frame_key(filter, frame_number);
+            have_frame = self
+                .db
+                .get(&canonical_key)
+                .map_err(|e| QuilError::Store(e.to_string()))?
+                .is_some();
         }
 
         // Update the latest-index pointer (skipped during backfill,
-        // matching Go).
-        if !backfill {
+        // matching Go). SECURITY: `frame_number` comes from the QC's wire
+        // field, which is NOT covered by the aggregate signature (the vote
+        // binds filter‖state_id‖rank only). A malicious peer can take a valid
+        // QC and set frame_number = u64::MAX; without the `have_frame` guard
+        // that would bump the index past every real frame and permanently
+        // wedge the shard (no future commit can exceed MAX). Only advance the
+        // index to a frame_number for which a frame actually exists.
+        if !backfill && have_frame {
             let idx_key = encoding::clock_shard_latest_index(filter);
             let current = self.read_u64_index(&idx_key);
             if current.is_none() || frame_number > current.unwrap() {

@@ -25,12 +25,6 @@ fn main() {
     let openssl_prefix = resolve_lib_root("openssl@3", "OPENSSL_DIR");
     let openssl_inc = format!("-I{}/include", openssl_prefix);
     let openssl_lib = format!("-L{}/lib", openssl_prefix);
-    let emp_prefix = env::var("EMP_DIR").ok().filter(|p| !p.is_empty());
-    let emp_include = emp_prefix
-        .as_ref()
-        .map(|p| format!("-I{}/include", p))
-        .unwrap_or_else(|| "-I/usr/local/include".to_string());
-    let emp_lib_dir = emp_prefix.as_ref().map(|p| PathBuf::from(p).join("lib"));
 
     cc::Build::new()
         .cpp(true)
@@ -40,7 +34,6 @@ fn main() {
         .flag(&format!("-I{}", emp_tool_local))
         // Local emp-ot first (for ferret_cot.h with is_setup())
         .flag(&format!("-I{}", emp_ot_local))
-        .flag(&emp_include)
         .flag("-I/usr/local/include/emp-tool/")
         .flag("-I/usr/local/include/emp-ot/")
         .flag(&openssl_inc)
@@ -49,9 +42,6 @@ fn main() {
         .warnings(false)
         .compile("emp_bridge");
 
-    if let Some(dir) = emp_lib_dir {
-      println!("cargo:rustc-link-search=native={}", dir.display());
-    }
     println!("cargo:rustc-link-search=native=/usr/local/lib");
     println!("cargo:rustc-link-search=native={}/lib", openssl_prefix);
     println!("cargo:rustc-link-search=native=/opt/homebrew/lib");

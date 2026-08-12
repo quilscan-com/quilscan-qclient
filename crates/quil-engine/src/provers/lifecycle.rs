@@ -6,17 +6,17 @@
 //! in `node/consensus/global/worker_allocator.go`.
 //!
 //! Split of responsibilities with `WorkerAllocator`:
-//!   - `WorkerAllocator::on_new_frame`: reconciles registry state with
-//!     running workers (assigns filters to idle cores, clears stale
-//!     filters). Pure state sync, no proposals.
-//!   - `ProverLifecycle::evaluate`: examines registry + worker state
-//!     and returns the full list of actions to submit this frame
-//!     (matching Go's `evaluateForProposals`, which can emit Propose
-//!     + Decide actions in the same cycle). The caller dispatches each
-//!     through the submission pipeline; per-address locking in the
-//!     consensus engine serializes them so only one takes effect per
-//!     affected prover address per frame. The single cooldown timer
-//!     lives on the `WorkerAllocator`.
+//! - `WorkerAllocator::on_new_frame`: reconciles registry state with
+//! running workers (assigns filters to idle cores, clears stale
+//! filters). Pure state sync, no proposals.
+//! - `ProverLifecycle::evaluate`: examines registry + worker state
+//! and returns the full list of actions to submit this frame
+//! (matching Go's `evaluateForProposals`, which can emit Propose
+//! + Decide actions in the same cycle). The caller dispatches each
+//! through the submission pipeline; per-address locking in the
+//! consensus engine serializes them so only one takes effect per
+//! affected prover address per frame. The single cooldown timer
+//! lives on the `WorkerAllocator`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,6 +41,63 @@ pub const DEFAULT_CONFIRM_WINDOW_FRAMES: u64 = 360;
 pub const MAX_PROPOSALS_PER_CYCLE: usize = 100;
 /// Max proposals per single PlanAndAllocate call in Go (worker_allocator.go:215).
 pub const GO_PLAN_ALLOCATE_CAP: usize = 100;
+/// Per-filter cooldown between successive Leave proposals on the same
+/// filter. Suppresses duplicate Leave publishes during the
+/// publish→archive-materialize→registry-sync round-trip. Wider than
+/// `JOIN_COOLDOWN_FRAMES` because Leave round-trips include both
+/// archive-side materialization and the (~5-minute-cadence) prover
+/// tree sync that updates our local view of allocation status. 20
+/// frames ≈ 10 minutes on mainnet, comfortably spanning one full
+/// sync cycle so the next plan_leaves cycle sees the Leaving status.
+pub const LEAVE_COOLDOWN_FRAMES: u64 = 20;
+/// Minimum frames an allocation must have been Active (since its join
+/// confirmed) before it is eligible for a *pure-score* leave. A freshly
+/// established, producing allocation is "fine" — shedding it to chase a
+/// marginally-higher unallocated shard is the churn this dwell prevents
+/// (workers leaving good allocations, rejoining elsewhere, then leaving
+/// again). Health-driven leaves (empty / orphan / halt-risk-deficit swap)
+/// ignore the dwell. Matches one confirm window so a holding is kept at
+/// least as long as it took to establish it.
+pub const SCORE_LEAVE_MIN_HOLD_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
+/// Per-filter cooldown between successive Join proposals on the same
+/// filter. Closes the orphan-Joining gap created by
+/// `PROPOSAL_TIMEOUT_FRAMES` (10) being shorter than typical
+/// bundle-to-local-registry round-trip latency. When the worker-level
+/// pending marker times out, the worker goes back into `free_auto`
+/// and the next cycle can re-pick the same filter via a fresh bundle
+/// — but the prior bundle is still on the wire. Both eventually land,
+/// the registry holds two Joining allocs for the same filter (or
+/// overlapping cycles dilute the worker budget), and the assignment
+/// loop runs out of idle workers, leaving the excess as orphans
+/// (Joining alloc with no worker bound, observed in the wild
+/// 2026-06-07 — 5 overlapping ProposeJoin cycles for the same ~13
+/// halt-risk filters within 45 frames produced 22 unique Joining
+/// allocs against 13 available worker slots, leaving ~9 orphans).
+/// 30 frames ≈ 15 minutes on mainnet, well past the worst-case
+/// archive materialize + prover-tree sync round-trip we've seen.
+pub const JOIN_FILTER_COOLDOWN_FRAMES: u64 = 30;
+
+/// Backoff between successive per-epoch re-confirm submissions on the same
+/// filter. An `ExpiredEpoch` allocation stays expired through the
+/// submit→archive→materialize round-trip (the local registry shows the stale
+/// epoch until the ProverConfirm lands), so without this every cycle in that
+/// window would re-publish an identical confirm. Sized like the join cooldown:
+/// well past the round-trip, but short enough that a failed submit (cooldown
+/// never recorded on success) retries promptly — critical, since a missed
+/// re-confirm means eviction at the next audit.
+pub const RECONFIRM_COOLDOWN_FRAMES: u64 = 30;
+
+/// Backoff before re-proposing a join to a shard that *rejected* our
+/// last join. `JOIN_FILTER_COOLDOWN_FRAMES` only gates re-proposal off
+/// the last join *attempt*, so a contested shard that keeps rejecting us
+/// is re-hammered every ~cooldown forever (observed: a single filter
+/// oscillating Joining↔Rejected for hours, ~480 rejected allocs on one
+/// node, workers saturated by never-confirming pending joins). When our
+/// allocation lands in Rejected, hold off re-proposing that filter for
+/// this window so the node tries *other* (less contested) unallocated
+/// shards instead of fighting for the same one. Matches one confirm
+/// window. Tunable.
+pub const JOIN_REJECT_BACKOFF_FRAMES: u64 = DEFAULT_CONFIRM_WINDOW_FRAMES;
 
 /// Result of evaluating the current frame for prover lifecycle actions.
 pub enum LifecycleAction {
@@ -71,6 +128,14 @@ pub enum LifecycleAction {
     },
     /// Submit a ProverConfirm for these leave filters.
     ConfirmLeaves {
+        filters: Vec<Vec<u8>>,
+        frame_number: u64,
+    },
+    /// Re-confirm Active allocations whose storage epoch went stale: re-encode
+    /// fresh-epoch SDR replicas + re-register leaf roots (a ProverConfirm at the
+    /// current frame), then prune replicas below the new epoch. PoRep epoch
+    /// rotation — without it the storage audit evicts the prover next epoch.
+    ReconfirmEpoch {
         filters: Vec<Vec<u8>>,
         frame_number: u64,
     },
@@ -124,6 +189,11 @@ impl std::fmt::Debug for LifecycleAction {
                 .field("filters", &hex_list(filters))
                 .field("frame_number", frame_number)
                 .finish(),
+            Self::ReconfirmEpoch { filters, frame_number } => f
+                .debug_struct("ReconfirmEpoch")
+                .field("filters", &hex_list(filters))
+                .field("frame_number", frame_number)
+                .finish(),
             Self::RejectLeaves { filters, frame_number } => f
                 .debug_struct("RejectLeaves")
                 .field("filters", &hex_list(filters))
@@ -157,6 +227,10 @@ pub struct AllocationBuckets {
     /// Every filter we own (Joining, Active, Paused, Leaving) but
     /// NOT terminal/expired. The "are we already on this shard" set.
     pub all_ours: Vec<Vec<u8>>,
+    /// On-chain Active allocations whose recorded storage epoch is stale
+    /// (`EffectiveStatus::ExpiredEpoch`) — must re-confirm fresh leaf roots
+    /// for the current epoch to keep counting + avoid the storage audit.
+    pub expired_epoch: Vec<Vec<u8>>,
 }
 
 impl AllocationBuckets {
@@ -171,19 +245,46 @@ impl AllocationBuckets {
         allocations: &[quil_types::consensus::ProverAllocationInfo],
         frame_number: u64,
     ) -> Self {
-        use quil_types::consensus::EffectiveStatus;
+        use quil_types::consensus::{EffectiveStatus, ProverStatus};
         let mut buckets = AllocationBuckets::default();
         for alloc in allocations {
             match alloc.effective_status(frame_number) {
                 EffectiveStatus::Joining => {
                     buckets.all_ours.push(alloc.confirmation_filter.clone());
-                    buckets
-                        .joining
-                        .push((alloc.confirmation_filter.clone(), alloc.join_frame_number));
+                    // Only a NOT-YET-CONFIRMED join (raw byte still Joining) is
+                    // eligible for confirm. A join that already confirmed reads
+                    // as Joining too — deferred activation keeps it out of the
+                    // committee until the next epoch boundary — but its raw byte
+                    // is Active and it must NOT be re-confirmed. It owns the slot
+                    // (all_ours) and its worker prepares during the wait.
+                    if alloc.status == ProverStatus::Joining {
+                        buckets
+                            .joining
+                            .push((alloc.confirmation_filter.clone(), alloc.join_frame_number));
+                    }
                 }
                 EffectiveStatus::Active => {
                     buckets.all_ours.push(alloc.confirmation_filter.clone());
                     buckets.active.push(alloc.confirmation_filter.clone());
+                    // Proactive per-epoch re-confirm. An allocation registered
+                    // only for the current epoch (alloc.epoch == current) is
+                    // still Active now but flips ExpiredEpoch at the next
+                    // boundary — and, worse, the global storage audit at the new
+                    // epoch finds no leaf-root registration for it. Re-confirming
+                    // NOW registers current+1 (and encodes its replica ahead), so
+                    // the member stays continuously Active/attesting. The prior
+                    // ExpiredEpoch-ONLY trigger only fired after expiry, yielding
+                    // an every-other-epoch cadence with a coverage/attestation
+                    // gap at each boundary. Global (empty-filter) allocations are
+                    // exempt (no storage epoch). Stays in `active` so it keeps
+                    // counting for coverage; the re-confirm is cooldown-gated
+                    // downstream so it isn't re-published every frame.
+                    if !alloc.confirmation_filter.is_empty()
+                        && alloc.epoch
+                            <= quil_types::consensus::epoch_for_frame(frame_number)
+                    {
+                        buckets.expired_epoch.push(alloc.confirmation_filter.clone());
+                    }
                 }
                 EffectiveStatus::Leaving => {
                     buckets.all_ours.push(alloc.confirmation_filter.clone());
@@ -199,6 +300,16 @@ impl AllocationBuckets {
                     // surplus/leave pressure) nor joining/leaving
                     // (no decide-pending action).
                     buckets.all_ours.push(alloc.confirmation_filter.clone());
+                }
+                // ExpiredEpoch: the prover holds an on-chain Active allocation
+                // but hasn't re-confirmed its leaf roots for the current epoch.
+                // Recoverable, not terminal — keep it in `all_ours` (we still
+                // own the shard, so don't re-propose a join) but NOT in `active`
+                // (it doesn't count toward coverage until re-confirmed), and
+                // queue it for the per-epoch re-confirm (PoRep increment E).
+                EffectiveStatus::ExpiredEpoch => {
+                    buckets.all_ours.push(alloc.confirmation_filter.clone());
+                    buckets.expired_epoch.push(alloc.confirmation_filter.clone());
                 }
                 // Terminal / past-grace. Treat as "doesn't exist":
                 // don't push anywhere, otherwise these would leak
@@ -382,6 +493,35 @@ pub struct ProverLifecycle {
     /// global filter, which is explicitly skipped, so no joins
     /// are ever proposed.
     shards_store: RwLock<Option<Arc<dyn quil_types::store::ShardsStore>>>,
+    /// Per-filter "last frame we proposed Leave on this filter."
+    /// Used to suppress duplicate Leave publishes during the
+    /// publish→archive→materialize→sync round-trip — without this,
+    /// every cycle within that window re-proposes Leave on the same
+    /// filter (the local registry still shows it Active until the
+    /// round-trip completes), and the pipeline republishes
+    /// identical bundles. Entries older than `LEAVE_COOLDOWN_FRAMES`
+    /// are pruned lazily on read so the map can't grow unbounded.
+    last_leave_attempt: RwLock<HashMap<Vec<u8>, u64>>,
+    /// Per-filter "last frame we proposed Join on this filter."
+    /// Worker-level `pending_filter_frame` already prevents re-using
+    /// the same worker slot mid-flight, but it times out after 10
+    /// frames (`PROPOSAL_TIMEOUT_FRAMES`) — after which the worker
+    /// is freed for reuse, and the next cycle can propose a Join
+    /// for a DIFFERENT filter via that worker even though the first
+    /// bundle is still in flight on the wire. When both bundles
+    /// eventually materialize, the registry ends up with more
+    /// Joining allocs than we have workers for, and the excess
+    /// becomes orphans (alloc Joining, no worker bound). This map
+    /// gates `plan_and_allocate` candidate selection so a filter
+    /// with a recent in-flight bundle isn't re-picked until the
+    /// cooldown elapses. Pruned lazily on read.
+    last_join_attempt: RwLock<HashMap<Vec<u8>, u64>>,
+    /// Per-filter "last frame we submitted a per-epoch re-confirm." Suppresses
+    /// duplicate ProverConfirm publishes while an `ExpiredEpoch` allocation's
+    /// re-confirm is in flight (the local registry shows the stale epoch until
+    /// the round-trip completes). Pruned lazily on read. See
+    /// [`RECONFIRM_COOLDOWN_FRAMES`].
+    last_reconfirm_attempt: RwLock<HashMap<Vec<u8>, u64>>,
     /// Set to true after the first successful `GetAppShards` refresh
     /// (`set_remote_shard_sizes`). Gates `ProposeJoin` and `ProposeLeave`:
     /// the lifecycle must not auto-pick shards while it lacks any
@@ -423,6 +563,9 @@ impl ProverLifecycle {
             remote_shard_sizes: RwLock::new(HashMap::new()),
             confirm_window_frames: AtomicU64::new(DEFAULT_CONFIRM_WINDOW_FRAMES),
             shards_store: RwLock::new(None),
+            last_leave_attempt: RwLock::new(HashMap::new()),
+            last_join_attempt: RwLock::new(HashMap::new()),
+            last_reconfirm_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
         }
     }
@@ -455,6 +598,14 @@ impl ProverLifecycle {
     pub fn confirm_window_frames(&self) -> u64 {
         self.confirm_window_frames
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only handle to the shared halt state, so tests can simulate
+    /// degraded-coverage / prover-only mode and assert leave proposals
+    /// are suppressed.
+    #[cfg(test)]
+    pub(crate) fn halt_state(&self) -> &Arc<HaltState> {
+        &self.halt_state
     }
 
     /// Populate the **local** per-shard byte size map (sizes derived
@@ -543,6 +694,115 @@ impl ProverLifecycle {
     /// post-success cooldown semantics at `worker_allocator.go:224`.
     pub fn record_join_attempt(&self, frame_number: u64) {
         self.allocator.set_last_join_attempt(frame_number);
+    }
+
+    /// Drop filters whose last Leave proposal is within
+    /// `LEAVE_COOLDOWN_FRAMES` of `frame_number`. Also opportunistically
+    /// prunes expired entries from the cooldown map so it can't grow
+    /// unbounded.
+    fn filter_recent_leave_attempts(
+        &self,
+        candidates: Vec<Vec<u8>>,
+        frame_number: u64,
+    ) -> Vec<Vec<u8>> {
+        let Ok(mut guard) = self.last_leave_attempt.write() else {
+            return candidates;
+        };
+        // Lazy prune: drop entries that are past the cooldown window.
+        guard.retain(|_, last| {
+            frame_number.saturating_sub(*last) < LEAVE_COOLDOWN_FRAMES
+        });
+        candidates
+            .into_iter()
+            .filter(|f| {
+                guard
+                    .get(f)
+                    .map(|&last| {
+                        frame_number.saturating_sub(last) >= LEAVE_COOLDOWN_FRAMES
+                    })
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    /// Stamp the per-filter Leave cooldown map. Called immediately
+    /// before pushing a ProposeLeave action so the next cycle's
+    /// `filter_recent_leave_attempts` excludes these filters.
+    fn record_leave_attempts(&self, filters: &[Vec<u8>], frame_number: u64) {
+        let Ok(mut guard) = self.last_leave_attempt.write() else {
+            return;
+        };
+        for f in filters {
+            guard.insert(f.clone(), frame_number);
+        }
+    }
+
+    /// Drop `candidates` whose per-epoch re-confirm was submitted within the
+    /// last `RECONFIRM_COOLDOWN_FRAMES` — mirrors `filter_recent_leave_attempts`.
+    fn filter_recent_reconfirm_attempts(
+        &self,
+        candidates: Vec<Vec<u8>>,
+        frame_number: u64,
+    ) -> Vec<Vec<u8>> {
+        let Ok(mut guard) = self.last_reconfirm_attempt.write() else {
+            return candidates;
+        };
+        guard.retain(|_, last| {
+            frame_number.saturating_sub(*last) < RECONFIRM_COOLDOWN_FRAMES
+        });
+        candidates
+            .into_iter()
+            .filter(|f| {
+                guard
+                    .get(f)
+                    .map(|&last| frame_number.saturating_sub(last) >= RECONFIRM_COOLDOWN_FRAMES)
+                    .unwrap_or(true)
+            })
+            .collect()
+    }
+
+    /// Stamp the per-filter re-confirm cooldown map, just before pushing a
+    /// `ReconfirmEpoch` action.
+    fn record_reconfirm_attempts(&self, filters: &[Vec<u8>], frame_number: u64) {
+        let Ok(mut guard) = self.last_reconfirm_attempt.write() else {
+            return;
+        };
+        for f in filters {
+            guard.insert(f.clone(), frame_number);
+        }
+    }
+
+    /// Build a set of filters with an in-flight Join proposal — i.e.,
+    /// any filter we stamped in `last_join_attempt` within the last
+    /// `JOIN_FILTER_COOLDOWN_FRAMES`. Used by the propose path to
+    /// exclude these filters from the candidate set passed to
+    /// `plan_and_allocate`, preventing the orphan-Joining failure
+    /// mode where overlapping cycles propose the same filter via
+    /// different workers and both bundles eventually materialize.
+    /// Also opportunistically prunes expired entries so the map
+    /// can't grow unbounded.
+    fn filters_with_inflight_join(&self, frame_number: u64) -> std::collections::HashSet<Vec<u8>> {
+        let Ok(mut guard) = self.last_join_attempt.write() else {
+            return std::collections::HashSet::new();
+        };
+        // Lazy prune.
+        guard.retain(|_, last| {
+            frame_number.saturating_sub(*last) < JOIN_FILTER_COOLDOWN_FRAMES
+        });
+        guard.keys().cloned().collect()
+    }
+
+    /// Stamp the per-filter Join cooldown map. Called immediately
+    /// before pushing a ProposeJoin action so the next cycle excludes
+    /// these filters from `plan_and_allocate`'s candidate pool until
+    /// `JOIN_FILTER_COOLDOWN_FRAMES` elapses.
+    fn record_join_filter_attempts(&self, filters: &[Vec<u8>], frame_number: u64) {
+        let Ok(mut guard) = self.last_join_attempt.write() else {
+            return;
+        };
+        for f in filters {
+            guard.insert(f.clone(), frame_number);
+        }
     }
 
     /// Port of Go's `selectExcessPendingFilters` at
@@ -837,6 +1097,7 @@ impl ProverLifecycle {
         let active_filters = buckets.active;
         let leaving_filters = buckets.leaving;
         let all_our_filters = buckets.all_ours;
+        let expired_epoch_filters = buckets.expired_epoch;
 
         // Build separate descriptor views.
         //
@@ -860,12 +1121,40 @@ impl ProverLifecycle {
         // not on) overlaid by local sizes (authoritative for shards
         // we hold data for). See `merged_shard_sizes` for the rule.
         let shard_sizes_snapshot = self.merged_shard_sizes();
-        let proposal_descriptors = build_proposal_descriptors(
+        let mut proposal_descriptors = build_proposal_descriptors(
             &summaries,
             &all_our_filters,
             &shard_sizes_snapshot,
             &shards_store_filters,
         );
+        // Recently-rejected join backoff: drop any shard that rejected our
+        // join within the last `JOIN_REJECT_BACKOFF_FRAMES`. A Rejected
+        // allocation is terminal so it's excluded from `all_our_filters`
+        // and would otherwise reappear as a join candidate immediately —
+        // producing the Joining↔Rejected oscillation that saturates
+        // workers with never-confirming pending joins. Backing it off
+        // steers the proposer to other (less contested) unallocated
+        // shards. Also keeps these out of the plan_leaves comparison set
+        // (they're not realistically available to us right now).
+        let reject_backoff: std::collections::HashSet<Vec<u8>> = prover_info
+            .as_ref()
+            .map(|p| {
+                p.allocations
+                    .iter()
+                    .filter(|a| {
+                        a.status == ProverStatus::Rejected
+                            && a.join_reject_frame_number > 0
+                            && frame_number
+                                < a.join_reject_frame_number
+                                    .saturating_add(JOIN_REJECT_BACKOFF_FRAMES)
+                    })
+                    .map(|a| a.confirmation_filter.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !reject_backoff.is_empty() {
+            proposal_descriptors.retain(|d| !reject_backoff.contains(&d.filter));
+        }
         let decide_all_descriptors =
             build_decide_descriptors(&summaries, &shard_sizes_snapshot);
         let allocated_descriptors: Vec<ShardDescriptor> = decide_all_descriptors.iter()
@@ -914,6 +1203,25 @@ impl ProverLifecycle {
 
         let mut actions: Vec<LifecycleAction> = Vec::new();
         let mut join_proposed_this_cycle = false;
+
+        // PoRep epoch rotation: any Active allocation whose recorded storage
+        // epoch went stale must re-confirm fresh leaf roots for the current
+        // epoch — otherwise the global storage audit evicts it. Gate behind the
+        // per-filter cooldown so the confirm isn't re-published every frame
+        // while the round-trip is in flight. This runs regardless of coverage
+        // halts: a prover maintaining its own storage commitment is never the
+        // cause of a halt and must not be evicted for one.
+        if !expired_epoch_filters.is_empty() {
+            let to_reconfirm =
+                self.filter_recent_reconfirm_attempts(expired_epoch_filters, frame_number);
+            if !to_reconfirm.is_empty() {
+                self.record_reconfirm_attempts(&to_reconfirm, frame_number);
+                actions.push(LifecycleAction::ReconfirmEpoch {
+                    filters: to_reconfirm,
+                    frame_number,
+                });
+            }
+        }
 
         // Seniority-merge check — matches Go's `checkAndSubmitSeniorityMerge`
         // at worker_allocator.go:963-1011. When our on-chain seniority
@@ -1116,8 +1424,29 @@ impl ProverLifecycle {
             );
 
             if can_propose {
+                // Per-filter Join cooldown: exclude any filter we've
+                // already proposed Join for within the last
+                // `JOIN_FILTER_COOLDOWN_FRAMES`. Closes the orphan-
+                // Joining gap where the worker-level
+                // `PROPOSAL_TIMEOUT_FRAMES` (10) frees a worker for
+                // re-use after 10 frames but the prior bundle is still
+                // in flight on the wire — both eventually land, and
+                // the registry ends up with more Joining allocs than
+                // worker slots. See `JOIN_FILTER_COOLDOWN_FRAMES`
+                // docstring for the production trace.
+                let inflight_filters = self.filters_with_inflight_join(frame_number);
+                let pre_cooldown_candidates = proposal_descriptors.len();
+                let proposal_descriptors_filtered: Vec<proposer::ShardDescriptor> =
+                    proposal_descriptors
+                        .iter()
+                        .filter(|d| !inflight_filters.contains(&d.filter))
+                        .cloned()
+                        .collect();
+                let join_cooldown_suppressed =
+                    pre_cooldown_candidates.saturating_sub(proposal_descriptors_filtered.len());
+
                 let proposals = proposer::plan_and_allocate(
-                    &proposal_descriptors,
+                    &proposal_descriptors_filtered,
                     difficulty,
                     &world_bytes,
                     self.units,
@@ -1140,11 +1469,17 @@ impl ProverLifecycle {
                     let worker_ids: Vec<u32> = proposals.iter().map(|p| p.worker_id).collect();
                     let filters: Vec<Vec<u8>> = proposals.into_iter().map(|p| p.filter).collect();
 
+                    // Stamp the per-filter Join cooldown before
+                    // emitting the action so the next cycle sees
+                    // these filters as in-flight and excludes them.
+                    self.record_join_filter_attempts(&filters, frame_number);
+
                     info!(
                         filters = filters.len(),
                         frame = frame_number,
                         prev_join_attempt = prev_attempt,
                         cooldown_frames = crate::worker_allocator::JOIN_COOLDOWN_FRAMES,
+                        join_cooldown_suppressed,
                         strategy = ?self.strategy,
                         "proposing join for shards"
                     );
@@ -1154,6 +1489,12 @@ impl ProverLifecycle {
                         worker_ids,
                         frame_number,
                     });
+                } else if join_cooldown_suppressed > 0 {
+                    tracing::debug!(
+                        frame = frame_number,
+                        join_cooldown_suppressed,
+                        "no join candidates after applying per-filter cooldown",
+                    );
                 }
             } else {
                 tracing::debug!(
@@ -1174,9 +1515,12 @@ impl ProverLifecycle {
         // (no score-based reject). Filters bound to auto workers or
         // currently unbound flow through the existing score-driven
         // `decide_joins` against the remaining capacity.
-        let confirm_window = self.confirm_window_frames();
+        // Epoch-aligned: a join proposed in epoch E is confirmed in EXACTLY
+        // epoch E+1 (the chain rejects confirms outside that slot). We emit the
+        // confirm anywhere within E+1; dedup/cooldown handles repeats.
+        let cur_epoch = quil_types::consensus::epoch_for_frame(frame_number);
         let ready_join_filters: Vec<Vec<u8>> = joining_filters.iter()
-            .filter(|(_, jf)| frame_number >= *jf + confirm_window)
+            .filter(|(_, jf)| cur_epoch == quil_types::consensus::epoch_for_frame(*jf) + 1)
             .map(|(f, _)| f.clone())
             .collect();
 
@@ -1288,7 +1632,18 @@ impl ProverLifecycle {
         //    because `decide_leaves` auto-confirms any pending leave
         //    whose filter isn't in the scored list — and size==0
         //    shards aren't, by the same rule.
-        if shard_info_ready && can_propose && !join_proposed_this_cycle && !active_filters.is_empty()
+        // Do NOT propose leaves while in degraded-coverage / prover-only
+        // mode: coverage data is stale/unreliable there, so the halt-risk
+        // counts that drive `plan_leaves` (and its swap path) are false
+        // positives. A node stuck in prover-only mode was observed
+        // proposing swap leaves against a phantom halt-risk shard for
+        // hours (2026-06-16). Halt-risk swaps are still wanted — but only
+        // off a trustworthy coverage view, i.e. when not halted.
+        if shard_info_ready
+            && can_propose
+            && !join_proposed_this_cycle
+            && !active_filters.is_empty()
+            && !self.halt_state.any_halted()
         {
             let manually_managed_filters: std::collections::HashSet<Vec<u8>> = workers
                 .iter()
@@ -1336,6 +1691,27 @@ impl ProverLifecycle {
                 .cloned()
                 .collect();
 
+            // Min-hold dwell: allocations confirmed within the last
+            // `SCORE_LEAVE_MIN_HOLD_FRAMES` are exempt from pure-score
+            // leaves so a freshly-established, producing holding isn't
+            // churned to chase a marginally-better unallocated shard.
+            // (Halt-risk swap, empty, and orphan leaves ignore this.)
+            let min_hold_filters: std::collections::HashSet<Vec<u8>> = prover_info
+                .as_ref()
+                .map(|p| {
+                    p.allocations
+                        .iter()
+                        .filter(|a| {
+                            a.join_confirm_frame_number > 0
+                                && frame_number
+                                    < a.join_confirm_frame_number
+                                        .saturating_add(SCORE_LEAVE_MIN_HOLD_FRAMES)
+                        })
+                        .map(|a| a.confirmation_filter.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
             // Score-driven candidates — only meaningful when there are
             // unallocated alternatives to compare against.
             let score_candidates: Vec<Vec<u8>> = if !proposal_descriptors.is_empty() {
@@ -1346,6 +1722,8 @@ impl ProverLifecycle {
                     &world_bytes,
                     self.units,
                     self.strategy,
+                    free_worker_ids.len(),
+                    &min_hold_filters,
                 )
             } else {
                 Vec::new()
@@ -1366,12 +1744,32 @@ impl ProverLifecycle {
             }
             let orphan_count =
                 leave_candidates.len() - score_driven_count - empty_shard_count;
+
+            // Per-filter Leave cooldown: drop any filter we already
+            // proposed Leave on within the last `LEAVE_COOLDOWN_FRAMES`
+            // frames. Until that window elapses we don't know whether
+            // the prior bundle landed at the archive, materialized, or
+            // round-tripped back into our local registry. Re-publishing
+            // the same Leave bundle every 4-frame `JOIN_COOLDOWN_FRAMES`
+            // tick is the wire-side symptom of this — observed on
+            // mainnet 2026-06-06: identical 3-filter Leave action
+            // re-emitted ~every 4 frames for 30+ minutes on a single
+            // node.
+            let pre_cooldown_count = leave_candidates.len();
+            leave_candidates = self.filter_recent_leave_attempts(
+                leave_candidates,
+                frame_number,
+            );
+            let cooldown_suppressed =
+                pre_cooldown_count.saturating_sub(leave_candidates.len());
+
             if leave_candidates.len() > MAX_PROPOSALS_PER_CYCLE {
                 leave_candidates.truncate(MAX_PROPOSALS_PER_CYCLE);
             }
 
             if !leave_candidates.is_empty() {
                 self.allocator.set_last_join_attempt(frame_number);
+                self.record_leave_attempts(&leave_candidates, frame_number);
                 let leave_summary: Vec<String> = leave_candidates
                     .iter()
                     .map(hex::encode)
@@ -1384,6 +1782,7 @@ impl ProverLifecycle {
                     score_driven = score_driven_count,
                     empty_allocated = empty_shard_count,
                     orphan = orphan_count,
+                    cooldown_suppressed,
                     ?leave_summary,
                     "proposing leaves (overcrowded + empty + orphan)"
                 );
@@ -1391,6 +1790,12 @@ impl ProverLifecycle {
                     filters: leave_candidates,
                     frame_number,
                 });
+            } else if cooldown_suppressed > 0 {
+                tracing::debug!(
+                    frame = frame_number,
+                    cooldown_suppressed,
+                    "all leave candidates suppressed by per-filter cooldown",
+                );
             }
         }
 
@@ -1402,8 +1807,10 @@ impl ProverLifecycle {
         // the leave via gRPC, so the registry-side score should not
         // veto). Auto-bound and unbound leaves flow through the
         // existing score-driven `decide_leaves`.
+        // Epoch-aligned: a leave proposed in epoch E is confirmed in EXACTLY
+        // epoch E+1 (departs at the E+2 boundary).
         let ready_leave_filters: Vec<Vec<u8>> = leaving_filters.iter()
-            .filter(|(_, lf)| frame_number >= *lf + confirm_window)
+            .filter(|(_, lf)| cur_epoch == quil_types::consensus::epoch_for_frame(*lf) + 1)
             .map(|(f, _)| f.clone())
             .collect();
 
@@ -1532,7 +1939,10 @@ fn build_proposal_descriptors(
         out.push(ShardDescriptor {
             filter: s.filter.clone(),
             size: raw_size,
-            ring: ri.joiner_ring,
+            // Contention-dampened joiner ring (see JOIN_CONTENTION_MARGIN):
+            // score as if a few other provers also pile onto this shard,
+            // so near-ring-boundary shards aren't over-proposed.
+            ring: proposer::dampened_joiner_ring(total),
             shards: 1,
             active_on_ring: ri.active_on_joiner_ring,
             total_active_joining: total as u64,
@@ -1648,6 +2058,8 @@ mod buckets_tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: 0,
+            epoch: 0,
+            ring: 0,
             vertex_address: Vec::new(),
         }
     }
@@ -1668,17 +2080,38 @@ mod buckets_tests {
         assert_eq!(b.all_ours.len(), 4);
     }
 
+    /// Deferred activation: an allocation whose RAW byte is Active but whose
+    /// effective_status is `Joining` (confirmed, awaiting the E+2 activation
+    /// boundary) is OWNED (`all_ours`) but must NOT be re-confirmed (`joining`
+    /// bucket, gated on the raw Joining byte) nor counted `active` yet — the
+    /// committee stays frozen until activation. Guards against re-confirm storms.
+    #[test]
+    fn deferred_active_is_owned_but_not_reconfirmed_or_counted() {
+        let e = 720u64;
+        let deferred = ProverAllocationInfo {
+            status: ProverStatus::Active,
+            join_confirm_frame_number: 2 * e + 100, // confirmed epoch 2 → activation epoch 3
+            epoch: 100,                             // high → not epoch-expired
+            ..alloc(0x07, ProverStatus::Active, 0, 0)
+        };
+        // Evaluate in epoch 2 (before activation epoch 3) → effective = Joining.
+        let b = AllocationBuckets::from_allocations(&[deferred], 2 * e + 500);
+        assert_eq!(b.all_ours.len(), 1, "deferred-active allocation is owned");
+        assert!(b.joining.is_empty(), "no re-confirm for an already-confirmed (deferred) join");
+        assert!(b.active.is_empty(), "not counted active until the E+2 boundary");
+    }
+
     #[test]
     fn expired_joining_and_leaving_are_excluded_from_all_ours() {
-        // Joining at frame 1 — by frame 1 + GRACE + 1, it's expired.
+        // Epoch-aligned: a join/leave proposed in epoch 0 must settle in epoch 1;
+        // by epoch 2 (current_epoch > proposed_epoch + 1) it's implicitly expired.
         let allocations = vec![
             alloc(0x01, ProverStatus::Joining, 1, 0),
-            // Leaving at frame 2 — by frame 2 + GRACE + 1, it's expired.
             alloc(0x02, ProverStatus::Leaving, 1, 2),
         ];
         let b = AllocationBuckets::from_allocations(
             &allocations,
-            ALLOCATION_GRACE_FRAMES + 100,
+            2 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 1, // epoch 2
         );
         assert!(b.joining.is_empty(), "expired joining excluded");
         assert!(b.leaving.is_empty(), "expired leaving excluded");
@@ -1696,6 +2129,76 @@ mod buckets_tests {
         assert!(b.joining.is_empty());
         assert!(b.active.is_empty());
         assert!(b.leaving.is_empty());
+    }
+
+    #[test]
+    fn stale_epoch_active_alloc_buckets_into_reconfirm() {
+        // Storage attestation is always-on: an Active alloc recorded at epoch 0,
+        // evaluated at frame 1000 (epoch 1 > 0), is ExpiredEpoch.
+        let b = AllocationBuckets::from_allocations(
+            &[alloc(0x02, ProverStatus::Active, 50, 0)],
+            1000,
+        );
+        assert_eq!(
+            b.expired_epoch,
+            vec![vec![0x02]],
+            "stale-epoch active alloc must queue for re-confirm",
+        );
+        assert!(
+            b.active.is_empty(),
+            "an expired-epoch alloc must NOT count as active coverage",
+        );
+        assert_eq!(
+            b.all_ours,
+            vec![vec![0x02]],
+            "still owned — don't re-propose a join for it",
+        );
+    }
+
+    #[test]
+    fn current_epoch_active_alloc_queues_proactive_reconfirm() {
+        // Registered only for the current epoch (1), evaluated during epoch 1.
+        // Still Active (counts for coverage), but must re-confirm NOW to register
+        // epoch 2 — otherwise it flips ExpiredEpoch at the next boundary and the
+        // storage audit finds no registration for epoch 2. Proactive per-epoch
+        // re-confirm (not the old ExpiredEpoch-only, every-other-epoch cadence).
+        let mut a = alloc(0x02, ProverStatus::Active, 50, 0);
+        a.epoch = 1;
+        let b = AllocationBuckets::from_allocations(&[a], 1000);
+        assert_eq!(b.active, vec![vec![0x02]], "still counts for coverage");
+        assert_eq!(
+            b.expired_epoch,
+            vec![vec![0x02]],
+            "current-epoch alloc must proactively re-confirm for next epoch",
+        );
+    }
+
+    #[test]
+    fn alloc_registered_ahead_does_not_reconfirm() {
+        // Already re-confirmed this epoch: registered for epoch 2 (current+1)
+        // while evaluated during epoch 1. No further re-confirm this epoch.
+        let mut a = alloc(0x02, ProverStatus::Active, 50, 0);
+        a.epoch = 2;
+        let b = AllocationBuckets::from_allocations(&[a], 1000);
+        assert_eq!(b.active, vec![vec![0x02]]);
+        assert!(
+            b.expired_epoch.is_empty(),
+            "an alloc already registered for next epoch must not re-confirm again",
+        );
+    }
+
+    #[test]
+    fn global_empty_filter_alloc_never_reconfirms() {
+        // Global (empty ConfirmationFilter) allocations do no storage attestation
+        // and are exempt from epoch expiry — they must never queue a re-confirm.
+        let mut a = alloc(0x02, ProverStatus::Active, 50, 0);
+        a.confirmation_filter = Vec::new();
+        a.epoch = 0;
+        let b = AllocationBuckets::from_allocations(&[a], 1000);
+        assert!(
+            b.expired_epoch.is_empty(),
+            "global empty-filter alloc must never re-confirm",
+        );
     }
 }
 
@@ -1902,11 +2405,19 @@ mod proposal_loop_tests {
             pause_frame_number: 0,
             resume_frame_number: 0,
             kick_frame_number: 0,
-            join_confirm_frame_number: if status == ProverStatus::Active { join_frame + 1 } else { 0 },
+            // join_confirm 0 = genesis/no deferred-activation: an Active alloc
+            // reads Active immediately (these tests run in epoch 0 and exercise
+            // active/leave/surplus decisions, not the deferred-activation gate).
+            join_confirm_frame_number: 0,
             join_reject_frame_number: 0,
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
+            // Far-future epoch = never epoch-expires. These tests isolate
+            // join/leave/surplus/cooldown decisions from the orthogonal storage
+            // re-confirm cycle, so an Active alloc reads Active at any eval frame.
+            epoch: u64::MAX,
             last_active_frame_number: 0,
+            ring: 0,
             vertex_address: vec![],
         }
     }
@@ -2021,6 +2532,68 @@ mod proposal_loop_tests {
     }
 
     #[test]
+    fn rejected_join_is_backed_off_then_retried() {
+        // A shard that recently rejected our join must NOT be re-proposed
+        // until JOIN_REJECT_BACKOFF_FRAMES elapse — this breaks the
+        // Joining↔Rejected oscillation that saturates workers with
+        // never-confirming pending joins. After the backoff the shard is
+        // eligible again.
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+        reg.set_summaries(vec![
+            shard_summary(filter_bytes(0x01), 1),
+            shard_summary(filter_bytes(0x02), 1),
+        ]);
+        // We hold a recently-Rejected allocation for 0x01 (rejected @ 90).
+        let mut rejected = alloc(filter_bytes(0x01), ProverStatus::Rejected, 50);
+        rejected.join_reject_frame_number = 90;
+        reg.set_prover(prover(address.clone(), vec![rejected]));
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+
+        let proposed = |actions: &[LifecycleAction]| -> Vec<Vec<u8>> {
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+
+        // Within backoff (frame 100 < 90 + JOIN_REJECT_BACKOFF_FRAMES):
+        // 0x01 must NOT be proposed.
+        lifecycle.set_prover_root_verified_frame(100);
+        let a = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let p = proposed(&a);
+        assert!(
+            !p.contains(&filter_bytes(0x01)),
+            "recently-rejected shard 0x01 must be backed off; proposed={:?}",
+            p
+        );
+
+        // Past the backoff: 0x01 is joinable again.
+        let after = 90 + JOIN_REJECT_BACKOFF_FRAMES + 1;
+        lifecycle.set_prover_root_verified_frame(after);
+        let a = lifecycle.evaluate(after, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let p = proposed(&a);
+        assert!(
+            p.contains(&filter_bytes(0x01)),
+            "shard 0x01 must be joinable again after the reject backoff; proposed={:?}",
+            p
+        );
+    }
+
+    #[test]
     fn excess_pending_joins_get_rejected() {
         let address = vec![0xCDu8; 32];
         let wm = Arc::new(ConfigurableWorkerManager::new());
@@ -2101,14 +2674,360 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
+        // Evaluate well past SCORE_LEAVE_MIN_HOLD_FRAMES (360) so the
+        // anti-churn dwell doesn't exempt these allocations (join_confirm
+        // = 11) from score-driven leaves.
+        lifecycle.set_prover_root_verified_frame(500);
 
-        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let actions = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
         let proposed = count_proposed_leaves(&actions);
         assert!(
             proposed > 0,
-            "expected ProposeLeave when allocated shards score below the 67% threshold of unallocated alternatives; got {:?}",
+            "expected ProposeLeave when allocated shards score below the threshold of unallocated alternatives; got {:?}",
             actions
+        );
+    }
+
+    /// Regression: in degraded-coverage / prover-only mode the coverage
+    /// view is stale, so halt-risk counts are false positives. Leave
+    /// proposals (incl. the halt-risk swap) must be suppressed entirely —
+    /// the exact same setup that proposes a leave above must propose NONE
+    /// once `halt_state` reports halted.
+    #[test]
+    fn leaves_suppressed_in_prover_only_mode() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+        wm.add(allocated_worker(3, filter_bytes(0xA3)));
+
+        reg.set_prover(prover(
+            address.clone(),
+            vec![
+                alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+                alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+                alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+            ],
+        ));
+
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            crowded(filter_bytes(0xA1), 64, 1_000_000),
+            crowded(filter_bytes(0xA2), 64, 1_000_000),
+            crowded(filter_bytes(0xA3), 64, 1_000_000),
+            crowded(filter_bytes(0xC0), 1, 10_000_000),
+            crowded(filter_bytes(0xC1), 1, 10_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(500);
+        // Degraded coverage → prover-only mode.
+        lifecycle.halt_state().mark_halted(filter_bytes(0xC0));
+        assert!(lifecycle.halt_state().any_halted());
+
+        let actions = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert_eq!(
+            count_proposed_leaves(&actions),
+            0,
+            "no leaves may be proposed while halted (stale coverage → phantom \
+             halt-risk); got {:?}",
+            actions
+        );
+    }
+
+    /// Per-filter Leave cooldown: a filter we just proposed Leave on
+    /// must not be re-proposed until LEAVE_COOLDOWN_FRAMES have
+    /// elapsed. Without the cooldown, every cycle within the
+    /// publish→archive-materialize→registry-sync round-trip
+    /// re-emits an identical Leave bundle for the same filters —
+    /// observed on mainnet 2026-06-06 as a 30+-minute loop of the
+    /// same 3-filter ProposeLeave being emitted every 4 frames.
+    #[test]
+    fn leave_cooldown_suppresses_repeat_proposal_within_window() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+        wm.add(allocated_worker(3, filter_bytes(0xA3)));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        // Same shape as `overcrowded_actives_get_leave_proposed`:
+        // allocated 0xA1..0xA3 are deep-ring (low score), unallocated
+        // 0xC0/0xC1 are ring 0 (high score). plan_leaves picks the
+        // allocated below the 67% threshold.
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            crowded(filter_bytes(0xA1), 64, 1_000_000),
+            crowded(filter_bytes(0xA2), 64, 1_000_000),
+            crowded(filter_bytes(0xA3), 64, 1_000_000),
+            crowded(filter_bytes(0xC0), 1, 10_000_000),
+            crowded(filter_bytes(0xC1), 1, 10_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        // Past the score-leave dwell (360) so allocations (join_confirm
+        // = 11) are eligible for score-driven leaves.
+        lifecycle.set_prover_root_verified_frame(500);
+
+        // First cycle proposes leaves.
+        let actions = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let first_leaves: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !first_leaves.is_empty(),
+            "expected first cycle to produce ProposeLeave; got {:?}",
+            actions,
+        );
+
+        // Second cycle, 4 frames later (well within LEAVE_COOLDOWN_FRAMES=20)
+        // — must NOT re-propose Leave on the same filters.
+        // Bump prover_root_verified_frame so the readiness gate passes.
+        lifecycle.set_prover_root_verified_frame(504);
+        let actions = lifecycle.evaluate(504, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let repeat_leaves: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for f in &first_leaves {
+            assert!(
+                !repeat_leaves.contains(f),
+                "filter {} re-proposed Leave within cooldown window; \
+                 first_leaves={:?} repeat_leaves={:?}",
+                hex::encode(f),
+                first_leaves,
+                repeat_leaves,
+            );
+        }
+    }
+
+    /// Per-filter Leave cooldown expires after LEAVE_COOLDOWN_FRAMES:
+    /// once enough frames have passed, the same filter is eligible
+    /// for Leave again. (Without this, a stuck Leave that never
+    /// materializes would lock the filter forever.)
+    #[test]
+    fn leave_cooldown_expires_after_window() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(allocated_worker(1, filter_bytes(0xA1)));
+        wm.add(allocated_worker(2, filter_bytes(0xA2)));
+        wm.add(allocated_worker(3, filter_bytes(0xA3)));
+
+        let allocs = vec![
+            alloc(filter_bytes(0xA1), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA2), ProverStatus::Active, 10),
+            alloc(filter_bytes(0xA3), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs));
+
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            crowded(filter_bytes(0xA1), 64, 1_000_000),
+            crowded(filter_bytes(0xA2), 64, 1_000_000),
+            crowded(filter_bytes(0xA3), 64, 1_000_000),
+            crowded(filter_bytes(0xC0), 1, 10_000_000),
+            crowded(filter_bytes(0xC1), 1, 10_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        // Past the score-leave dwell (360) so the allocations (join_confirm
+        // = 11) are score-leave eligible.
+        lifecycle.set_prover_root_verified_frame(500);
+        let _ = lifecycle.evaluate(500, 1, reg.as_ref(), wm.as_ref()).unwrap();
+
+        // After the cooldown window, the same filters should be
+        // eligible again. (Use frame 500 + LEAVE_COOLDOWN_FRAMES.)
+        let later_frame = 500 + LEAVE_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(later_frame);
+        let actions = lifecycle.evaluate(later_frame, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let leaves: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeLeave { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !leaves.is_empty(),
+            "expected Leave to be proposed again after LEAVE_COOLDOWN_FRAMES elapsed; got {:?}",
+            actions,
+        );
+    }
+
+    /// Per-filter Join cooldown: a filter we just proposed Join on
+    /// must NOT be re-picked by `plan_and_allocate` within
+    /// `JOIN_FILTER_COOLDOWN_FRAMES`. Without this, the 10-frame
+    /// `PROPOSAL_TIMEOUT_FRAMES` (which clears the worker-level
+    /// pending marker) lets the same filter get re-proposed via a
+    /// different worker while the prior bundle is still on the wire
+    /// — both eventually materialize and the registry ends up with
+    /// excess Joining allocs (one per cycle) but only one worker
+    /// slot, producing orphan Joining allocs. Observed on mainnet
+    /// 2026-06-07.
+    #[test]
+    fn join_cooldown_suppresses_repeat_proposal_within_window() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // Two idle workers to make joins possible.
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+
+        // Empty prover info — no allocations yet.
+        reg.set_prover(prover(address.clone(), vec![]));
+
+        // Two attractive unallocated shards (high score). Both halt-
+        // risk so they're prioritized by the join-side bucket pass.
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![
+            crowded(filter_bytes(0xC0), 1, 10_000_000),
+            crowded(filter_bytes(0xC1), 1, 10_000_000),
+        ]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        // First cycle proposes Joins.
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let first_joins: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !first_joins.is_empty(),
+            "expected first cycle to produce ProposeJoin; got {:?}",
+            actions,
+        );
+
+        // Second cycle 5 frames later (within JOIN_FILTER_COOLDOWN_FRAMES=30):
+        // none of the just-proposed filters may be re-picked.
+        // Bump prover_root_verified_frame so the readiness gate passes.
+        lifecycle.set_prover_root_verified_frame(105);
+        let actions = lifecycle.evaluate(105, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let repeat_joins: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for f in &first_joins {
+            assert!(
+                !repeat_joins.contains(f),
+                "filter {} re-proposed Join within cooldown window; \
+                 first_joins={:?} repeat_joins={:?}",
+                hex::encode(f),
+                first_joins,
+                repeat_joins,
+            );
+        }
+    }
+
+    /// Per-filter Join cooldown expires after JOIN_FILTER_COOLDOWN_FRAMES.
+    /// If a published bundle never materializes (archive silently
+    /// dropped it, network drop, etc.) we must eventually be able
+    /// to re-attempt — otherwise the filter is locked out forever.
+    #[test]
+    fn join_cooldown_expires_after_window() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        wm.add(idle_worker(1));
+        reg.set_prover(prover(address.clone(), vec![]));
+
+        let crowded = |filter: Vec<u8>, active: u32, size: u64| {
+            let mut counts: HashMap<ProverStatus, u32> = HashMap::new();
+            counts.insert(ProverStatus::Active, active);
+            ProverShardSummary { filter, status_counts: counts, total_size: size }
+        };
+        reg.set_summaries(vec![crowded(filter_bytes(0xC0), 1, 10_000_000)]);
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+        let _ = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+
+        // After the cooldown window, the same filter is eligible
+        // again. Frame 100 + JOIN_FILTER_COOLDOWN_FRAMES = 130.
+        let later_frame = 100 + JOIN_FILTER_COOLDOWN_FRAMES;
+        lifecycle.set_prover_root_verified_frame(later_frame);
+        let actions = lifecycle.evaluate(later_frame, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let joins: Vec<Vec<u8>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !joins.is_empty(),
+            "expected Join to be proposed again after JOIN_FILTER_COOLDOWN_FRAMES elapsed; got {:?}",
+            actions,
         );
     }
 
@@ -2297,6 +3216,8 @@ mod proposal_loop_tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: 0,
+            epoch: 0,
+            ring: 0,
             vertex_address: vec![],
         };
         let allocs = vec![
@@ -2320,10 +3241,10 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
-        // confirm_window is 2 in make_lifecycle. leave_frame=90, so
-        // frame 100 is well past 90 + 2.
-        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        lifecycle.set_prover_root_verified_frame(800);
+        // Epoch-aligned: leave_frame=90 is epoch 0, so the leave confirms in
+        // epoch 1 — evaluate at frame 800 (epoch 1).
+        let actions = lifecycle.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
 
         let confirm_filters: Vec<Vec<u8>> = actions
             .iter()
@@ -2770,8 +3691,8 @@ mod proposal_loop_tests {
 
         wm.add(idle_worker(1));
 
-        // Joined at frame 10, current frame 800 → 790 frames past join,
-        // well over the 720-frame grace.
+        // Joined in epoch 0 (frame 10), never confirmed in epoch 1 → by epoch 2
+        // (eval frame 1440) the join is implicitly expired/rejected.
         let allocs = vec![alloc(filter_bytes(0xA1), ProverStatus::Joining, 10)];
         reg.set_prover(prover(address.clone(), allocs));
         // Only the expired-shard summary; no alternatives. Without the
@@ -2784,9 +3705,9 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(800);
+        lifecycle.set_prover_root_verified_frame(1440);
 
-        let actions = lifecycle.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let actions = lifecycle.evaluate(1440, 1, reg.as_ref(), wm.as_ref()).unwrap();
 
         // Expired joins must not be force-rejected.
         assert_eq!(
@@ -2985,9 +3906,7 @@ mod proposal_loop_tests {
         // Worker 1 is manually pinned to the alloc we'll confirm.
         wm.add(manual_worker(1, manual_filter.clone()));
 
-        // Alloc is Joining, ready to confirm. Set join_frame to 50 so
-        // at frame 100 the confirm-window (default 2 frames in tests)
-        // has long passed.
+        // Alloc is Joining (proposed epoch 0, join_frame 50); confirms in epoch 1.
         let allocs = vec![alloc(manual_filter.clone(), ProverStatus::Joining, 50)];
         reg.set_prover(prover(address.clone(), allocs));
 
@@ -3011,10 +3930,11 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
+        lifecycle.set_prover_root_verified_frame(800);
 
+        // Epoch 1 → the epoch-0 join is in its confirm slot.
         let actions = lifecycle
-            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .evaluate(800, 1, reg.as_ref(), wm.as_ref())
             .unwrap();
 
         let confirms = count_confirms(&actions);
@@ -3076,10 +3996,11 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
+        lifecycle.set_prover_root_verified_frame(800);
 
+        // Epoch 1 → all 150 epoch-0 joins are in their confirm slot.
         let actions = lifecycle
-            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .evaluate(800, 1, reg.as_ref(), wm.as_ref())
             .unwrap();
 
         let confirms = count_confirms(&actions);
@@ -3146,10 +4067,11 @@ mod proposal_loop_tests {
             wm.clone() as Arc<dyn WorkerManager>,
             reg.clone() as Arc<dyn ProverRegistry>,
         );
-        lifecycle.set_prover_root_verified_frame(100);
+        lifecycle.set_prover_root_verified_frame(800);
 
+        // Epoch 1 → the three epoch-0 joins are in their confirm slot.
         let actions = lifecycle
-            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .evaluate(800, 1, reg.as_ref(), wm.as_ref())
             .unwrap();
 
         let confirms = count_confirms(&actions);

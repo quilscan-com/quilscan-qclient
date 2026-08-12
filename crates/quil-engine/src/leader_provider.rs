@@ -47,6 +47,25 @@ pub struct GlobalLeaderProvider {
     /// bound is required because `VectorCommitmentTree::commit` walks
     /// branches in parallel via rayon.
     inclusion_prover: Arc<dyn InclusionProver + Send + Sync>,
+    /// Execution manager used to validate collected messages before they
+    /// ride into a proposal. Mirrors Go's
+    /// `executionManager.ValidateMessage` gate in the liveness provider's
+    /// collect loop (`consensus_liveness_provider.go:86-97`): a message
+    /// that fails validation is dropped from the mempool
+    /// (`MessageCollector::remove`) instead of being re-collected and
+    /// re-proposed every rank until it ages out. `None` disables the gate
+    /// (tests / nodes without an execution manager wired).
+    message_validator: Option<Arc<quil_execution::ExecutionEngineManager>>,
+    /// Hypergraph CRDT used to compute the `prover_tree_commitment` the
+    /// leader binds into the frame header (and the VDF challenge) at
+    /// proving time. Mirrors Go's `rebuildShardCommitments`, which commits
+    /// the CRDT and reads the global prover shard's (`L1=[0;3]`,
+    /// `L2=[0xff;32]`) phase-0 root — the state-through-parent commitment
+    /// every follower re-derives and cross-checks in the materializer
+    /// (`verify_prover_root`), POMW mint, prover-kick verification, and
+    /// state-jump sync anchoring. `None` (unit tests without a store)
+    /// leaves the commitment empty, which those consumers tolerate.
+    hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
 }
 
 impl GlobalLeaderProvider {
@@ -60,6 +79,8 @@ impl GlobalLeaderProvider {
         local_public_key: Vec<u8>,
         signer: Arc<dyn Signer>,
         inclusion_prover: Arc<dyn InclusionProver + Send + Sync>,
+        message_validator: Option<Arc<quil_execution::ExecutionEngineManager>>,
+        hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
     ) -> Self {
         Self {
             prover_registry,
@@ -71,7 +92,145 @@ impl GlobalLeaderProvider {
             local_public_key,
             signer,
             inclusion_prover,
+            message_validator,
+            hypergraph,
         }
+    }
+
+    /// Compute the `prover_tree_commitment` for the frame being proved:
+    /// the global prover shard's (`L1=[0;3]`, `L2=[0xff;32]`) vertex-adds
+    /// forest root of the PARENT frame (`frame_number - 1`) — the state the
+    /// new frame builds on, which every follower cross-checks in
+    /// `verify_prover_root`.
+    ///
+    /// Reads the DETERMINISTIC recorded parent root via
+    /// [`prover_root_at`](quil_hypergraph::HypergraphCrdt::prover_root_at), NOT
+    /// the live forest. The live forest is RACY at proposal time: the async
+    /// materializer may or may not have already advanced it to `frame_number`,
+    /// so a live read lands on the parent OR self unpredictably and forks the
+    /// commitment across nodes (the prover-root-mismatch storm). The recorded
+    /// per-frame map is identical network-wide (all nodes materialize a frame to
+    /// the same root), so binding `prover_root_at(N-1)` is stable and every
+    /// follower reproduces it. Falls back to a live read only before the parent
+    /// has been recorded (bootstrap).
+    ///
+    /// Returns empty only when no CRDT is wired (unit tests) or the shard
+    /// truly has no root — tolerated by the empty-root branch in
+    /// `verify_prover_root`.
+    fn compute_prover_root(&self, frame_number: u64) -> Vec<u8> {
+        let Some(hg) = self.hypergraph.as_ref() else {
+            return Vec::new();
+        };
+        // Bind the PARENT (frame_number-1) prover-shard root: the deterministic
+        // post-materialize-(N-1) value recorded by the frame materializer, which
+        // every node reproduces identically. Do NOT read the LIVE forest here —
+        // it is RACY: the async materializer lags the (faster) produce path, so a
+        // live read lands on N-2/N-1 unpredictably and forks the commitment (the
+        // prover-root-mismatch storm).
+        //
+        // SERIAL/MONOTONIC GATE: the leader must not produce frame N until its
+        // materializer has recorded the parent (N-1) root. Produce outruns the
+        // async materializer by ~1-2 frames, so briefly BLOCK for the in-flight
+        // materialize(N-1) to record rather than reading the lagging forest.
+        // Bounded so a genuinely-behind materializer (deep catch-up) can't wedge
+        // proposing — past the deadline we fall back to a best-effort live read
+        // (tolerated by the empty/degenerate branch and `verify_prover_root`'s
+        // empty-root skip). Once produce paces to materialize, the wait is a
+        // single poll.
+        let parent = frame_number.saturating_sub(1);
+        let mut recorded = hg.prover_root_at(parent);
+        if recorded.is_none() && frame_number > 1 {
+            const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(5000);
+            const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+            let deadline = std::time::Instant::now() + MAX_WAIT;
+            while recorded.is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(POLL);
+                recorded = hg.prover_root_at(parent);
+            }
+            if recorded.is_none() {
+                // STRICT GATE: never produce frame N on a stale root. We do NOT
+                // fall back to a live forest read — that stale read is exactly what
+                // let a fleet-wide materializer wedge keep producing frames on a
+                // FROZEN root (the whole chain advanced on unmaterialized state).
+                // Return empty so the caller DECLINES to propose (the view
+                // nullifies); this node resumes producing only once its materializer
+                // records the parent (N-1) root.
+                tracing::warn!(
+                    frame = frame_number,
+                    parent,
+                    "parent (N-1) prover root not materialized before deadline — \
+                     declining to produce (never build N on an unmaterialized N-1)"
+                );
+                return Vec::new();
+            }
+        }
+        // Genesis (frame ≤ 1) has no parent to materialize — read the live genesis
+        // forest. Every other frame is `recorded` by the strict gate above.
+        let root = recorded.unwrap_or_else(|| {
+            let global_shard = quil_types::store::ShardKey {
+                l1: [0u8; 3],
+                l2: [0xffu8; 32],
+            };
+            hg.compute_shard_root("vertex", "adds", &global_shard)
+        });
+        // A real forest root is 32 bytes; reject the empty/degenerate case.
+        if root.len() == 32 || root.len() >= 64 {
+            root
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Compute the prover shard's phase 1/2/3 roots (vertex-removes,
+    /// hyperedge-adds, hyperedge-removes) — the companions to
+    /// [`Self::compute_prover_root`] (phase 0). The global prover shard uses
+    /// removes + hyperedge-adds (not just vertex-adds), so these must be
+    /// committed too (audit #5). An empty/degenerate phase normalizes to the
+    /// zero root so the aux vector always has exactly 3 fixed-length entries
+    /// (matching what `sync_single_shard`'s zero-anchor expects).
+    fn compute_prover_aux_roots(&self) -> Vec<Vec<u8>> {
+        let Some(hg) = self.hypergraph.as_ref() else {
+            return Vec::new();
+        };
+        let global_shard = quil_types::store::ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
+        let zero = vec![0u8; if hg.has_forest() { 32 } else { 64 }];
+        [
+            ("vertex", "removes"),
+            ("hyperedge", "adds"),
+            ("hyperedge", "removes"),
+        ]
+        .iter()
+        .map(|(s, p)| {
+            // The prover shard's HYPEREDGE-ADDS root is NOT committed. That
+            // phase holds only the denormalized prover→allocation index
+            // (`build_prover_allocation_hyperedge_blob`) — redundant with the
+            // phase-0 allocation VERTICES the prover registry actually reads
+            // (`prover_registry::refresh` walks vertices, never hyperedges), and
+            // consumed by no committee/verifier. Committing it required a LIVE
+            // forest read here (there is no materialized-N-1 anchor for aux
+            // phases, unlike `compute_prover_root`), which races the async
+            // materializer and yields a non-reproducible root: a peer serving
+            // its now-advanced live head fails the sync anchor-check forever
+            // (the phase-2 "peer phase root != header-committed root" storm).
+            // Emit an EMPTY root so the syncer treats it as "no anchor / trust"
+            // and skips the phase. Empty is VDF-bound like any other value and
+            // read straight from the header by verifiers, so this is
+            // rolling-upgrade safe. vertex/hyperedge REMOVES stay empty (zero
+            // root) in the prover shard, so they remain stable and are kept.
+            if *s == "hyperedge" && *p == "adds" {
+                return Vec::new();
+            }
+            let r = hg.compute_shard_root(s, p, &global_shard);
+            if r.len() == 32 || r.len() >= 64 {
+                r
+            } else {
+                zero.clone()
+            }
+        })
+        .collect()
     }
 
     /// Compute the parent selector from a VDF output: Poseidon hash of
@@ -120,12 +279,12 @@ impl GlobalLeaderProvider {
     /// Mirrors Go's `consensus_leader_provider.go:256-307`:
     ///
     /// ```go
-    ///   requestTree := &tries.VectorCommitmentTree{}
-    ///   for _, msgData := range collectedMessages {
-    ///     id := sha3.Sum256(msgData)
-    ///     requestTree.Insert(id[:], msgData, nil, big.NewInt(0))
-    ///   }
-    ///   requestRoot := requestTree.Commit(inclusionProver, false)
+    /// requestTree := &tries.VectorCommitmentTree{}
+    /// for _, msgData := range collectedMessages {
+    /// id := sha3.Sum256(msgData)
+    /// requestTree.Insert(id[:], msgData, nil, big.NewInt(0))
+    /// }
+    /// requestRoot := requestTree.Commit(inclusionProver, false)
     /// ```
     ///
     /// Empty inputs yield the canonical empty-root `[0u8; 64]` produced
@@ -133,25 +292,33 @@ impl GlobalLeaderProvider {
     /// failures are logged and skipped, matching Go's `if err != nil`
     /// soft-fail (a single bad bundle does not abort the whole frame).
     fn compute_requests_root(&self, messages: &[Vec<u8>]) -> Vec<u8> {
-        use sha3::{Digest as _, Sha3_256};
-        let mut tree = quil_tries::VectorCommitmentTree::new();
-        for msg in messages {
-            let id: [u8; 32] = Sha3_256::digest(msg).into();
-            if let Err(e) = tree.insert(
-                &id,
-                msg,
-                &[],
-                &num_bigint::BigInt::from(0),
-            ) {
-                tracing::warn!(
-                    error = %e,
-                    "failed to add global request to tree",
-                );
-                continue;
-            }
-        }
-        tree.commit(self.inclusion_prover.as_ref())
+        compute_global_requests_root(messages, self.inclusion_prover.as_ref())
     }
+}
+
+/// Compute a global frame's `requests_root` over its canonical request bytes.
+///
+/// Free function (shared by the producer in [`GlobalLeaderProvider`] and the
+/// receive-path verifier that binds a gossiped frame's body to its authenticated
+/// header). Keys each request by `SHA3(index_be ‖ msg)` so the commitment binds
+/// request ORDER + MULTIPLICITY. The `prover` MUST match the one the producer
+/// used (`quil_tries::ShaInclusionProver` in production) or the roots won't agree.
+pub fn compute_global_requests_root(
+    messages: &[Vec<u8>],
+    prover: &dyn quil_types::crypto::InclusionProver,
+) -> Vec<u8> {
+    use sha3::{Digest as _, Sha3_256};
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    for (i, msg) in messages.iter().enumerate() {
+        let mut keyed = (i as u64).to_be_bytes().to_vec();
+        keyed.extend_from_slice(msg);
+        let id: [u8; 32] = Sha3_256::digest(&keyed).into();
+        if let Err(e) = tree.insert(&id, msg, &[], &num_bigint::BigInt::from(0)) {
+            tracing::warn!(error = %e, "failed to add global request to tree");
+            continue;
+        }
+    }
+    tree.commit(prover)
 }
 
 impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
@@ -178,8 +345,13 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
 
         // Get provers ordered by VDF distance to the parent selector.
         // Empty filter = global chain (matches Go's `nil` filter).
-        let ordered_addresses =
-            self.prover_registry.get_ordered_provers(&parent_selector, &[])?;
+        // Committee/leader-rotation set for the frame being decided
+        // (parent + 1) — the epoch-aligned membership at that frame.
+        let ordered_addresses = self.prover_registry.get_ordered_provers(
+            &parent_selector,
+            &[],
+            prior.state.frame_number + 1,
+        )?;
 
         if ordered_addresses.is_empty() {
             return Err(QuilError::Consensus(
@@ -219,33 +391,43 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         &self,
         rank: u64,
         _filter: &[u8],
+        prior_frame_number: u64,
         prior_state_id: &Identity,
     ) -> Result<State<GlobalState>> {
         // ------------------------------------------------------------------
-        // 1. Resolve the prior frame via the latest QC
-        // ------------------------------------------------------------------
-        let latest_qc = self
-            .clock_store
-            .get_latest_quorum_certificate(&[])
-            .map_err(|e| {
-                tracing::debug!(error = %e, "could not fetch latest quorum certificate");
-                QuilError::Consensus(format!("could not fetch latest QC: {}", e))
-            })?;
-
-        let prior = if latest_qc.frame_number == 0 {
-            self.clock_store.get_global_clock_frame(latest_qc.frame_number)?
+        // 1. Resolve the prior frame the CONSENSUS layer chose to build on.
+        //
+        // `(prior_frame_number, prior_state_id)` come straight from the
+        // newest QC the pacemaker handed the state producer. We must build
+        // on EXACTLY that parent. Historically this re-read the clock
+        // store's OWN `get_latest_quorum_certificate`, but that QC can
+        // diverge from the consensus newest-QC — e.g. after a coordinated
+        // halt the clock store may still name an uncommitted candidate
+        // (frame N) that consensus has NOT adopted (its newest-QC is the
+        // committed head N-1), or a peer's candidate this node never
+        // received. Reading it there made the producer try to load a frame
+        // that isn't local (`frame N not found`) or build on a different
+        // parent than consensus asked for (a fork). Resolving purely from
+        // the passed parent removes that whole divergence class.
+        //
+        // Resolve the parent by the consensus-chosen IDENTITY, not merely by
+        // height. The committed frame at `prior_frame_number` can be a DIFFERENT
+        // fork candidate than the one consensus certified (`prior_state_id`) —
+        // e.g. this node materialized fork A while the newest QC is on fork B at
+        // the same height. Looking up the COMMITTED frame first and only falling
+        // back to the candidate on error (the previous order) accepted that
+        // wrong-fork committed frame and never consulted the candidate the node
+        // actually anchored on, wedging the leader in a permanent "needs sync".
+        // So query the candidate keyed by the exact consensus identity FIRST
+        // (returns the anchored tip when we hold it), then fall back to the
+        // committed frame — whose identity is validated just below, yielding a
+        // clean "needs sync + catch-up" only when we genuinely lack the parent.
+        let prior = if prior_frame_number == 0 {
+            self.clock_store.get_global_clock_frame(0)?
         } else {
-            // Fetch the candidate frame that matches the QC's
-            // frame number + the caller's prior_state_id as selector.
-            // `prior_state_id` is already raw 32-byte Identity bytes
-            // (post-Tier-1 fix). Mirrors Go's `[]byte(priorState)` at
-            // `consensus_leader_provider.go:99-101`.
             self.clock_store
-                .get_global_clock_frame_candidate(latest_qc.frame_number, prior_state_id)
-                .or_else(|_| {
-                    // Fall back to the canonical frame at this number
-                    self.clock_store.get_global_clock_frame(latest_qc.frame_number)
-                })?
+                .get_global_clock_frame_candidate(prior_frame_number, prior_state_id)
+                .or_else(|_| self.clock_store.get_global_clock_frame(prior_frame_number))?
         };
 
         let prior_header = prior.header.as_ref().ok_or_else(|| {
@@ -253,36 +435,18 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         })?;
 
         // ------------------------------------------------------------------
-        // 2. Validate prior frame identity matches prior_state_id
+        // 2. Validate the resolved frame's identity matches what consensus
+        //    asked for. A mismatch means this node doesn't hold the parent
+        //    consensus wants (it needs to sync it) — a clean, recoverable
+        //    skip, not a fork.
         // ------------------------------------------------------------------
         let prior_identity = Self::frame_identity(prior_header);
         if prior_identity != *prior_state_id {
-            // Check if the QC itself matches -- could be a fork
-            let qc_id = Self::qc_identity(&latest_qc);
-            if qc_id == *prior_state_id {
-                if prior_header.rank < latest_qc.rank {
-                    return Err(QuilError::Consensus(format!(
-                        "needs sync: prior rank {} behind latest QC rank {}",
-                        prior_header.rank, latest_qc.rank,
-                    )));
-                }
-                if prior_header.frame_number == latest_qc.frame_number {
-                    return Err(QuilError::Consensus(format!(
-                        "fork detected at rank {} (local: {}, qc: {})",
-                        latest_qc.rank,
-                        hex::encode(&prior_identity),
-                        hex::encode(&qc_id),
-                    )));
-                }
-            }
-
             return Err(QuilError::Consensus(format!(
-                "building on fork or needs sync: frame {}, rank {}, parent_id: {}, \
-                 asked: rank {}, id: {}",
-                prior_header.frame_number,
-                prior_header.rank,
-                hex::encode(&prior_header.parent_selector),
-                rank,
+                "needs sync: local frame {} has identity {} but consensus parent is {} — \
+                 fetch the parent via catch-up and retry",
+                prior_frame_number,
+                hex::encode(&prior_identity),
                 hex::encode(prior_state_id),
             )));
         }
@@ -290,9 +454,121 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         let frame_number = prior_header.frame_number + 1;
 
         // ------------------------------------------------------------------
-        // 3. Collect pending messages
+        // 2b. Pace the chain to the mainnet inter-frame interval.
+        //
+        // commonware-simplex has no minimum block time: it proposes,
+        // finalizes, and immediately opens the next view as fast as the
+        // network + VDF prove allow. With the VDF difficulty pinned near
+        // the floor that round is ~3s, so frames land at the testnet rate
+        // regardless of `IDEAL_FRAME_TIME`. The VDF is NOT the pace-setter
+        // under CW — the proposer is. So gate proposal production here.
+        //
+        // Each header's `timestamp` is set to `production_now + IDEAL`
+        // (step 6 below), so the parent's timestamp is 1 interval ahead of
+        // the instant the parent was produced. Sleeping until
+        // `now >= prior_header.timestamp` therefore spaces our production
+        // instant exactly one `IDEAL_FRAME_TIME` after the parent's — a
+        // clean 10s cadence in both wall-clock and recorded timestamps —
+        // without any dependence on VDF difficulty.
+        //
+        // Capped at one interval so a parent timestamp far in the future
+        // (cross-leader clock skew, or a misbehaving prior leader) can
+        // never stall this node more than a single frame; if the parent
+        // timestamp is already in the past we proceed immediately (we're
+        // catching up, don't slow down).
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let target = prior_header.timestamp;
+            let wait_ms = (target - now_ms)
+                .clamp(0, crate::difficulty::IDEAL_FRAME_TIME);
+            if wait_ms > 0 {
+                tracing::debug!(
+                    frame = frame_number,
+                    wait_ms,
+                    "pacing global proposal to mainnet interval",
+                );
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms as u64));
+            }
+        }
+
         // ------------------------------------------------------------------
-        let messages = self.message_collector.collect_for_rank(rank);
+        // 3. Collect pending messages, then drop protocol-invalid ones.
+        //
+        // Collection is non-destructive (so a timed-out proposal doesn't
+        // vaporize the mempool). That means a message which fails protocol
+        // validation would otherwise be re-collected and re-proposed every
+        // rank until it ages out of the retention window. Mirror Go's
+        // liveness-provider collect loop
+        // (`consensus_liveness_provider.go:86-97`): validate each collected
+        // message and `MessageCollector::remove` the failures so they leave
+        // the mempool the moment we know they're invalid. Only the
+        // surviving (valid) messages ride into this proposal.
+        //
+        // Shard-`FrameHeader` bundles are NOT re-validated here: they are
+        // deduplicated at ingest and fully validated by the materializer,
+        // and re-verifying their per-proof VDF multiproofs (unbatchable,
+        // and now uncapped — a frame can carry thousands) would load the
+        // latency-sensitive prove path. Structurally-invalid bundles were
+        // already rejected at ingest.
+        // ------------------------------------------------------------------
+        let collected = self.message_collector.collect_for_rank(rank);
+        let messages = match self.message_validator.as_ref() {
+            Some(validator) => {
+                // The collector holds GLOBAL messages, validated against the
+                // global intrinsic engine address (0xff..), matching Go's
+                // `globalMessageAddress`.
+                let global_addr = [0xFFu8; 32];
+                let mut valid: Vec<Vec<u8>> = Vec::with_capacity(collected.len());
+                let mut invalid: Vec<Vec<u8>> = Vec::new();
+                for raw in collected {
+                    if crate::message_collector::bundle_has_shard_frame(&raw) {
+                        // Strict lockstep: include a shard-frame proof ONLY if it
+                        // anchors to `frame_number - 1` (or genesis anchor 0). The
+                        // materializer hard-rejects any frame carrying an
+                        // out-of-lockstep shard op, so packing a stale proof would
+                        // halt the chain — drop it here instead. A lagging shard
+                        // must re-attest against the new tip to be included.
+                        if crate::message_collector::bundle_shard_frames_in_lockstep(
+                            &raw,
+                            frame_number,
+                        ) {
+                            valid.push(raw);
+                        } else {
+                            tracing::debug!(
+                                frame = frame_number,
+                                "dropping out-of-lockstep shard frame proof from global mempool",
+                            );
+                            invalid.push(raw);
+                        }
+                        continue;
+                    }
+                    match validator.validate_message(frame_number, &global_addr, &raw) {
+                        Ok(()) => valid.push(raw),
+                        Err(e) => {
+                            tracing::debug!(
+                                frame = frame_number,
+                                error = %e,
+                                "dropping protocol-invalid message from global mempool",
+                            );
+                            invalid.push(raw);
+                        }
+                    }
+                }
+                if !invalid.is_empty() {
+                    tracing::info!(
+                        frame = frame_number,
+                        removed = invalid.len(),
+                        "dropped protocol-invalid messages from global mempool",
+                    );
+                    self.message_collector.remove(&invalid);
+                }
+                valid
+            }
+            None => collected,
+        };
 
         tracing::info!(
             frame = frame_number,
@@ -309,7 +585,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // ------------------------------------------------------------------
         // 5. Verify this node is an active prover and find our index
         // ------------------------------------------------------------------
-        let active_provers = self.prover_registry.get_active_provers(&[])?;
+        let active_provers = self.prover_registry.get_active_provers(&[], frame_number)?;
         let prover_index = active_provers
             .iter()
             .position(|p| p.address == self.local_prover_address);
@@ -340,40 +616,78 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // 7. VDF prove + sign — blocks for seconds.
         //
         // ProveGlobalFrameHeader internally computes
-        //   parent     = poseidon(previous_frame.output[:516])
-        //   challenge  = sha3(frame# || timestamp || difficulty ||
+        //   parent = poseidon(previous_frame.output[:516])
+        //   challenge = sha3(frame# || timestamp || difficulty ||
         //                     parent || commitments... || prover_root ||
         //                     request_root)
-        //   output     = WesolowskiSolve(challenge, difficulty)
-        //   signature  = signer.SignWithDomain(challenge||output, "global")
+        //   output = WesolowskiSolve(challenge, difficulty)
+        //   signature = signer.SignWithDomain(challenge||output, "global")
         //
-        // shard `commitments` and `prover_root` here are still
-        // placeholders pending Tier 2 wiring of the materializer's
-        // shardCommitments + proverRoot output. `requests_root` is the
-        // partial commit we already have. Once Tier 2 lands, these
-        // become the real values. (See audit BLOCKER list, Tier 2.)
+        // `prover_root` is the global prover shard commitment over the
+        // committed state through the parent frame — bound into the VDF
+        // challenge here AND carried on the header (`prover_tree_commitment`)
+        // so every follower re-derives and cross-checks it in the
+        // materializer, POMW mint, prover-kick verification, and state
+        // sync. Computed from the CRDT (Go's `rebuildShardCommitments`
+        // proverRoot). The per-L1 `global_commitments` array is still a
+        // placeholder (not cross-checked at runtime, only VDF-bound) —
+        // follow-up wiring.
         let prover_index_u8 = prover_index.map(|i| i as u8).unwrap_or(0);
-        let commitments: Vec<Vec<u8>> = Vec::new();
-        let prover_root: Vec<u8> = Vec::new();
+        // The 256 Level-1 global bucket commitments (per first address byte),
+        // retrieved live from the CRDT forest. Bound into the VDF challenge and
+        // carried on the header via `GlobalState.global_commitments`.
+        let commitments: Vec<Vec<u8>> = self
+            .hypergraph
+            .as_ref()
+            .map(|hg| hg.global_commitments())
+            .unwrap_or_default();
+        let prover_root: Vec<u8> = self.compute_prover_root(frame_number);
+        if prover_root.is_empty() && frame_number > 1 {
+            // STRICT GATE (see compute_prover_root): the parent (N-1) prover root is
+            // not materialized, so we cannot bind a valid prover_tree_commitment.
+            // DECLINE — `propose` maps this Err to a nullified view — rather than
+            // producing on a stale/empty root. Never build N without materializing
+            // N-1. Resumes once the materializer catches the parent up.
+            return Err(QuilError::Consensus(format!(
+                "cannot produce frame {frame_number}: parent {} not materialized \
+                 (prover root unavailable)",
+                frame_number.saturating_sub(1)
+            )));
+        }
+        if prover_root.is_empty() {
+            tracing::warn!(
+                frame = frame_number,
+                "proving genesis global frame with EMPTY prover_tree_commitment",
+            );
+        }
+        // Prover shard phases 1/2/3 roots (audit #5) — bound into the VDF
+        // challenge + carried on the header so catch-up authenticates all phases.
+        let prover_aux_roots: Vec<Vec<u8>> = self.compute_prover_aux_roots();
+        let prove_start = std::time::Instant::now();
         let header = self.frame_prover.prove_global_frame_header(
             prior_header,
             &commitments,
             &prover_root,
+            &prover_aux_roots,
             &requests_root,
             self.signer.as_ref(),
             timestamp,
             difficulty as u32,
             prover_index_u8,
         )?;
+        crate::metrics::record_vdf_prove_duration(prove_start.elapsed().as_secs_f64());
 
         // ------------------------------------------------------------------
         // 9. Assemble GlobalState
         // ------------------------------------------------------------------
-        // The prover_tree_commitment is empty here and populated after
-        // the hypergraph CRDT commit in rebuildShardCommitments (which
-        // runs during the consensus commit path, not during proving).
-        // Similarly, the signature is populated by the consensus signing
-        // step after the proposal is voted on.
+        // The prover_tree_commitment is the CRDT prover-shard root we just
+        // bound into the VDF challenge above — it MUST equal the
+        // `prover_root` passed to `prove_global_frame_header`, since the
+        // stored header is rebuilt from THIS `GlobalState`
+        // (`cw_global_seams::global_frame_from_state`) and every follower's
+        // `verify_global_frame_header` recomputes the challenge from the
+        // header's own `prover_tree_commitment`. The signature is populated
+        // by the consensus signing step after the proposal is voted on.
         // Decode each canonical bundle into a prost `MessageBundle`
         // (the proto type the materializer expects). Bundles that
         // fail decode are skipped — `requests_root` was hashed over
@@ -394,14 +708,19 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             header.output.clone(),
             header.parent_selector.clone(),
             self.local_prover_address.clone(),
-            Vec::new(), // prover_tree_commitment — populated after hypergraph commit
+            prover_root.clone(), // prover_tree_commitment — must match the VDF challenge
             requests_root,
             Vec::new(), // signature — populated by consensus signing step
         )
         // Attach the collected messages so they ride with the proposal
         // into `GlobalFrame.requests` and reach every replica's
         // materializer on finalization.
-        .with_messages(proto_messages);
+        .with_messages(proto_messages)
+        // Carry the 256 global commitments bound into the VDF challenge so the
+        // rebuilt header (`global_frame_from_state`) reproduces them verbatim.
+        .with_global_commitments(commitments)
+        // Same for the prover shard's phase 1/2/3 roots (audit #5).
+        .with_prover_aux_roots(prover_aux_roots);
 
         // ------------------------------------------------------------------
         // 10. Build and return State<GlobalState>
@@ -432,7 +751,370 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
     }
 }
 
-// Tests for GlobalLeaderProvider require full ClockStore/ProverRegistry
-// stubs. These are integration-tested via the consensus bootstrap tests
-// which use the real RocksDB stores. The struct construction is verified
-// implicitly by the consensus bootstrap wiring.
+// `prove_next_state` (the VDF/clock-store path) is integration-tested
+// via the consensus bootstrap tests on real stores. The unit tests
+// below cover `get_next_leaders` (leader selection) and the pure
+// helper functions, which need only a `ProverRegistry`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_types::consensus::{ProverInfo, ProverStatus};
+    use quil_types::proto::global::GlobalFrameHeader;
+
+    use crate::difficulty::AsertDifficultyAdjuster;
+    use crate::test_support::TestProverRegistry;
+
+    /// Minimal `FrameProver` stub — `get_next_leaders` never invokes it.
+    #[derive(Default)]
+    struct StubFrameProver;
+    impl FrameProver for StubFrameProver {
+        fn prove_frame_header(
+            &self, _: &[u8], _: &[u8], _: &[u8], _: &[Vec<u8>], _: &[u8], _: i64, _: u32, _: u64, _: u64, _: &[u8], _: u64,
+        ) -> Result<quil_types::proto::global::FrameHeader> {
+            Err(QuilError::Internal("stub".into()))
+        }
+        fn verify_frame_header(
+            &self, _: &quil_types::proto::global::FrameHeader,
+        ) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn prove_global_frame_header(
+            &self, _: &GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[Vec<u8>], _: &[u8],
+            _: &dyn Signer, _: i64, _: u32, _: u8,
+        ) -> Result<GlobalFrameHeader> {
+            Err(QuilError::Internal("stub".into()))
+        }
+        fn verify_global_frame_header(&self, _: &GlobalFrameHeader) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn calculate_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: u32) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn verify_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: &[&[u8]]) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn make_prover(addr_byte: u8) -> ProverInfo {
+        ProverInfo {
+            public_key: vec![addr_byte; 96],
+            address: vec![addr_byte; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![],
+            available_storage: 0,
+            seniority: 1,
+            delegate_address: vec![],
+        }
+    }
+
+    /// Structure-only signer (never actually invoked by these tests).
+    struct DummySigner;
+    impl Signer for DummySigner {
+        fn key_type(&self) -> quil_types::crypto::KeyType {
+            quil_types::crypto::KeyType::Bls48581G1
+        }
+        fn public_key(&self) -> &[u8] {
+            &[]
+        }
+        fn private_key(&self) -> &[u8] {
+            &[0u8]
+        }
+        fn sign(&self, _: &[u8]) -> Result<Vec<u8>> {
+            Ok(vec![0xAA; 74])
+        }
+        fn sign_with_domain(&self, _: &[u8], _: &[u8]) -> Result<Vec<u8>> {
+            Ok(vec![0xAA; 74])
+        }
+    }
+
+    fn provider_with(registry: Arc<dyn ProverRegistry>) -> GlobalLeaderProvider {
+        let signer: Arc<dyn Signer> = Arc::new(DummySigner);
+        GlobalLeaderProvider::new(
+            registry,
+            Arc::new(StubFrameProver),
+            Arc::new(AsertDifficultyAdjuster::new(0, 0, 100)),
+            Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            Arc::new(MessageCollector::new()),
+            vec![0xABu8; 32],
+            vec![0xABu8; 96],
+            signer,
+            // Real KZG prover so `compute_requests_root` reflects tree
+            // contents (the noop prover returns all-zero roots).
+            Arc::new(quil_crypto::KzgInclusionProver),
+            // No execution manager in these unit tests — the validate-and-
+            // drop gate is exercised via integration tests on real stores.
+            None,
+            // No CRDT wired — prover_tree_commitment stays empty (tolerated).
+            None,
+        )
+    }
+
+    fn provider_with_prover(
+        prover: Arc<dyn quil_types::crypto::InclusionProver + Send + Sync>,
+    ) -> GlobalLeaderProvider {
+        let signer: Arc<dyn Signer> = Arc::new(DummySigner);
+        GlobalLeaderProvider::new(
+            Arc::new(TestProverRegistry::new()),
+            Arc::new(StubFrameProver),
+            Arc::new(AsertDifficultyAdjuster::new(0, 0, 100)),
+            Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            Arc::new(MessageCollector::new()),
+            vec![0xABu8; 32],
+            vec![0xABu8; 96],
+            signer,
+            prover,
+            None,
+            None,
+        )
+    }
+
+    /// Regression for the archive-consensus `requests_root = 0x00..00` bug.
+    /// `compute_requests_root` builds a VectorCommitmentTree and commits it
+    /// via the WIRED inclusion prover. A `NoopInclusionProver` commits any
+    /// BRANCH (>= 2 messages) to 64 zero bytes — so every non-trivial frame
+    /// shipped a zero root. A single message is a LEAF (SHA-512), non-zero
+    /// even under Noop, which is exactly why the bug was invisible on
+    /// near-empty frames. The real KZG prover yields a non-zero root. The
+    /// archive path had been wired with Noop (fixed to Kzg); this pins the
+    /// contract so it can't silently regress.
+    #[test]
+    fn requests_root_zero_under_noop_nonzero_under_kzg_for_branch() {
+        let msgs: Vec<Vec<u8>> = vec![vec![1u8; 40], vec![2u8; 40], vec![3u8; 40]];
+
+        let noop = provider_with_prover(Arc::new(quil_types::crypto::NoopInclusionProver));
+        assert_eq!(
+            noop.compute_requests_root(&msgs),
+            vec![0u8; 64],
+            "Noop prover commits the multi-message branch to zeros — the bug"
+        );
+
+        let kzg = provider_with_prover(Arc::new(quil_crypto::KzgInclusionProver));
+        assert_ne!(
+            kzg.compute_requests_root(&msgs),
+            vec![0u8; 64],
+            "real KZG prover must produce a non-zero requests_root for a multi-message frame"
+        );
+    }
+
+    fn prior_state(output_len: usize) -> State<GlobalState> {
+        let gs = GlobalState::new(
+            5,                          // frame_number
+            5,                          // rank
+            0,                          // timestamp
+            100,                        // difficulty
+            vec![0x11u8; output_len],   // output
+            vec![0x03u8; 32],           // parent_selector
+            vec![0x02u8; 32],           // prover
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        State {
+            rank: 5,
+            identifier: vec![0x01u8; 32],
+            proposer_id: vec![0x02u8; 32],
+            parent_qc_identity: vec![0x03u8; 32],
+            parent_qc_rank: 4,
+            parent_quorum_certificate: None,
+            timestamp: 0,
+            state: gs,
+        }
+    }
+
+    #[test]
+    fn get_next_leaders_errors_without_prior() {
+        let p = provider_with(Arc::new(TestProverRegistry::new()));
+        let err = p.get_next_leaders(None).unwrap_err();
+        assert!(err.to_string().contains("no prior frame"));
+    }
+
+    #[test]
+    fn get_next_leaders_errors_on_wrong_output_length() {
+        let p = provider_with(Arc::new(TestProverRegistry::with_provers(vec![make_prover(1)])));
+        let prior = prior_state(100); // != VDF_OUTPUT_LEN
+        let err = p.get_next_leaders(Some(&prior)).unwrap_err();
+        assert!(err.to_string().contains("output length"));
+    }
+
+    #[test]
+    fn get_next_leaders_errors_when_registry_empty() {
+        let p = provider_with(Arc::new(TestProverRegistry::new()));
+        let prior = prior_state(VDF_OUTPUT_LEN);
+        let err = p.get_next_leaders(Some(&prior)).unwrap_err();
+        assert!(err.to_string().contains("no active provers"));
+    }
+
+    #[test]
+    fn get_next_leaders_returns_ordered_identities() {
+        let registry = TestProverRegistry::with_provers(vec![
+            make_prover(0xAA),
+            make_prover(0xBB),
+            make_prover(0xCC),
+        ]);
+        let p = provider_with(Arc::new(registry));
+        let prior = prior_state(VDF_OUTPUT_LEN);
+        let leaders = p.get_next_leaders(Some(&prior)).unwrap();
+        assert_eq!(leaders.len(), 3);
+        // Identities are the raw 32-byte addresses (address_to_identity).
+        assert_eq!(leaders[0], vec![0xAAu8; 32]);
+        assert_eq!(leaders[1], vec![0xBBu8; 32]);
+        assert_eq!(leaders[2], vec![0xCCu8; 32]);
+    }
+
+    #[test]
+    fn compute_parent_selector_is_deterministic_and_32_bytes() {
+        let out = vec![0x42u8; VDF_OUTPUT_LEN];
+        let a = GlobalLeaderProvider::compute_parent_selector(&out);
+        let b = GlobalLeaderProvider::compute_parent_selector(&out);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32);
+        // Different input → different selector.
+        let c = GlobalLeaderProvider::compute_parent_selector(&vec![0x43u8; VDF_OUTPUT_LEN]);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn frame_identity_hashes_output() {
+        let header = GlobalFrameHeader {
+            output: vec![0x55u8; VDF_OUTPUT_LEN],
+            ..Default::default()
+        };
+        let id = GlobalLeaderProvider::frame_identity(&header);
+        assert_eq!(id.len(), 32);
+        // Matches the direct poseidon hash of the output.
+        let expected = quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap();
+        assert_eq!(id, expected.to_vec());
+    }
+
+    #[test]
+    fn qc_identity_returns_selector_bytes() {
+        let qc = quil_types::proto::global::QuorumCertificate {
+            selector: vec![0x77u8; 32],
+            ..Default::default()
+        };
+        assert_eq!(GlobalLeaderProvider::qc_identity(&qc), vec![0x77u8; 32]);
+    }
+
+    #[test]
+    fn compute_requests_root_empty_vs_nonempty_differ() {
+        let p = provider_with(Arc::new(TestProverRegistry::new()));
+        let empty = p.compute_requests_root(&[]);
+        let nonempty = p.compute_requests_root(&[vec![0x01u8; 16], vec![0x02u8; 16]]);
+        assert_ne!(empty, nonempty);
+        // Deterministic for the same input.
+        assert_eq!(empty, p.compute_requests_root(&[]));
+    }
+
+    /// Regression (audit Finding #2 / residual): the requests_root MUST bind
+    /// request ORDER and MULTIPLICITY. Before keying leaves by `SHA3(index‖msg)`,
+    /// a reordered or duplicated body produced the SAME root — a collision-free
+    /// consensus-divergence vector (e.g. two conflicting spends `[A,B]` vs `[B,A]`
+    /// share a certified root but execute differently).
+    #[test]
+    fn compute_requests_root_binds_order_and_multiplicity() {
+        let p = provider_with(Arc::new(TestProverRegistry::new()));
+        let a = vec![0x0Au8; 16];
+        let b = vec![0x0Bu8; 16];
+        // Order: [A,B] != [B,A].
+        assert_ne!(
+            p.compute_requests_root(&[a.clone(), b.clone()]),
+            p.compute_requests_root(&[b.clone(), a.clone()]),
+            "requests_root must bind request order",
+        );
+        // Multiplicity: [A] != [A,A].
+        assert_ne!(
+            p.compute_requests_root(&[a.clone()]),
+            p.compute_requests_root(&[a.clone(), a.clone()]),
+            "requests_root must bind request multiplicity",
+        );
+        // Still deterministic for the exact same ordered sequence.
+        assert_eq!(
+            p.compute_requests_root(&[a.clone(), b.clone()]),
+            p.compute_requests_root(&[a, b]),
+        );
+    }
+
+    /// Build a leader whose only non-default wiring is the hypergraph CRDT,
+    /// so `compute_prover_root` can be exercised in isolation.
+    fn provider_with_crdt(
+        crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    ) -> GlobalLeaderProvider {
+        let signer: Arc<dyn Signer> = Arc::new(DummySigner);
+        GlobalLeaderProvider::new(
+            Arc::new(TestProverRegistry::new()),
+            Arc::new(StubFrameProver),
+            Arc::new(AsertDifficultyAdjuster::new(0, 0, 100)),
+            Arc::new(quil_store::testing::InMemoryClockStore::new()),
+            Arc::new(MessageCollector::new()),
+            vec![0xABu8; 32],
+            vec![0xABu8; 96],
+            signer,
+            Arc::new(quil_crypto::KzgInclusionProver),
+            None,
+            crdt,
+        )
+    }
+
+    /// The `prover_tree_commitment` the leader binds into the VDF challenge
+    /// is the global prover shard's (`L1=[0;3]`, `L2=[0xff;32]`) live
+    /// vertex-adds forest root — read via `compute_shard_root`, the same
+    /// value `commit_inner` writes into the header, and the value every
+    /// follower re-derives. Seeding that shard and committing must yield a
+    /// real (32-byte, non-zero) root that `compute_prover_root` returns,
+    /// matching a direct `compute_shard_root`, while a populated distractor
+    /// shard's root is NOT returned (targets the global shard specifically).
+    #[test]
+    fn compute_prover_root_reads_live_global_shard_root() {
+        use quil_hypergraph::testing::{MemStore, StubProver};
+        use quil_hypergraph::Location;
+        use quil_types::store::ShardKey;
+
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(StubProver),
+        ));
+        let global_shard = ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+        // Seed real state into the global prover shard (app == global
+        // address) plus a distractor app shard, then commit to the forest.
+        crdt.add_vertex(
+            &Location { app_address: [0xff; 32], data_address: [0x01; 32] },
+            b"prover-state",
+        )
+        .unwrap();
+        crdt.add_vertex(
+            &Location { app_address: [0x2a; 32], data_address: [0x07; 32] },
+            b"distractor",
+        )
+        .unwrap();
+        crdt.commit(1).unwrap();
+
+        let expected = crdt.compute_shard_root("vertex", "adds", &global_shard);
+        let distractor = crdt.compute_shard_root(
+            "vertex",
+            "adds",
+            &ShardKey { l1: [0u8; 3], l2: [0x2a; 32] },
+        );
+
+        let provider = provider_with_crdt(Some(crdt.clone()));
+        let got = provider.compute_prover_root(0);
+
+        assert_eq!(
+            got, expected,
+            "compute_prover_root must return the live global-shard vertex-adds root",
+        );
+        assert_eq!(got.len(), 32, "a real forest root is 32 bytes");
+        assert!(got.iter().any(|&b| b != 0), "global shard has data → non-zero root");
+        assert_ne!(got, distractor, "must target the global shard, not another app shard");
+        // Deterministic across re-proves of the same committed state.
+        assert_eq!(got, provider.compute_prover_root(0));
+    }
+
+    /// No CRDT wired (unit-test / degraded node) → empty commitment, which
+    /// `verify_prover_root`'s empty-root branch tolerates without a halt.
+    #[test]
+    fn compute_prover_root_empty_without_crdt() {
+        let provider = provider_with_crdt(None);
+        assert!(provider.compute_prover_root(0).is_empty());
+    }
+}

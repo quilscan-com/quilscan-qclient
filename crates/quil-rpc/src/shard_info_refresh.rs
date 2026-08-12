@@ -62,16 +62,16 @@ pub enum ShardInfoRefreshError {
 ///
 /// Behaviors:
 /// - Local shard_keys are deduplicated. Each `RangeAppShards` row
-///   carries one (shard_key, prefix) pair, but multiple rows can
-///   share the same 35-byte shard_key (with different prefixes); we
-///   only need one RPC per unique shard_key since the response
-///   includes every sub-shard under that L2.
+/// carries one (shard_key, prefix) pair, but multiple rows can
+/// share the same 35-byte shard_key (with different prefixes); we
+/// only need one RPC per unique shard_key since the response
+/// includes every sub-shard under that L2.
 /// - Per-shard RPC failures within a connected endpoint are logged
-///   and skipped — partial data is preferable to aborting the entire
-///   refresh (the lifecycle's "propose over what we have" contract).
+/// and skipped — partial data is preferable to aborting the entire
+/// refresh (the lifecycle's "propose over what we have" contract).
 /// - Endpoint-level transport failures rotate to the next endpoint.
-///   The first endpoint to return at least one successful per-shard
-///   result wins; the partial map is returned.
+/// The first endpoint to return at least one successful per-shard
+/// result wins; the partial map is returned.
 ///
 /// The wire filter is constructed from `shard_key[3..]` (L2, 32 bytes)
 /// concatenated with one byte per `prefix` element — matching the
@@ -87,7 +87,7 @@ pub enum ShardInfoRefreshError {
 /// giving up in this call. `None` means "every endpoint in the pool."
 pub async fn fetch_shard_sizes_from_archive(
     pool: &Arc<ArchiveEndpointPool>,
-    ed448_seed: &[u8; 57],
+    falcon_signing_key: &[u8],
     shards_store: &dyn ShardsStore,
     cap_per_attempt: Option<usize>,
 ) -> Result<HashMap<Vec<u8>, u64>, ShardInfoRefreshError> {
@@ -120,7 +120,7 @@ pub async fn fetch_shard_sizes_from_archive(
             break;
         };
 
-        match try_one_endpoint(&endpoint, ed448_seed, &shard_keys).await {
+        match try_one_endpoint(&endpoint, falcon_signing_key, &shard_keys).await {
             Ok(map) if !map.is_empty() => {
                 info!(
                     %endpoint,
@@ -165,14 +165,19 @@ pub async fn fetch_shard_sizes_from_archive(
 /// logged and skipped (partial OK).
 async fn try_one_endpoint(
     endpoint: &str,
-    ed448_seed: &[u8; 57],
+    falcon_signing_key: &[u8],
     shard_keys: &[Vec<u8>],
 ) -> Result<HashMap<Vec<u8>, u64>, ArchiveClientError> {
-    let mut client = ArchiveClient::connect_mtls(endpoint, ed448_seed).await?;
+    let mut client = ArchiveClient::connect_mtls(endpoint, falcon_signing_key).await?;
     let mut out: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut any_success = false;
+    let mut last_err: Option<ArchiveClientError> = None;
     for shard_key in shard_keys {
         let infos = match client.get_app_shards(shard_key.clone(), Vec::new()).await {
-            Ok(v) => v,
+            Ok(v) => {
+                any_success = true;
+                v
+            }
             Err(e) => {
                 debug!(
                     %endpoint,
@@ -180,6 +185,7 @@ async fn try_one_endpoint(
                     error = %e,
                     "shard_info refresh: per-shard call failed, skipping"
                 );
+                last_err = Some(e);
                 continue;
             }
         };
@@ -196,6 +202,16 @@ async fn try_one_endpoint(
             }
             let size = bigint_to_u64_saturating(&info.size);
             out.insert(filter, size);
+        }
+    }
+    // Distinguish "every per-shard call errored" (a real transport/handler
+    // failure that was being masked as the generic 'no shard sizes' rotate
+    // message) from "calls succeeded but returned no data" (legitimately
+    // empty). Only the former is surfaced as an error so the caller logs
+    // the actual cause at WARN; the latter stays Ok(empty).
+    if out.is_empty() && !any_success {
+        if let Some(e) = last_err {
+            return Err(e);
         }
     }
     Ok(out)

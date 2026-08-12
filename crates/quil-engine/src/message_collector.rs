@@ -10,8 +10,15 @@ use std::sync::RwLock;
 
 use sha3::{Digest, Sha3_256};
 
-/// Maximum messages per frame (matches Go's maxGlobalMessagesPerFrame).
-pub const MAX_MESSAGES_PER_FRAME: usize = 100;
+// NOTE: global consensus has NO per-frame request cap. The original
+// 100-message cap existed because a global proposal was gossiped and
+// BlossomSub has a ~1 MiB message-size ceiling; global consensus now
+// uses the direct point-to-point :8340 transport (see
+// `direct_global_consensus_publisher`), which has no such ceiling, so
+// the global frame carries every pending request (e.g. a shard-frame
+// coverage proof from every shard). App-shard consensus keeps its own
+// cap (`MAX_APP_MESSAGES_PER_RANK` in `app_engine`); this collector is
+// global-only.
 
 /// Number of ranks to retain before pruning (matches Go's retention window).
 const RETENTION_WINDOW: u64 = 10;
@@ -20,7 +27,46 @@ const RETENTION_WINDOW: u64 = 10;
 #[derive(Clone)]
 struct CollectedMessage {
     data: Vec<u8>,
-    _hash: [u8; 32],
+    hash: [u8; 32],
+}
+
+/// Maximum number of finalized message hashes retained for the
+/// "already-included-in-a-finalized-frame" reject set. Bounded FIFO so
+/// the set can't grow without limit; sized well above the per-frame cap
+/// times the consensus depth so a message can't be re-collected before
+/// it ages out.
+const MAX_FINALIZED_HASHES: usize = 8192;
+
+/// Bounded FIFO set of message hashes already included in a finalized
+/// frame. New `add_message` / `collect_for_rank` skip these so a message
+/// consumed by a finalized frame is never re-proposed.
+struct FinalizedSet {
+    set: HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+}
+
+impl FinalizedSet {
+    fn new() -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn contains(&self, h: &[u8; 32]) -> bool {
+        self.set.contains(h)
+    }
+
+    fn insert(&mut self, h: [u8; 32]) {
+        if self.set.insert(h) {
+            self.order.push_back(h);
+            if self.order.len() > MAX_FINALIZED_HASHES {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+    }
 }
 
 /// Outcome of adding a message to a [`RankBuffer`].
@@ -28,13 +74,24 @@ struct CollectedMessage {
 enum AddOutcome {
     Added,
     Duplicate,
+    /// The per-rank count/byte cap is full — message rejected (not retained).
     Full,
 }
+
+/// Per-rank caps. Without these an attacker floods DISTINCT payloads (vary one
+/// byte to defeat the SHA-256 dedup) at the current rank — each retained until
+/// the rank ages out — a memory-amplification DoS (submit paths accept up to
+/// 64 MiB/msg on :8340). A leader can only pack ~15 MiB into one proposal anyway,
+/// so retaining far more than that is pointless; these bound the buffer while
+/// staying well above any legitimate per-rank volume.
+const MAX_MESSAGES_PER_RANK: usize = 65_536;
+const MAX_BYTES_PER_RANK: usize = 64 * 1024 * 1024;
 
 /// Per-rank message buffer.
 struct RankBuffer {
     messages: Vec<CollectedMessage>,
     seen: HashSet<[u8; 32]>,
+    bytes: usize,
 }
 
 impl RankBuffer {
@@ -42,33 +99,45 @@ impl RankBuffer {
         Self {
             messages: Vec::new(),
             seen: HashSet::new(),
+            bytes: 0,
         }
     }
 
-    /// Add a message if not already seen and there's capacity.
+    /// Add a message if not already seen and the rank isn't over its cap.
     fn add(&mut self, data: Vec<u8>) -> AddOutcome {
         let hash = sha256(&data);
         if self.seen.contains(&hash) {
             return AddOutcome::Duplicate;
         }
-        if self.messages.len() >= MAX_MESSAGES_PER_FRAME {
+        if self.messages.len() >= MAX_MESSAGES_PER_RANK
+            || self.bytes.saturating_add(data.len()) > MAX_BYTES_PER_RANK
+        {
             return AddOutcome::Full;
         }
         self.seen.insert(hash);
-        self.messages.push(CollectedMessage { data, _hash: hash });
+        self.bytes += data.len();
+        self.messages.push(CollectedMessage { data, hash });
         AddOutcome::Added
-    }
-
-    /// Drain all messages, returning their raw bytes.
-    fn drain(&mut self) -> Vec<Vec<u8>> {
-        let msgs: Vec<Vec<u8>> = self.messages.drain(..).map(|m| m.data).collect();
-        self.seen.clear();
-        msgs
     }
 
     fn len(&self) -> usize {
         self.messages.len()
     }
+}
+
+/// Outcome of an [`MessageCollector::add_message_outcome`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// Newly added to the mempool.
+    Accepted,
+    /// The collector already holds this message (already finalized, a byte
+    /// duplicate, or superseded by a newer shard frame for the same shard).
+    /// The submitter's work is NOT lost — a network submit handler should
+    /// report this to the caller as success, not a dropped message.
+    Duplicate,
+    /// Rejected by a real filter (prover-only mode dropped a non-prover
+    /// message during degraded coverage); the message was NOT retained.
+    Filtered,
 }
 
 /// Thread-safe message collector. The message receive loop (writer)
@@ -84,16 +153,19 @@ pub struct MessageCollector {
     /// serializations of the same shard frame; hash dedup misses
     /// those, but `(shard_address, frame_number)` catches them.
     shard_frame_dedup: RwLock<HashMap<Vec<u8>, u64>>,
-    /// Spillover bundles per target rank. Mirrors Go's
-    /// `globalMessageSpillover` (`message_collector.go:519-574`). When
-    /// `add_message` would exceed `MAX_MESSAGES_PER_FRAME` for a rank,
-    /// the bundle is appended to `spillover[rank]` instead of being
-    /// dropped silently. On `collect_for_rank(rank)`, all spillover
-    /// entries for ranks `<= rank` are drained and merged into the
-    /// returned message list (Go flushes a single target rank when
-    /// rank rolls forward; merging `<= rank` accomplishes the same
-    /// end-to-end behavior since collect is what advances the rank).
-    spillover: RwLock<HashMap<u64, VecDeque<Vec<u8>>>>,
+    /// Hashes of messages already included in a finalized frame. A
+    /// message here is never re-collected or re-accepted — this is the
+    /// "consume on finalize" half of the lifecycle. Mirrors the effect
+    /// of Go's per-frame `lockCollectorMessage`, which prevents an
+    /// already-included message from being proposed again.
+    finalized: RwLock<FinalizedSet>,
+    /// The set of CURRENT valid shard addresses (a shard `FrameHeader`'s
+    /// `address` — the L2‖prefix filter). Refreshed from the shards store. Used
+    /// to preemptively reject shard frames whose address is not a real current
+    /// shard (e.g. an old 4096-grid division that no longer exists). Empty =
+    /// "not yet loaded" → the address check is skipped (fail-open) so a fresh
+    /// node doesn't drop everything before its first refresh.
+    valid_shard_addresses: RwLock<HashSet<Vec<u8>>>,
 }
 
 impl MessageCollector {
@@ -102,8 +174,17 @@ impl MessageCollector {
             buffers: RwLock::new(HashMap::new()),
             prover_only_mode: std::sync::atomic::AtomicBool::new(false),
             shard_frame_dedup: RwLock::new(HashMap::new()),
-            spillover: RwLock::new(HashMap::new()),
+            finalized: RwLock::new(FinalizedSet::new()),
+            valid_shard_addresses: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Replace the set of valid current shard addresses (called from the
+    /// shard-info refresh with the L2‖prefix filter of every current shard).
+    /// Once populated, shard frames whose address isn't in the set are rejected
+    /// at ingestion.
+    pub fn set_valid_shard_addresses(&self, addresses: HashSet<Vec<u8>>) {
+        *self.valid_shard_addresses.write().unwrap() = addresses;
     }
 
     /// Reject a bundle if any of its embedded shard frames is at or
@@ -139,106 +220,204 @@ impl MessageCollector {
         self.shard_frame_dedup.write().unwrap().clear();
     }
 
-    /// Add a message for the given rank. Returns true if the message
-    /// was accepted (not a duplicate, not truncated, not filtered).
-    /// When the per-rank buffer is full, the message is appended to
-    /// `spillover[rank]` instead of being dropped — matches Go's
-    /// `deferGlobalMessage` semantic (`message_collector.go:519-543`).
+    /// Add a message for the given rank. Returns true iff it was NEWLY
+    /// added (see [`SubmitOutcome`] via [`add_message_outcome`] for the
+    /// duplicate-vs-filtered distinction). Global consensus has no
+    /// per-frame count cap, so a well-formed, non-duplicate message is
+    /// always retained.
     pub fn add_message(&self, rank: u64, data: Vec<u8>) -> bool {
+        matches!(self.add_message_outcome(rank, data), SubmitOutcome::Accepted)
+    }
+
+    /// Add a message, distinguishing "newly accepted" from "we already
+    /// hold it (or a newer shard frame)" from "filtered out". A network
+    /// submit handler should treat both `Accepted` and `Duplicate` as
+    /// SUCCESS — re-delivering something the collector already has (or has
+    /// superseded) is not a dropped message; only `Filtered` is a real
+    /// rejection. This is what stops a prover's idempotent re-submission
+    /// of an already-delivered bundle from being reported to it as a
+    /// transport failure.
+    pub fn add_message_outcome(&self, rank: u64, data: Vec<u8>) -> SubmitOutcome {
         // Prover-only mode filtering: check if the message is a
         // prover-protocol op (type prefix 0x0301-0x031A). If not,
         // reject it during degraded coverage.
         if self.prover_only_mode.load(std::sync::atomic::Ordering::Relaxed) {
             if !is_prover_message(&data) {
-                return false;
+                return SubmitOutcome::Filtered;
             }
         }
 
-        let mut buffers = self.buffers.write().unwrap();
-        let buffer = buffers.entry(rank).or_insert_with(RankBuffer::new);
-        match buffer.add(data.clone()) {
-            AddOutcome::Added => true,
-            AddOutcome::Duplicate => false,
-            AddOutcome::Full => {
-                // Spill over instead of dropping — match Go's
-                // deferGlobalMessage behavior.
-                drop(buffers);
-                let mut spill = self.spillover.write().unwrap();
-                spill
-                    .entry(rank)
-                    .or_insert_with(VecDeque::new)
-                    .push_back(data);
-                true
-            }
-        }
-    }
-
-    /// Drain all messages for the given rank. Returns up to
-    /// `MAX_MESSAGES_PER_FRAME` messages, removing them from the buffer.
-    /// Also prunes ranks older than the retention window. Drains any
-    /// spillover entries for ranks `<= rank` and merges them in —
-    /// matches Go's `flushDeferredGlobalMessages` rolling forward as
-    /// rank advances (`event_distributor.go:61`).
-    ///
-    /// Buffers at ranks `< rank` are also drained: receivers tag
-    /// inbound messages with their local "current rank" (e.g. last
-    /// finalized frame), but on archives that never receive their own
-    /// broadcasts the local rank lags behind the consensus rank the
-    /// leader uses to collect. Draining `<= rank` matches Go's
-    /// behavior where producer and consumer share a single rank view.
-    /// The `MAX_MESSAGES_PER_FRAME` cap is applied to the merged set.
-    pub fn collect_for_rank(&self, rank: u64) -> Vec<Vec<u8>> {
-        let mut buffers = self.buffers.write().unwrap();
-
-        // Drain messages for all ranks <= rank, in ascending rank order
-        // so older messages land first (FIFO across ranks).
-        let mut ranks_to_drain: Vec<u64> = buffers
-            .keys()
-            .copied()
-            .filter(|r| *r <= rank)
-            .collect();
-        ranks_to_drain.sort();
-        let mut messages: Vec<Vec<u8>> = Vec::new();
-        for r in &ranks_to_drain {
-            if let Some(buf) = buffers.get_mut(r) {
-                messages.extend(buf.drain());
-            }
+        // Already included in a finalized frame → never re-accept. This
+        // is what stops a message from re-entering the mempool after it
+        // has been consumed by a committed frame. The archive already has
+        // this work, so this is a duplicate, not a rejection.
+        if self.finalized.read().unwrap().contains(&sha256(&data)) {
+            return SubmitOutcome::Duplicate;
         }
 
-        // Prune old ranks
-        if rank > RETENTION_WINDOW {
-            let cutoff = rank - RETENTION_WINDOW;
-            buffers.retain(|&r, _| r >= cutoff);
-        }
-        drop(buffers);
+        // Shard-frame dedup at ingest (Go parity,
+        // `message_collector.go:250-271`): a bundle carrying a shard
+        // `FrameHeader` is rejected if that shard's frame_number is at or
+        // below the last one already seen for the shard. Without this,
+        // re-gossiped or stale shard-frame proofs re-enter the mempool
+        // every round, so frames fill with already-seen proofs that the
+        // materializer must re-verify (the expensive per-proof BLS work)
+        // and then skip — the backlog explosion behind the halt. The
+        // dedup commits the new high-water marks as a side effect. A stale
+        // shard frame means we hold a newer one — a duplicate, not a drop.
+        let checks = extract_shard_frame_checks(&data);
 
-        // Drain spillover for ranks <= rank.
-        let mut spill = self.spillover.write().unwrap();
-        let to_flush: Vec<u64> = spill.keys().copied().filter(|r| *r <= rank).collect();
-        for r in to_flush {
-            if let Some(mut q) = spill.remove(&r) {
-                while let Some(payload) = q.pop_front() {
-                    messages.push(payload);
+        // Preemptive shard-frame validation: reject a bundle whose embedded
+        // shard frame(s) have NO chance of being valid, before it enters the
+        // mempool and the leader spends per-proof BLS work on it —
+        //   1. a storage frame (global_frame_number > 0) carrying NO storage
+        //      attestation (empty `storage_attestation_root`), and
+        //   2. an `address` that isn't a real current shard (e.g. an old
+        //      4096-grid division that no longer exists in the 64-shard
+        //      topology).
+        // The address check only engages once the valid-shard set has been
+        // populated from the shards store (fail-open before the first refresh
+        // so a just-started node doesn't drop everything).
+        if !checks.is_empty() {
+            let valid = self.valid_shard_addresses.read().unwrap();
+            for c in &checks {
+                if c.global_frame_number > 0 && !c.has_attestation {
+                    return SubmitOutcome::Filtered;
+                }
+                if !valid.is_empty() && !valid.contains(&c.address) {
+                    return SubmitOutcome::Filtered;
                 }
             }
         }
 
-        if messages.len() > MAX_MESSAGES_PER_FRAME {
-            messages.truncate(MAX_MESSAGES_PER_FRAME);
+        let shard_frames: Vec<(Vec<u8>, u64)> = checks
+            .iter()
+            .map(|c| (c.address.clone(), c.frame_number))
+            .collect();
+        if !shard_frames.is_empty() && !self.dedup_shard_frames(&shard_frames) {
+            return SubmitOutcome::Duplicate;
+        }
+
+        let mut buffers = self.buffers.write().unwrap();
+        let buffer = buffers.entry(rank).or_insert_with(RankBuffer::new);
+        match buffer.add(data) {
+            AddOutcome::Added => SubmitOutcome::Accepted,
+            AddOutcome::Duplicate => SubmitOutcome::Duplicate,
+            AddOutcome::Full => SubmitOutcome::Filtered,
+        }
+    }
+
+    /// Collect (NON-destructively) ALL pending messages for ranks
+    /// `<= rank`. There is no per-frame count cap on global consensus —
+    /// the frame carries every pending request (e.g. a coverage proof
+    /// from every shard). Messages are NOT removed — they stay available
+    /// so a proposal that times out (very common under churn) doesn't
+    /// vaporize them; the next proposal sees the same set. They leave the
+    /// collector only via [`mark_finalized`] (consumed by a committed
+    /// frame) or retention pruning (aged out).
+    ///
+    /// Buffers at ranks `< rank` are also included: receivers tag inbound
+    /// messages with their local "current rank", but on archives that
+    /// never receive their own broadcasts the local rank lags the
+    /// consensus rank the leader collects at. Including `<= rank` matches
+    /// Go's behavior where producer and consumer share a single rank view.
+    ///
+    /// Mirrors Go's `consensus_liveness_provider.go`, which reads
+    /// `collector.Records()` non-destructively into a persistent
+    /// `collectedMessages` rather than draining. The previous Rust
+    /// implementation drained here, so under the field's heavy timeout
+    /// rate every finalized frame came out empty (messages were consumed
+    /// by earlier proposals that never finalized).
+    pub fn collect_for_rank(&self, rank: u64) -> Vec<Vec<u8>> {
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let mut messages: Vec<Vec<u8>> = Vec::new();
+
+        // PEEK first (before any pruning) so a message at a rank that is
+        // about to age out is still returned by this call — matching the
+        // old drain-then-prune ordering. Test harnesses tag with rank 0
+        // and rely on `collect_for_rank(N)` finding them.
+        {
+            let buffers = self.buffers.read().unwrap();
+            let finalized = self.finalized.read().unwrap();
+            let mut ranks: Vec<u64> = buffers.keys().copied().filter(|r| *r <= rank).collect();
+            ranks.sort();
+            for r in &ranks {
+                if let Some(buf) = buffers.get(r) {
+                    for m in &buf.messages {
+                        if finalized.contains(&m.hash) || !seen.insert(m.hash) {
+                            continue;
+                        }
+                        messages.push(m.data.clone());
+                    }
+                }
+            }
+        }
+
+        // Retention prune AFTER peeking: ranks strictly older than the
+        // window are dropped (they aged out). This is the only removal
+        // path besides `mark_finalized`. No per-frame count cap — global
+        // frames carry every pending request (direct transport, no gossip
+        // size ceiling).
+        if rank > RETENTION_WINDOW {
+            let cutoff = rank - RETENTION_WINDOW;
+            self.buffers.write().unwrap().retain(|&r, _| r >= cutoff);
         }
 
         messages
     }
 
-    /// Number of pending spillover bundles for a given rank. For tests
-    /// and diagnostics.
-    pub fn spillover_count(&self, rank: u64) -> usize {
-        self.spillover
-            .read()
-            .unwrap()
-            .get(&rank)
-            .map(|q| q.len())
-            .unwrap_or(0)
+    /// Mark `raw_msgs` as included in a finalized frame: remove them from
+    /// the live buffers and record their hashes so they are never
+    /// re-collected or re-accepted. Called by the materializer
+    /// after a frame commits, with the canonical bytes of every bundle in
+    /// the finalized frame. This is the "consume" half of the lifecycle
+    /// that [`collect_for_rank`] (now non-destructive) no longer performs.
+    pub fn mark_finalized(&self, raw_msgs: &[Vec<u8>]) {
+        if raw_msgs.is_empty() {
+            return;
+        }
+        let hashes: HashSet<[u8; 32]> = raw_msgs.iter().map(|m| sha256(m)).collect();
+
+        {
+            let mut buffers = self.buffers.write().unwrap();
+            for buf in buffers.values_mut() {
+                buf.messages.retain(|m| !hashes.contains(&m.hash));
+                buf.seen.retain(|h| !hashes.contains(h));
+                buf.bytes = buf.messages.iter().map(|m| m.data.len()).sum();
+            }
+            buffers.retain(|_, b| !b.messages.is_empty());
+        }
+        {
+            let mut fin = self.finalized.write().unwrap();
+            for h in hashes {
+                fin.insert(h);
+            }
+        }
+    }
+
+    /// Remove `raw_msgs` from the live buffers WITHOUT recording them as
+    /// finalized. Used by the leader's collect path to drop messages that
+    /// fail protocol validation, mirroring Go's `collector.Remove(record)`
+    /// after a failed `lockCollectorMessage`/`ValidateMessage`
+    /// (`consensus_liveness_provider.go:86-97`). Unlike [`mark_finalized`],
+    /// a removed message is NOT blacklisted: validity is frame- and
+    /// state-dependent (a join may reference a not-yet-seen frame), so a
+    /// message invalid now can be valid later and is re-accepted if
+    /// re-received. This stops invalid messages from being re-collected
+    /// and re-proposed every rank until they age out of the retention
+    /// window — they leave the mempool the moment we know they're invalid.
+    pub fn remove(&self, raw_msgs: &[Vec<u8>]) {
+        if raw_msgs.is_empty() {
+            return;
+        }
+        let hashes: HashSet<[u8; 32]> = raw_msgs.iter().map(|m| sha256(m)).collect();
+        let mut buffers = self.buffers.write().unwrap();
+        for buf in buffers.values_mut() {
+            buf.messages.retain(|m| !hashes.contains(&m.hash));
+            buf.seen.retain(|h| !hashes.contains(h));
+            buf.bytes = buf.messages.iter().map(|m| m.data.len()).sum();
+        }
+        buffers.retain(|_, b| !b.messages.is_empty());
     }
 
     /// Number of pending messages for a given rank.
@@ -268,6 +447,114 @@ impl MessageCollector {
         self.prover_only_mode
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+/// Extract `(shard_address, frame_number)` keys from every shard
+/// `FrameHeader` request carried by a canonical `MessageBundle`. Used by
+/// [`MessageCollector::add_message`] to dedup shard-frame proofs at
+/// ingest. Returns empty if `data` isn't a decodable bundle or carries
+/// no shard frames (the common case for prover-admin ops) — those skip
+/// the dedup entirely. Mirrors Go's `req.GetShard()` extraction in
+/// `addGlobalMessage`.
+/// True if `data` (a canonical `MessageBundle`) carries at least one
+/// shard `FrameHeader` request. The leader uses this to skip protocol
+/// re-validation of shard-frame bundles at collect time: they are
+/// deduplicated at ingest and fully validated by the materializer, and
+/// re-verifying their (unbatchable, per-challenge class-group) VDF
+/// multiproofs here — now that the per-frame cap is gone and a frame can
+/// carry thousands — would load the latency-sensitive prove path. Only
+/// non-shard-frame messages (joins, leaves, confirms, kicks) are
+/// validated + dropped on the leader.
+pub fn bundle_has_shard_frame(data: &[u8]) -> bool {
+    !extract_shard_frame_keys(data).is_empty()
+}
+
+/// True iff every shard `FrameHeader` carried by `data` is in STRICT LOCKSTEP
+/// with a global frame `frame_number`: its `global_frame_number` (storage-beacon
+/// anchor) is either 0 (genesis / legacy-VDF, no anchor) or exactly
+/// `frame_number - 1` (the immediately-preceding global frame). Returns `true`
+/// for bundles that aren't decodable / carry no shard frames (this gate only
+/// governs shard proofs).
+///
+/// The global leader calls this to include ONLY in-lockstep shard proofs.
+/// Because the materializer HARD-REJECTS any frame containing an out-of-lockstep
+/// shard op (`audit_storage_attestation`), a leader that packed a stale proof
+/// would produce a frame its followers refuse — a halt. Dropping stale proofs
+/// here keeps producer and verifier symmetric: the shard must re-attest fresh
+/// (anchored to the new tip) to be included.
+pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
+    use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+    use quil_execution::message_envelope::CanonicalMessageBundle;
+
+    // WINDOWED LOCKSTEP (must mirror the materializer's `audit_storage_attestation`
+    // exactly, or a packed frame would be rejected by followers → halt): a storage
+    // shard proof is includable iff its anchor is 0 (genesis/legacy) OR within
+    // `[expected - W, expected]`. Multi-member shards anchor to `latest − K`, so a
+    // strict `== expected` is unsatisfiable; the window absorbs K + transit.
+    use quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
+    let expected = frame_number.saturating_sub(1);
+    let oldest = expected.saturating_sub(STORAGE_ANCHOR_LOCKSTEP_WINDOW);
+    let bundle = match CanonicalMessageBundle::from_canonical_bytes(data) {
+        Ok(b) => b,
+        Err(_) => return true,
+    };
+    for req in bundle.requests.into_iter().flatten() {
+        if req.inner_type_prefix == TYPE_FRAME_HEADER {
+            if let Ok(fh) = FrameHeader::from_canonical_bytes(&req.inner_bytes) {
+                let anchor = fh.global_frame_number;
+                if anchor != 0 && (anchor > expected || anchor < oldest) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// A shard `FrameHeader` carried by a bundle, with the fields needed for both
+/// dedup and preemptive ingestion validation.
+struct ShardFrameCheck {
+    address: Vec<u8>,
+    frame_number: u64,
+    /// The global frame this shard frame anchors to. `> 0` ⇒ a storage frame
+    /// (must carry storage attestation); `== 0` ⇒ genesis/legacy VDF frame.
+    global_frame_number: u64,
+    /// True iff the header commits to a storage attestation
+    /// (`storage_attestation_root` non-empty).
+    has_attestation: bool,
+}
+
+fn extract_shard_frame_checks(data: &[u8]) -> Vec<ShardFrameCheck> {
+    use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+    use quil_execution::message_envelope::CanonicalMessageBundle;
+
+    let bundle = match CanonicalMessageBundle::from_canonical_bytes(data) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for req in bundle.requests.into_iter().flatten() {
+        if req.inner_type_prefix == TYPE_FRAME_HEADER {
+            if let Ok(fh) = FrameHeader::from_canonical_bytes(&req.inner_bytes) {
+                if !fh.address.is_empty() {
+                    out.push(ShardFrameCheck {
+                        address: fh.address,
+                        frame_number: fh.frame_number,
+                        global_frame_number: fh.global_frame_number,
+                        has_attestation: !fh.storage_attestation_root.is_empty(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn extract_shard_frame_keys(data: &[u8]) -> Vec<(Vec<u8>, u64)> {
+    extract_shard_frame_checks(data)
+        .into_iter()
+        .map(|c| (c.address, c.frame_number))
+        .collect()
 }
 
 /// SHA3-256 digest of `data`. Mirrors Go's
@@ -310,9 +597,47 @@ mod tests {
         assert!(mc.add_message(1, b"msg-b".to_vec()));
         assert_eq!(mc.pending_count(1), 2);
 
+        // Collect is now NON-destructive: the messages stay pending so a
+        // timed-out proposal doesn't lose them.
         let msgs = mc.collect_for_rank(1);
         assert_eq!(msgs.len(), 2);
+        assert_eq!(mc.pending_count(1), 2);
+
+        // A second collect returns the same set.
+        assert_eq!(mc.collect_for_rank(1).len(), 2);
+
+        // Only mark_finalized consumes them.
+        mc.mark_finalized(&[b"msg-a".to_vec(), b"msg-b".to_vec()]);
         assert_eq!(mc.pending_count(1), 0);
+        assert!(mc.collect_for_rank(1).is_empty());
+    }
+
+    #[test]
+    fn finalized_messages_not_recollected_or_readded() {
+        let mc = MessageCollector::new();
+        assert!(mc.add_message(3, b"tx-1".to_vec()));
+        assert_eq!(mc.collect_for_rank(3).len(), 1);
+
+        // Finalize it → gone from the buffer and from future collects.
+        mc.mark_finalized(&[b"tx-1".to_vec()]);
+        assert!(mc.collect_for_rank(3).is_empty());
+
+        // A late re-submission of the same bytes is rejected (already
+        // included in a finalized frame).
+        assert!(!mc.add_message(3, b"tx-1".to_vec()));
+        assert!(mc.collect_for_rank(3).is_empty());
+    }
+
+    #[test]
+    fn collect_is_idempotent_across_timeouts() {
+        // Simulates a proposal collecting at rank R, timing out, then a
+        // re-proposal at R+1 still seeing the messages (the bug this
+        // fixes: the old drain lost them on the first collect).
+        let mc = MessageCollector::new();
+        mc.add_message(5, b"a".to_vec());
+        mc.add_message(5, b"b".to_vec());
+        assert_eq!(mc.collect_for_rank(5).len(), 2); // proposal @ rank 5 (times out)
+        assert_eq!(mc.collect_for_rank(6).len(), 2); // re-proposal @ rank 6 still sees them
     }
 
     #[test]
@@ -324,63 +649,56 @@ mod tests {
     }
 
     #[test]
-    fn truncation_at_max() {
+    fn no_per_frame_cap() {
+        // Global consensus has NO per-frame request cap: every message is
+        // retained (only exact-duplicate is rejected). 500 distinct
+        // messages all stay pending.
         let mc = MessageCollector::new();
-        for i in 0..MAX_MESSAGES_PER_FRAME + 10 {
-            mc.add_message(1, format!("msg-{}", i).into_bytes());
+        for i in 0..500 {
+            assert!(mc.add_message(1, format!("msg-{}", i).into_bytes()));
         }
-        // Live buffer is capped at MAX_MESSAGES_PER_FRAME; the rest
-        // overflow into spillover (no longer dropped silently).
-        assert_eq!(mc.pending_count(1), MAX_MESSAGES_PER_FRAME);
-        assert_eq!(mc.spillover_count(1), 10);
+        assert_eq!(mc.pending_count(1), 500);
+        // Duplicate still rejected.
+        assert!(!mc.add_message(1, b"msg-0".to_vec()));
+        assert_eq!(mc.pending_count(1), 500);
     }
 
     #[test]
-    fn spillover_buffers_overflow() {
-        // Past the per-rank cap, additional messages spill over instead
-        // of being silently dropped. add_message should still return
-        // true for accepted-into-spillover bundles.
+    fn remove_drops_without_blacklisting() {
+        // `remove` evicts messages from the live buffers but, unlike
+        // `mark_finalized`, does NOT blacklist them — a removed message can
+        // be re-accepted if re-received (validity is state-dependent).
         let mc = MessageCollector::new();
-        for i in 0..MAX_MESSAGES_PER_FRAME {
-            assert!(mc.add_message(1, format!("a-{}", i).into_bytes()));
-        }
-        // Next 5 messages overflow into spillover.
-        for i in 0..5 {
-            assert!(mc.add_message(1, format!("b-{}", i).into_bytes()));
-        }
-        assert_eq!(mc.pending_count(1), MAX_MESSAGES_PER_FRAME);
-        assert_eq!(mc.spillover_count(1), 5);
+        mc.add_message(1, b"keep".to_vec());
+        mc.add_message(1, b"drop".to_vec());
+        assert_eq!(mc.pending_count(1), 2);
+
+        mc.remove(&[b"drop".to_vec()]);
+        assert_eq!(mc.pending_count(1), 1);
+        // The surviving message is still collectable.
+        assert_eq!(mc.collect_for_rank(1), vec![b"keep".to_vec()]);
+
+        // Not blacklisted: the same bytes can be re-added later.
+        assert!(mc.add_message(1, b"drop".to_vec()));
+        assert_eq!(mc.pending_count(1), 2);
     }
 
     #[test]
-    fn spillover_drains_on_collect() {
-        // `collect_for_rank(rank)` drains every live buffer and every
-        // spillover bucket for ranks `<= rank`, then caps the merged
-        // result at `MAX_MESSAGES_PER_FRAME` (proposals can't carry
-        // more than the per-frame cap regardless of how much was
-        // queued).
+    fn collect_returns_all_uncapped() {
+        // collect_for_rank returns EVERY pending message `<= rank`, no
+        // truncation, and is non-destructive.
         let mc = MessageCollector::new();
-        // Fill rank 0 to capacity + spill 2.
-        for i in 0..MAX_MESSAGES_PER_FRAME + 2 {
+        for i in 0..250 {
             mc.add_message(0, format!("r0-{}", i).into_bytes());
         }
-        assert_eq!(mc.spillover_count(0), 2);
-        // Fill rank 1 to capacity + spill 3.
-        for i in 0..MAX_MESSAGES_PER_FRAME + 3 {
+        for i in 0..250 {
             mc.add_message(1, format!("r1-{}", i).into_bytes());
         }
-        assert_eq!(mc.spillover_count(1), 3);
-
-        // Total queued = 2 * MAX + 5 = 205. After collect, the merged
-        // set is truncated to MAX_MESSAGES_PER_FRAME.
         let msgs = mc.collect_for_rank(1);
-        assert_eq!(msgs.len(), MAX_MESSAGES_PER_FRAME);
-        // Both spillover buckets drain on collect.
-        assert_eq!(mc.spillover_count(0), 0);
-        assert_eq!(mc.spillover_count(1), 0);
-        // Live buffers also drain (single rank-view: producer & consumer share).
-        assert_eq!(mc.pending_count(0), 0);
-        assert_eq!(mc.pending_count(1), 0);
+        assert_eq!(msgs.len(), 500);
+        // Non-destructive: still pending after collect.
+        assert_eq!(mc.pending_count(0), 250);
+        assert_eq!(mc.pending_count(1), 250);
     }
 
     #[test]
@@ -401,15 +719,16 @@ mod tests {
         mc.add_message(20, b"new".to_vec());
 
         let msgs = mc.collect_for_rank(20);
-        // Producer and consumer share a single rank view: collect_for_rank
-        // drains EVERY live rank `<= rank`, not just the target rank.
-        // All three ranks (1, 15, 20) drain.
+        // collect_for_rank PEEKS every live rank `<= rank` (including the
+        // about-to-age-out rank 1) before pruning, so all 3 are returned.
         assert_eq!(msgs.len(), 3);
-        // Retention prune: rank 1 < 20 - RETENTION_WINDOW(10) → bucket dropped.
+        // Retention prune runs AFTER the peek: rank 1 < 20 - WINDOW(10) is
+        // dropped; ranks 15 and 20 survive and are NOT consumed (collect is
+        // non-destructive).
         assert_eq!(mc.pending_count(1), 0);
-        // Rank 15 stays inside the retention window but is now empty.
-        assert_eq!(mc.pending_count(15), 0);
-        assert_eq!(mc.total_pending(), 0);
+        assert_eq!(mc.pending_count(15), 1);
+        assert_eq!(mc.pending_count(20), 1);
+        assert_eq!(mc.total_pending(), 2);
     }
 
     #[test]
@@ -431,6 +750,29 @@ mod tests {
         assert!(mc.add_message(1, join));
 
         assert_eq!(mc.pending_count(1), 2);
+    }
+
+    #[test]
+    fn add_message_outcome_distinguishes_accepted_duplicate_filtered() {
+        let mc = MessageCollector::new();
+        // A prover op (0x0301 = ProverJoin): new → Accepted, re-submit →
+        // Duplicate (the collector already holds it — NOT a drop, so a submit
+        // handler reports success and the prover doesn't see a transport error).
+        let mut bundle = 0x0301u32.to_be_bytes().to_vec();
+        bundle.extend_from_slice(b"prover-op");
+        assert_eq!(mc.add_message_outcome(1, bundle.clone()), SubmitOutcome::Accepted);
+        assert_eq!(mc.add_message_outcome(1, bundle), SubmitOutcome::Duplicate);
+        // In prover-only mode a non-prover message is a REAL reject (Filtered).
+        mc.set_prover_only_mode(true);
+        assert_eq!(
+            mc.add_message_outcome(2, b"not-a-prover-message".to_vec()),
+            SubmitOutcome::Filtered
+        );
+        // The bool `add_message` wrapper is unchanged: true only for Accepted.
+        let mut b2 = 0x0301u32.to_be_bytes().to_vec();
+        b2.extend_from_slice(b"another");
+        assert!(mc.add_message(3, b2.clone()));
+        assert!(!mc.add_message(3, b2));
     }
 
     #[test]
@@ -494,5 +836,41 @@ mod tests {
         mc.clear_shard_frame_dedup();
         // Same frame number now accepted because cache is empty.
         assert!(mc.dedup_shard_frames(&vec![(vec![0xAAu8; 32], 100)]));
+    }
+
+    #[test]
+    fn lockstep_gate_accepts_only_preceding_anchor() {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{
+            CanonicalMessageBundle, CanonicalMessageRequest,
+        };
+
+        // A bundle carrying one shard FrameHeader anchored to `anchor`.
+        let make = |anchor: u64| -> Vec<u8> {
+            let fh = FrameHeader {
+                address: vec![0x11u8; 32],
+                frame_number: 7,
+                global_frame_number: anchor,
+                ..Default::default()
+            };
+            let req = CanonicalMessageRequest {
+                inner_type_prefix: TYPE_FRAME_HEADER,
+                inner_bytes: fh.to_canonical_bytes().unwrap(),
+            };
+            CanonicalMessageBundle { requests: vec![Some(req)], timestamp: 0 }
+                .to_canonical_bytes()
+                .unwrap()
+        };
+
+        // Building global frame 100: in lockstep iff anchor ∈ [99-W, 99] or 0.
+        // With W = STORAGE_ANCHOR_LOCKSTEP_WINDOW, the window is [87, 99].
+        assert!(bundle_shard_frames_in_lockstep(&make(99), 100), "anchor==frame-1 in lockstep");
+        assert!(bundle_shard_frames_in_lockstep(&make(0), 100), "genesis anchor exempt");
+        assert!(bundle_shard_frames_in_lockstep(&make(98), 100), "anchor just inside window accepted");
+        assert!(bundle_shard_frames_in_lockstep(&make(87), 100), "oldest in-window anchor accepted");
+        assert!(!bundle_shard_frames_in_lockstep(&make(86), 100), "anchor older than window dropped");
+        assert!(!bundle_shard_frames_in_lockstep(&make(100), 100), "future anchor dropped");
+        // Non-bundle / non-shard-frame data passes (this gate only governs shard frames).
+        assert!(bundle_shard_frames_in_lockstep(b"not a bundle", 100));
     }
 }

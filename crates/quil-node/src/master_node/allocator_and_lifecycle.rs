@@ -6,12 +6,6 @@ use quil_lifecycle::Supervisor;
 
 pub(crate) struct LifecycleHandles {
     pub worker_allocator: Arc<quil_engine::worker_allocator::WorkerAllocator>,
-    pub consensus_handle:
-        Arc<std::sync::OnceLock<quil_engine::consensus_types::GlobalEventLoopHandle>>,
-    pub vote_aggregator:
-        Arc<std::sync::OnceLock<Arc<quil_engine::vote_aggregation::VoteAggregation>>>,
-    pub timeout_aggregator:
-        Arc<std::sync::OnceLock<Arc<quil_engine::timeout_aggregation::TimeoutAggregation>>>,
     pub prover_lifecycle: Arc<quil_engine::provers::lifecycle::ProverLifecycle>,
     pub frame_materializer: Option<Arc<quil_engine::frame_materializer::FrameMaterializer>>,
 }
@@ -154,30 +148,6 @@ pub(crate) fn init(
         });
     }
 
-    // Shared slot for the consensus event-loop handle, populated by the
-    // sync task once a genesis frame is in the store. The receive loop
-    // and lifecycle pipeline read from it to feed inbound proposals/QCs/TCs
-    // back into the HotStuff event loop.
-    let consensus_handle: Arc<std::sync::OnceLock<
-        quil_engine::consensus_types::GlobalEventLoopHandle,
-    >> = Arc::new(std::sync::OnceLock::new());
-
-    // Per-rank vote aggregator. Populated alongside the handle by
-    // `activate_consensus`. The receive loop feeds inbound
-    // ProposalVote + GlobalProposal messages in so votes accumulate
-    // toward a quorum certificate, which is then submitted back to
-    // the event loop via the shared handle.
-    let vote_aggregator: Arc<std::sync::OnceLock<
-        Arc<quil_engine::vote_aggregation::VoteAggregation>,
-    >> = Arc::new(std::sync::OnceLock::new());
-
-    // Per-rank timeout aggregator. Same lifecycle as the vote aggregator
-    // but for TimeoutState messages — produces TCs (and partial TCs)
-    // from aggregated timeout signatures.
-    let timeout_aggregator: Arc<std::sync::OnceLock<
-        Arc<quil_engine::timeout_aggregation::TimeoutAggregation>,
-    >> = Arc::new(std::sync::OnceLock::new());
-
     // Prover lifecycle coordinator — evaluates join/confirm/leave on each frame.
     // Pulls cooldown state off the WorkerAllocator (single source of truth).
     let reward_greedy = config.engine.reward_strategy == "reward-greedy";
@@ -205,6 +175,10 @@ pub(crate) fn init(
     if network != 0 {
         const TESTNET_CONFIRM_WINDOW_FRAMES: u64 = 10;
         lifecycle_inner.set_confirm_window_frames(TESTNET_CONFIRM_WINDOW_FRAMES);
+        // Keep the worker reestablish cutoff in lockstep: a recovered
+        // Leaving allocation is reestablished only while within the
+        // confirm window, then handed to the lifecycle to confirm.
+        worker_allocator.set_confirm_window_frames(TESTNET_CONFIRM_WINDOW_FRAMES);
         // The lifecycle setting controls *when the local node submits*
         // a Confirm. The materializer's `validate_confirm_timing`
         // independently enforces that the recipient ledger has waited
@@ -255,7 +229,7 @@ pub(crate) fn init(
         Arc::new(quil_engine::OptRewardIssuance);
     if archive_mode {
         let bls_for_intrinsic: Arc<dyn quil_types::crypto::BlsConstructor> =
-            Arc::new(quil_crypto::Bls48581KeyConstructor);
+            Arc::new(quil_crypto::FalconKeyConstructor);
         exec_manager.install_global_frame_header_deps(
             prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
             reward_issuer.clone(),
@@ -280,7 +254,53 @@ pub(crate) fn init(
             )
             .with_eviction_registry(prover_registry.clone())
             .with_rocks_hg_store(hg_store.clone())
-            .with_current_frame(current_frame.clone());
+            // Deterministic per-shard data-size source for the eviction
+            // halt gate: enumerate committed shards from the shards store
+            // and key by `confirmation_filter` = L2(32) ++ prefix-byte
+            // (strip the leading L1(3) from shard_key) — exactly how the
+            // registry/worker-allocator key filters. Every archive derives
+            // the same map from the same committed frames, so eviction is
+            // consensus-deterministic. Empty (size==0) shards are thereby
+            // excluded from suppressing eviction.
+            .with_shard_size_source({
+                let ss = shards_store.clone();
+                std::sync::Arc::new(move || {
+                    let mut out: std::collections::HashMap<Vec<u8>, u64> =
+                        std::collections::HashMap::new();
+                    if let Ok(shards) = ss.range_app_shards() {
+                        for s in shards {
+                            let l2_start = if s.shard_key.len() >= 3 { 3 } else { 0 };
+                            let mut filter = s.shard_key[l2_start..].to_vec();
+                            for p in &s.prefix {
+                                filter.push(*p as u8);
+                            }
+                            if filter.is_empty() {
+                                continue;
+                            }
+                            // `size` is a big-endian byte count; we only need
+                            // "has any data" → record 1 when non-zero.
+                            let has_data = s.size.iter().any(|&b| b != 0);
+                            out.insert(filter, if has_data { 1 } else { 0 });
+                        }
+                    }
+                    out
+                })
+            })
+            .with_current_frame(current_frame.clone())
+            // MAINNET-ONLY 2.1.0.25 frozen-era recovery: no-op-materialize the
+            // frozen range so the wedged fleet un-sticks deterministically. Off
+            // on localnet/testnet, which never reach these heights anyway.
+            .with_frozen_era_recovery(network == 0)
+            // Same `frame_prover` Arc installed into the intrinsic above, so
+            // the batch-preverified set the materializer records is the one
+            // `verify_frame_header_signature` reads. BLS constructor is
+            // stateless (the set lives on the frame prover), so a fresh one
+            // is equivalent.
+            .with_bls_batch_verify(
+                frame_prover.clone(),
+                Arc::new(quil_crypto::FalconKeyConstructor)
+                    as Arc<dyn quil_types::crypto::BlsConstructor>,
+            );
             Some(Arc::new(m))
         } else {
             None
@@ -288,9 +308,6 @@ pub(crate) fn init(
 
     LifecycleHandles {
         worker_allocator,
-        consensus_handle,
-        vote_aggregator,
-        timeout_aggregator,
         prover_lifecycle,
         frame_materializer,
     }

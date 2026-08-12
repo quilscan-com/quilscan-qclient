@@ -32,6 +32,34 @@ pub(crate) async fn start(
     // `tokio::spawn`.
     let detached_spawner = sup.detached_spawner();
 
+    // Pin the epoch length from the network id BEFORE genesis (frame 0) or any
+    // frame evaluation. Mainnet keeps 720; testnet/devnet use a short epoch so
+    // the join→confirm→activate lifecycle runs in minutes. Every epoch timing
+    // rule reads `epoch_length_frames()`, so this one call scales them all.
+    quil_types::consensus::init_epoch_length_for_network(network);
+    // Localnet-only shortcut: `QUIL_EPOCH_LENGTH_FRAMES=<n>` shrinks the epoch so
+    // the join→confirm→activate lifecycle completes in a handful of frames (the
+    // confirm is gated to the epoch AFTER join). CONSENSUS PARAMETER — every node
+    // in the net MUST set the same value; localnet.sh sets it uniformly. Never
+    // set on a shared testnet/mainnet. Ignored on mainnet (network 0).
+    if network != 0 {
+        if let Ok(v) = std::env::var("QUIL_EPOCH_LENGTH_FRAMES") {
+            if let Ok(frames) = v.parse::<u64>() {
+                if frames > 0 {
+                    quil_types::consensus::set_epoch_length_frames(frames);
+                    warn!(frames, "QUIL_EPOCH_LENGTH_FRAMES override active (localnet only)");
+                }
+            }
+        }
+    }
+    if network != 0 {
+        info!(
+            network,
+            epoch_length_frames = quil_types::consensus::epoch_length_frames(),
+            "testnet epoch length pinned",
+        );
+    }
+
     let storage = storage::init(config, archive_mode)?;
     let db_arc = storage.db_arc.clone();
     let clock_store = storage.clock_store.clone();
@@ -40,16 +68,116 @@ pub(crate) async fn start(
     let shards_store = storage.shards_store.clone();
     let hg_store = storage.hg_store.clone();
 
+    // Normalize the QUIL-token shard grid to the single-nibble (64-shard)
+    // topology. MAINNET ONLY (network 0): a DB restored via the pebble->rocksdb
+    // migration carries the legacy 64x64 = 4096 grid; with a fresh prover tree
+    // those 4096 shards each start with zero coverage and the network can never
+    // escape the coverage halt. On testnet/devnet QUIL is a single shard that
+    // splits DYNAMICALLY like every other app, so forcing a fixed grid here
+    // would fight the split logic (collapsing legitimate splits on every
+    // restart) — skip it entirely.
+    if network == 0 {
+        if let Err(e) = normalize_quil_token_grid(shards_store.as_ref(), clock_store.as_ref()) {
+            tracing::warn!(error = %e, "failed to normalize QUIL token shard grid");
+        }
+    }
+
+    // Fresh-config peer key: on first run `config.p2p.peer_priv_key` is
+    // empty. Generate + persist the Ed448 identity HERE, before anything
+    // reads it — `keys::init` derives `prover_address` from this key, and
+    // `P2PNode::new` would otherwise generate its own copy that the
+    // already-built `FileKeyManager` never sees. That gap was the
+    // "q-peer-key not found" failure on the first run that vanished on
+    // the second (once the key had been persisted to the config file).
+    // Shadow `config` with the filled-in version so the entire startup —
+    // keys, networking, prover address, downstream peer-key reads — is
+    // consistent on the very first run.
+    let owned_config;
+    let config: &quil_config::Config = if config.p2p.peer_priv_key.is_empty() {
+        let key_hex = quil_p2p::ed448_identity::Ed448Identity::generate()
+            .map_err(|e| anyhow::anyhow!("failed to generate Ed448 peer key: {}", e))?
+            .to_config_hex();
+        let mut c = config.clone();
+        c.p2p.peer_priv_key = key_hex;
+        match quil_config::save_config(config_dir, &c) {
+            Ok(()) => info!("generated and persisted new Ed448 peer key (stable identity)"),
+            Err(e) => warn!(error = %e, "failed to persist generated peer key to config (continuing with in-memory key)"),
+        }
+        owned_config = c;
+        &owned_config
+    } else {
+        config
+    };
+
     let keys = keys::init(config, config_dir)?;
     let file_key_manager = keys.file_key_manager.clone();
     let bls_pubkey = keys.bls_pubkey.clone();
     let prover_address = keys.prover_address;
 
-    let engines = engines::init_engines(&storage);
+    // Raw Falcon-512 signing key (q-prover-key) — the libp2p network identity.
+    let falcon_signing_key = {
+        use quil_keys::KeyManager as _;
+        file_key_manager
+            .get_private_key(quil_types::crypto::KeyType::Falcon512)
+            .map_err(|e| anyhow::anyhow!("load Falcon network identity key: {e}"))?
+    };
+
+    let engines = engines::init_engines(&storage, network);
     let inclusion_prover = engines.inclusion_prover.clone();
     let crdt = engines.crdt.clone();
     let exec_manager = engines.exec_manager.clone();
     engines::bootstrap_genesis(network, config, &storage, &engines, &bls_pubkey)?;
+
+    // One-time corrective restore of the global-committee provers' Seniority.
+    // The re-bootstrapped mainnet left the genesis archive provers at
+    // Seniority=0 (a pre-fix eviction that kicked global provers zeroes
+    // Seniority). Since the global consensus quorum threshold is
+    // `(Σ seniority · 2) / 3`, zero total weight makes the threshold 0 — a
+    // single vote forms a QC/TC, the committee forks into per-archive solo
+    // chains, and global consensus can't finalize. This deterministically
+    // restores the genesis seniority (idempotent no-op once correct), so all
+    // archives converge on the same corrected prover-tree root and a real
+    // quorum is required again. It ALSO SEEDS the global committee when the
+    // prover tree is empty — the case on a freshly-migrated DB (the KZG→JMT
+    // migration only carries shards that hold state, so an emptied global prover
+    // shard is dropped), which is the only post-genesis path that installs the
+    // Falcon global provers. Archive-only: non-archives converge via hypersync
+    // of the corrected/seeded tree. See
+    // `quil_engine::genesis::restore_global_prover_seniority`.
+    if network == 0 && archive_mode {
+        let head = storage.clock_store.get_latest_frame_number().unwrap_or(0);
+        match quil_engine::genesis::restore_global_prover_seniority(&crdt, head) {
+            Ok(n) => {
+                if n > 0 {
+                    info!(corrected = n, head, "restored global prover seniority");
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to restore global prover seniority: {}",
+                    e
+                ));
+            }
+        }
+        // Remove the permanently-offline genesis archive prover from the
+        // global committee, so the active set is exactly 5 members and the
+        // hard-set count-based quorum resolves to 4-of-5. Deterministic +
+        // idempotent; must run on every archive so they converge on the same
+        // corrected prover-tree root before consensus resumes.
+        match quil_engine::genesis::remove_offline_global_prover(&crdt, head) {
+            Ok(changed) => {
+                if changed {
+                    info!(head, "removed offline global prover from committee");
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to remove offline global prover: {}",
+                    e
+                ));
+            }
+        }
+    }
 
 
     let frame_pipeline::FramePipeline {
@@ -65,7 +193,17 @@ pub(crate) async fn start(
         consensus_loopback_tx,
         consensus_loopback_rx,
         listen_addr,
-    } = networking::init(&mut sup, config, config_dir, network, archive_mode).await?;
+    } = networking::init(&mut sup, config, config_dir, network, archive_mode, &falcon_signing_key).await?;
+
+    // Bridge the p2p prometheus registry (blossomsub_* mesh/graft/prune/
+    // message families + libp2p_* connection families) into every metrics
+    // exposition (HTTP /metrics, gRPC GetMetrics, --metrics, TUI).
+    {
+        let p2p_for_metrics = p2p_handle.clone();
+        crate::rpc_metrics::set_extra_metrics_render(std::sync::Arc::new(move || {
+            p2p_for_metrics.render_metrics()
+        }));
+    }
 
     // Frame tracking — single source of truth for "what frame is
     // this node on right now." Updated by the BlossomSub receive
@@ -132,6 +270,11 @@ pub(crate) async fn start(
         );
     }
     let last_global_head_frame = Arc::new(std::sync::atomic::AtomicU64::new(initial_head_frame));
+    // Shared "gossip is carrying the global head" signal: stamped by the
+    // `GLOBAL_FRAME` receive path, read by the RPC poller so it backs off while
+    // gossip keeps the head fresh (regular nodes then follow the chain over the
+    // mesh instead of per-second RPC).
+    let gossip_freshness = quil_rpc::GossipFreshness::new();
 
     // Deferred worker-manager handle for per-worker reachability
     // advertisements. The PeerInfo broadcaster spawns here (before
@@ -162,6 +305,8 @@ pub(crate) async fn start(
         key_manager: file_key_manager.clone(),
         exec_manager: exec_manager.clone(),
         archive_mode,
+        network,
+        onion_routing_enabled: !config.p2p.disable_onion_routing,
     });
 
     let runtime_state::RuntimeState {
@@ -214,9 +359,6 @@ pub(crate) async fn start(
 
     let allocator_and_lifecycle::LifecycleHandles {
         worker_allocator,
-        consensus_handle,
-        vote_aggregator,
-        timeout_aggregator,
         prover_lifecycle,
         frame_materializer,
     } = allocator_and_lifecycle::init(&mut sup, allocator_and_lifecycle::LifecycleInitArgs {
@@ -256,14 +398,16 @@ pub(crate) async fn start(
         Some(seed)
     })();
 
-    // Log Ed448 identity if available
+    // Log the Ed448 SENIORITY-ROOT identity if available. NOTE: this is no
+    // longer the network peer-id (that's the Falcon q-prover-key — see
+    // networking::init); the Ed448 key is retained only as the seniority root.
     if let Some(ref seed) = mtls_seed {
         let ed448_pubkey = quil_p2p::ed448_identity::derive_public_key(seed);
         let ed448_peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&ed448_pubkey);
         info!(
             ed448_peer_id = hex::encode(&ed448_peer_id),
             ed448_pubkey_len = ed448_pubkey.len(),
-            "Ed448 identity ready (Go-compatible peer ID)"
+            "Ed448 seniority-root identity ready (NOT the network peer-id)"
         );
     }
 
@@ -271,7 +415,20 @@ pub(crate) async fn start(
     // PeerInfo handler whenever it sees a peer advertising
     // ARCHIVE_SERVICE_CAPABILITY_ID. The poller spawned below picks one as
     // its source and forward-polls the chain head.
-    let archive_pool = std::sync::Arc::new(quil_rpc::ArchiveEndpointPool::new());
+    // `-1` disables endpoint blacklisting entirely (devnet uses this so
+    // partition recovery is instantaneous); `0` was already coerced to the
+    // default by `EngineConfig::apply_defaults`. Any other negative value is
+    // a config mistake, not a second way to spell "disabled".
+    let blacklist_ttl = match config.engine.archive_blacklist_ttl_secs {
+        -1 => std::time::Duration::ZERO,
+        n if n < 0 => anyhow::bail!(
+            "engine.archiveBlacklistTtl must be -1 (disabled), 0 (default), or a \
+             positive number of seconds; got {n}"
+        ),
+        n => std::time::Duration::from_secs(n as u64),
+    };
+    let archive_pool =
+        std::sync::Arc::new(quil_rpc::ArchiveEndpointPool::new(blacklist_ttl));
 
     // Pre-seed the archive pool. Precedence matches the Go node
     // (`node/main.go:737-741`):
@@ -462,7 +619,9 @@ pub(crate) async fn start(
             archive_pool: archive_pool.clone(),
             clock_store: clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
             p2p_handle: p2p_handle.clone(),
-            ed448_seed: mtls_seed,
+            // Falcon network identity for :8340 dials (present iff we have a
+            // transport identity, gated by mtls_seed as before).
+            falcon_signing_key: mtls_seed.map(|_| falcon_signing_key.clone()),
             publish_to_blossomsub: archive_mode,
         });
 
@@ -483,6 +642,13 @@ pub(crate) async fn start(
         multisig_ed448_seeds,
         delegate_address,
         transport: prover_message_transport,
+        // Storage-attestation confirm hook deps (PoRep). Gated by
+        // STORAGE_EPOCH_ACTIVATION_FRAME inside `submit_confirm`, so these are
+        // inert until the storage fork.
+        hypergraph: Some(crdt.clone()),
+        replica_store: Some(quil_store::replica_store::ReplicaStore::new(
+            db_arc.clone() as Arc<dyn quil_types::store::KvDb>,
+        )),
     });
 
     // Shard orchestration subscriber: watches for ShardSplitEligible /
@@ -545,6 +711,171 @@ pub(crate) async fn start(
         info!("shard orchestration subscriber spawned");
     }
 
+    // Archive: subscribe to each active shard's per-shard gossip topics so the
+    // shard-frame firehose actually reaches this node. The message-loop already
+    // routes un-matched shard-frame traffic → `ArchiveAppShardIngest`, but only
+    // if the archive is MESHED on that shard's topic. The legacy `[0xFF; len]`
+    // catch-all relied on blossomsub's overlapping-bitmask (bloom-cover) mesh;
+    // under stock libp2p::gossipsub topics are EXACT-MATCH `IdentTopic`s, so the
+    // all-ones bitmask meshes with nobody. Subscribe per-shard instead (frame =
+    // ingest; consensus/prover/dispatch/cw = relay so the shard's provers —
+    // including separate-process cluster committee members — mesh through the
+    // archive). Re-scan periodically for new/split shards. `app_address == filter
+    // == shard_key l2` (app_engine.rs:1224), so the shard's 32-byte l2 is the
+    // topic seed.
+    if archive_mode {
+        let p2p_sub = p2p_handle.clone();
+        let reg_sub: Arc<dyn quil_types::consensus::ProverRegistry> =
+            prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>;
+        sup.spawn("archive-shard-topic-subscriber", move |cancel| async move {
+            let mut subscribed: std::collections::HashSet<Vec<u8>> =
+                std::collections::HashSet::new();
+            loop {
+                // Collect the EXACT per-shard filters the shard's provers publish
+                // on — `ProverAllocationInfo.confirmation_filter` IS the app
+                // engine's `filter` (`app_engine.rs:1224`), including the
+                // sub-shard prefix byte. The base shard_key l2 alone yields a
+                // DIFFERENT bloom topic (`get_bloom_filter`) and never meshes with
+                // the workers. Owned (no borrow held across the awaits below).
+                let mut filters: Vec<Vec<u8>> = Vec::new();
+                if let Ok(provers) = reg_sub.get_all_active_app_shard_provers() {
+                    for p in &provers {
+                        for a in &p.allocations {
+                            if !a.confirmation_filter.is_empty() {
+                                filters.push(a.confirmation_filter.clone());
+                            }
+                        }
+                    }
+                }
+                for f in filters {
+                    if subscribed.insert(f.clone()) {
+                        p2p_sub
+                            .subscribe(quil_engine::bitmasks::shard_frame_bitmask(&f))
+                            .await;
+                        p2p_sub
+                            .subscribe(quil_engine::bitmasks::shard_consensus_bitmask(&f))
+                            .await;
+                        p2p_sub
+                            .subscribe(quil_engine::bitmasks::shard_prover_bitmask(&f))
+                            .await;
+                        p2p_sub
+                            .subscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&f))
+                            .await;
+                        p2p_sub
+                            .subscribe(quil_engine::bitmasks::shard_cw_bitmask(&f))
+                            .await;
+                        info!(
+                            shard = %hex::encode(&f),
+                            "archive subscribed to per-shard gossip topics",
+                        );
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    _ = cancel.cancelled() => return Ok(()),
+                }
+            }
+        });
+        info!("archive shard-topic subscriber spawned");
+    }
+
+    // Commonware-simplex inbound router (P2c cutover). Shared, set post-spawn at
+    // the archive-sync activation site when the committee is configured; unset
+    // (the default) leaves the simplex path off.
+    let cw_router: Arc<
+        std::sync::OnceLock<Arc<crate::cw_consensus_bridge::CwInboundRouter>>,
+    > = Arc::new(std::sync::OnceLock::new());
+
+    // CW global-consensus committee roster. On mainnet (network 0) the committee
+    // IS the embedded genesis data — the same `archive_peers` (peer_id ->
+    // Falcon-512 pubkey) that already seeds `genesis_prover_addrs` and the
+    // static archive pool. It is fixed by the binary, NOT a hand-populated
+    // operator config: every archive would otherwise have to carry an identical
+    // `consensusCommittee`/`consensusCommitteePeerIds` list, and any one archive
+    // shipping it empty (as happened on the flag-day) leaves that node unable to
+    // start simplex (`start_cw_global_consensus returned None`), stranding it at
+    // the last legacy head forever. `genesis_archive_peers()` derives each
+    // member's peer id via `peer_id_from_falcon_pubkey`, so the resolve_peer map
+    // keys match exactly what the :8340 PQNoise transport authenticates inbound
+    // peers as. Non-mainnet networks keep the config-driven lists (localnet.sh
+    // populates them from `--print-identity`).
+    let (consensus_committee, consensus_committee_peer_ids): (Vec<String>, Vec<String>) =
+        if network == 0 {
+            match quil_engine::genesis::genesis_archive_peers() {
+                Ok(peers) => {
+                    let mut hexes = Vec::with_capacity(peers.len());
+                    let mut pids = Vec::with_capacity(peers.len());
+                    for (peer_id, pubkey) in peers {
+                        pids.push(peer_id);
+                        hexes.push(hex::encode(&pubkey));
+                    }
+                    info!(committee = hexes.len(), "CW committee loaded from genesis data");
+                    (hexes, pids)
+                }
+                Err(e) => {
+                    warn!(error = %e, "could not load genesis archive peers for CW committee");
+                    (Vec::new(), Vec::new())
+                }
+            }
+        } else {
+            (
+                config.engine.consensus_committee.clone(),
+                config.engine.consensus_committee_peer_ids.clone(),
+            )
+        };
+
+    // Bind the fixed global committee (genesis archives' Falcon pubkeys) into the
+    // receive-path frame validator so CW-finalized global frames arriving over
+    // GLOBAL_FRAME gossip are verified via their carried finalization cert (CWCT).
+    // Without the committee the validator can't detect the cert, falls through to
+    // the legacy BLS-aggregate path, and rejects every cert-bearing gossip frame
+    // as "BLS signature INVALID" — which is exactly why non-archives couldn't
+    // follow the chain over gossip. The poller's own verifier is already
+    // committee-bound (see archive_sync); this gives the gossip path parity.
+    let frame_validator = {
+        let committee: Vec<Vec<u8>> = consensus_committee
+            .iter()
+            .filter_map(|s| hex::decode(s).ok())
+            .collect();
+        frame_validator.with_global_committee(committee)
+    };
+
+    // Broadcast channel for GlobalService::StreamGlobalMessages. Created here
+    // (before archive_sync + the recv loop) so the archive poller can tee
+    // GLOBAL_FRAME to cluster workers and the recv loop can feed GLOBAL_PEER_INFO;
+    // the gRPC server takes a clone later.
+    let global_msg_tx: tokio::sync::broadcast::Sender<
+        quil_types::proto::global::StreamGlobalMessagesResponse,
+    > = tokio::sync::broadcast::channel(
+        quil_rpc::global_service::GLOBAL_MESSAGE_BROADCAST_CAPACITY,
+    )
+    .0;
+
+    // GLOBAL_FRAME gossip publisher. The CW global finalizer (proposer-only)
+    // hands each finalized global frame here; this drain publishes it on the
+    // GLOBAL_FRAME topic so REGULAR / non-committee nodes get the chain head over
+    // gossip instead of RPC-polling archives (the poller stays as gap-fill).
+    // Non-blocking from the consensus finalize path: unbounded send → async
+    // publish. Wired only for CW committee members that actually finalize.
+    let global_frame_publisher: Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>> = {
+        let (gf_tx, mut gf_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let gf_p2p = p2p_handle.clone();
+        detached_spawner.detach("global-frame-gossip-publish", async move {
+            while let Some(data) = gf_rx.recv().await {
+                if let Err(e) = gf_p2p
+                    .publish(quil_engine::bitmasks::GLOBAL_FRAME.to_vec(), data)
+                    .await
+                {
+                    tracing::debug!(error = %e, "global-frame gossip publish failed");
+                }
+            }
+            Ok(())
+        });
+        Some(std::sync::Arc::new(move |data: Vec<u8>| {
+            let _ = gf_tx.send(data);
+        }))
+    };
+
     archive_sync::spawn_all(&mut sup, archive_sync::ArchiveSyncArgs {
         mtls_seed,
         network,
@@ -562,33 +893,70 @@ pub(crate) async fn start(
         coverage_monitor: coverage_monitor.clone(),
         current_frame: current_frame.clone(),
         last_global_head_frame: last_global_head_frame.clone(),
+        gossip_freshness: gossip_freshness.clone(),
         prover_pipeline: prover_pipeline.clone(),
         file_key_manager: file_key_manager.clone(),
         frame_prover: frame_prover.clone(),
         message_collector: message_collector.clone(),
         bls_pubkey: bls_pubkey.clone(),
         prover_address,
-        p2p_handle: p2p_handle.clone(),
-        consensus_handle: consensus_handle.clone(),
-        vote_aggregator: vote_aggregator.clone(),
-        timeout_aggregator: timeout_aggregator.clone(),
-        db_arc: db_arc.clone(),
+        genesis_prover_addrs: genesis_prover_addrs.clone(),
         frame_materializer: frame_materializer.clone(),
         consensus_loopback_tx: consensus_loopback_tx.clone(),
+        global_frame_publisher,
         peer_id,
         spawner: detached_spawner.clone(),
+        consensus_committee,
+        consensus_committee_peer_ids,
+        consensus_leader_timeout_secs: config.engine.consensus_leader_timeout_secs,
+        cw_router: cw_router.clone(),
+        // A STABLE subdir of the node's data dir for the simplex journal, so
+        // consensus resumes across restarts instead of replaying from the
+        // migration head (the CW runtime otherwise defaults to a random temp
+        // dir). Mirrors `storage::init`'s db-path default.
+        cw_storage_dir: {
+            let base = if config.db.path.is_empty() {
+                std::path::PathBuf::from(".config/store")
+            } else {
+                std::path::PathBuf::from(&config.db.path)
+            };
+            base.join("cw-global-consensus")
+        },
+        global_msg_tx: global_msg_tx.clone(),
     });
 
 
-    // Broadcast channel for GlobalService::StreamGlobalMessages.
-    // Construction here (before recv loop) so the recv loop can
-    // feed it; the gRPC server takes a clone later.
-    let global_msg_tx: tokio::sync::broadcast::Sender<
-        quil_types::proto::global::StreamGlobalMessagesResponse,
-    > = tokio::sync::broadcast::channel(
-        quil_rpc::global_service::GLOBAL_MESSAGE_BROADCAST_CAPACITY,
-    )
-    .0;
+    // Archive-only: ingest full app-shard frames into the archive's CRDT
+    // so it holds (and can serve via HyperSync) every shard's state.
+    let archive_app_shard_ingest = if archive_mode {
+        Some(quil_engine::archive_ingest::ArchiveAppShardIngest::new(
+            prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+            Arc::new(quil_crypto::FalconKeyConstructor)
+                as Arc<dyn quil_types::crypto::BlsConstructor>,
+            frame_prover.clone(),
+            exec_manager.clone(),
+            inclusion_prover.clone(),
+            crdt.clone(),
+            Some(db_arc.clone() as Arc<dyn quil_types::store::KvDb>),
+            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+        ))
+    } else {
+        None
+    };
+
+    // Explorer service is archive-only (only archives hold the full frame
+    // + hypergraph history it serves) and gated by config. The recent-
+    // message ring is created here so the message loop can feed it; `None`
+    // means no tap and no overhead.
+    let explorer_enabled = archive_mode && config.explorer.enabled;
+    let recent_messages: Option<Arc<quil_explorer::RecentMessageRing>> = if explorer_enabled {
+        Some(Arc::new(quil_explorer::RecentMessageRing::new(
+            quil_explorer::message_ring::DEFAULT_CAPACITY,
+        )))
+    } else {
+        None
+    };
+
     message_loop::spawn(&mut sup, message_loop::MessageLoopArgs {
         clock_store: clock_store.clone(),
         exec_manager: exec_manager.clone(),
@@ -597,20 +965,22 @@ pub(crate) async fn start(
         global_msg_tx: global_msg_tx.clone(),
         archive_pool: archive_pool.clone(),
         mtls_seed,
+        // Falcon network identity for the prover-tree bootstrap :8340 dial
+        // (present iff we have a transport identity, gated by mtls_seed).
+        prover_falcon_key: mtls_seed.map(|_| falcon_signing_key.clone()),
         hg_store: hg_store.clone(),
         frame_validator,
         message_collector: message_collector.clone(),
         coverage_monitor: coverage_monitor.clone(),
         worker_allocator: worker_allocator.clone(),
         prover_pipeline: prover_pipeline.clone(),
-        consensus_handle: consensus_handle.clone(),
-        vote_aggregator: vote_aggregator.clone(),
-        timeout_aggregator: timeout_aggregator.clone(),
         peer_info_cache: peer_info_cache.clone(),
         shard_engines: shard_engines.clone(),
         signer_registry: signer_registry.clone(),
         current_frame: current_frame.clone(),
+        cw_router: cw_router.clone(),
         last_global_head_frame: last_global_head_frame.clone(),
+        gossip_freshness: gossip_freshness.clone(),
         genesis_archive_peer_ids: genesis_archive_peer_ids.clone(),
         genesis_prover_addrs: genesis_prover_addrs.clone(),
         alert_pubkey: hex::decode(&config.engine.alert_key).unwrap_or_default(),
@@ -627,6 +997,8 @@ pub(crate) async fn start(
             None
         },
         spawner: detached_spawner.clone(),
+        archive_app_shard_ingest,
+        recent_messages: recent_messages.clone(),
     });
 
     // ---------------------------------------------------------------
@@ -645,6 +1017,7 @@ pub(crate) async fn start(
         prover_address,
         token_store: token_store.clone(),
         prover_registry: prover_registry.clone(),
+        signer_registry: signer_registry.clone(),
         prover_pipeline: prover_pipeline.clone(),
         worker_manager: worker_manager.clone(),
         inclusion_prover: inclusion_prover.clone(),
@@ -659,8 +1032,75 @@ pub(crate) async fn start(
         global_msg_tx: global_msg_tx.clone(),
         archive_pool: archive_pool.clone(),
         spawner: detached_spawner.clone(),
+        consensus_loopback_tx: consensus_loopback_tx.clone(),
     })?;
 
+    // ---------------------------------------------------------------
+    // 7b. Explorer REST API (archive-only, config-gated)
+    // ---------------------------------------------------------------
+    // Serves a read-only JSON API over the live stores — no second DB,
+    // no second sync (unlike the standalone Go `node/explorer`). Reuses
+    // the same per-shard metadata provider the gRPC global service uses,
+    // so `/provers/shards` sizes match `GetAppShards`.
+    if explorer_enabled {
+        let listen_addr = config.explorer.listen_addr.clone();
+        let app_shards_provider: quil_explorer::AppShardsProvider = {
+            let crdt = crdt.clone();
+            Arc::new(move |shard_key: &[u8], prefix: &[u32]| {
+                let info = quil_types::store::ShardInfo {
+                    shard_key: shard_key.to_vec(),
+                    prefix: prefix.to_vec(),
+                    size: Vec::new(),
+                    data_shards: 0,
+                    commitment: Vec::new(),
+                };
+                let meta = quil_engine::app_shard_metadata::get_app_shard_metadata(
+                    crdt.as_ref(),
+                    &info,
+                )?;
+                Some((meta.size, meta.data_shards, meta.commitments))
+            })
+        };
+        // Coverage-halt durations provider — the same source the archive
+        // evictor consults, so the explorer's eviction-risk numbers match
+        // real eviction decisions.
+        let halt_durations_provider: quil_explorer::HaltDurationsProvider = {
+            let cm = coverage_monitor.clone();
+            Arc::new(move |frame: u64| cm.current_halt_durations(frame))
+        };
+        let state = quil_explorer::ExplorerState::new(
+            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+            crdt.clone(),
+            prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+            key_store.clone() as Arc<dyn quil_types::store::KeyStore>,
+            shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>,
+            Some(app_shards_provider),
+            Some(halt_durations_provider),
+            peer_info_cache.clone(),
+            recent_messages
+                .clone()
+                .expect("recent_messages ring present when explorer enabled"),
+            last_global_head_frame.clone(),
+        );
+        let router = quil_explorer::router(state);
+        match tokio::net::TcpListener::bind(&listen_addr).await {
+            Ok(listener) => {
+                info!(addr = %listen_addr, "explorer REST API listening");
+                sup.spawn("explorer-http", move |token| async move {
+                    quil_explorer::serve(listener, router, async move {
+                        token.cancelled().await;
+                    })
+                    .await
+                    .map_err(anyhow::Error::from)
+                });
+            }
+            Err(e) => warn!(
+                addr = %listen_addr,
+                error = %e,
+                "failed to bind explorer REST API; explorer disabled",
+            ),
+        }
+    }
 
     // ---------------------------------------------------------------
     // 8. Wait for shutdown
@@ -668,6 +1108,147 @@ pub(crate) async fn start(
     let reason = sup.run().await;
     info!("master node shutting down");
 
+    // Release retained RocksDB snapshots before teardown so they don't
+    // pin superseded versions past the DB's life. Drop would eventually
+    // do this, but an explicit close also stops new generations from
+    // being published during shutdown. Any in-flight sync session
+    // holding a generation handle keeps its own snapshot alive until it
+    // finishes (the Arc clone), then releases.
+    crdt.close_snapshots();
+
     Ok(reason)
 }
 
+
+/// Ensure the QUIL-token app-shard grid is the single-nibble (64-shard)
+/// topology rather than the legacy 64x64 = 4096 grid. Genesis seeds 64
+/// directly; this handles a DB restored via the pebble->rocksdb migration
+/// (which carries the old 4096 grid) so a fresh prover tree re-forms
+/// coverage over 64 shards instead of stalling on 4096 under-covered ones.
+///
+/// Idempotent: returns early when the grid is already exactly 64 QUIL
+/// shards each with a single-byte prefix. Token DATA (the `l2 = QUIL_TOKEN`
+/// tree) is never touched — only the coverage/assignment grid.
+fn normalize_quil_token_grid(
+    shards_store: &dyn quil_types::store::ShardsStore,
+    clock_store: &quil_store::RocksClockStore,
+) -> anyhow::Result<()> {
+    use quil_types::store::ClockStore as _;
+    use quil_types::store::ShardInfo;
+    let quil = quil_execution::domains::QUIL_TOKEN;
+    let all = shards_store.range_app_shards()?;
+    // QUIL entries: shard_key = L1(3) || L2(32); L2 == QUIL_TOKEN.
+    let quil_entries: Vec<&ShardInfo> = all
+        .iter()
+        .filter(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == quil[..])
+        .collect();
+    let already_normalized =
+        quil_entries.len() == 64 && quil_entries.iter().all(|s| s.prefix.len() == 1);
+    if already_normalized {
+        return Ok(());
+    }
+    // shard_key is identical across all QUIL entries (they differ only in
+    // prefix); reuse an existing one, or reconstruct it as L1 || QUIL_TOKEN.
+    let shard_key = match quil_entries.first() {
+        Some(s) => s.shard_key.clone(),
+        None => {
+            let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
+            let mut sk = Vec::with_capacity(3 + quil.len());
+            sk.extend_from_slice(&l1);
+            sk.extend_from_slice(&quil);
+            sk
+        }
+    };
+    let old_count = quil_entries.len();
+    let txn = clock_store.new_transaction(false)?;
+    for s in &quil_entries {
+        shards_store.delete_app_shard(txn.as_ref(), &s.shard_key, &s.prefix)?;
+    }
+    for i in 0..64u32 {
+        shards_store.put_app_shard(
+            txn.as_ref(),
+            &ShardInfo {
+                shard_key: shard_key.clone(),
+                prefix: vec![i],
+                size: Vec::new(),
+                data_shards: 0,
+                commitment: Vec::new(),
+            },
+        )?;
+    }
+    txn.commit()?;
+    tracing::info!(
+        old_count,
+        new_count = 64,
+        "normalized QUIL token shard grid to single-nibble (64-shard) topology"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod reshard_tests {
+    use super::*;
+    use quil_types::store::{ClockStore, ShardInfo, ShardsStore};
+
+    /// Integration test over a real RocksShardsStore: a legacy 64x64
+    /// (`[i,j]`) QUIL grid is collapsed to exactly 64 single-nibble (`[i]`)
+    /// shards by the actual `normalize_quil_token_grid` used at node
+    /// startup; non-QUIL tokens are untouched; and it's idempotent. Guards
+    /// the reshard wiring that a DB restored via the pebble->rocksdb tool
+    /// relies on.
+    #[test]
+    fn normalize_collapses_quil_grid_to_64_idempotent() {
+        let rocks = quil_store::RocksDb::open_in_memory().expect("open in-memory db");
+        let db = rocks.inner();
+        let shards = quil_store::RocksShardsStore::new(db.clone());
+        let clock = quil_store::RocksClockStore::new(db.clone());
+
+        let quil = quil_execution::domains::QUIL_TOKEN;
+        let mut quil_key = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3).to_vec();
+        quil_key.extend_from_slice(&quil);
+
+        // A non-QUIL token shard that must survive normalization.
+        let other_l2 = [0xABu8; 32];
+        let mut other_key = quil_hypergraph::addressing::get_bloom_filter_indices(&other_l2, 256, 3).to_vec();
+        other_key.extend_from_slice(&other_l2);
+
+        // Seed a legacy [i,j] QUIL grid (100 entries: i,j in 0..10) plus the
+        // non-QUIL shard.
+        let txn = clock.new_transaction(false).unwrap();
+        for i in 0u32..10 {
+            for j in 0u32..10 {
+                shards.put_app_shard(txn.as_ref(), &ShardInfo {
+                    shard_key: quil_key.clone(),
+                    prefix: vec![i, j],
+                    size: Vec::new(), data_shards: 0, commitment: Vec::new(),
+                }).unwrap();
+            }
+        }
+        shards.put_app_shard(txn.as_ref(), &ShardInfo {
+            shard_key: other_key.clone(),
+            prefix: vec![1, 2],
+            size: Vec::new(), data_shards: 0, commitment: Vec::new(),
+        }).unwrap();
+        txn.commit().unwrap();
+
+        normalize_quil_token_grid(&shards, &clock).unwrap();
+
+        let after = shards.range_app_shards().unwrap();
+        let quil_entries: Vec<_> = after.iter()
+            .filter(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == quil[..])
+            .collect();
+        assert_eq!(quil_entries.len(), 64, "QUIL collapses to exactly 64 (from 100 [i,j])");
+        assert!(quil_entries.iter().all(|s| s.prefix.len() == 1), "all QUIL shards single-nibble");
+        assert!(
+            after.iter().any(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == other_l2[..] && s.prefix == vec![1, 2]),
+            "non-QUIL token shard must be left untouched"
+        );
+
+        // Idempotent: a second pass is a no-op (still 64).
+        normalize_quil_token_grid(&shards, &clock).unwrap();
+        let quil2 = shards.range_app_shards().unwrap().iter()
+            .filter(|s| s.shard_key.len() >= 35 && s.shard_key[3..35] == quil[..])
+            .count();
+        assert_eq!(quil2, 64, "normalize is idempotent");
+    }
+}

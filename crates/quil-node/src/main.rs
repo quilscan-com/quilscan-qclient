@@ -19,6 +19,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod logging;
 
+mod forest_sync;
 mod prover_message_transport_prod;
 mod prover_tree_syncer_prod;
 
@@ -26,17 +27,28 @@ mod release_check;
 
 mod util;
 
-mod blossomsub_consensus_publisher;
+mod direct_global_consensus_publisher;
+mod cw_consensus_bridge;
 
 mod dht_node;
 
 mod worker_node;
 
 mod diagnostic;
+mod check_bootstrap;
+mod check_submit;
+mod fork_ladder;
+mod verify_migration;
+mod forest_migration;
+mod legacy_migration;
+mod coin_rescale;
 
 mod master_node;
 
 mod mem_stats;
+
+mod metrics_tui;
+mod rpc_metrics;
 
 /// Quilibrium Node — Rust implementation
 #[derive(Parser, Debug)]
@@ -74,6 +86,61 @@ struct Args {
     #[arg(long)]
     import_db: Option<PathBuf>,
 
+    /// Verify a migrated RocksDB is valid/accepted by the node's loaders
+    /// and validators (trie root, frame, QC/TC, certified state), then
+    /// exit. Empty path uses config.db.path.
+    #[arg(long)]
+    verify_db: Option<PathBuf>,
+
+    /// Convert the node's current KZG state DB (config.db.path) into a fresh
+    /// JMT forest DB at the given destination path, then exit. The forest is
+    /// the Phase-3 hash-Merkle state tree; the destination MUST be a new/empty
+    /// path (its key-space collides with the source DB's).
+    #[arg(long)]
+    migrate_db: Option<PathBuf>,
+
+    /// Archive-only: convert pre-2.1 verenc coins in the DB (config.db.path, or
+    /// the given path) into compact transparent public token entries and refresh
+    /// the lattice shadow-accumulator root, then exit. Deterministic and
+    /// consensus-safe; run once at the flag frame. Empty path uses config.db.path.
+    #[arg(long)]
+    migrate_legacy: Option<PathBuf>,
+
+    /// Archive-only CORRECTIVE pass for a DB migrated by the OLD byte-shifted
+    /// decode (every transparent coin ×256): in place, `÷256` each coin amount
+    /// and re-key to its corrected content address, then rebuild the forest +
+    /// receipt. No verenc re-decrypt, no backup. Bails loudly if the data isn't
+    /// uniformly inflated. Empty path uses config.db.path. Run once.
+    #[arg(long)]
+    fix_coin_scale: Option<PathBuf>,
+
+    /// Diagnose the consensus bootstrap root: replay the latest-QC
+    /// candidate-frame lookup and report whether the forks-root identity
+    /// (Poseidon of the frame output) matches the QC selector the leader
+    /// resolves its parent by. Empty path uses config.db.path. Read-only.
+    #[arg(long)]
+    check_bootstrap: Option<PathBuf>,
+
+    /// Diagnose prover-message submission to an archive. Connects to the
+    /// given `host:8340` over Ed448 mTLS and submits a no-op ProverJoin
+    /// bundle, reporting where the path breaks (handshake vs RPC). Use a
+    /// known archive, e.g. `--check-submit 192.69.222.130:8340`.
+    #[arg(long)]
+    check_submit: Option<String>,
+
+    /// Dump a ladder of stored global-frame fingerprints (frame, rank,
+    /// poseidon(output)) at back-off offsets from the head, then exit.
+    /// Run on every archive and diff the outputs to find where their chains
+    /// forked; the deepest frame all still share is the re-bootstrap
+    /// checkpoint. Empty path uses config.db.path. Read-only.
+    #[arg(long)]
+    fork_ladder: Option<PathBuf>,
+
+    /// Optional comma-separated back-off offsets for `--fork-ladder`
+    /// (e.g. `0,1000,30000,31000,32000`). Default is a wide ladder.
+    #[arg(long)]
+    fork_ladder_offsets: Option<String>,
+
     /// Print the peer ID to stdout and exit
     #[arg(long)]
     peer_id: bool,
@@ -82,17 +149,43 @@ struct Args {
     #[arg(long)]
     node_info: bool,
 
+    /// Ensure the node's identity keys exist (Ed448 seniority-root peer key +
+    /// the unified Falcon-512 `q-prover-key`), then print machine-readable
+    /// `PEER_ID=<base58>` (derived from the FALCON network identity),
+    /// `ED448_PEER_ID=<base58>` (the seniority-root id), `BLS_PUBKEY`,
+    /// `CONSENSUS_PUBKEY`, and `PROVER_ADDRESS` lines and exit. Used by
+    /// `scripts/localnet.sh` to assemble a genesis seed + peer multiaddrs.
+    #[arg(long)]
+    print_identity: bool,
+
+    /// Ensure all standard keys exist in `keys.yml` (creating any missing —
+    /// including the unified Falcon-512 `q-prover-key`, which is BOTH the prover
+    /// and the commonware-simplex consensus committee identity), then print
+    /// `CONSENSUS_PUBKEY=<hex>` and exit. Does NOT open the state DB
+    /// or start the node — a lightweight keys-only mode (mirrors Go's
+    /// `--generate-keys`). Safe to run against a stopped node's config.
+    #[arg(long)]
+    generate_keys: bool,
+
     /// Print peer info and exit
     #[arg(long)]
     peer_info: bool,
 
-    /// Print prometheus metrics and exit
+    /// Fetch prometheus metrics from the RUNNING node (over its gRPC
+    /// GetMetrics on listenGrpcMultiaddr), print, and exit
     #[arg(long)]
     metrics: bool,
 
     /// Filter metrics output by substring match
     #[arg(long)]
     metrics_filter: Option<String>,
+
+    /// Live metrics dashboard: attach to the RUNNING node's gRPC and watch
+    /// every metric (p2p connections, blossomsub mesh/grafts/prunes, RPC
+    /// requests, consensus) with rates, sections, and filtering. Keys:
+    /// `/` filter, Tab section, s sort, p pause, q quit.
+    #[arg(long)]
+    metrics_tui: bool,
 
     /// Write CPU profile to file
     #[arg(long)]
@@ -145,6 +238,14 @@ async fn main() -> anyhow::Result<ExitCode> {
         args.log_filter.as_deref(),
     );
 
+    // Raise RLIMIT_NOFILE soft → hard. The Go runtime did this
+    // automatically (Go ≥1.19), so the Go node never saw EMFILE; Rust
+    // does not, leaving the default soft limit (often 1024) in place.
+    // RocksDB alone is configured for up to 1000 open files, before
+    // counting p2p connections and gRPC — exhaustion kills the node
+    // mid-dial with "too many open files".
+    raise_fd_limit();
+
     // Initialize crypto subsystem
     quil_crypto::init();
 
@@ -155,35 +256,151 @@ async fn main() -> anyhow::Result<ExitCode> {
         peer_id: args.peer_id,
         node_info: args.node_info,
         peer_info: args.peer_info,
-        metrics: args.metrics,
-        metrics_filter: args.metrics_filter.clone(),
         network: args.network,
     };
     if diagnostic::handle_diagnostic_flags(&diag_flags, &config)? {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Install a Prometheus recorder. If `--prometheus-server` is given,
-    // ALSO start an HTTP listener; otherwise the recorder is installed
-    // silently so `NodeService::get_metrics` can render a snapshot on
-    // demand from the same recorder.
-    let metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle> = {
-        let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-        let builder = if let Some(ref addr) = args.prometheus_server {
+    // `--metrics` (Go parity): dial the RUNNING node's gRPC GetMetrics and
+    // print the full prometheus snapshot (optionally `--metrics-filter`).
+    if args.metrics {
+        return match diagnostic::print_metrics_from_node(
+            &config,
+            args.metrics_filter.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    // `--metrics-tui`: live dashboard attached to the running node's gRPC.
+    if args.metrics_tui {
+        return match metrics_tui::run_metrics_tui(&config, args.metrics_filter.clone()).await {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    // `--print-identity`: ensure keys exist, print them machine-readably, exit.
+    if args.print_identity {
+        // Ensure a stable Ed448 peer key (generate + persist if missing).
+        let mut cfg = config.clone();
+        if cfg.p2p.peer_priv_key.is_empty() {
+            cfg.p2p.peer_priv_key = quil_p2p::ed448_identity::Ed448Identity::generate()
+                .map_err(|e| anyhow::anyhow!("generate Ed448 peer key: {e}"))?
+                .to_config_hex();
+            quil_config::save_config(&args.config, &cfg)?;
+        }
+        // Derive the libp2p peer ID from the Ed448 key.
+        let pk_bytes = hex::decode(&cfg.p2p.peer_priv_key).unwrap_or_default();
+        let mut seed = [0u8; 57];
+        seed.copy_from_slice(&pk_bytes[..57]);
+        let ed_pub = quil_p2p::ed448_identity::derive_public_key(&seed);
+        let peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&ed_pub);
+        // Ensure the BLS prover key (auto-created if missing), read full pubkey.
+        let keys_path = if cfg.key.key_store_file.path.is_empty() {
+            args.config.join("keys.yml")
+        } else {
+            PathBuf::from(&cfg.key.key_store_file.path)
+        };
+        let proving_key_id = if cfg.engine.proving_key_id.is_empty() {
+            "default-proving-key".to_string()
+        } else {
+            cfg.engine.proving_key_id.clone()
+        };
+        let fkm = quil_keys::FileKeyManager::new(
+            keys_path,
+            &cfg.key.key_store_file.encryption_key,
+            proving_key_id,
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )?;
+        fkm.set_peer_priv_key_hex(&cfg.p2p.peer_priv_key);
+        fkm.ensure_standard_keys()?;
+        use quil_keys::KeyManager as _;
+        let bls_pubkey =
+            fkm.get_public_key(quil_types::crypto::KeyType::Falcon512)?;
+        // The consensus committee identity IS the proving key: prover and
+        // commonware-simplex committee roles share one Falcon-512 key. Emit it
+        // under CONSENSUS_PUBKEY (equal to BLS_PUBKEY) so genesis tooling can
+        // assemble the committee `Set<FalconPublicKey>` from the same value.
+        let consensus_pubkey = bls_pubkey.clone();
+        // The on-chain prover address = poseidon(prover pubkey). Emit it so
+        // archive keys/addresses can be hard-coded into genesis / prover tries.
+        let prover_address =
+            quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(&bls_pubkey)?;
+        // The libp2p NETWORK peer-id is now derived from the Falcon q-prover-key
+        // (== bls_pubkey), NOT the Ed448 peer key. The Ed448-derived id is still
+        // emitted (as ED448_PEER_ID) since it's the seniority-root identity.
+        let falcon_peer_id = quil_p2p::peer_id_from_falcon_pubkey(&bls_pubkey);
+        println!("PEER_ID={}", bs58::encode(&falcon_peer_id).into_string());
+        println!("ED448_PEER_ID={}", bs58::encode(&peer_id).into_string());
+        println!("BLS_PUBKEY={}", hex::encode(&bls_pubkey));
+        println!("CONSENSUS_PUBKEY={}", hex::encode(&consensus_pubkey));
+        println!("PROVER_ADDRESS={}", hex::encode(prover_address));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // `--generate-keys`: ensure all standard keys exist in keys.yml, print the
+    // consensus pubkey (which is the Falcon-512 proving key — prover and
+    // committee roles share one key), and exit — WITHOUT opening the state DB
+    // or starting the node. Used to bootstrap a node's consensus identity for a
+    // committee list.
+    if args.generate_keys {
+        let keys_path = if config.key.key_store_file.path.is_empty() {
+            args.config.join("keys.yml")
+        } else {
+            PathBuf::from(&config.key.key_store_file.path)
+        };
+        let proving_key_id = if config.engine.proving_key_id.is_empty() {
+            "default-proving-key".to_string()
+        } else {
+            config.engine.proving_key_id.clone()
+        };
+        let fkm = quil_keys::FileKeyManager::new(
+            keys_path,
+            &config.key.key_store_file.encryption_key,
+            proving_key_id,
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )?;
+        fkm.ensure_standard_keys()?;
+        use quil_keys::KeyManager as _;
+        let consensus_pubkey = fkm.get_public_key(quil_types::crypto::KeyType::Falcon512)?;
+        println!("CONSENSUS_PUBKEY={}", hex::encode(&consensus_pubkey));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Install a Prometheus recorder. If `--prometheus-server` is given, a
+    // unified HTTP `/metrics` endpoint is served on that address (spawned
+    // below, once the supervisor exists); otherwise the recorder is
+    // installed silently so `NodeService::get_metrics` can render a
+    // snapshot on demand from the same recorder.
+    //
+    // We deliberately do NOT use the exporter's built-in
+    // `with_http_listener`: it serves only the `metrics`-facade recorder,
+    // while our exposition also appends the p2p `prometheus-client`
+    // families (blossomsub_* / libp2p_*) via
+    // `rpc_metrics::extra_metrics_render` — one endpoint, both stacks.
+    let prometheus_http_addr: Option<std::net::SocketAddr> =
+        args.prometheus_server.as_ref().and_then(|addr| {
             match addr.parse::<std::net::SocketAddr>() {
-                Ok(sock) => {
-                    info!(addr = %sock, "prometheus HTTP listener enabled");
-                    builder.with_http_listener(sock)
-                }
+                Ok(sock) => Some(sock),
                 Err(e) => {
                     warn!(addr = %addr, error = %e, "invalid prometheus address, no HTTP listener");
-                    builder
+                    None
                 }
             }
-        } else {
-            builder
-        };
-        match builder.install_recorder() {
+        });
+    let metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle> = {
+        match metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder() {
             Ok(h) => Some(h),
             Err(e) => {
                 warn!(error = %e, "prometheus recorder install failed");
@@ -192,9 +409,24 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
     };
 
+    // Preflight: Falcon (KeyType=5) is the network peer identity. Prove this
+    // binary can round-trip a Falcon key through the peer-decode path BEFORE any
+    // handshake, so a falcon-incapable build (stale artifact / mis-provisioned
+    // feature / fn-dsa platform issue) fails here with one clear message instead
+    // of a storm of "cargo feature `falcon` is not enabled" per-peer errors.
+    match quil_p2p::falcon_identity_self_check() {
+        Ok(()) => info!("Falcon (KeyType=5) network identity: enabled"),
+        Err(e) => {
+            error!("{e}");
+            return Err(anyhow::anyhow!(e));
+        }
+    }
+
     // Register all engine metric descriptors once, AFTER the recorder
     // is installed so `describe_*` calls attach to it.
     quil_engine::metrics::register_engine_metrics();
+    quil_execution::metrics::register_execution_metrics();
+    rpc_metrics::register_rpc_metrics();
 
     // Build the supervisor that owns every long-running task in the
     // binary. Each spawned task is joined, so panics or task errors
@@ -215,14 +447,104 @@ async fn main() -> anyhow::Result<ExitCode> {
         });
     }
 
+    // Unified prometheus HTTP endpoint (`--prometheus-server <addr>`, Go
+    // parity with `-prometheus-server`): serves the facade recorder's
+    // snapshot plus the p2p prometheus-client families on every GET. A
+    // deliberately minimal HTTP/1.1 responder (Connection: close) — scrape
+    // traffic doesn't justify a web framework dependency.
+    if let (Some(sock), Some(h)) = (prometheus_http_addr, metrics_handle.as_ref().cloned()) {
+        sup.run_until_cancelled("prometheus-http", move |_token| async move {
+            let listener = match tokio::net::TcpListener::bind(sock).await {
+                Ok(l) => {
+                    info!(addr = %sock, "prometheus HTTP listener enabled");
+                    l
+                }
+                Err(e) => {
+                    warn!(addr = %sock, error = %e, "prometheus HTTP bind failed");
+                    return Ok(());
+                }
+            };
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+                let h = h.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    // Drain the request head (we answer every GET the same
+                    // way); bounded read with a short deadline so a stalled
+                    // client can't pin the task.
+                    let mut buf = [0u8; 2048];
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        stream.read(&mut buf),
+                    )
+                    .await;
+                    let mut body = h.render();
+                    let extra = rpc_metrics::extra_metrics_render();
+                    if !extra.is_empty() {
+                        if !body.ends_with('\n') {
+                            body.push('\n');
+                        }
+                        body.push_str(&extra);
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+    }
+
     // CPU profiling (placeholder — requires pprof crate)
     if let Some(ref path) = args.cpuprofile {
         info!(path = %path.display(), "CPU profiling requested (requires pprof crate integration)");
     }
 
-    // Memory profiling (placeholder — requires jemalloc-ctl or similar)
+    // On-demand jemalloc heap-profile dump via SIGUSR1. Heap profiling is
+    // compiled in (tikv-jemallocator `profiling` feature); it only produces
+    // output when the process was started with `MALLOC_CONF=prof:true`
+    // (+ `prof_prefix:<path>`). This is the remote-box workflow: the operator
+    // runs `kill -USR1 <pid>` once, watches RSS climb, runs it again, then
+    // diffs the two `.heap` files with `jeprof --base=` to name the leaking
+    // allocation stacks. Armed unconditionally on unix so no restart/flag is
+    // needed to capture a dump; a no-prof build just logs the enabling hint.
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sig = match signal(SignalKind::user_defined1()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "SIGUSR1 heap-dump handler unavailable");
+                    return;
+                }
+            };
+            info!(
+                "SIGUSR1 heap-profile handler armed — `kill -USR1 <pid>` dumps a jemalloc \
+                 profile (requires MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof at startup)"
+            );
+            while sig.recv().await.is_some() {
+                match crate::mem_stats::dump_heap_profile() {
+                    Ok(()) => info!(
+                        "jemalloc heap profile dumped to the MALLOC_CONF prof_prefix path \
+                         (<prefix>.<pid>.<seq>.heap)"
+                    ),
+                    Err(e) => warn!(error = %e, "heap profile dump failed"),
+                }
+            }
+        });
+    }
     if let Some(ref path) = args.memprofile {
-        info!(path = %path.display(), "memory profiling requested (will write after 20 minutes)");
+        info!(
+            path = %path.display(),
+            "note: --memprofile is superseded by the SIGUSR1 heap dump (MALLOC_CONF=prof:true)"
+        );
     }
 
     info!(
@@ -278,6 +600,80 @@ async fn main() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    if let Some(ref verify_path) = args.verify_db {
+        return match verify_migration::run_verify_db(verify_path, &config) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref dest_path) = args.migrate_db {
+        return match forest_migration::run_migrate_db(dest_path, &config) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref dest_path) = args.migrate_legacy {
+        return match legacy_migration::run_migrate_legacy(dest_path, &config) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref target_path) = args.fix_coin_scale {
+        return match coin_rescale::run_fix_coin_scale(target_path, &config) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref check_path) = args.check_bootstrap {
+        return match check_bootstrap::run_check_bootstrap(check_path, &config) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref db_path) = args.fork_ladder {
+        return match fork_ladder::run_fork_ladder(
+            db_path,
+            &config,
+            args.fork_ladder_offsets.as_deref(),
+        ) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
+    if let Some(ref addr) = args.check_submit {
+        return match check_submit::run_check_submit(addr, &config).await {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("{e}");
+                Ok(ExitCode::FAILURE)
+            }
+        };
+    }
+
     // Hand off to the chosen node mode. It owns `sup` for its lifetime,
     // registers its subsystems, runs the supervisor, and returns the
     // `ShutdownReason` for `main` to translate into an exit code.
@@ -306,11 +702,52 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
     };
 
-    match reason {
-        // POSIX convention: SIGINT-driven exit is 128 + SIGINT(2) = 130.
+    // The supervisor has returned, so shutdown is underway — but not
+    // everything it kicked off is the supervisor's to stop. The consensus
+    // event loop and materializer run as DETACHED tasks, and the
+    // peer-facing :8340 gRPC server runs on its own dedicated runtime;
+    // none are cancelled when `sup.run()` returns. Worse, tonic drives a
+    // GRACEFUL shutdown of :8340 that waits for in-flight requests to
+    // finish, and hypersync sessions are long-lived streams — a single
+    // one still in flight wedges teardown indefinitely (observed in the
+    // field: a node logged ctrl-c, then kept materializing frames and
+    // serving sync for an hour). Arm a hard-deadline watchdog on a plain
+    // OS thread (independent of any runtime): if the process can't exit
+    // under its own power within the grace window, force it. This is
+    // safe — RocksDB is crash-consistent via its WAL and the master node
+    // already released its snapshots before returning, so a forced exit
+    // costs only a WAL replay on restart.
+    {
+        let code: i32 = match &reason {
+            // POSIX: signal-driven exit is 128 + signal number.
+            ShutdownReason::CtrlC => 130,
+            ShutdownReason::Terminated => 143,
+            _ => 1,
+        };
+        const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+        let _ = std::thread::Builder::new()
+            .name("shutdown-watchdog".into())
+            .spawn(move || {
+                std::thread::sleep(SHUTDOWN_GRACE);
+                // Logging may already be torn down; go straight to stderr.
+                eprintln!(
+                    "shutdown watchdog: graceful teardown exceeded {}s — forcing exit({})",
+                    SHUTDOWN_GRACE.as_secs(),
+                    code,
+                );
+                std::process::exit(code);
+            });
+    }
+
+    let result = match reason {
+        // POSIX convention: signal-driven exit is 128 + signal number.
         ShutdownReason::CtrlC => {
             info!("shut down via ctrl-c");
             Ok(ExitCode::from(130))
+        }
+        ShutdownReason::Terminated => {
+            info!("shut down via SIGTERM");
+            Ok(ExitCode::from(143))
         }
         ShutdownReason::TaskExited(name) => {
             error!(task = %name, "supervised task exited unexpectedly");
@@ -326,6 +763,70 @@ async fn main() -> anyhow::Result<ExitCode> {
             error!(task = %name, error = %e, "supervised task join failed");
             Err(anyhow::Error::from(e)
                 .context(format!("supervised task {name:?} join failed")))
+        }
+    };
+
+    // Drop the file appender guards, blocking until their writer threads
+    // drain. Without this the error! lines above — the only record of WHY
+    // the node died — race process exit and routinely lose.
+    logging::shutdown_logging();
+
+    result
+}
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit. No-op on
+/// non-unix. Failure is non-fatal — the node may still run fine under
+/// a low limit on small networks — but a low effective limit gets a
+/// loud warning so EMFILE deaths aren't a mystery.
+fn raise_fd_limit() {
+    #[cfg(unix)]
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let original_soft = lim.rlim_cur;
+        let target = lim.rlim_max;
+        // macOS reports RLIM_INFINITY as the hard limit but rejects
+        // anything above `kern.maxfilesperproc`; OPEN_MAX (10240) is
+        // accepted everywhere. The walk-down below covers hosts where
+        // even that is too high.
+        #[cfg(target_os = "macos")]
+        let target = target.min(10_240);
+        let mut target = target;
+        while target > lim.rlim_cur {
+            let new = libc::rlimit {
+                rlim_cur: target,
+                rlim_max: lim.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &new) == 0 {
+                lim.rlim_cur = target;
+                break;
+            }
+            target /= 2;
+        }
+        if lim.rlim_cur > original_soft {
+            info!(
+                soft = lim.rlim_cur,
+                previous = original_soft,
+                "raised RLIMIT_NOFILE soft limit to hard limit"
+            );
+        }
+        // RocksDB is configured for up to 1000 open files and the p2p
+        // swarm allows 512 connections — anything under ~4096 is asking
+        // for an EMFILE death under load.
+        if lim.rlim_cur < 4096 {
+            warn!(
+                soft = lim.rlim_cur,
+                hard = lim.rlim_max,
+                "open-file limit is low; raise the hard limit \
+                 (systemd: LimitNOFILE=, docker: --ulimit nofile=, \
+                 shell: ulimit -n) or the node may die with \
+                 'too many open files'"
+            );
         }
     }
 }

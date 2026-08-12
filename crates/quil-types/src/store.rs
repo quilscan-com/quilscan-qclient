@@ -17,6 +17,14 @@ pub trait KvDb: Send + Sync {
     fn compact_all(&self) -> Result<()>;
     fn close(&self) -> Result<()>;
     fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()>;
+    /// Approximate bytes of process memory this DB instance holds (block
+    /// cache + memtables + table-reader index/filter blocks). Used by memory
+    /// diagnostics to attribute RSS to RocksDB — especially worker DBs, which
+    /// run in separate threads invisible to the master's structural snapshot.
+    /// Default `0` for non-RocksDB (in-memory / test) impls.
+    fn approximate_memory_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// Batch/transaction abstraction over the KV store.
@@ -65,9 +73,100 @@ pub struct ShardInfo {
     pub commitment: Vec<Vec<u8>>,
 }
 
+/// The kind of a staged shard topology change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardChangeKind {
+    /// Parent shard splits into the listed child sub-shards.
+    Split,
+    /// The listed child sub-shards merge back into the parent.
+    Merge,
+}
+
+/// A staged (epoch-aligned) shard topology change. A split/merge proposed in
+/// epoch E is recorded as pending and only flips the live topology at the E+2
+/// boundary (`effective_epoch`), keeping committee membership frozen within an
+/// epoch. Recorded deterministically by every node that materializes the op, so
+/// the shards store stays consistent across the network. See
+/// `[[epoch-aligned-lifecycle-design]]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingShardChange {
+    pub kind: ShardChangeKind,
+    /// The parent shard address (split source / merge target).
+    pub parent: Vec<u8>,
+    /// The child sub-shard addresses (split targets / merge sources).
+    pub children: Vec<Vec<u8>>,
+    /// The epoch at which the change takes effect (= epoch_for_frame(proposed)+2).
+    pub effective_epoch: u64,
+    /// The frame the op was materialized at (for diagnostics / ordering).
+    pub proposed_frame: u64,
+}
+
+impl PendingShardChange {
+    /// True when this pending change touches the given shard address — either as
+    /// the parent or one of the children. Used by the join-freeze gate: a join
+    /// targeting a shard with a pending change (between E and E+2) is rejected
+    /// because the shard's existence/identity is about to change.
+    pub fn affects_shard(&self, shard: &[u8]) -> bool {
+        self.parent == shard || self.children.iter().any(|c| c == shard)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Domain-specific stores
 // ---------------------------------------------------------------------------
+
+/// The result of MATERIALIZING one request bundle in a finalized frame.
+/// A frame carries every structurally-valid bundle, but that does not mean the
+/// bundle's op actually applied — it may fail signature validation or execution.
+/// Recorded per bundle (in frame order) so the explorer can show whether each
+/// request took effect. Deterministic across nodes (same frame → same outcomes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestStatus {
+    /// `process_message` succeeded — the op applied.
+    Succeeded,
+    /// Failed signature / PoP / protocol validation before execution.
+    Rejected,
+    /// Passed validation but `process_message` returned an error.
+    Failed,
+    /// Structurally unusable (canonical-encode failure / too short).
+    Skipped,
+}
+
+impl RequestStatus {
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            RequestStatus::Succeeded => 0,
+            RequestStatus::Rejected => 1,
+            RequestStatus::Failed => 2,
+            RequestStatus::Skipped => 3,
+        }
+    }
+    pub fn from_u8(b: u8) -> Self {
+        match b {
+            1 => RequestStatus::Rejected,
+            2 => RequestStatus::Failed,
+            3 => RequestStatus::Skipped,
+            _ => RequestStatus::Succeeded,
+        }
+    }
+    /// Lowercase wire name for the explorer JSON.
+    pub fn name(&self) -> &'static str {
+        match self {
+            RequestStatus::Succeeded => "succeeded",
+            RequestStatus::Rejected => "rejected",
+            RequestStatus::Failed => "failed",
+            RequestStatus::Skipped => "skipped",
+        }
+    }
+}
+
+/// One bundle's materialization outcome: status + a short reason (empty for
+/// `Succeeded`/`Skipped`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestOutcome {
+    pub status: RequestStatus,
+    pub error: String,
+}
 
 /// Clock/frame storage.
 pub trait ClockStore: Send + Sync {
@@ -92,6 +191,25 @@ pub trait ClockStore: Send + Sync {
         frame_number: u64,
         selector: &[u8],
     ) -> Result<proto::global::GlobalFrame>;
+    /// Persist the per-bundle MATERIALIZATION outcomes for a frame (in frame
+    /// order, one per `frame.requests` bundle). Written by the materializer
+    /// AFTER the frame + its requests are stored. Default no-op for backends
+    /// that don't record outcomes (tests / in-memory).
+    fn put_global_clock_frame_outcomes(
+        &self,
+        _frame_number: u64,
+        _outcomes: &[RequestOutcome],
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Read the per-bundle materialization outcomes for a frame (empty if the
+    /// frame hasn't materialized yet or the backend doesn't record them).
+    fn get_global_clock_frame_outcomes(
+        &self,
+        _frame_number: u64,
+    ) -> Result<Vec<RequestOutcome>> {
+        Ok(Vec::new())
+    }
     /// Returns up to `limit` candidate frames in
     /// `[min_frame_number, max_frame_number]` (any selector). Used as
     /// a fallback when the certified frame isn't available — mirrors
@@ -443,9 +561,122 @@ pub trait ShardsStore: Send + Sync {
         shard_key: &[u8],
         prefix: &[u32],
     ) -> Result<()>;
+
+    // ---- Epoch-aligned pending topology changes (Phase F) -------------------
+    // Default no-ops so light/test stores don't need to implement staging; the
+    // persistent RocksDB store overrides them.
+
+    /// Stage a pending split/merge. Recorded by `invoke_shard_split/merge` at
+    /// proposal time; applied at the `effective_epoch` boundary.
+    fn put_pending_shard_change(
+        &self,
+        _txn: &dyn Transaction,
+        _change: &PendingShardChange,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// All pending changes that take effect at exactly `effective_epoch` — the
+    /// set the epoch-boundary materializer applies when the chain crosses into
+    /// that epoch.
+    fn get_pending_shard_changes(&self, _effective_epoch: u64) -> Result<Vec<PendingShardChange>> {
+        Ok(Vec::new())
+    }
+
+    /// Every staged change not yet applied — used by the join-freeze gate to ask
+    /// "does any pending change touch this shard?".
+    fn all_pending_shard_changes(&self) -> Result<Vec<PendingShardChange>> {
+        Ok(Vec::new())
+    }
+
+    /// Remove a staged change after it has been applied (or superseded).
+    fn delete_pending_shard_change(
+        &self,
+        _txn: &dyn Transaction,
+        _parent: &[u8],
+        _effective_epoch: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Hypergraph tree backing store (vector commitment trees).
+/// One coin's accumulator membership witness (see [`CoinWitnessProvider`]).
+#[derive(Debug, Clone)]
+pub struct CoinWitnessData {
+    pub one_time_key: Vec<u8>,
+    pub found: bool,
+    pub leaf_index: u64,
+    pub auth_path: Vec<Vec<u8>>,
+}
+
+/// One enumerated domain coin (see [`CoinWitnessProvider::list_domain_coins`]).
+#[derive(Debug, Clone)]
+pub struct DomainCoinData {
+    pub address: Vec<u8>,
+    pub one_time_key: Vec<u8>,
+    pub commitment: Vec<u8>,
+    pub memo: Vec<u8>,
+}
+
+/// One enumerated escrow/pending vertex (see
+/// [`CoinWitnessProvider::list_domain_escrows`]).
+#[derive(Debug, Clone)]
+pub struct DomainEscrowData {
+    pub address: Vec<u8>,
+    pub cv: Vec<u8>,
+    pub to_key: Vec<u8>,
+    pub refund_key: Vec<u8>,
+    pub expiration: u64,
+    pub memo: Vec<u8>,
+}
+
+/// A PoMW reward-mint witness (see [`CoinWitnessProvider::prover_reward_witness`]):
+/// the forest membership proof of the owner's `reward:ProverReward` vertex, the
+/// current claimable `value` (the Balance field), and the `cited_frame` whose
+/// header `prover_tree_commitment` is the reward root the proof verifies against.
+#[derive(Debug, Clone, Default)]
+pub struct RewardWitnessData {
+    pub found: bool,
+    pub forest_proof: Vec<u8>,
+    pub value: u128,
+    pub cited_frame: u64,
+}
+
+/// Node-side backing for the lattice confidential-transaction wallet RPCs
+/// (`GetCoinSpendWitness` / `ListDomainCoins`). Implemented by the layer that
+/// holds the live `HypergraphState` (so it can rebuild the coin accumulator),
+/// and injected into the RPC server like the other store providers.
+pub trait CoinWitnessProvider: Send + Sync {
+    /// `(depth, root, per-key witnesses)` for a lattice spend.
+    fn coin_spend_witnesses(
+        &self,
+        domain: &[u8],
+        one_time_keys: &[Vec<u8>],
+    ) -> Result<(u32, Vec<u8>, Vec<CoinWitnessData>)>;
+
+    /// Enumerate the domain's committed coins (for wallet scanning).
+    fn list_domain_coins(&self, domain: &[u8]) -> Result<Vec<DomainCoinData>>;
+
+    /// Enumerate the domain's committed escrows/pending vertices (for the
+    /// `accept`/`reject` wallet flow). Default empty so existing providers
+    /// compile without change.
+    fn list_domain_escrows(&self, _domain: &[u8]) -> Result<Vec<DomainEscrowData>> {
+        Ok(Vec::new())
+    }
+
+    /// Build a PoMW reward-mint witness for `owner_prover_address` in `domain`
+    /// (for the `token mint` flow). Default `found = false` so existing
+    /// providers compile without change.
+    fn prover_reward_witness(
+        &self,
+        _domain: &[u8],
+        _owner_prover_address: &[u8],
+    ) -> Result<RewardWitnessData> {
+        Ok(RewardWitnessData::default())
+    }
+}
+
 pub trait HypergraphStore: Send + Sync {
     fn new_transaction(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
 
@@ -520,6 +751,21 @@ pub trait HypergraphStore: Send + Sync {
         frame_number: u64,
     ) -> Result<std::collections::HashMap<ShardKey, Vec<Vec<u8>>>>;
 
+    /// Delete the cached per-frame shard-commit roots (all four phases)
+    /// for a single shard, identified by its 32-byte shard address (the
+    /// `ShardKey.l2`). Used to force `commit(frame_number)` to recompute
+    /// and reflush a shard whose tree was mutated AFTER that frame's first
+    /// commit — the same-frame idempotency cache would otherwise reuse the
+    /// stale cached root and skip the now-dirty tree. Default no-op for
+    /// stores without a per-frame commit cache (test/in-memory impls).
+    fn delete_shard_commits(
+        &self,
+        _frame_number: u64,
+        _shard_address: &[u8],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Load one vertex's underlying data blob (Go-serialized tree format
     /// per `SerializeNonLazyTree`), or `Ok(None)` if absent. Used by
     /// `NodeService::GetVertexData` / `GetHyperedgeData` to serve
@@ -538,8 +784,15 @@ pub trait HypergraphStore: Send + Sync {
     /// `data` is the Go-serialized sub-tree blob. The per-vertex
     /// keyspace is the canonical record of vertex content; the lazy
     /// commitment tree blob is metadata-only.
+    ///
+    /// The write joins `txn` (staged into its batch) so that vertex
+    /// content becomes durable atomically with the tree nodes and shard
+    /// commit of the surrounding transaction — matching Go's
+    /// `SaveVertexTree`, which threads the transaction through to
+    /// `txn.Set`. 
     fn save_vertex_underlying(
         &self,
+        txn: &dyn Transaction,
         set_type: &str,
         phase_type: &str,
         shard_key: &ShardKey,
@@ -557,6 +810,108 @@ pub trait HypergraphStore: Send + Sync {
         shard_key: &ShardKey,
         callback: &mut dyn FnMut(Vec<u8>, Vec<u8>),
     ) -> Result<usize>;
+
+    // -------------------------------------------------------------------
+    // Versioned (MVCC) blob store + root→version index + split-app manifest.
+    // See crates/quil-hypergraph/VERSIONED_SNAPSHOT_SYNC.md. Default impls make
+    // the versioned store degrade to the legacy unversioned behavior so mocks
+    // and alternate backends compile unchanged; RocksHypergraphStore overrides
+    // them with real MVCC semantics.
+    // -------------------------------------------------------------------
+
+    /// Persist a vertex blob at a specific per-`(shard,phase)` commit `version`,
+    /// staged into `txn`. The read path (`load_vertex_underlying_at`) resolves
+    /// the latest write with version ≤ a requested version.
+    fn save_vertex_underlying_versioned(
+        &self,
+        txn: &dyn Transaction,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        vertex_key: &[u8],
+        data: &[u8],
+        _version: u64,
+    ) -> Result<()> {
+        // Default: fall back to the unversioned write (latest-only).
+        self.save_vertex_underlying(txn, set_type, phase_type, shard_key, vertex_key, data)
+    }
+
+    /// MVCC read: the blob for `vertex_key` as-of `version` (latest write ≤ V).
+    fn load_vertex_underlying_at(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        vertex_key: &[u8],
+        _version: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        // Default: no versioning — return the latest.
+        self.load_vertex_underlying_raw(set_type, phase_type, shard_key, vertex_key)
+    }
+
+    /// Record `root_hash → (version, global_frame)` for a `(shard, phase)` tree,
+    /// staged into `txn`. Written atomically with the tree/blob commit so any
+    /// committed root resolves to the local version that can fully serve it.
+    fn put_root_version(
+        &self,
+        _txn: &dyn Transaction,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_id: &[u8],
+        _root_hash: &[u8],
+        _version: u64,
+        _frame_number: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Resolve a `(shard, phase)` tree root → `(version, global_frame)` on this
+    /// node. `None` if this node never committed that root (behind or pruned).
+    fn get_root_version(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_id: &[u8],
+        _root_hash: &[u8],
+    ) -> Result<Option<(u64, u64)>> {
+        Ok(None)
+    }
+
+    /// Record a split app's `app_root → [(prefix, sub_root, version)]` manifest,
+    /// staged into `txn`, so a sync-by-hash of the aggregate root can be split
+    /// into per-sub-shard syncs. `entries` are `(prefix_bytes, sub_root(32), ver)`.
+    fn put_app_manifest(
+        &self,
+        _txn: &dyn Transaction,
+        _set_type: &str,
+        _phase_type: &str,
+        _app_address: &[u8],
+        _app_root: &[u8],
+        _entries: &[(Vec<u8>, [u8; 32], u64)],
+        _frame_number: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Resolve a split app's `app_root` → its sub-shard manifest on this node.
+    fn get_app_manifest(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _app_address: &[u8],
+        _app_root: &[u8],
+    ) -> Result<Option<Vec<(Vec<u8>, [u8; 32], u64)>>> {
+        Ok(None)
+    }
+
+    /// Prune superseded versioned state older than the 2-epoch retention
+    /// watermark derived from `cull_frame` (the versioned blob keyspace, the
+    /// `root→version` index, and split-app manifests). Returns per-tree
+    /// `(shard_id, phase_idx, min_readable_version)` so the caller can prune the
+    /// matching forest trees in lockstep. Default: no-op (unversioned backends).
+    fn prune_versioned(&self, _cull_frame: u64) -> Result<Vec<(Vec<u8>, usize, u64)>> {
+        Ok(Vec::new())
+    }
 
     fn apply_snapshot(&self, db_path: &str) -> Result<()>;
 
@@ -667,4 +1022,34 @@ pub trait SnapshotReadable: Send + Sync {
         phase_type: &str,
         shard_key: &ShardKey,
     ) -> Result<Option<Vec<u8>>>;
+
+    /// Read one tree node by its by-path index, point-in-time consistent
+    /// at the captured sequence. Mirrors
+    /// [`HypergraphStore::get_node_by_path`] (SeekGE + prefix
+    /// compression). Lets a consumer walk a whole tree over a single
+    /// consistent snapshot (e.g. the prover shard) instead of issuing
+    /// non-isolated live reads. Default `Ok(None)` for blob-only snapshot
+    /// impls that don't support per-node reads.
+    fn get_node_by_path(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_key: &ShardKey,
+        _path: &[i32],
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Read one vertex's underlying data blob at the captured sequence.
+    /// Mirrors [`HypergraphStore::load_vertex_underlying_raw`]. Default
+    /// `Ok(None)`.
+    fn load_vertex_underlying_raw(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_key: &ShardKey,
+        _vertex_key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }

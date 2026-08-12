@@ -41,12 +41,24 @@ struct RemoteWorkerState {
     channel: Option<Channel>,
     /// Whether the worker is reachable.
     connected: bool,
+    /// Whether a `start_consensus=true` Respawn is owed to this worker. Set when
+    /// the allocator asks to start consensus while the worker's channel is down
+    /// (a cluster worker that connects AFTER its alloc went Active). `connect_all`
+    /// re-issues the Respawn once the channel comes up. Without this the deferred
+    /// Respawn (remote_worker.rs "consensus not yet started"/"deferred") was lost
+    /// and the worker never activated.
+    wants_consensus: bool,
 }
 
 /// Manages workers running on remote machines via gRPC.
 ///
 /// Implements the `WorkerManager` trait so it can be used as a
 /// drop-in replacement for `ThreadWorkerManager`.
+/// TLS domain name for the worker-channel leaf cert. MUST match
+/// `quil_rpc::quil_tls::WORKER_CHANNEL_SAN` (duplicated to avoid a crate cycle —
+/// quil-engine cannot depend on quil-rpc).
+const WORKER_CHANNEL_SAN: &str = "quil-worker";
+
 pub struct RemoteWorkerManager {
     /// Shared so background tasks spawned from `set_worker_filter`
     /// (which only has `&self`) can re-acquire the channel to issue
@@ -57,6 +69,12 @@ pub struct RemoteWorkerManager {
     /// Channel for receiving events from remote workers.
     event_tx: mpsc::Sender<RemoteWorkerEvent>,
     event_rx: Mutex<Option<mpsc::Receiver<RemoteWorkerEvent>>>,
+    /// mTLS config for dialing workers, derived from the node's Falcon key
+    /// (`quil_rpc::quil_tls::build_worker_channel_cert`). When set (cluster
+    /// mode), the master presents the node leaf cert and verifies the worker's
+    /// server cert against the node CA — so only node-key holders interoperate.
+    /// `None` = plaintext (back-compat / tests).
+    client_tls: Option<tonic::transport::ClientTlsConfig>,
 }
 
 /// Events from remote workers to the master.
@@ -83,8 +101,16 @@ impl RemoteWorkerManager {
     pub fn new(
         worker_endpoints: Vec<(u32, String)>,
         master_endpoint: String,
+        channel_tls_pem: Option<(String, String, String)>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(256);
+        // Build the client mTLS config from (ca, leaf, key) PEM once.
+        let client_tls = channel_tls_pem.map(|(ca, leaf, key)| {
+            tonic::transport::ClientTlsConfig::new()
+                .ca_certificate(tonic::transport::Certificate::from_pem(ca))
+                .identity(tonic::transport::Identity::from_pem(leaf, key))
+                .domain_name(WORKER_CHANNEL_SAN)
+        });
         let mut workers = HashMap::new();
 
         for (core_id, endpoint) in worker_endpoints {
@@ -102,6 +128,7 @@ impl RemoteWorkerManager {
                 allocated: false,
                 channel: None,
                 connected: false,
+                wants_consensus: false,
             });
         }
 
@@ -110,6 +137,7 @@ impl RemoteWorkerManager {
             master_endpoint,
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
+            client_tls,
         }
     }
 
@@ -118,6 +146,7 @@ impl RemoteWorkerManager {
     pub fn from_config(
         stream_multiaddrs: &[String],
         master_endpoint: String,
+        channel_tls_pem: Option<(String, String, String)>,
     ) -> Self {
         let endpoints: Vec<(u32, String)> = stream_multiaddrs
             .iter()
@@ -130,7 +159,7 @@ impl RemoteWorkerManager {
                 (core_id, endpoint)
             })
             .collect();
-        Self::new(endpoints, master_endpoint)
+        Self::new(endpoints, master_endpoint, channel_tls_pem)
     }
 
     /// Take the event receiver (call once at startup).
@@ -138,25 +167,56 @@ impl RemoteWorkerManager {
         self.event_rx.lock().unwrap().take()
     }
 
-    /// Connect to all registered workers. Called during startup.
+    /// Connect to any registered workers that are NOT already connected. Safe to
+    /// poll on an interval: workers with a live channel are skipped (no redundant
+    /// reconnect / duplicate deferred-Respawn), so it only acts on the initial
+    /// connect or after a disconnect clears the channel.
     pub async fn connect_all(&self) {
         let endpoints: Vec<(u32, String)> = {
             let workers = self.workers.lock().unwrap();
             workers.values()
+                .filter(|w| w.channel.is_none())
                 .map(|w| (w.core_id, w.endpoint.clone()))
                 .collect()
         };
+        if endpoints.is_empty() {
+            return;
+        }
 
         for (core_id, endpoint) in endpoints {
-            match connect_to_worker(&endpoint).await {
+            match connect_to_worker(&endpoint, self.client_tls.as_ref()).await {
                 Ok(channel) => {
-                    let mut workers = self.workers.lock().unwrap();
-                    if let Some(w) = workers.get_mut(&core_id) {
-                        w.channel = Some(channel);
-                        w.connected = true;
-                    }
+                    let (owed_filter, chan) = {
+                        let mut workers = self.workers.lock().unwrap();
+                        if let Some(w) = workers.get_mut(&core_id) {
+                            w.channel = Some(channel.clone());
+                            w.connected = true;
+                            // If a start_consensus Respawn was deferred while the
+                            // channel was down, it's owed now.
+                            let owed = if w.wants_consensus && !w.filter.is_empty() {
+                                Some(w.filter.clone())
+                            } else {
+                                None
+                            };
+                            (owed, channel)
+                        } else {
+                            (None, channel)
+                        }
+                    };
                     info!(core_id, endpoint = %endpoint, "connected to remote worker");
                     let _ = self.event_tx.send(RemoteWorkerEvent::Connected { core_id }).await;
+                    // Re-issue the deferred Respawn now that the worker is up.
+                    if let Some(filter) = owed_filter {
+                        info!(core_id, filter = hex::encode(&filter), "re-issuing deferred Respawn on connect");
+                        let mut client =
+                            quil_types::proto::node::data_ipc_service_client::DataIpcServiceClient::new(chan);
+                        let req = tonic::Request::new(quil_types::proto::node::RespawnRequest {
+                            filter,
+                        });
+                        if let Err(e) = client.respawn(req).await {
+                            warn!(core_id, error = %e, "deferred Respawn failed");
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -250,6 +310,11 @@ impl WorkerManager for RemoteWorkerManager {
             let mut workers = self.workers.lock().unwrap();
             if let Some(w) = workers.get_mut(&core_id) {
                 w.filter = filter.to_vec();
+                // Remember whether consensus is owed, so `connect_all` can
+                // re-issue the Respawn if the worker connects later. A
+                // non-empty filter with start_consensus=false (Joining) clears
+                // it; an empty filter (idle) clears it too.
+                w.wants_consensus = start_consensus && !filter.is_empty();
                 w.channel.is_some()
             } else {
                 return Err(QuilError::InvalidArgument(
@@ -422,18 +487,37 @@ fn multiaddr_to_http(multiaddr: &str) -> String {
     format!("http://{}:{}", host, port)
 }
 
-/// Connect to a remote worker's gRPC endpoint with retry.
-async fn connect_to_worker(endpoint: &str) -> Result<Channel> {
+/// Connect to a remote worker's gRPC endpoint with retry. When `tls` is set the
+/// dial is mTLS (https): the master presents the node leaf cert and verifies the
+/// worker's cert against the node CA — only node-key holders interoperate.
+async fn connect_to_worker(
+    endpoint: &str,
+    tls: Option<&tonic::transport::ClientTlsConfig>,
+) -> Result<Channel> {
     let mut backoff = std::time::Duration::from_millis(50);
     let max_backoff = std::time::Duration::from_secs(5);
     let max_attempts = 10;
 
+    // tonic uses TLS based on the URI scheme + tls_config; switch http→https.
+    let uri = if tls.is_some() {
+        endpoint.replacen("http://", "https://", 1)
+    } else {
+        endpoint.to_string()
+    };
+
     for attempt in 1..=max_attempts {
-        match Channel::from_shared(endpoint.to_string())
-            .map_err(|e| QuilError::Internal(format!("invalid endpoint: {}", e)))?
-            .connect()
-            .await
+        let mut ep = match Channel::from_shared(uri.clone())
+            .map_err(|e| QuilError::Internal(format!("invalid endpoint: {}", e)))
         {
+            Ok(ep) => ep,
+            Err(e) => return Err(e),
+        };
+        if let Some(cfg) = tls {
+            ep = ep
+                .tls_config(cfg.clone())
+                .map_err(|e| QuilError::Internal(format!("worker channel TLS: {}", e)))?;
+        }
+        match ep.connect().await {
             Ok(channel) => return Ok(channel),
             Err(e) => {
                 if attempt == max_attempts {
@@ -476,7 +560,7 @@ mod tests {
             "/ip4/10.0.0.1/tcp/32501".to_string(),
             "/ip4/10.0.0.2/tcp/32502".to_string(),
         ];
-        let mgr = RemoteWorkerManager::from_config(&addrs, "http://master:8340".into());
+        let mgr = RemoteWorkerManager::from_config(&addrs, "http://master:8340".into(), None);
         assert_eq!(mgr.worker_count(), 2);
         let workers = mgr.range_workers().unwrap();
         let ids: Vec<u32> = workers.iter().map(|w| w.core_id).collect();
@@ -486,7 +570,7 @@ mod tests {
 
     #[test]
     fn allocate_unknown_core_errors() {
-        let mgr = RemoteWorkerManager::new(vec![], "http://master:8340".into());
+        let mgr = RemoteWorkerManager::new(vec![], "http://master:8340".into(), None);
         assert!(mgr.allocate_worker(99, &[0x01]).is_err());
     }
 
@@ -495,6 +579,7 @@ mod tests {
         let mgr = RemoteWorkerManager::new(
             vec![(1, "http://10.0.0.1:32501".into())],
             "http://master:8340".into(),
+            None,
         );
         mgr.allocate_worker(1, &[0xAA; 32]).unwrap();
         mgr.deallocate_worker(1).unwrap();

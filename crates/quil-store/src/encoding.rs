@@ -20,6 +20,10 @@ pub const HYPERGRAPH_SHARD: u8 = 0x09;
 pub const SHARD: u8 = 0x0A;
 pub const INBOX: u8 = 0x0B;
 pub const CONSENSUS: u8 = 0x0C;
+/// Per-member SDR storage replicas for proof-of-storage attestation, keyed
+/// `[STORAGE_REPLICA][epoch:u64 BE][leaf_id]` (epoch-first so dropping a stale
+/// epoch is a single `delete_range`). Rust-only (no Go counterpart).
+pub const STORAGE_REPLICA: u8 = 0x0D;
 /// Sub-discriminators under CONSENSUS — match Go's
 /// `node/store/constants.go:178-179`. The Rust consensus store
 /// historically wrote these at top-level prefixes 0x01/0x02 which
@@ -28,6 +32,24 @@ pub const CONSENSUS: u8 = 0x0C;
 /// migration without overwriting key-bundle data.
 pub const CONSENSUS_STATE: u8 = 0x00;
 pub const CONSENSUS_LIVENESS: u8 = 0x01;
+/// Rust-node-only: highest app-shard frame whose `requests` have been
+/// materialized into the hypergraph CRDT, persisted per shard filter so
+/// the in-memory cursor survives restart (it would otherwise reset to 0
+/// and re-materialize, or — worse — silently skip frames the CRDT
+/// already advanced past). Go has no equivalent record, so 0x02 under
+/// CONSENSUS is unused by a migrated Go store.
+pub const CONSENSUS_MATERIALIZED_CURSOR: u8 = 0x02;
+/// Rust-node-only: highest GLOBAL frame whose `requests` have been
+/// materialized into the hypergraph CRDT (reward balances + prover/shard
+/// state). Unlike [`CONSENSUS_MATERIALIZED_CURSOR`] this is a SINGLE global
+/// key (no filter) and is written ATOMICALLY inside the CRDT commit's own
+/// RocksTxn batch — so the durable cursor can never diverge from the CRDT
+/// frontier. On restart the materializer re-materializes only the
+/// un-committed tail `[cursor+1 ..= clock_head]`, which is the only safe
+/// window given reward minting is additive (no per-frame idempotency).
+/// Go has no equivalent record, so 0x03 under CONSENSUS is unused by a
+/// migrated Go store.
+pub const CONSENSUS_GLOBAL_MATERIALIZED_CURSOR: u8 = 0x03;
 pub const MIGRATION: u8 = 0xF0;
 pub const WORKER: u8 = 0xFF;
 
@@ -49,6 +71,9 @@ pub const CLOCK_COMPACTION: u8 = 0x05;
 pub const CLOCK_PEER_SENIORITY: u8 = 0x06;
 pub const CLOCK_APP_CERTIFIED_STATE: u8 = 0x07;
 pub const CLOCK_GLOBAL_FRAME_REQUEST: u8 = 0x08;
+/// Rust-node-only: per-frame MATERIALIZATION outcomes (one per request bundle).
+/// Not a Go concept; keyed like the frame itself so it prunes with the frame.
+pub const CLOCK_GLOBAL_FRAME_OUTCOMES: u8 = 0x09;
 pub const CLOCK_GLOBAL_CERTIFIED_STATE: u8 = 0x09;
 pub const CLOCK_SHARD_CERTIFIED_STATE: u8 = 0x0A;
 pub const CLOCK_QUORUM_CERTIFICATE: u8 = 0x0B;
@@ -108,7 +133,7 @@ pub const HG_VERTEX_DATA_PREFIX: u8 = 0x30;
 // `quil_tries::serialize_node_solo`). Go's on-disk node bytes are
 // never read by Rust — the migration is the only point of contact.
 //
-// [0x33, set_byte, phase_byte, l1(1), l2(32), node_key]            → solo-node bytes
+// [0x33, set_byte, phase_byte, l1(1), l2(32), node_key] → solo-node bytes
 // [0x34, set_byte, phase_byte, l1(1), l2(32), path_i32_BE × depth] → by-key pointer
 //
 // `set_byte` and `phase_byte` are the same single-byte encoding as
@@ -188,6 +213,15 @@ pub fn clock_global_frame_request_key(frame_number: u64, request_index: u16) -> 
     key.push(CLOCK_GLOBAL_FRAME_REQUEST);
     key.extend_from_slice(&frame_number.to_be_bytes());
     key.extend_from_slice(&request_index.to_be_bytes());
+    key
+}
+
+/// Per-frame materialization outcomes: [CLOCK_FRAME, 0x09, frame_number(8 BE)]
+pub fn clock_global_frame_outcomes_key(frame_number: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(10);
+    key.push(CLOCK_FRAME);
+    key.push(CLOCK_GLOBAL_FRAME_OUTCOMES);
+    key.extend_from_slice(&frame_number.to_be_bytes());
     key
 }
 
@@ -608,6 +642,98 @@ pub fn hypergraph_vertex_data_key(
 }
 
 // -----------------------------------------------------------------------
+// Versioned (MVCC) blob keyspace — see crates/quil-hypergraph/VERSIONED_SNAPSHOT_SYNC.md
+//
+// The forest is version-addressable but the blob KV historically was not, which
+// let an incremental sync diff the forest at a pinned version while fetching the
+// LATEST blob → a race. The v2 keyspace carries the per-`(shard,phase)` commit
+// version (NON-inverted, big-endian) as an 8-byte SUFFIX so a reverse-seek to
+// `vk_prefix ‖ V` lands on the latest write with version ≤ V (MVCC read). The
+// version is fixed-width, so `vk = key[shard_prefix .. len-8]` recovers it
+// regardless of vertex-key length. Distinct prefix byte (0x31) from the legacy
+// unversioned keyspace (0x30) so the two coexist during migration.
+// -----------------------------------------------------------------------
+pub const HG_VERTEX_DATA_V2: u8 = 0x31;
+/// `root_hash → (version, global_frame)` index — written atomically with the
+/// forest+blobs so any committed root resolves to the local version that serves it.
+pub const HG_ROOT_VERSION: u8 = 0x35;
+/// `app_root → [(prefix, sub_root, version)]` manifest for split apps, so a
+/// sync-by-hash of an aggregate app root can be broken into per-sub-shard syncs.
+pub const HG_APP_MANIFEST: u8 = 0x36;
+
+/// `[0x31][set][phase][l1(3)][l2(32)]` — scan prefix for all versioned blobs of a shard.
+pub fn hypergraph_vertex_data_v2_shard_prefix(
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &quil_types::store::ShardKey,
+) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 1 + 1 + 3 + 32);
+    k.push(HG_VERTEX_DATA_V2);
+    k.push(set_type_byte(set_type));
+    k.push(phase_type_byte(phase_type));
+    k.extend_from_slice(&shard_key.l1);
+    k.extend_from_slice(&shard_key.l2);
+    k
+}
+
+/// `…shard_prefix ‖ vertex_key` — the per-vertex prefix a version suffix appends to.
+pub fn hypergraph_vertex_data_v2_vk_prefix(
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &quil_types::store::ShardKey,
+    vertex_key: &[u8],
+) -> Vec<u8> {
+    let mut k = hypergraph_vertex_data_v2_shard_prefix(set_type, phase_type, shard_key);
+    k.extend_from_slice(vertex_key);
+    k
+}
+
+/// `…vk_prefix ‖ version_be(8)` — the full MVCC key for one vertex at one version.
+pub fn hypergraph_vertex_data_v2_key(
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &quil_types::store::ShardKey,
+    vertex_key: &[u8],
+    version: u64,
+) -> Vec<u8> {
+    let mut k = hypergraph_vertex_data_v2_vk_prefix(set_type, phase_type, shard_key, vertex_key);
+    k.extend_from_slice(&version.to_be_bytes());
+    k
+}
+
+/// `[0x35][set][phase][l1(3)][l2(32)][root_hash(32)]` — root→version index key.
+pub fn hypergraph_root_version_key(
+    set_type: &str,
+    phase_type: &str,
+    shard_id: &[u8],
+    root_hash: &[u8],
+) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 1 + 1 + shard_id.len() + root_hash.len());
+    k.push(HG_ROOT_VERSION);
+    k.push(set_type_byte(set_type));
+    k.push(phase_type_byte(phase_type));
+    k.extend_from_slice(shard_id);
+    k.extend_from_slice(root_hash);
+    k
+}
+
+/// `[0x36][set][phase][app(32)][app_root(32)]` — split-app manifest key.
+pub fn hypergraph_app_manifest_key(
+    set_type: &str,
+    phase_type: &str,
+    app_address: &[u8],
+    app_root: &[u8],
+) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 1 + 1 + app_address.len() + app_root.len());
+    k.push(HG_APP_MANIFEST);
+    k.push(set_type_byte(set_type));
+    k.push(phase_type_byte(phase_type));
+    k.extend_from_slice(app_address);
+    k.extend_from_slice(app_root);
+    k
+}
+
+// -----------------------------------------------------------------------
 // Per-node lazy tree backend key builders.
 //
 // `node_key` is whatever bytes the in-memory tree uses as the node's
@@ -696,6 +822,24 @@ pub fn consensus_liveness_key(filter: &[u8]) -> Vec<u8> {
     k.push(CONSENSUS_LIVENESS);
     k.extend_from_slice(filter);
     k
+}
+
+/// Key for the per-shard "highest materialized frame" cursor. Value is
+/// an 8-byte big-endian `u64`. See [`CONSENSUS_MATERIALIZED_CURSOR`].
+pub fn consensus_materialized_cursor_key(filter: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + filter.len());
+    k.push(CONSENSUS);
+    k.push(CONSENSUS_MATERIALIZED_CURSOR);
+    k.extend_from_slice(filter);
+    k
+}
+
+/// Key for the single GLOBAL "highest materialized frame" cursor. Value is
+/// an 8-byte big-endian `u64`. There is exactly ONE such key (no filter) —
+/// it tracks the global materializer's CRDT frontier and is staged into the
+/// CRDT commit's own batch. See [`CONSENSUS_GLOBAL_MATERIALIZED_CURSOR`].
+pub fn global_materialized_cursor_key() -> Vec<u8> {
+    vec![CONSENSUS, CONSENSUS_GLOBAL_MATERIALIZED_CURSOR]
 }
 
 // -----------------------------------------------------------------------
@@ -801,6 +945,20 @@ mod tests {
         assert_eq!(key[0], CLOCK_FRAME);    // 0x00
         assert_eq!(key[1], CLOCK_GLOBAL_FRAME); // 0x00
         assert_eq!(&key[2..], &42u64.to_be_bytes());
+    }
+
+    #[test]
+    fn materialized_cursor_key_layout() {
+        // [CONSENSUS(0x0C), CONSENSUS_MATERIALIZED_CURSOR(0x02), filter...]
+        let key = consensus_materialized_cursor_key(&[0xAB, 0xCD]);
+        assert_eq!(key.len(), 4);
+        assert_eq!(key[0], CONSENSUS); // 0x0C
+        assert_eq!(key[1], CONSENSUS_MATERIALIZED_CURSOR); // 0x02
+        assert_eq!(&key[2..], &[0xAB, 0xCD]);
+        // Distinct from the state/liveness keys for the same filter so
+        // the cursor can't clobber persisted consensus/liveness state.
+        assert_ne!(key, consensus_state_key(&[0xAB, 0xCD]));
+        assert_ne!(key, consensus_liveness_key(&[0xAB, 0xCD]));
     }
 
     #[test]

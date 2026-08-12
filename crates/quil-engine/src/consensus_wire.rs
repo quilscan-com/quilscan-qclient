@@ -2,12 +2,12 @@
 //! protobuf types on GLOBAL_CONSENSUS and GLOBAL_FRAME bitmasks.
 //!
 //! Type prefixes from `protobufs/canonical_types.go`:
-//!   0x030C = ProposalVote
-//!   0x030D = QuorumCertificate
-//!   0x030E = GlobalFrame (header + requests)
-//!   0x0317 = GlobalProposal
-//!   0x031C = TimeoutState
-//!   0x031D = TimeoutCertificate
+//! 0x030C = ProposalVote
+//! 0x030D = QuorumCertificate
+//! 0x030E = GlobalFrame (header + requests)
+//! 0x0317 = GlobalProposal
+//! 0x031C = TimeoutState
+//! 0x031D = TimeoutCertificate
 
 use std::sync::Arc;
 
@@ -104,8 +104,8 @@ impl AggregateSignature {
     /// Empty aggregate signature for genesis QC.
     pub fn empty() -> Self {
         Self {
-            public_key: vec![0u8; 585],
-            signature: vec![0u8; 74],
+            public_key: vec![0u8; 897],
+            signature: vec![0u8; 666],
             bitmask: vec![0xffu8; 32],
         }
     }
@@ -125,6 +125,15 @@ pub struct ProposalVote {
     pub timestamp: u64,
     pub signature: Vec<u8>,   // BLS48581AddressedSignature bytes
     pub address: Vec<u8>,     // 32 bytes — prover address
+    /// PoRep storage openings this voter attaches to its app-shard vote
+    /// (a serialized `global::StorageAttestation`). The vote-aggregator
+    /// collects these and assembles the frame's `StorageAttestation` +
+    /// 74-byte aggregate `storage_attestation_root` when the QC forms.
+    /// Empty for global / timeout votes and pre-activation app votes — and
+    /// when empty it is NOT written, so the encoding is byte-identical to
+    /// the legacy `ProposalVote`. Trailing + tolerant-decoded; safe because
+    /// the only embedded use (`TimeoutState.vote`) is length-prefixed.
+    pub openings: Vec<u8>,
 }
 
 impl ProposalVote {
@@ -149,6 +158,11 @@ impl ProposalVote {
             put_bytes(&mut sig, &self.signature);
             put_bytes(&mut sig, &self.address);
             put_bytes(&mut out, &sig);
+        }
+        // PoRep openings — appended ONLY when present, so an empty-openings
+        // vote serializes byte-identically to the legacy wire form.
+        if !self.openings.is_empty() {
+            put_bytes(&mut out, &self.openings);
         }
         Ok(out)
     }
@@ -176,7 +190,60 @@ impl ProposalVote {
             let address = read_bytes(&sig_bytes, &mut sc)?;
             (signature, address)
         };
-        Ok(Self { filter, rank, frame_number, selector, timestamp, signature, address })
+        // Tolerant trailing field: PoRep openings, present only on post-
+        // activation app-shard votes. Absent on legacy / global / timeout
+        // votes — the cursor is already at the end, so this reads nothing.
+        let openings = if c < data.len() {
+            read_bytes(data, &mut c)?
+        } else {
+            Vec::new()
+        };
+        Ok(Self { filter, rank, frame_number, selector, timestamp, signature, address, openings })
+    }
+
+    /// Build a wire `ProposalVote` from the proto representation (as returned by
+    /// `GlobalService.GetGlobalProposal`). Inverse of the proto produced by the
+    /// engine; lets the catch-up sync client reconstruct a `SignedProposal`.
+    pub fn from_proto(v: &quil_types::proto::global::ProposalVote) -> Self {
+        let (signature, address) = match v.public_key_signature_bls48581.as_ref() {
+            Some(s) => (s.signature.clone(), s.address.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+        Self {
+            filter: v.filter.clone(),
+            rank: v.rank,
+            frame_number: v.frame_number,
+            selector: v.selector.clone(),
+            timestamp: v.timestamp,
+            signature,
+            address,
+            // The proto ProposalVote has no openings field; reconstructed
+            // votes (catch-up sync) carry none.
+            openings: Vec::new(),
+        }
+    }
+
+    /// Convert to the proto representation for persistence
+    /// (`ClockStore::put_proposal_vote`), so it can later be served by
+    /// `GetGlobalProposal`. Inverse of [`Self::from_proto`].
+    pub fn to_proto(&self) -> quil_types::proto::global::ProposalVote {
+        let public_key_signature_bls48581 =
+            if self.signature.is_empty() && self.address.is_empty() {
+                None
+            } else {
+                Some(quil_types::proto::keys::Bls48581AddressedSignature {
+                    signature: self.signature.clone(),
+                    address: self.address.clone(),
+                })
+            };
+        quil_types::proto::global::ProposalVote {
+            filter: self.filter.clone(),
+            rank: self.rank,
+            frame_number: self.frame_number,
+            selector: self.selector.clone(),
+            timestamp: self.timestamp,
+            public_key_signature_bls48581,
+        }
     }
 }
 
@@ -304,6 +371,36 @@ pub struct TimeoutCertificate {
 }
 
 impl TimeoutCertificate {
+    /// Build a wire `TimeoutCertificate` from the proto representation (as
+    /// returned by `GlobalService.GetGlobalProposal` in a proposal's
+    /// `prior_rank_timeout_certificate`). Lets the catch-up sync client
+    /// reconstruct a `SignedProposal`.
+    pub fn from_proto(tc: &quil_types::proto::global::TimeoutCertificate) -> Self {
+        let (public_key, signature, bitmask) = match tc.aggregate_signature.as_ref() {
+            Some(agg) => (
+                agg.public_key.as_ref().map(|pk| pk.key_value.clone()).unwrap_or_default(),
+                agg.signature.clone(),
+                agg.bitmask.clone(),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        Self {
+            filter: tc.filter.clone(),
+            rank: tc.rank,
+            latest_ranks: tc.latest_ranks.clone(),
+            latest_quorum_certificate: tc
+                .latest_quorum_certificate
+                .as_ref()
+                .map(QuorumCertificate::from_proto),
+            timestamp: tc.timestamp,
+            aggregate_signature: AggregateSignature {
+                public_key,
+                signature,
+                bitmask,
+            },
+        }
+    }
+
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         put_u32(&mut out, TIMEOUT_CERTIFICATE_TYPE);
@@ -333,6 +430,13 @@ impl TimeoutCertificate {
         let filter = read_bytes(data, &mut c)?;
         let rank = read_u64(data, &mut c)?;
         let count = read_u32(data, &mut c)? as usize;
+        // Allocation-bomb guard: each entry is a u64 (8 bytes), so a count above
+        // `remaining / 8` is impossible — reject before `Vec::with_capacity`.
+        if count > data.len().saturating_sub(c) / 8 {
+            return Err(QuilError::InvalidArgument(format!(
+                "TimeoutCertificate: latest_ranks count {} exceeds remaining bytes", count
+            )));
+        }
         let mut latest_ranks = Vec::with_capacity(count);
         for _ in 0..count { latest_ranks.push(read_u64(data, &mut c)?); }
         let qc_bytes = read_bytes(data, &mut c)?;
@@ -599,7 +703,7 @@ impl TimeoutState {
 ///
 /// Wire format:
 /// [u32 type=0x030E][u32 header_len][header_bytes][u32 requests_count]
-///   [for each: u32 request_len, request_bytes (MessageBundle canonical)]
+/// [for each: u32 request_len, request_bytes (MessageBundle canonical)]
 ///
 /// Header format (0x0309):
 /// [u32 type=0x0309][u64 frame_number][u64 rank][i64 timestamp][u32 difficulty]
@@ -656,6 +760,12 @@ fn encode_frame_header(
     }
     put_bytes(&mut out, &header.prover_tree_commitment);
     put_bytes(&mut out, &header.requests_root);
+    // Prover shard phase 1/2/3 roots (audit #5). Count-prefixed like
+    // global_commitments; decode mirrors this position.
+    put_u32(&mut out, header.prover_tree_aux_roots.len() as u32);
+    for r in &header.prover_tree_aux_roots {
+        put_bytes(&mut out, r);
+    }
     put_bytes(&mut out, &header.prover);
     let sig_bytes: Vec<u8> = match header.public_key_signature_bls48581.as_ref() {
         None => Vec::new(),
@@ -694,9 +804,17 @@ pub fn decode_global_frame(
     // Requests: each entry is a length-prefixed MessageBundle in canonical
     // bytes form (see Go: protobufs/global.go GlobalFrame.FromCanonicalBytes).
     let req_count = read_u32(data, &mut c)? as usize;
-    if req_count > 100 {
+    // No fixed per-frame request cap: a global frame carries every pending
+    // request (a coverage proof from every shard), delivered over the
+    // direct :8340 transport which has no gossip size ceiling. Guard only
+    // against an allocation bomb — each request is length-prefixed (>= 4
+    // bytes), so a valid count can't exceed the remaining bytes / 4. The
+    // read loop below still validates each entry against the actual data.
+    let remaining = data.len().saturating_sub(c);
+    if req_count > remaining / 4 {
         return Err(QuilError::InvalidArgument(format!(
-            "GlobalFrame: invalid requests count {}", req_count
+            "GlobalFrame: requests count {} exceeds what {} remaining bytes can hold",
+            req_count, remaining
         )));
     }
     let mut requests = Vec::with_capacity(req_count);
@@ -751,6 +869,25 @@ fn canonical_request_to_proto(
     req: &quil_execution::message_envelope::CanonicalMessageRequest,
 ) -> quil_types::proto::global::MessageRequest {
     use quil_execution::global_intrinsic::{conversions, prover_filter_ops, prover_join, prover_ops};
+    use quil_execution::global_intrinsic::consensus_types::{AltShardUpdate, TYPE_ALT_SHARD_UPDATE};
+    use quil_execution::hypergraph_intrinsic::canonical::{
+        TYPE_HYPEREDGE_ADD, TYPE_HYPEREDGE_REMOVE, TYPE_HYPERGRAPH_DEPLOYMENT,
+        TYPE_HYPERGRAPH_UPDATE, TYPE_VERTEX_ADD, TYPE_VERTEX_REMOVE,
+    };
+    use quil_execution::hypergraph_intrinsic::types as hg_types;
+    use quil_execution::token_intrinsic::{
+        conversions as token_conv, MintTransaction, PendingTransaction, TokenDeploy, TokenUpdate,
+        Transaction, TYPE_MINT_TRANSACTION, TYPE_PENDING_TRANSACTION, TYPE_TOKEN_DEPLOY,
+        TYPE_TOKEN_UPDATE, TYPE_TRANSACTION,
+    };
+    use quil_execution::compute_intrinsic::conversions as compute_conv;
+    use quil_execution::compute_intrinsic::config::{
+        ComputeDeploy, ComputeUpdate, TYPE_COMPUTE_DEPLOY, TYPE_COMPUTE_UPDATE,
+    };
+    use quil_execution::compute_intrinsic::ops::{
+        CodeDeployment, CodeExecute, CodeFinalize, TYPE_CODE_DEPLOYMENT, TYPE_CODE_EXECUTE,
+        TYPE_CODE_FINALIZE,
+    };
     use quil_types::proto::global::{message_request::Request, MessageRequest};
 
     let inner = &req.inner_bytes;
@@ -776,19 +913,105 @@ fn canonical_request_to_proto(
         prover_ops::TYPE_PROVER_UPDATE => prover_ops::ProverUpdate::from_canonical_bytes(inner)
             .ok()
             .map(|u| Request::Update(conversions::prover_update_to_proto(&u))),
+        // Global lifecycle ops (kick / shard split / shard merge). Previously
+        // `_ => None` dropped these: a global frame carrying one showed an empty
+        // request in the explorer AND was skipped by the materializer (the
+        // re-encode below produced nothing), diverging the prover-registry /
+        // shard-lifecycle state consensus depends on.
+        prover_ops::TYPE_PROVER_KICK => prover_ops::ProverKick::from_canonical_bytes(inner)
+            .ok()
+            .map(|k| Request::Kick(conversions::prover_kick_to_proto(&k))),
+        prover_ops::TYPE_SHARD_SPLIT => prover_ops::ShardSplit::from_canonical_bytes(inner)
+            .ok()
+            .map(|s| Request::ShardSplit(conversions::shard_split_to_proto(&s))),
+        prover_ops::TYPE_SHARD_MERGE => prover_ops::ShardMerge::from_canonical_bytes(inner)
+            .ok()
+            .map(|s| Request::ShardMerge(conversions::shard_merge_to_proto(&s))),
+        prover_ops::TYPE_PROVER_SENIORITY_MERGE => {
+            prover_ops::ProverSeniorityMerge::from_canonical_bytes(inner)
+                .ok()
+                .map(|s| Request::SeniorityMerge(conversions::prover_seniority_merge_to_proto(&s)))
+        }
         quil_execution::global_intrinsic::TYPE_FRAME_HEADER => {
             quil_execution::global_intrinsic::FrameHeader::from_canonical_bytes(inner)
                 .ok()
                 .map(|h| Request::Shard(conversions::frame_header_to_proto(&h)))
         }
-        // The remaining 21 variants (Kick, TokenDeploy/Update, Transaction,
-        // PendingTransaction, MintTransaction, HypergraphDeploy/Update,
-        // VertexAdd/Remove, HyperedgeAdd/Remove, ComputeDeploy/Update,
-        // CodeDeploy/Execute/Finalize, AltShardUpdate, SeniorityMerge,
-        // ShardSplit, ShardMerge) require canonical→proto converters that
-        // are not yet ported. The bundle structure (count + timestamp) is
-        // preserved; the inner oneof is left None until those converters
-        // land.
+        // Hypergraph ops — decode canonical → proto so an app-shard frame's
+        // `requests` carry them (and `materialize_app_shard_requests` can then
+        // re-encode via `proto_message_request_to_canonical` below). Without
+        // this, a VertexAdd/Hyperedge dispatch rides `requests_root` but is
+        // dropped from `frame.requests` and never materializes.
+        TYPE_HYPERGRAPH_DEPLOYMENT => hg_types::HypergraphDeploy::from_canonical_bytes(inner)
+            .ok()
+            .map(|d| Request::HypergraphDeploy(d.to_proto())),
+        TYPE_HYPERGRAPH_UPDATE => hg_types::HypergraphUpdate::from_canonical_bytes(inner)
+            .ok()
+            .map(|u| Request::HypergraphUpdate(u.to_proto())),
+        TYPE_VERTEX_ADD => hg_types::VertexAdd::from_canonical_bytes(inner)
+            .ok()
+            .map(|v| Request::VertexAdd(v.to_proto())),
+        TYPE_VERTEX_REMOVE => hg_types::VertexRemove::from_canonical_bytes(inner)
+            .ok()
+            .map(|v| Request::VertexRemove(v.to_proto())),
+        TYPE_HYPEREDGE_ADD => hg_types::HyperedgeAdd::from_canonical_bytes(inner)
+            .ok()
+            .map(|h| Request::HyperedgeAdd(h.to_proto())),
+        TYPE_HYPEREDGE_REMOVE => hg_types::HyperedgeRemove::from_canonical_bytes(inner)
+            .ok()
+            .map(|h| Request::HyperedgeRemove(h.to_proto())),
+        // Token ops — decode canonical → proto so an app-shard frame's
+        // `requests` carry them and `materialize_app_shard_requests` can
+        // re-encode via `proto_message_request_to_canonical`. Without this
+        // they rode `requests_root` but were dropped from `frame.requests`.
+        TYPE_TOKEN_DEPLOY => TokenDeploy::from_canonical_bytes(inner)
+            .ok()
+            .and_then(|d| token_conv::token_deploy_to_proto(&d).ok())
+            .map(Request::TokenDeploy),
+        TYPE_TOKEN_UPDATE => TokenUpdate::from_canonical_bytes(inner)
+            .ok()
+            .and_then(|u| token_conv::token_update_to_proto(&u).ok())
+            .map(Request::TokenUpdate),
+        TYPE_TRANSACTION => Transaction::from_canonical_bytes(inner)
+            .ok()
+            .and_then(|t| token_conv::transaction_to_proto(&t).ok())
+            .map(Request::Transaction),
+        TYPE_PENDING_TRANSACTION => PendingTransaction::from_canonical_bytes(inner)
+            .ok()
+            .and_then(|t| token_conv::pending_transaction_to_proto(&t).ok())
+            .map(Request::PendingTransaction),
+        TYPE_MINT_TRANSACTION => MintTransaction::from_canonical_bytes(inner)
+            .ok()
+            .and_then(|t| token_conv::mint_transaction_to_proto(&t).ok())
+            .map(Request::MintTransaction),
+        // Compute ops — same rationale as the token ops above.
+        TYPE_COMPUTE_DEPLOY => ComputeDeploy::from_canonical_bytes(inner)
+            .ok()
+            .and_then(|d| compute_conv::compute_deploy_to_proto(&d).ok())
+            .map(Request::ComputeDeploy),
+        TYPE_COMPUTE_UPDATE => ComputeUpdate::from_canonical_bytes(inner)
+            .ok()
+            .and_then(|u| compute_conv::compute_update_to_proto(&u).ok())
+            .map(Request::ComputeUpdate),
+        TYPE_CODE_DEPLOYMENT => CodeDeployment::from_canonical_bytes(inner)
+            .ok()
+            .map(|d| Request::CodeDeploy(compute_conv::code_deployment_to_proto(&d))),
+        TYPE_CODE_EXECUTE => CodeExecute::from_canonical_bytes(inner)
+            .ok()
+            .and_then(|e| compute_conv::code_execute_to_proto(&e).ok())
+            .map(Request::CodeExecute),
+        TYPE_CODE_FINALIZE => CodeFinalize::from_canonical_bytes(inner)
+            .ok()
+            .and_then(|f| compute_conv::code_finalize_to_proto(&f).ok())
+            .map(Request::CodeFinalize),
+        // AltShardUpdate — non-consensus application address space (the
+        // network only holds the roots); still surfaced + round-tripped for
+        // completeness.
+        TYPE_ALT_SHARD_UPDATE => AltShardUpdate::from_canonical_bytes(inner)
+            .ok()
+            .map(|a| Request::AltShardUpdate(conversions::alt_shard_update_to_proto(&a))),
+        // Any genuinely unported variant preserves the bundle structure
+        // (count + timestamp) with a `None` inner oneof.
         _ => None,
     };
     MessageRequest {
@@ -848,6 +1071,8 @@ fn proto_message_request_to_canonical(
     req: &quil_types::proto::global::MessageRequest,
 ) -> Option<quil_execution::message_envelope::CanonicalMessageRequest> {
     use quil_execution::global_intrinsic::conversions;
+    use quil_execution::token_intrinsic::conversions as token_conv;
+    use quil_execution::compute_intrinsic::conversions as compute_conv;
     use quil_execution::message_envelope::CanonicalMessageRequest;
     use quil_types::proto::global::message_request::Request;
 
@@ -877,9 +1102,81 @@ fn proto_message_request_to_canonical(
         Request::Shard(p) => conversions::frame_header_from_proto(p)
             .to_canonical_bytes()
             .ok()?,
-        // Other 21 variants — Kick, TokenDeploy, Transaction, etc. — do
-        // not yet have proto→canonical converters. Symmetric with
-        // `canonical_request_to_proto` which also doesn't handle them.
+        // Global lifecycle ops — symmetric with `canonical_request_to_proto` so
+        // the materializer re-encodes them into `process_message` instead of
+        // silently dropping them.
+        Request::Kick(p) => conversions::prover_kick_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        Request::ShardSplit(p) => conversions::shard_split_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        Request::ShardMerge(p) => conversions::shard_merge_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        Request::SeniorityMerge(p) => conversions::prover_seniority_merge_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        // Hypergraph ops (deploy/update, vertex add/remove, hyperedge
+        // add/remove): `request_to_payload` handles all six proto→canonical.
+        // This is what lets `materialize_app_shard_requests` carry a hypergraph
+        // write from `frame.requests` into `process_message`.
+        Request::HypergraphDeploy(_)
+        | Request::HypergraphUpdate(_)
+        | Request::VertexAdd(_)
+        | Request::VertexRemove(_)
+        | Request::HyperedgeAdd(_)
+        | Request::HyperedgeRemove(_) => {
+            quil_execution::hypergraph_engine::request_to_payload(req).ok()?
+        }
+        // Token ops — symmetric with `canonical_request_to_proto` so the
+        // materializer re-encodes them into `process_message` rather than
+        // dropping them.
+        Request::TokenDeploy(p) => token_conv::token_deploy_from_proto(p)
+            .ok()?
+            .to_canonical_bytes()
+            .ok()?,
+        Request::TokenUpdate(p) => token_conv::token_update_from_proto(p)
+            .ok()?
+            .to_canonical_bytes()
+            .ok()?,
+        Request::Transaction(p) => token_conv::transaction_from_proto(p)
+            .ok()?
+            .to_canonical_bytes()
+            .ok()?,
+        Request::PendingTransaction(p) => token_conv::pending_transaction_from_proto(p)
+            .ok()?
+            .to_canonical_bytes()
+            .ok()?,
+        Request::MintTransaction(p) => token_conv::mint_transaction_from_proto(p)
+            .ok()?
+            .to_canonical_bytes()
+            .ok()?,
+        // Compute ops — same rationale.
+        Request::ComputeDeploy(p) => compute_conv::compute_deploy_from_proto(p)
+            .ok()?
+            .to_canonical_bytes()
+            .ok()?,
+        Request::ComputeUpdate(p) => compute_conv::compute_update_from_proto(p)
+            .ok()?
+            .to_canonical_bytes()
+            .ok()?,
+        Request::CodeDeploy(p) => compute_conv::code_deployment_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        Request::CodeExecute(p) => compute_conv::code_execute_from_proto(p)
+            .ok()?
+            .to_canonical_bytes()
+            .ok()?,
+        Request::CodeFinalize(p) => compute_conv::code_finalize_from_proto(p)
+            .ok()?
+            .to_canonical_bytes()
+            .ok()?,
+        Request::AltShardUpdate(p) => conversions::alt_shard_update_from_proto(p)
+            .to_canonical_bytes()
+            .ok()?,
+        // Any genuinely unported variant is dropped (symmetric with the
+        // `_ => None` in `canonical_request_to_proto`).
         _ => return None,
     };
 
@@ -916,6 +1213,16 @@ fn decode_frame_header(
 
     let commit_count = read_u32(data, &mut c)
         .map_err(|e| QuilError::InvalidArgument(format!("commit_count at {}/{}: {}", c, total, e)))? as usize;
+    // Bound the count against remaining bytes BEFORE pre-allocating: each entry
+    // is a length-prefixed blob (>= 4 bytes), so a claimed count larger than
+    // `remaining / 4` is impossible — reject it instead of letting an
+    // attacker-chosen u32 drive a huge `Vec::with_capacity` (a ~100GB alloc =
+    // OOM/abort from a tiny frame, reachable pre-auth on the gossip path).
+    if commit_count > data.len().saturating_sub(c) / 4 {
+        return Err(QuilError::InvalidArgument(format!(
+            "GlobalFrame: commit_count {} exceeds what remaining bytes can hold", commit_count
+        )));
+    }
     let mut global_commitments = Vec::with_capacity(commit_count);
     for i in 0..commit_count {
         global_commitments.push(read_bytes(data, &mut c)
@@ -926,6 +1233,19 @@ fn decode_frame_header(
         .map_err(|e| QuilError::InvalidArgument(format!("prover_tree_commit at {}/{}: {}", c, total, e)))?;
     let requests_root = read_bytes(data, &mut c)
         .map_err(|e| QuilError::InvalidArgument(format!("requests_root at {}/{}: {}", c, total, e)))?;
+    let aux_count = read_u32(data, &mut c)
+        .map_err(|e| QuilError::InvalidArgument(format!("aux_root_count at {}/{}: {}", c, total, e)))? as usize;
+    // Same allocation-bomb guard as commit_count (entries are length-prefixed).
+    if aux_count > data.len().saturating_sub(c) / 4 {
+        return Err(QuilError::InvalidArgument(format!(
+            "GlobalFrame: aux_count {} exceeds what remaining bytes can hold", aux_count
+        )));
+    }
+    let mut prover_tree_aux_roots = Vec::with_capacity(aux_count);
+    for i in 0..aux_count {
+        prover_tree_aux_roots.push(read_bytes(data, &mut c)
+            .map_err(|e| QuilError::InvalidArgument(format!("aux_root[{}] at {}/{}: {}", i, c, total, e)))?);
+    }
     let prover = read_bytes(data, &mut c)
         .map_err(|e| QuilError::InvalidArgument(format!("prover at {}/{}: {}", c, total, e)))?;
 
@@ -955,6 +1275,7 @@ fn decode_frame_header(
         parent_selector,
         global_commitments,
         prover_tree_commitment,
+        prover_tree_aux_roots,
         requests_root,
         prover,
         public_key_signature_bls48581,
@@ -976,6 +1297,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn header_decode_rejects_alloc_bomb_counts() {
+        // A tiny header claiming a huge commit_count/aux_count must be REJECTED
+        // by the remaining-bytes bound, not drive a ~100GB `Vec::with_capacity`
+        // (OOM/abort). Reachable pre-auth on the gossip decode path.
+        let build = |commit_count: u32, aux_count: u32| {
+            let mut b = Vec::new();
+            put_u32(&mut b, GLOBAL_FRAME_HEADER_TYPE);
+            b.extend_from_slice(&0u64.to_be_bytes()); // frame_number
+            b.extend_from_slice(&0u64.to_be_bytes()); // rank
+            b.extend_from_slice(&0i64.to_be_bytes()); // timestamp
+            put_u32(&mut b, 0); // difficulty
+            put_u32(&mut b, 0); // output (empty LP)
+            put_u32(&mut b, 0); // parent_selector (empty LP)
+            put_u32(&mut b, commit_count);
+            // For the aux-count case we need a valid (empty) commitments list +
+            // the intervening fields so the cursor reaches aux_count.
+            if commit_count == 0 {
+                put_u32(&mut b, 0); // prover_tree_commitment (empty LP)
+                put_u32(&mut b, 0); // requests_root (empty LP)
+                put_u32(&mut b, aux_count);
+            }
+            b
+        };
+        let r = decode_frame_header(&build(u32::MAX, 0));
+        assert!(r.is_err(), "huge commit_count must be rejected");
+        assert!(r.unwrap_err().to_string().contains("commit_count"));
+
+        let r = decode_frame_header(&build(0, u32::MAX));
+        assert!(r.is_err(), "huge aux_count must be rejected");
+        assert!(r.unwrap_err().to_string().contains("aux_count"));
+    }
+
+    #[test]
     fn proposal_vote_roundtrip() {
         let vote = ProposalVote {
             filter: vec![0xFF; 32],
@@ -985,6 +1339,7 @@ mod tests {
             timestamp: 1700000000,
             signature: vec![0xBB; 74],
             address: vec![0xCC; 32],
+            openings: Vec::new(),
         };
         let bytes = vote.to_canonical_bytes().unwrap();
         assert_eq!(&bytes[..4], &PROPOSAL_VOTE_TYPE.to_be_bytes());
@@ -992,6 +1347,37 @@ mod tests {
         assert_eq!(decoded.rank, 42);
         assert_eq!(decoded.frame_number, 1000);
         assert_eq!(decoded.filter, vec![0xFF; 32]);
+    }
+
+    #[test]
+    fn proposal_vote_openings_roundtrip_and_backcompat() {
+        let base = ProposalVote {
+            filter: vec![0xFF; 32],
+            rank: 7,
+            frame_number: 9,
+            selector: vec![0xAA; 32],
+            timestamp: 5,
+            signature: vec![0xBB; 74],
+            address: vec![0xCC; 32],
+            openings: Vec::new(),
+        };
+        // Empty openings → nothing appended → decodes back to empty.
+        let empty_bytes = base.to_canonical_bytes().unwrap();
+        assert!(ProposalVote::from_canonical_bytes(&empty_bytes).unwrap().openings.is_empty());
+
+        // Non-empty openings → appended (longer) and round-trips, with the
+        // legacy fields intact.
+        let with = ProposalVote { openings: vec![0x11, 0x22, 0x33, 0x44], ..base.clone() };
+        let with_bytes = with.to_canonical_bytes().unwrap();
+        assert!(
+            with_bytes.len() > empty_bytes.len(),
+            "openings must be appended after the legacy fields"
+        );
+        let d = ProposalVote::from_canonical_bytes(&with_bytes).unwrap();
+        assert_eq!(d.openings, vec![0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(d.rank, 7);
+        assert_eq!(d.signature, vec![0xBB; 74]);
+        assert_eq!(d.address, vec![0xCC; 32]);
     }
 
     #[test]
@@ -1015,8 +1401,8 @@ mod tests {
         let qc = QuorumCertificate::genesis(0, vec![0xAA; 32]);
         assert_eq!(qc.rank, 0);
         assert_eq!(qc.frame_number, 0);
-        assert_eq!(qc.aggregate_signature.public_key.len(), 585);
-        assert_eq!(qc.aggregate_signature.signature.len(), 74);
+        assert_eq!(qc.aggregate_signature.public_key.len(), 897);
+        assert_eq!(qc.aggregate_signature.signature.len(), 666);
         assert_eq!(qc.aggregate_signature.bitmask.len(), 32);
         assert!(qc.aggregate_signature.bitmask.iter().all(|&b| b == 0xFF));
     }
@@ -1030,6 +1416,7 @@ mod tests {
                 filter: vec![], rank: 1, frame_number: 1,
                 selector: vec![0; 32], timestamp: 0,
                 signature: vec![0; 74], address: vec![0; 32],
+                openings: Vec::new(),
             },
             timeout_tick: 10,
             timestamp: 5000,
@@ -1063,7 +1450,7 @@ mod tests {
             filter: vec![0xAAu8; 32],
             frame_number: 7,
             public_key_signature_bls48581: Some(AddressedSignature {
-                signature: vec![0xBBu8; 74],
+                signature: vec![0xBBu8; 666],
                 address: vec![0xCCu8; 32],
             }),
         }
@@ -1097,6 +1484,7 @@ mod tests {
             parent_selector: vec![0x02; 32],
             global_commitments: vec![vec![0x03; 32]],
             prover_tree_commitment: vec![0x04; 32],
+            prover_tree_aux_roots: vec![vec![0x07; 32], vec![0x08; 32], vec![0x09; 32]],
             requests_root: vec![0x05; 32],
             prover: vec![0x06; 32],
             public_key_signature_bls48581: Vec::new(),
@@ -1116,6 +1504,11 @@ mod tests {
         let h = decoded.header.as_ref().expect("header");
         assert_eq!(h.frame_number, 12345);
         assert_eq!(h.rank, 1);
+        // Prover shard aux roots (audit #5) survive the canonical round-trip.
+        assert_eq!(
+            h.prover_tree_aux_roots,
+            vec![vec![0x07; 32], vec![0x08; 32], vec![0x09; 32]]
+        );
 
         assert_eq!(decoded.requests.len(), 2);
         assert_eq!(decoded.requests[0].timestamp, 1_700_000_000);
@@ -1155,5 +1548,328 @@ mod tests {
         put_bytes(&mut frame, &header_bytes);
         put_u32(&mut frame, 101); // exceeds the 100 cap mirror'd from Go
         assert!(decode_global_frame(&frame).is_err());
+    }
+
+    /// A hypergraph VertexAdd must survive the app-shard frame's request
+    /// round-trip: canonical → proto (`decode_message_bundle`, which builds
+    /// `frame.requests`) → canonical (`proto_message_bundle_to_canonical_bytes`,
+    /// used by `materialize_app_shard_requests`). Before both conversions learned
+    /// the hypergraph ops, the VertexAdd was dropped to `None` in each direction —
+    /// so a real write rode `requests_root` but never reached materialize.
+    #[test]
+    fn hypergraph_vertex_add_survives_bundle_round_trip() {
+        use quil_execution::hypergraph_intrinsic::types::VertexAdd;
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use quil_types::proto::global::message_request::Request;
+
+        let vadd = VertexAdd {
+            domain: vec![0x11u8; 32],
+            data_address: vec![0x22u8; 32],
+            data: vec![0u8; 8],
+            signature: vec![0xCCu8; 114],
+        };
+        let vadd_canon = vadd.to_canonical_bytes().unwrap();
+        let canon_bundle = CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest::wrap(vadd_canon).unwrap())],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+
+        // canonical → proto: the VertexAdd must be PRESERVED (not dropped to None).
+        let proto_bundle = decode_message_bundle(&canon_bundle).unwrap();
+        assert_eq!(proto_bundle.requests.len(), 1);
+        assert!(
+            matches!(proto_bundle.requests[0].request, Some(Request::VertexAdd(_))),
+            "canonical→proto must preserve the VertexAdd, got {:?}",
+            proto_bundle.requests[0].request
+        );
+
+        // proto → canonical: byte-exact round-trip back to the original bundle.
+        let re_canon = proto_message_bundle_to_canonical_bytes(&proto_bundle).unwrap();
+        assert_eq!(
+            re_canon, canon_bundle,
+            "proto→canonical round-trip must reproduce the original canonical bundle"
+        );
+    }
+
+    #[test]
+    fn global_lifecycle_ops_survive_bundle_round_trip() {
+        use quil_execution::global_intrinsic::addressed_signature::AddressedSignature;
+        use quil_execution::global_intrinsic::prover_ops::{
+            ProverKick, ProverSeniorityMerge, ShardMerge, ShardSplit,
+        };
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use quil_types::proto::global::message_request::Request;
+
+        let sig = || AddressedSignature {
+            signature: vec![0x66u8; AddressedSignature::SIG_LEN_SINGLE],
+            address: vec![0x77u8; 32],
+        };
+        let kick = ProverKick {
+            frame_number: 100,
+            kicked_prover_public_key: vec![0xCCu8; 585],
+            conflicting_frame_1: vec![1u8; 100],
+            conflicting_frame_2: vec![2u8; 100],
+            commitment: vec![3u8; 74],
+            proof: vec![4u8; 64],
+            // Empty → None; a populated TraversalProof round-trips via prost.
+            traversal_proof: Vec::new(),
+        };
+        let split = ShardSplit {
+            shard_address: vec![0x33u8; 32],
+            proposed_shards: vec![vec![0x44u8; 32], vec![0x55u8; 32]],
+            frame_number: 101,
+            public_key_signature_bls48581: Some(sig()),
+        };
+        let merge = ShardMerge {
+            shard_addresses: vec![vec![0x88u8; 32]],
+            parent_address: vec![0x99u8; 32],
+            frame_number: 102,
+            public_key_signature_bls48581: Some(sig()),
+        };
+        let seniority = ProverSeniorityMerge {
+            frame_number: 103,
+            public_key_signature_bls48581: Some(sig()),
+            merge_targets: Vec::new(),
+        };
+
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (kick.to_canonical_bytes().unwrap(), "kick"),
+            (split.to_canonical_bytes().unwrap(), "split"),
+            (merge.to_canonical_bytes().unwrap(), "merge"),
+            (seniority.to_canonical_bytes().unwrap(), "seniority"),
+        ];
+        for (canon, want) in cases {
+            let bundle = CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest::wrap(canon).unwrap())],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap();
+
+            // canonical → proto: the op must be PRESERVED (not dropped to None).
+            let proto = decode_message_bundle(&bundle).unwrap();
+            assert_eq!(proto.requests.len(), 1);
+            let ok = matches!(
+                (&proto.requests[0].request, want),
+                (Some(Request::Kick(_)), "kick")
+                    | (Some(Request::ShardSplit(_)), "split")
+                    | (Some(Request::ShardMerge(_)), "merge")
+                    | (Some(Request::SeniorityMerge(_)), "seniority")
+            );
+            assert!(
+                ok,
+                "canonical→proto must preserve {want}, got {:?}",
+                proto.requests[0].request
+            );
+
+            // proto → canonical: byte-exact round-trip.
+            let re = proto_message_bundle_to_canonical_bytes(&proto).unwrap();
+            assert_eq!(re, bundle, "byte-exact round-trip for {want}");
+        }
+    }
+
+    #[test]
+    fn token_compute_altshard_ops_survive_bundle_round_trip() {
+        use quil_execution::compute_intrinsic::ops::{
+            CodeDeployment, CodeExecute, CodeFinalize, ExecuteOperation, ExecutionResult,
+            StateTransition,
+        };
+        use quil_execution::compute_intrinsic::config::{ComputeDeploy, ComputeUpdate};
+        use quil_execution::global_intrinsic::consensus_types::AltShardUpdate;
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use quil_execution::token_intrinsic::deploy::{TokenDeploy, TokenUpdate};
+        use quil_execution::token_intrinsic::mint::{
+            MintTransaction, MintTransactionInput, MintTransactionOutput,
+        };
+        use quil_execution::token_intrinsic::pending::{
+            PendingTransaction, PendingTransactionInput, PendingTransactionOutput,
+        };
+        use quil_execution::token_intrinsic::transaction::{
+            Transaction, TransactionInput, TransactionOutput,
+        };
+        use quil_types::proto::global::message_request::Request;
+
+        // --- token ---
+        let token_deploy = TokenDeploy { config: Vec::new(), rdf_schema: b"schema".to_vec() };
+        let token_update = TokenUpdate {
+            config: Vec::new(),
+            rdf_schema: b"schema".to_vec(),
+            public_key_signature_bls48581: vec![0x66u8; 74],
+        };
+        let tx = Transaction {
+            domain: vec![0x11u8; 32],
+            inputs: vec![TransactionInput {
+                commitment: vec![1u8; 74],
+                signature: vec![2u8; 74],
+                proofs: vec![vec![3u8; 32]],
+            }
+            .to_canonical_bytes()
+            .unwrap()],
+            outputs: vec![TransactionOutput {
+                frame_number: vec![0u8; 8],
+                commitment: vec![4u8; 74],
+                recipient_output: Vec::new(),
+            }
+            .to_canonical_bytes()
+            .unwrap()],
+            fees: vec![vec![0u8, 5]],
+            range_proof: vec![6u8; 32],
+            traversal_proof: Vec::new(),
+        };
+        let pending = PendingTransaction {
+            domain: vec![0x12u8; 32],
+            inputs: vec![PendingTransactionInput {
+                commitment: vec![1u8; 74],
+                signature: vec![2u8; 74],
+                proofs: vec![vec![3u8; 32]],
+            }
+            .to_canonical_bytes()
+            .unwrap()],
+            outputs: vec![PendingTransactionOutput {
+                frame_number: vec![0u8; 8],
+                commitment: vec![4u8; 74],
+                to: Vec::new(),
+                refund: Vec::new(),
+                expiration: 42,
+            }
+            .to_canonical_bytes()
+            .unwrap()],
+            fees: vec![vec![0u8, 5]],
+            range_proof: vec![6u8; 32],
+            traversal_proof: Vec::new(),
+        };
+        let mint = MintTransaction {
+            domain: vec![0x13u8; 32],
+            inputs: vec![MintTransactionInput {
+                value: vec![0u8, 9],
+                commitment: vec![1u8; 74],
+                signature: vec![2u8; 74],
+                proofs: vec![vec![3u8; 32]],
+                additional_reference: vec![7u8; 64],
+                additional_reference_key: vec![8u8; 57],
+            }
+            .to_canonical_bytes()
+            .unwrap()],
+            outputs: vec![MintTransactionOutput {
+                frame_number: vec![0u8; 8],
+                commitment: vec![4u8; 74],
+                recipient_output: Vec::new(),
+            }
+            .to_canonical_bytes()
+            .unwrap()],
+            fees: vec![vec![0u8, 5]],
+            range_proof: vec![6u8; 32],
+        };
+
+        // --- compute ---
+        let compute_deploy = ComputeDeploy { config: Vec::new(), rdf_schema: b"schema".to_vec() };
+        let compute_update = ComputeUpdate {
+            config: Vec::new(),
+            rdf_schema: b"schema".to_vec(),
+            public_key_signature_bls48581: vec![0x66u8; 74],
+        };
+        // input/output types round-trip through String → must be valid UTF-8.
+        let code_deploy = CodeDeployment {
+            circuit: vec![0xAAu8; 40],
+            input_types: vec![b"uint64".to_vec()],
+            output_types: vec![b"bool".to_vec()],
+            domain: [0x11u8; 32],
+        };
+        let code_execute = CodeExecute {
+            proof_of_payment: vec![vec![1u8; 2]],
+            domain: [0x22u8; 32],
+            rendezvous: [0x33u8; 32],
+            execute_operations: vec![ExecuteOperation {
+                application: Vec::new(),
+                identifier: vec![9u8; 16],
+                dependencies: vec![vec![0xAu8; 16]],
+            }
+            .to_canonical_bytes()
+            .unwrap()],
+        };
+        let code_finalize = CodeFinalize {
+            rendezvous: [0x44u8; 32],
+            results: vec![ExecutionResult {
+                operation_id: vec![9u8; 16],
+                success: true,
+                output: vec![1u8; 8],
+                error: Vec::new(),
+            }
+            .to_canonical_bytes()
+            .unwrap()],
+            state_changes: vec![StateTransition {
+                domain: [0x55u8; 32],
+                address: vec![2u8; 32],
+                old_value: vec![3u8; 8],
+                new_value: vec![4u8; 8],
+                proof: vec![5u8; 32],
+            }
+            .to_canonical_bytes()
+            .unwrap()],
+            proof_of_execution: vec![6u8; 32],
+            message_output: vec![7u8; 8],
+        };
+
+        // --- altshard ---
+        let alt = AltShardUpdate {
+            public_key: vec![0xCCu8; 585],
+            frame_number: 200,
+            vertex_adds_root: vec![1u8; 74],
+            vertex_removes_root: vec![2u8; 74],
+            hyperedge_adds_root: vec![3u8; 74],
+            hyperedge_removes_root: vec![4u8; 74],
+            signature: vec![5u8; 74],
+        };
+
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (token_deploy.to_canonical_bytes().unwrap(), "token_deploy"),
+            (token_update.to_canonical_bytes().unwrap(), "token_update"),
+            (tx.to_canonical_bytes().unwrap(), "transaction"),
+            (pending.to_canonical_bytes().unwrap(), "pending"),
+            (mint.to_canonical_bytes().unwrap(), "mint"),
+            (compute_deploy.to_canonical_bytes().unwrap(), "compute_deploy"),
+            (compute_update.to_canonical_bytes().unwrap(), "compute_update"),
+            (code_deploy.to_canonical_bytes().unwrap(), "code_deploy"),
+            (code_execute.to_canonical_bytes().unwrap(), "code_execute"),
+            (code_finalize.to_canonical_bytes().unwrap(), "code_finalize"),
+            (alt.to_canonical_bytes().unwrap(), "alt_shard_update"),
+        ];
+        for (canon, want) in cases {
+            let bundle = CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest::wrap(canon).unwrap())],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap();
+
+            // canonical → proto: the op must be PRESERVED (not dropped to None).
+            let proto = decode_message_bundle(&bundle).unwrap();
+            assert_eq!(proto.requests.len(), 1);
+            let ok = matches!(
+                (&proto.requests[0].request, want),
+                (Some(Request::TokenDeploy(_)), "token_deploy")
+                    | (Some(Request::TokenUpdate(_)), "token_update")
+                    | (Some(Request::Transaction(_)), "transaction")
+                    | (Some(Request::PendingTransaction(_)), "pending")
+                    | (Some(Request::MintTransaction(_)), "mint")
+                    | (Some(Request::ComputeDeploy(_)), "compute_deploy")
+                    | (Some(Request::ComputeUpdate(_)), "compute_update")
+                    | (Some(Request::CodeDeploy(_)), "code_deploy")
+                    | (Some(Request::CodeExecute(_)), "code_execute")
+                    | (Some(Request::CodeFinalize(_)), "code_finalize")
+                    | (Some(Request::AltShardUpdate(_)), "alt_shard_update")
+            );
+            assert!(
+                ok,
+                "canonical→proto must preserve {want}, got {:?}",
+                proto.requests[0].request
+            );
+
+            // proto → canonical: byte-exact round-trip.
+            let re = proto_message_bundle_to_canonical_bytes(&proto).unwrap();
+            assert_eq!(re, bundle, "byte-exact round-trip for {want}");
+        }
     }
 }

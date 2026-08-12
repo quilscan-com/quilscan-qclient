@@ -91,20 +91,20 @@ pub struct CanonicalCapability {
 /// `node/consensus/global/global_consensus_engine.go:1585-1647`):
 ///
 /// - **Process mode** — if either `worker_p2p_multiaddrs` or
-///   `worker_stream_multiaddrs` contains a non-empty entry, the node
-///   is running workers as separate processes with their own ports.
-///   For each worker, the reachability uses that worker's own
-///   addresses: announce variant first (`worker_announce_p2p[i]` /
-///   `worker_announce_stream[i]`), then listen variant
-///   (`worker_p2p_multiaddrs[i]` / `worker_stream_multiaddrs[i]`),
-///   then falling back to master's addresses if neither is set for
-///   that index.
+/// `worker_stream_multiaddrs` contains a non-empty entry, the node
+/// is running workers as separate processes with their own ports.
+/// For each worker, the reachability uses that worker's own
+/// addresses: announce variant first (`worker_announce_p2p[i]` /
+/// `worker_announce_stream[i]`), then listen variant
+/// (`worker_p2p_multiaddrs[i]` / `worker_stream_multiaddrs[i]`),
+/// then falling back to master's addresses if neither is set for
+/// that index.
 ///
 /// - **Thread mode** — otherwise, workers run as in-process tokio
-///   tasks sharing the master's BlossomSub instance. Each worker's
-///   reachability uses the master's `pubsub_addr` and `stream_addrs`
-///   verbatim; only the filter varies. This is the default for the
-///   Rust port.
+/// tasks sharing the master's BlossomSub instance. Each worker's
+/// reachability uses the master's `pubsub_addr` and `stream_addrs`
+/// verbatim; only the filter varies. This is the default for the
+/// Rust port.
 ///
 /// Index `i` into the per-worker config arrays corresponds to
 /// `core_id = i + 1` (core 0 is reserved for the master). Workers with
@@ -268,7 +268,7 @@ pub fn decode_canonical_peer_info(data: &[u8]) -> Result<CanonicalPeerInfo> {
     let mut info = CanonicalPeerInfo::default();
     info.peer_id = r.read_bytes()?;
     let reach_count = r.read_u32()? as usize;
-    info.reachability.reserve(reach_count);
+    info.reachability.reserve(reach_count.min(r.remaining()));
     for _ in 0..reach_count {
         let mut reach = CanonicalReachability::default();
         reach.filter = r.read_bytes()?;
@@ -286,7 +286,7 @@ pub fn decode_canonical_peer_info(data: &[u8]) -> Result<CanonicalPeerInfo> {
     info.version = r.read_bytes()?;
     info.patch_number = r.read_bytes()?;
     let cap_count = r.read_u32()? as usize;
-    info.capabilities.reserve(cap_count);
+    info.capabilities.reserve(cap_count.min(r.remaining()));
     for _ in 0..cap_count {
         let protocol_identifier = r.read_u32()?;
         let additional_metadata = r.read_bytes()?;
@@ -316,6 +316,15 @@ struct Reader<'a> {
 impl<'a> Reader<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
+    }
+    /// Bytes not yet consumed. Used to bound `Vec::reserve` against an
+    /// attacker-supplied count: a length-prefixed collection can never contain
+    /// more entries than there are remaining bytes (each entry is >= 1 byte),
+    /// so reserving `min(count, remaining())` prevents a crafted count from
+    /// requesting a multi-GB allocation that aborts the process via
+    /// `handle_alloc_error` (uncatchable) before the short-read check fires.
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
     }
     fn ensure(&self, n: usize) -> Result<()> {
         if self.pos + n > self.buf.len() {
@@ -613,7 +622,7 @@ pub fn decode_canonical_key_registry(data: &[u8]) -> Result<CanonicalKeyRegistry
     // Each value carries a Go canonical-bytes wrapper (4-byte type
     // prefix); we strip it so callers get the raw key material.
     let kbp_count = r.read_u32()? as usize;
-    out.keys_by_purpose.reserve(kbp_count);
+    out.keys_by_purpose.reserve(kbp_count.min(r.remaining()));
     for _ in 0..kbp_count {
         let purpose = r.read_bytes()?.to_vec();
         let raw_value = r.read_bytes()?;

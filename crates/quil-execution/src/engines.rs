@@ -131,14 +131,14 @@ impl GlobalExecutionEngine {
     }
 
     /// Install only the `frame_prover` on the intrinsic. This is the
-    /// minimum that ProverJoin validation needs
-    /// (`verify_prover_join_vdf` in `GlobalIntrinsic::validate`); the
-    /// broader `install_frame_header_deps` also wires materializer-side
-    /// registry/issuance/kick deps and is only needed on nodes that
-    /// locally materialize global frames (archives). Non-archive
-    /// masters call this so the archive-poller callback can pass
-    /// ProverJoin validation without taking on archive-only
-    /// materialization.
+    /// minimum needed to verify frame-header attestations
+    /// (`verify_frame_header_signature` in `GlobalIntrinsic::validate`);
+    /// the broader `install_frame_header_deps` also wires
+    /// materializer-side registry/issuance/kick deps and is only needed
+    /// on nodes that locally materialize global frames (archives).
+    /// Non-archive masters call this so the archive-poller callback can
+    /// validate frame headers without taking on archive-only
+    /// materialization. (ProverJoin no longer requires a VDF proof.)
     pub fn install_frame_prover(
         &mut self,
         frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
@@ -276,8 +276,14 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
                 for req in &bundle.requests {
                     if let Some(r) = req {
                         if let Err(e) = invoke(&r.inner_bytes, r.inner_type_prefix) {
-                            eprintln!(
-                                "[WARN] global invoke_step failed for bundle request type=0x{:08x}: {}",
+                            // Invalid global-intrinsic ops (prover join/confirm/
+                            // leave/reject/pause/resume/update/kick) are an
+                            // expected, high-volume part of normal operation
+                            // (stale frame numbers, races, superseded lifecycle
+                            // ops) — log at debug, not warn. Other engines keep
+                            // their failures at warn.
+                            tracing::debug!(
+                                "global invoke_step failed for bundle request type=0x{:08x}: {}",
                                 r.inner_type_prefix, e
                             );
                         }
@@ -303,8 +309,11 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
             TYPE_MESSAGE_REQUEST => {
                 let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
                 if let Err(e) = invoke(&req.inner_bytes, req.inner_type_prefix) {
-                    eprintln!(
-                        "[WARN] global invoke_step failed for single request type=0x{:08x}: {}",
+                    // Invalid global-intrinsic ops are expected/high-volume; log
+                    // at debug (see the bundle path above). Other engines' op
+                    // failures stay at warn.
+                    tracing::debug!(
+                        "global invoke_step failed for single request type=0x{:08x}: {}",
                         req.inner_type_prefix, e
                     );
                 }
@@ -380,8 +389,6 @@ pub struct TokenExecutionEngine {
     mode: ExecutionMode,
     inclusion_prover: Arc<dyn InclusionProver>,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
-    bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver>,
-    decaf_constructor: Arc<dyn quil_types::crypto::DecafConstructor>,
     key_manager: Arc<dyn quil_types::crypto::KeyManager>,
     clock_store: Arc<dyn quil_types::store::ClockStore>,
     config_resolver: Arc<dyn crate::token_intrinsic::config_resolver::TokenConfigResolver>,
@@ -395,8 +402,6 @@ impl TokenExecutionEngine {
     pub fn new(
         mode: ExecutionMode,
         inclusion_prover: Arc<dyn InclusionProver>,
-        bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver>,
-        decaf_constructor: Arc<dyn quil_types::crypto::DecafConstructor>,
         key_manager: Arc<dyn quil_types::crypto::KeyManager>,
         clock_store: Arc<dyn quil_types::store::ClockStore>,
     ) -> Self {
@@ -404,8 +409,6 @@ impl TokenExecutionEngine {
             mode,
             inclusion_prover,
             state: None,
-            bulletproof_prover,
-            decaf_constructor,
             key_manager,
             clock_store,
             config_resolver: Arc::new(
@@ -420,8 +423,6 @@ impl TokenExecutionEngine {
         mode: ExecutionMode,
         inclusion_prover: Arc<dyn InclusionProver>,
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
-        bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver>,
-        decaf_constructor: Arc<dyn quil_types::crypto::DecafConstructor>,
         key_manager: Arc<dyn quil_types::crypto::KeyManager>,
         clock_store: Arc<dyn quil_types::store::ClockStore>,
     ) -> Self {
@@ -430,8 +431,6 @@ impl TokenExecutionEngine {
             mode,
             inclusion_prover,
             state: Some(state),
-            bulletproof_prover,
-            decaf_constructor,
             key_manager,
             clock_store,
             config_resolver: Arc::new(
@@ -500,62 +499,17 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 return Ok(());
             }
             match inner_tp {
-                crate::token_engine::TYPE_TRANSACTION => {
-                    let tx = crate::token_intrinsic::Transaction::from_canonical_bytes(inner_bytes)?;
-                    crate::token_intrinsic::verify::validate_transaction_structural(
-                        tx.inputs.len(), tx.outputs.len(), &tx.fees,
-                        crate::token_intrinsic::constants::QUIL_BEHAVIOR, tx.inputs.len(),
-                    )?;
-                    // Validate individual input field lengths
-                    for raw_input in &tx.inputs {
-                        let input = crate::token_intrinsic::TransactionInput::from_canonical_bytes(raw_input)?;
-                        crate::token_intrinsic::verify::validate_input_structural(
-                            &input.commitment, &input.signature,
-                        )?;
-                    }
-                }
-                crate::token_engine::TYPE_MINT_TRANSACTION => {
-                    let tx = crate::token_intrinsic::MintTransaction::from_canonical_bytes(inner_bytes)?;
-                    crate::token_intrinsic::verify::validate_mint_transaction_structural(
-                        tx.inputs.len(), tx.outputs.len(), &tx.fees,
-                        crate::token_intrinsic::constants::QUIL_BEHAVIOR,
-                    )?;
-                }
-                crate::token_engine::TYPE_PENDING_TRANSACTION => {
-                    let tx = crate::token_intrinsic::PendingTransaction::from_canonical_bytes(inner_bytes)?;
-                    // Structural-only validation at the validate_message
-                    // phase: ACCEPTABLE flag check + exactly-2-outputs +
-                    // fee bounds + non-divisible I/O-count parity. Full
-                    // crypto verify runs later in process_message via
-                    // `pending::verify_pending_transaction` once the
-                    // hypergraph CRDT and BulletproofProver+DecafConstructor
-                    // are available.
-                    crate::token_intrinsic::pending::validate_pending_structural(
-                        &tx,
-                        crate::token_intrinsic::constants::QUIL_BEHAVIOR,
-                    )?;
-                    // Per-input structural: 336/259-byte sig length, commitment=56B
-                    // Mirror of Go `PendingTransactionInput.Verify` structural checks.
-                    // Legacy 259-byte sigs only allowed for QUIL domain.
-                    let is_quil = _address == &crate::domains::QUIL_TOKEN[..];
-                    let check_legacy = is_quil;
-                    for raw in &tx.inputs {
-                        let input = crate::token_intrinsic::PendingTransactionInput::from_canonical_bytes(raw)?;
-                        crate::token_intrinsic::pending::validate_pending_input_structural(
-                            &input,
-                            crate::token_intrinsic::constants::QUIL_BEHAVIOR,
-                            check_legacy,
-                        )?;
-                    }
-                    // Per-output structural: commitment/recipient field sizes,
-                    // non-divisible addref parity.
-                    for raw in &tx.outputs {
-                        let output = crate::token_intrinsic::PendingTransactionOutput::from_canonical_bytes(raw)?;
-                        crate::token_intrinsic::pending::validate_pending_output_structural(
-                            &output,
-                            crate::token_intrinsic::constants::QUIL_BEHAVIOR,
-                        )?;
-                    }
+                // Decaf448 token types are RETIRED (post-PQ flag day): the
+                // confidential-value path is now the lattice-CT types (0x0512–
+                // 0x0516). decaf448 was never live on mainnet (legacy coins are
+                // migrated via the verenc→transparent→shield path), so these
+                // types are rejected outright rather than crypto-verified.
+                crate::token_engine::TYPE_TRANSACTION
+                | crate::token_engine::TYPE_MINT_TRANSACTION
+                | crate::token_engine::TYPE_PENDING_TRANSACTION => {
+                    return Err(QuilError::InvalidArgument(
+                        "decaf448 token type retired; use lattice-CT types (0x0512–0x0516)".into(),
+                    ));
                 }
                 _ => {
                     crate::token_engine::peek_token_message_kind(inner_bytes)?;
@@ -608,562 +562,315 @@ impl ShardExecutionEngine for TokenExecutionEngine {
 
             match inner_tp {
                 crate::token_engine::TYPE_TRANSACTION => {
-                    let tx = crate::token_intrinsic::Transaction::from_canonical_bytes(inner_bytes)?;
-
-                    // STRUCTURAL FAIL-FAST. See
-                    // `require_traversal_proof_for_inputs` for the
-                    // attack chain this gate closes. Extracted to a
-                    // standalone function so the regression test can
-                    // pin the invariant directly (the engine's
-                    // `process_message` swallows invoke_token errors
-                    // by design — that's correct production behavior
-                    // but makes the gate untestable via the
-                    // process_message API).
-                    require_traversal_proof_for_inputs(&tx)?;
-
-                    // Full crypto verify is unconditional — the providers
-                    // are mandatory engine inputs. Production callers
-                    // MUST supply real `BulletproofProver` +
-                    // `DecafConstructor`; the noop stubs in
-                    // `crate::testing` make every verify fail, which
-                    // matches the security posture we want when no
-                    // real crypto is wired up.
-                    let bp = self.bulletproof_prover.as_ref();
-                    let decaf = self.decaf_constructor.as_ref();
-                    let transcript = crate::token_intrinsic::verify::build_transaction_transcript(&tx)?;
-                    let challenge = decaf.hash_to_scalar(&transcript)?;
-                    // Per-input verify chain — structural, hidden
-                    // Schnorr, double-spend, AND within-tx duplicate
-                    // check all run together for each input. Keeping
-                    // these atomic per-input matches Go's behaviour at
-                    // `token_intrinsic_transaction.go:528-533, 1515-1521`
-                    // and avoids any refactor short-circuit that could
-                    // bypass the spent check.
-                    //
-                    // Within-tx duplicate input detection: track
-                    // poseidon(vk) addresses already seen in this
-                    // batch and reject collisions.
-                    let mut seen_vk: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-                    for (idx, raw) in tx.inputs.iter().enumerate() {
-                        let input = crate::token_intrinsic::TransactionInput::from_canonical_bytes(raw)?;
-                        crate::token_intrinsic::verify::validate_input_structural(
-                            &input.commitment,
-                            &input.signature,
-                        )?;
-                        let ok = crate::token_intrinsic::verify::verify_input_hidden_signature(
-                            bp,
-                            &input.signature,
-                            &challenge,
-                        )?;
-                        if !ok {
-                            return Err(QuilError::InvalidArgument(format!(
-                                "transaction: input {} hidden-signature verify failed",
-                                idx
-                            )));
-                        }
-                        // Within-tx duplicate guard: same coin
-                        // can't appear twice in this transaction's
-                        // input list. Mirrors Go's check at
-                        // `token_intrinsic_transaction.go:1515-1521`.
-                        let vk_window = if input.signature.len() >= 56 * 5 {
-                            &input.signature[56 * 4..56 * 5]
-                        } else {
-                            return Err(QuilError::InvalidArgument(format!(
-                                "transaction: input {} signature too short for vk window",
-                                idx
-                            )));
-                        };
-                        if !seen_vk.insert(vk_window.to_vec()) {
-                            return Err(QuilError::InvalidArgument(format!(
-                                "transaction: input {} is a within-tx duplicate",
-                                idx
-                            )));
-                        }
-                        // Spent-marker check: the coin must not
-                        // already be consumed in the on-chain state.
-                        let not_spent = crate::token_intrinsic::spent_check::check_input_not_double_spent(
-                            state,
-                            _address,
-                            &input.signature,
-                        )?;
-                        if !not_spent {
-                            return Err(QuilError::InvalidArgument(format!(
-                                "transaction: input {} already spent (double-spend)",
-                                idx
-                            )));
-                        }
-                        // Refund-side expiration gate. For Expirable
-                        // tokens, each pending-claim input carries:
-                        //   - proofs[1]: 8-byte BE u64 expiration frame
-                        //   - proofs[2]: single-byte isTo indicator
-                        //     ([0x02] means "to" recipient; anything
-                        //     else means refund recipient)
-                        // A refund recipient (!isTo) cannot claim
-                        // before frame_number >= expiration, otherwise
-                        // they could short-circuit the recipient's
-                        // grace window. Mirrors Go
-                        // `token_intrinsic_transaction.go:656`.
-                        // QUIL_BEHAVIOR has EXPIRABLE set; non-QUIL
-                        // token configs would need to resolve their
-                        // behavior dynamically, but the only token
-                        // path through this engine today is QUIL.
-                        let behavior = crate::token_intrinsic::constants::QUIL_BEHAVIOR;
-                        if behavior & crate::token_intrinsic::constants::EXPIRABLE != 0
-                            && input.proofs.len() >= 3
-                        {
-                            let expiration_bytes = &input.proofs[1];
-                            let is_to_byte = input.proofs[2].first().copied();
-                            if expiration_bytes.len() == 8 && is_to_byte != Some(0x02) {
-                                let expiration = u64::from_be_bytes(
-                                    expiration_bytes.as_slice().try_into().unwrap(),
-                                );
-                                if _frame_number < expiration {
-                                    return Err(QuilError::InvalidArgument(format!(
-                                        "transaction: input {} refund-claim before expiration \
-                                         (frame_number={} < expiration={})",
-                                        idx, _frame_number, expiration,
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                    // Bulletproof range proof + sum check on output
-                    // commitments. `verify_transaction_crypto`
-                    // handles the quil-vs-other-domain fee inclusion
-                    // internally.
-                    let input_commits: Vec<Vec<u8>> = tx.inputs
-                        .iter()
-                        .map(|raw| {
-                            crate::token_intrinsic::TransactionInput::from_canonical_bytes(raw)
-                                .map(|i| i.commitment)
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let output_commits: Vec<Vec<u8>> = tx.outputs
-                        .iter()
-                        .map(|raw| {
-                            crate::token_intrinsic::TransactionOutput::from_canonical_bytes(raw)
-                                .map(|o| o.commitment)
-                        })
-                        .collect::<Result<Vec<_>>>()?;
+                    // Retired (decaf448): the confidential-value path is now
+                    // the lattice-CT types (0x0512-0x0516). Rejected at validate;
+                    // this is a defense-in-depth reject (unreachable in process).
+                    return Err(QuilError::InvalidArgument(
+                        "decaf448 token type retired; use lattice-CT (0x0512-0x0516)".into(),
+                    ));
+                }
+                crate::token_engine::TYPE_LATTICE_TRANSACTION => {
+                    // Post-quantum confidential transaction. `inner_bytes` is a
+                    // lattice-CT `TxEnvelope`: verify the folded spend proofs
+                    // against the token's committed accumulator root, check the
+                    // key-image nullifiers, and balance — then materialize the new
+                    // `(P, cv)` coins + key-image markers and refresh the shadow
+                    // tree's committed root. (Coexists with the decaf path during
+                    // cutover; retiring the decaf providers is a follow-up.)
+                    use crate::token_intrinsic::lattice_ct;
+                    let env = lattice_ct::decode_tx_envelope(inner_bytes)?;
+                    // Bound the consensus-opaque per-output memos + one-time keys
+                    // before they are stored verbatim in state (griefing/state-bloat
+                    // hardening #5).
+                    lattice_ct::check_memos_size(&env.output_memos)?;
+                    lattice_ct::check_otks_size(&env.output_otks)?;
+                    let np = lattice_ct::production_params();
                     let is_quil = _address == &crate::domains::QUIL_TOKEN[..];
-                    let verified = crate::token_intrinsic::verify::verify_transaction_crypto(
-                        bp,
-                        &input_commits,
-                        &output_commits,
-                        &tx.fees,
-                        &tx.range_proof,
-                        is_quil,
-                    )?;
-                    if !verified {
-                        return Err(QuilError::InvalidArgument(
-                            "transaction: bulletproof range/sum verify failed".into(),
-                        ));
-                    }
-
-                    // Traversal-proof verification against the source
-                    // shard's commitment root. The root comes from
-                    // `HypergraphCrdt::get_shard_commits(frame, domain)[0]`
-                    // (vertex-adds phase). This is the ON-CHAIN
-                    // EXISTENCE GATE for transaction inputs.
-                    //
-                    // SECURITY: this check is MANDATORY for any tx
-                    // with inputs. Without it, an attacker can mint
-                    // QUIL from thin air:
-                    //
-                    //   1. Fabricate a 336-byte signature for an
-                    //      input by choosing the secret first and
-                    //      computing the commitment to match — the
-                    //      hidden-Schnorr verify (`verify_input_hidden_signature`)
-                    //      passes by construction.
-                    //   2. The within-tx-duplicate check passes
-                    //      because the fabricated vk is unique.
-                    //   3. The spent-marker check
-                    //      (`check_input_not_double_spent`) returns
-                    //      `not_spent = true` because there is no
-                    //      spent marker at `poseidon(vk)` — but
-                    //      there's no marker because the coin was
-                    //      NEVER MINTED, not because it was
-                    //      "previously unspent." The marker check
-                    //      proves non-double-spend, not existence.
-                    //   4. The bulletproof range/sum check
-                    //      (`verify_transaction_crypto`) verifies
-                    //      internal consistency of the
-                    //      commitment-vs-balance math — but it does
-                    //      not require the input commitments to
-                    //      exist on-chain. An attacker who picks
-                    //      input and output values that sum can pass
-                    //      this trivially.
-                    //
-                    // The traversal_proof is the only place that
-                    // checks the input coin exists in the source
-                    // shard's vertex-adds tree at the cited frame.
-                    // Without it, the entire crypto stack reduces to
-                    // "prove knowledge of values you chose," which
-                    // is no proof at all.
-                    //
-                    // The earlier comment claimed spent-check
-                    // provided fallback correctness when
-                    // traversal_proof was empty. That was wrong — the
-                    // spent-marker is at `poseidon(vk)`, not at the
-                    // coin's address, and its absence is the
-                    // expected case for an unspent coin (whether
-                    // real or fake).
-                    // Structural fail-fast (empty inputs / empty
-                    // traversal_proof / empty outputs) has already
-                    // fired at the top of this arm. Reaching here
-                    // means we have all three; now verify the proof.
-                    if !tx.inputs.is_empty() {
-                        let first_output = crate::token_intrinsic::TransactionOutput::from_canonical_bytes(&tx.outputs[0])?;
-                        if first_output.frame_number.len() != 8 {
-                            return Err(QuilError::InvalidArgument(
-                                "transaction: outputs[0].frame_number must be 8 bytes".into(),
-                            ));
+                    match lattice_ct::verify_envelope_and_derive_coins(
+                        np, state, _address, &env, is_quil,
+                    )? {
+                        Some((key_images, new_coins)) => {
+                            let frame_bytes = _frame_number.to_be_bytes();
+                            let result =
+                                crate::token_intrinsic::materialize::materialize_lattice_transaction(
+                                    _address, &frame_bytes, &new_coins, &key_images,
+                                    &env.output_memos,
+                                )?;
+                            write_tx_result(state, _address, &va_disc, _frame_number, &result)?;
+                            crate::token_intrinsic::shadow_accumulator::refresh_root(
+                                state, _address,
+                            )?;
                         }
-                        let cited_frame = u64::from_be_bytes(
-                            first_output.frame_number.as_slice().try_into().unwrap(),
-                        );
-                        let crdt = state.crdt();
-                        let roots = crdt.get_shard_commits(cited_frame, &tx.domain)
-                            .map_err(|e| QuilError::InvalidArgument(format!(
-                                "transaction: cannot fetch shard commits for frame {} domain {}: {}",
-                                cited_frame, hex::encode(&tx.domain), e,
-                            )))?;
-                        if roots.is_empty() {
-                            return Err(QuilError::InvalidArgument(format!(
-                                "transaction: no shard commit at frame {} for domain {}",
-                                cited_frame, hex::encode(&tx.domain),
-                            )));
-                        }
-                        let traversal = crate::token_intrinsic::mint::parse_go_traversal_proof(
-                            &tx.traversal_proof,
-                        )?;
-                        let ok = crate::traversal_proof::verify_traversal_proof(
-                            self.inclusion_prover.as_ref(),
-                            &roots[0],
-                            &traversal,
-                        )?;
-                        if !ok {
+                        None => {
                             return Err(QuilError::InvalidArgument(
-                                "transaction: traversal proof failed (input not present \
-                                 in source-shard adds-phase)".into(),
+                                "lattice-ct: confidential transaction verification failed".into(),
                             ));
                         }
                     }
+                }
+                crate::token_engine::TYPE_LATTICE_MINT => {
+                    // Post-quantum PoMW mint. `inner_bytes` is a lattice-CT
+                    // `MintEnvelope`: verify each input's reward entitlement
+                    // (forest membership) + Falcon authorization + confidential
+                    // conservation, then materialize the new coins, DECREMENT the
+                    // provers' reward balances (soundness), and refresh the shadow
+                    // tree. All post-quantum — no decaf, no BLS.
+                    use crate::token_intrinsic::lattice_ct;
+                    let env = lattice_ct::decode_mint_envelope(inner_bytes)?;
+                    // Bound the consensus-opaque per-output memos + one-time keys
+                    // (hardening #5).
+                    lattice_ct::check_memos_size(&env.output_memos)?;
+                    lattice_ct::check_otks_size(&env.output_otks)?;
+                    let np = lattice_ct::production_params();
+                    let is_quil = _address == &crate::domains::QUIL_TOKEN[..];
+                    // Reward-tree root for the cited frame (forest, 32 bytes).
+                    let reward_root_vec: Vec<u8> = if is_quil {
+                        let frame = self.clock_store.get_global_clock_frame(env.cited_frame)?;
+                        let header = frame.header.ok_or_else(|| {
+                            QuilError::InvalidArgument("lattice-mint: cited frame has no header".into())
+                        })?;
+                        header.prover_tree_commitment
+                    } else {
+                        state
+                            .crdt()
+                            .get_shard_commits(env.cited_frame, _address)?
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                QuilError::InvalidArgument("lattice-mint: shard commit missing".into())
+                            })?
+                    };
+                    let reward_root: [u8; 32] = reward_root_vec.as_slice().try_into().map_err(|_| {
+                        QuilError::InvalidArgument(
+                            "lattice-mint: reward root not 32 bytes (forest reward tree required)".into(),
+                        )
+                    })?;
+                    // DoS guard: a malformed mint proof must not panic the block
+                    // thread (consensus halt) — reject it instead (audit hardening).
+                    match lattice_ct::guard_verify(|| {
+                        lattice_ct::verify_mint_envelope_and_derive(np, &reward_root, _address, &env)
+                    })? {
+                        Some((new_coins, decrements)) => {
+                            let frame_bytes = _frame_number.to_be_bytes();
+                            let result =
+                                crate::token_intrinsic::materialize::materialize_lattice_transaction(
+                                    _address, &frame_bytes, &new_coins, &[], &env.output_memos,
+                                )?;
+                            write_tx_result(state, _address, &va_disc, _frame_number, &result)?;
+                            lattice_ct::apply_reward_decrements(
+                                state, _address, _frame_number, &decrements, is_quil,
+                            )?;
+                            crate::token_intrinsic::shadow_accumulator::refresh_root(state, _address)?;
+                        }
+                        None => {
+                            return Err(QuilError::InvalidArgument(
+                                "lattice-mint: mint verification failed".into(),
+                            ));
+                        }
+                    }
+                }
+                crate::token_engine::TYPE_LATTICE_PENDING => {
+                    // Escrow CREATE: spend inputs, lock the value into a pending
+                    // vertex (dual Falcon recipients + expiration). No coin yet.
+                    use crate::token_intrinsic::lattice_ct;
+                    let env = lattice_ct::decode_pending_create(inner_bytes)?;
+                    // Bound all consensus-opaque fields stored verbatim in the
+                    // escrow vertex before verify (griefing/state-bloat hardening #5).
+                    lattice_ct::check_escrow_memo_size(&env.memo)?;
+                    lattice_ct::check_memos_size(&env.change_memos)?;
+                    lattice_ct::check_otks_size(&env.change_otks)?;
+                    lattice_ct::check_recipient_key_size(&env.to_key)?;
+                    lattice_ct::check_recipient_key_size(&env.refund_key)?;
+                    let np = lattice_ct::production_params();
+                    match lattice_ct::guard_verify(|| lattice_ct::verify_lattice_pending_create(
+                        np,
+                        state,
+                        _address,
+                        &env.input_spend_proofs,
+                        &env.escrow_commitment,
+                        &env.escrow_range_proof,
+                        &env.change_commitments,
+                        &env.change_otks,
+                        &env.balance_proof,
+                        env.fee,
+                    ))? {
+                        Some((key_images, cv, change_coins)) => {
+                            let frame_bytes = _frame_number.to_be_bytes();
+                            let mut result = crate::token_intrinsic::materialize::materialize_lattice_pending(
+                                _address, &frame_bytes, &cv, &env.to_key, &env.refund_key,
+                                env.expiration, &env.memo, &key_images,
+                            )?;
+                            // Materialize any change coins back to the sender.
+                            if !change_coins.is_empty() {
+                                let change = crate::token_intrinsic::materialize::materialize_lattice_transaction(
+                                    _address, &frame_bytes, &change_coins, &[], &env.change_memos,
+                                )?;
+                                result.coins.extend(change.coins);
+                            }
+                            write_tx_result(state, _address, &va_disc, _frame_number, &result)?;
+                            crate::token_intrinsic::shadow_accumulator::refresh_root(state, _address)?;
+                        }
+                        None => {
+                            return Err(QuilError::InvalidArgument(
+                                "lattice-pending: escrow create verification failed".into(),
+                            ));
+                        }
+                    }
+                }
+                crate::token_engine::TYPE_LATTICE_PENDING_CLAIM => {
+                    // Escrow CLAIM/REFUND: the `to` (or `refund` after expiration)
+                    // party claims the escrow into a coin; the escrow is retired.
+                    use crate::token_intrinsic::{lattice_ct, materialize, spent_check};
+                    let env = lattice_ct::decode_pending_claim(inner_bytes)?;
+                    // Bound the consensus-opaque claimed-coin memo + one-time key
+                    // (hardening #5).
+                    lattice_ct::check_memo_size(&env.output_memo)?;
+                    lattice_ct::check_otk_size(&env.output_otk)?;
+                    let np = lattice_ct::production_params();
 
-                    // Spent-check is inlined in the per-input loop
-                    // above. Do NOT reintroduce a separate post-crypto
-                    // spent-loop — keeping the spent check atomic with
-                    // the rest of each input's verification is what
-                    // prevents future refactors from short-circuiting
-                    // it. If the per-input spent-check is removed,
-                    // materialize_transaction will double-spend
-                    // silently.
+                    // Read the escrow vertex and extract its fields.
+                    let blob = state
+                        .get(_address, &env.escrow_address, &va_disc)?
+                        .ok_or_else(|| QuilError::InvalidArgument("lattice-pending: escrow not found".into()))?;
+                    let tree = quil_tries::VectorCommitmentTree {
+                        root: quil_tries::deserialize_go_tree(&blob)
+                            .map_err(|e| QuilError::Internal(format!("escrow decode: {e}")))?,
+                    };
+                    let ptype = materialize::pending_type_hash(_address)?;
+                    if tree.get(&[0xFFu8; 32]) != Some(&ptype[..]) {
+                        return Err(QuilError::InvalidArgument("lattice-pending: not an escrow vertex".into()));
+                    }
+                    let getf = |k: u8| -> Result<Vec<u8>> {
+                        tree.get(&[k << 2])
+                            .map(|v| v.to_vec())
+                            .ok_or_else(|| QuilError::InvalidArgument("lattice-pending: escrow field missing".into()))
+                    };
+                    let cv = getf(1)?;
+                    let (to_key, refund_key) = (getf(2)?, getf(3)?);
+                    let exp_bytes = getf(4)?;
+                    let expiration = u64::from_be_bytes(
+                        exp_bytes.get(..8).and_then(|s| s.try_into().ok())
+                            .ok_or_else(|| QuilError::InvalidArgument("lattice-pending: bad expiration".into()))?,
+                    );
+                    let recipient_key = if env.is_to {
+                        to_key
+                    } else {
+                        if _frame_number < expiration {
+                            return Err(QuilError::InvalidArgument(
+                                "lattice-pending: refund before expiration".into(),
+                            ));
+                        }
+                        refund_key
+                    };
+                    // The escrow must not have been claimed already (nullifier).
+                    if !spent_check::check_key_image_not_spent(state, _address, &env.escrow_address)? {
+                        return Err(QuilError::InvalidArgument("lattice-pending: escrow already claimed".into()));
+                    }
 
-                    let mat_outputs = parse_tx_outputs(&tx.outputs, _frame_number)?;
-                    let sigs = parse_tx_input_sigs(&tx.inputs)?;
-                    let result = crate::token_intrinsic::materialize::materialize_transaction(
-                        _address, &mat_outputs, &sigs, self.inclusion_prover.as_ref(),
-                    )?;
-                    write_tx_result(state, _address, &va_disc, _frame_number, &result)?;
+                    match lattice_ct::guard_verify(|| lattice_ct::verify_lattice_pending_claim(
+                        np, _address, &cv, &recipient_key, env.is_to, &env.falcon_sig,
+                        &env.output_commitment, &env.output_range_proof, &env.value_link_proof,
+                    ))? {
+                        Some(new_cv) => {
+                            let frame_bytes = _frame_number.to_be_bytes();
+                            let new_coins = vec![(env.output_otk.clone(), new_cv)];
+                            // Carry the claimant's per-output memo so the new coin is
+                            // scannable + spendable (empty ⇒ no memo, legacy claim).
+                            let memos: Vec<Vec<u8>> = if env.output_memo.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![env.output_memo.clone()]
+                            };
+                            // Retire the escrow via a nullifier keyed on its address.
+                            let result = materialize::materialize_lattice_transaction(
+                                _address, &frame_bytes, &new_coins, &[env.escrow_address.to_vec()], &memos,
+                            )?;
+                            write_tx_result(state, _address, &va_disc, _frame_number, &result)?;
+                            crate::token_intrinsic::shadow_accumulator::refresh_root(state, _address)?;
+                        }
+                        None => {
+                            return Err(QuilError::InvalidArgument(
+                                "lattice-pending: claim verification failed".into(),
+                            ));
+                        }
+                    }
+                }
+                crate::token_engine::TYPE_LATTICE_SHIELD => {
+                    // One-way shield: spend a legacy TRANSPARENT coin (its Ed448
+                    // owner signs) into a lattice private coin; the transparent
+                    // entry is nullified. Ed448 survives only here.
+                    use crate::token_intrinsic::{lattice_ct, materialize, spent_check};
+                    let env = lattice_ct::decode_shield(inner_bytes)?;
+                    // Bound the consensus-opaque one-time key (hardening #5); the
+                    // shield envelope carries no memo.
+                    lattice_ct::check_otk_size(&env.output_otk)?;
+                    let np = lattice_ct::production_params();
+
+                    let blob = state
+                        .get(_address, &env.transparent_address, &va_disc)?
+                        .ok_or_else(|| QuilError::InvalidArgument("shield: transparent coin not found".into()))?;
+                    let tree = quil_tries::VectorCommitmentTree {
+                        root: quil_tries::deserialize_go_tree(&blob)
+                            .map_err(|e| QuilError::Internal(format!("shield decode: {e}")))?,
+                    };
+                    let ttype = crate::token_intrinsic::legacy_migration::transparent_type_hash(_address)?;
+                    if tree.get(&[0xFFu8; 32]) != Some(&ttype[..]) {
+                        return Err(QuilError::InvalidArgument("shield: not a transparent coin".into()));
+                    }
+                    let mut owner_address = [0u8; 32];
+                    owner_address.copy_from_slice(
+                        tree.get(&[0x00]).and_then(|v| v.get(..32)).ok_or_else(|| {
+                            QuilError::InvalidArgument("shield: bad owner field".into())
+                        })?,
+                    );
+                    let mut a16 = [0u8; 16];
+                    a16.copy_from_slice(
+                        tree.get(&[1u8 << 2]).and_then(|v| v.get(..16)).ok_or_else(|| {
+                            QuilError::InvalidArgument("shield: bad amount field".into())
+                        })?,
+                    );
+                    let amount = u128::from_le_bytes(a16);
+
+                    // Not already shielded (nullifier keyed on the transparent addr).
+                    if !spent_check::check_key_image_not_spent(state, _address, &env.transparent_address)? {
+                        return Err(QuilError::InvalidArgument("shield: coin already shielded".into()));
+                    }
+
+                    match lattice_ct::guard_verify(|| lattice_ct::verify_lattice_shield(
+                        np, _address, &owner_address, amount, &env.ed448_pubkey, &env.ed448_sig,
+                        &env.output_commitment, &env.output_range_proof, &env.balance_proof,
+                    ))? {
+                        Some(cv) => {
+                            let frame_bytes = _frame_number.to_be_bytes();
+                            let new_coins = vec![(env.output_otk.clone(), cv)];
+                            let result = materialize::materialize_lattice_transaction(
+                                _address, &frame_bytes, &new_coins, &[env.transparent_address.to_vec()], &[],
+                            )?;
+                            write_tx_result(state, _address, &va_disc, _frame_number, &result)?;
+                            crate::token_intrinsic::shadow_accumulator::refresh_root(state, _address)?;
+                        }
+                        None => {
+                            return Err(QuilError::InvalidArgument(
+                                "shield: verification failed".into(),
+                            ));
+                        }
+                    }
                 }
                 crate::token_engine::TYPE_MINT_TRANSACTION => {
-                    let tx = crate::token_intrinsic::MintTransaction::from_canonical_bytes(inner_bytes)?;
-
-                    // Mint verify pipeline (Go `MintTransaction.Verify`
-                    // + per-input `MintTransactionInput.Verify`):
-                    //
-                    // 1. Decode all inputs + outputs (needed for
-                    //    per-input verify and transcript + bulletproof).
-                    // 2. Bulletproof range-proof over concat output
-                    //    commitments + sum check inputs==outputs (no
-                    //    fees for mints).
-                    // 3. Per-input PoMW verify via
-                    //    `verify_mint_transaction_pomw`: resolves the
-                    //    cited frame's reward root (QUIL: ClockStore
-                    //    prover_tree_commitment; non-QUIL: shard
-                    //    vertex_adds commit) and runs the 13-check
-                    //    `verify_pomw_input` chain per input. Currently
-                    //    assumes PoMW behavior for all tokens — once
-                    //    token config lookup by `_address` lands, route
-                    //    Authority-configured tokens through
-                    //    `verify_authority` instead.
-                    let mut decoded_inputs: Vec<crate::token_intrinsic::MintTransactionInput> =
-                        Vec::with_capacity(tx.inputs.len());
-                    for raw in &tx.inputs {
-                        decoded_inputs.push(
-                            crate::token_intrinsic::MintTransactionInput::from_canonical_bytes(raw)?,
-                        );
-                    }
-                    let mut decoded_outputs: Vec<crate::token_intrinsic::MintTransactionOutput> =
-                        Vec::with_capacity(tx.outputs.len());
-                    for raw in &tx.outputs {
-                        decoded_outputs.push(
-                            crate::token_intrinsic::MintTransactionOutput::from_canonical_bytes(raw)?,
-                        );
-                    }
-
-                    // Resolve the per-token mint variant from the
-                    // TokenConfigResolver. Default resolver routes QUIL
-                    // → PoMW; custom deployments can install a richer
-                    // resolver via `with_config_resolver`.
-                    use crate::token_intrinsic::config_resolver::MintVariant;
-                    let variant = self
-                        .config_resolver
-                        .mint_variant_for_domain(_address)
-                        .unwrap_or(MintVariant::Unknown);
-
-                    if matches!(variant, MintVariant::NoMint) {
-                        return Err(QuilError::InvalidArgument(
-                            "mint transaction: token has NoMintBehavior (not mintable)".into(),
-                        ));
-                    }
-                    if matches!(variant, MintVariant::Unknown) {
-                        return Err(QuilError::InvalidArgument(
-                            "mint transaction: unrecognized MintBehavior/ProofBasis combination \
-                             or token config resolver unavailable for domain".into(),
-                        ));
-                    }
-
-                    // Crypto verify: bulletproof range + sum, then
-                    // variant-specific per-input verify. Providers are
-                    // mandatory engine inputs — no silent skip on
-                    // missing crypto.
-                    let bp = self.bulletproof_prover.as_ref();
-                    let decaf = self.decaf_constructor.as_ref();
-                    let km = self.key_manager.as_ref();
-                    let input_commits: Vec<Vec<u8>> =
-                        decoded_inputs.iter().map(|i| i.commitment.clone()).collect();
-                    let output_commits: Vec<Vec<u8>> =
-                        decoded_outputs.iter().map(|o| o.commitment.clone()).collect();
-                    let verified = crate::token_intrinsic::verify::verify_mint_transaction_crypto(
-                        bp, &input_commits, &output_commits, &tx.range_proof,
-                    )?;
-                    if !verified {
-                        return Err(QuilError::InvalidArgument(
-                            "mint transaction: bulletproof range/sum verify failed".into(),
-                        ));
-                    }
-
-                    match variant {
-                        MintVariant::ProofOfMeaningfulWork => {
-                            let hg_arc: Arc<quil_hypergraph::HypergraphCrdt> =
-                                state.crdt().clone();
-                            crate::token_intrinsic::mint::verify_mint_transaction_pomw(
-                                &tx,
-                                &hg_arc,
-                                Some(self.clock_store.as_ref()),
-                                self.inclusion_prover.as_ref(),
-                                bp,
-                                km,
-                            )?;
-                        }
-                        MintVariant::Authority | MintVariant::Signature => {
-                            // Both variants run the identical
-                            // 9-check chain. Requires the
-                            // authority key type + pubkey from the
-                            // resolver.
-                            if let (Some(kt), Some(pk)) = (
-                                self.config_resolver.authority_key_type(_address),
-                                self.config_resolver.authority_public_key(_address),
-                            ) {
-                                let ok = crate::token_intrinsic::mint::verify_authority(
-                                    &tx, _frame_number, kt, &pk,
-                                    crate::token_intrinsic::constants::QUIL_BEHAVIOR,
-                                    bp, decaf, km,
-                                )?;
-                                if !ok {
-                                    return Err(QuilError::InvalidArgument(
-                                        "mint authority/signature: verify failed".into(),
-                                    ));
-                                }
-                            }
-                        }
-                        MintVariant::VerkleMultiproofWithSignature => {
-                            if let Some(vk_root) = self.config_resolver.verkle_root(_address) {
-                                // Build the output transcript via
-                                // the standard helper then run the
-                                // per-input verkle verify. (decaf
-                                // is not needed for verkle — the
-                                // transcript is byte-concat only.)
-                                let recipients: Vec<crate::token_intrinsic::transaction::RecipientBundle> =
-                                    decoded_outputs.iter()
-                                        .map(|o| crate::token_intrinsic::transaction::RecipientBundle::from_canonical_bytes(&o.recipient_output))
-                                        .collect::<Result<Vec<_>>>()?;
-                                let input_proofs: Vec<Vec<Vec<u8>>> =
-                                    decoded_inputs.iter().map(|i| i.proofs.clone()).collect();
-                                let transcript = crate::token_intrinsic::verify::build_mint_transaction_transcript(
-                                    &tx.domain, &input_proofs, &decoded_outputs, &recipients,
-                                )?;
-                                for input in &decoded_inputs {
-                                    crate::token_intrinsic::mint::verify_verkle_multiproof_input(
-                                        input, &transcript, &vk_root,
-                                        self.inclusion_prover.as_ref(),
-                                        bp,
-                                    )?;
-                                }
-                            }
-                        }
-                        MintVariant::Payment => {
-                            // MintWithPayment paths:
-                            // - free mint (fee_baseline None or 0):
-                            //   no nested tx; verify_with_payment_input
-                            //   short-circuits before the callback.
-                            // - paid mint: nested PendingTransaction
-                            //   verify runs through the callback,
-                            //   which parses `proof[..n-224]` as a
-                            //   PendingTransaction and re-validates
-                            //   it against the hypergraph.
-                            let fee_baseline =
-                                self.config_resolver.payment_fee_baseline(_address);
-                            let payment_addr = self
-                                .config_resolver
-                                .payment_address(_address)
-                                .ok_or_else(|| QuilError::InvalidArgument(
-                                    "mint payment: resolver missing payment_address".into(),
-                                ))?;
-                            let cfg = crate::token_intrinsic::mint::MintWithPaymentConfig {
-                                fee_baseline: fee_baseline.as_ref(),
-                                payment_address: &payment_addr,
-                            };
-                            // Build transcript once.
-                            let recipients: Vec<crate::token_intrinsic::transaction::RecipientBundle> =
-                                decoded_outputs.iter()
-                                    .map(|o| crate::token_intrinsic::transaction::RecipientBundle::from_canonical_bytes(&o.recipient_output))
-                                    .collect::<Result<Vec<_>>>()?;
-                            let input_proofs: Vec<Vec<Vec<u8>>> =
-                                decoded_inputs.iter().map(|i| i.proofs.clone()).collect();
-                            let transcript = crate::token_intrinsic::verify::build_mint_transaction_transcript(
-                                &tx.domain, &input_proofs, &decoded_outputs, &recipients,
-                            )?;
-                            let frame = _frame_number;
-                            let hg_arc: Arc<quil_hypergraph::HypergraphCrdt> =
-                                state.crdt().clone();
-                            for (idx, input) in decoded_inputs.iter().enumerate() {
-                                crate::token_intrinsic::mint::verify_with_payment_input(
-                                    input, &transcript, idx, &cfg,
-                                    decaf, bp,
-                                    |nested_bytes, output_idx, _pa| {
-                                        // Parse the nested
-                                        // PendingTransaction
-                                        // canonical bytes.
-                                        let nested_tx = crate::token_intrinsic::PendingTransaction::from_canonical_bytes(nested_bytes)?;
-                                        // Paid-mint always uses
-                                        // the QUIL domain for
-                                        // the payment (Go hard-
-                                        // codes QUIL_TOKEN_CONFIGURATION
-                                        // at line 1224). Call
-                                        // full crypto verify
-                                        // against the current
-                                        // hypergraph.
-                                        let verified = crate::token_intrinsic::pending::verify_pending_transaction(
-                                            &nested_tx,
-                                            frame,
-                                            crate::token_intrinsic::constants::QUIL_BEHAVIOR,
-                                            /* is_quil_domain */ true,
-                                            bp,
-                                            decaf,
-                                            Some(hg_arc.as_ref()),
-                                        )?;
-                                        if !verified {
-                                            return Err(QuilError::InvalidArgument(
-                                                "mint payment: nested PendingTransaction verify failed".into(),
-                                            ));
-                                        }
-                                        // Decode the referenced output so the
-                                        // caller can run the rate-scaled
-                                        // commitment + VK checks.
-                                        if output_idx >= nested_tx.outputs.len() {
-                                            return Err(QuilError::InvalidArgument(format!(
-                                                "mint payment: nested output_idx {} >= outputs len {}",
-                                                output_idx, nested_tx.outputs.len()
-                                            )));
-                                        }
-                                        let raw_out = &nested_tx.outputs[output_idx];
-                                        let out = crate::token_intrinsic::PendingTransactionOutput::from_canonical_bytes(raw_out)?;
-                                        let to_recipient = crate::token_intrinsic::transaction::RecipientBundle::from_canonical_bytes(&out.to)?;
-                                        let refund_recipient = crate::token_intrinsic::transaction::RecipientBundle::from_canonical_bytes(&out.refund)?;
-                                        Ok(crate::token_intrinsic::mint::NestedPendingResult {
-                                            output_commitment: out.commitment,
-                                            to_verification_key: to_recipient.verification_key,
-                                            refund_verification_key: refund_recipient.verification_key,
-                                        })
-                                    },
-                                )?;
-                            }
-                        }
-                        MintVariant::NoMint | MintVariant::Unknown => unreachable!(
-                            "rejected above before crypto verify"
-                        ),
-                    }
-
-                    // Materialize: PoMW decrements prover balance,
-                    // everything else uses the common authority path
-                    // (same coin-vertex + spent-marker writes).
-                    let result = match variant {
-                        MintVariant::ProofOfMeaningfulWork => {
-                            let is_quil = _address == &crate::domains::QUIL_TOKEN[..];
-                            crate::token_intrinsic::mint::materialize_pomw(
-                                &tx, state, _frame_number, is_quil,
-                                self.inclusion_prover.as_ref(),
-                            )?
-                        }
-                        _ => crate::token_intrinsic::mint::materialize_authority(
-                            &tx, self.inclusion_prover.as_ref(),
-                        )?,
-                    };
-                    write_tx_result(state, _address, &va_disc, _frame_number, &result)?;
+                    // Retired (decaf448): the confidential-value path is now
+                    // the lattice-CT types (0x0512-0x0516). Rejected at validate;
+                    // this is a defense-in-depth reject (unreachable in process).
+                    return Err(QuilError::InvalidArgument(
+                        "decaf448 token type retired; use lattice-CT (0x0512-0x0516)".into(),
+                    ));
                 }
                 crate::token_engine::TYPE_PENDING_TRANSACTION => {
-                    let tx = crate::token_intrinsic::PendingTransaction::from_canonical_bytes(inner_bytes)?;
-                    // Structural validation is always run.
-                    crate::token_intrinsic::pending::validate_pending_structural(
-                        &tx,
-                        crate::token_intrinsic::constants::QUIL_BEHAVIOR,
-                    )?;
-
-                    // Full crypto verify is now unconditional.
-                    // Mirrors Go's Verify → Materialize pattern.
-                    // Legacy pre-2.1 259-byte ed448 inputs are handled
-                    // inside `verify_pending_transaction` via the
-                    // hypergraph CRDT reference below.
-                    let bp = self.bulletproof_prover.as_ref();
-                    let decaf = self.decaf_constructor.as_ref();
-                    let is_quil = _address == &crate::domains::QUIL_TOKEN[..];
-                    let hg_ref = Some(state.crdt().as_ref());
-                    let verified = crate::token_intrinsic::pending::verify_pending_transaction(
-                        &tx,
-                        _frame_number,
-                        crate::token_intrinsic::constants::QUIL_BEHAVIOR,
-                        is_quil,
-                        bp,
-                        decaf,
-                        hg_ref,
-                    )?;
-                    if !verified {
-                        return Err(QuilError::InvalidArgument(
-                            "pending transaction: crypto verify failed".into(),
-                        ));
-                    }
-
-                    // PendingTransaction emits a `pending:PendingTransaction`
-                    // tree per canonical output (Go
-                    // `buildPendingTransactionTrees:1085-1297`),
-                    // not coin vertices. Coin vertices are produced
-                    // later when a recipient claims via Transaction.
-                    let result = crate::token_intrinsic::pending::materialize_pending_transaction(
-                        &tx,
-                        _frame_number,
-                        crate::token_intrinsic::constants::QUIL_BEHAVIOR,
-                        self.inclusion_prover.as_ref(),
-                    )?;
-                    for (addr, tree) in &result.pendings {
-                        let blob = crate::prover_registry::vertex_tree_to_blob(tree);
-                        state.set(_address, addr, &va_disc, _frame_number, blob)?;
-                    }
-                    for (addr, tree) in &result.spent_markers {
-                        let blob = crate::prover_registry::vertex_tree_to_blob(tree);
-                        state.set(_address, addr, &va_disc, _frame_number, blob)?;
-                    }
+                    // Retired (decaf448): the confidential-value path is now
+                    // the lattice-CT types (0x0512-0x0516). Rejected at validate;
+                    // this is a defense-in-depth reject (unreachable in process).
+                    return Err(QuilError::InvalidArgument(
+                        "decaf448 token type retired; use lattice-CT (0x0512-0x0516)".into(),
+                    ));
                 }
                 // TokenDeploy / TokenUpdate: write the
                 // `TokenConfigurationMetadata` tree at the metadata
@@ -1175,19 +882,22 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 // non-decrease. The domain comes from the message
                 // envelope (`_address`).
                 crate::token_intrinsic::TYPE_TOKEN_DEPLOY => {
-                    if _address.len() == 32 {
-                        let deploy = crate::token_intrinsic::TokenDeploy::from_canonical_bytes(inner_bytes)?;
-                        if !deploy.config.is_empty() {
-                            let cfg = crate::token_intrinsic::TokenConfiguration::from_canonical_bytes(&deploy.config)?;
-                            crate::token_intrinsic::materialize::materialize_token_deploy(
-                                state,
-                                _address,
-                                &cfg,
-                                _frame_number,
-                                self.inclusion_prover.as_ref(),
-                            )?;
-                        }
-                        self.config_resolver.invalidate(_address);
+                    // A deploy DERIVES a new token domain from its config
+                    // (Go token_intrinsic.go deploy branch) — it does NOT
+                    // write at the routing `_address`. materialize_token_
+                    // deploy_init builds the full metadata vertex (config +
+                    // RDF + the 0xff*32 type-domain) at the derived domain
+                    // so the manager routes it to the token engine.
+                    let deploy = crate::token_intrinsic::TokenDeploy::from_canonical_bytes(inner_bytes)?;
+                    if !deploy.config.is_empty() {
+                        let cfg = crate::token_intrinsic::TokenConfiguration::from_canonical_bytes(&deploy.config)?;
+                        let derived = crate::token_intrinsic::materialize::materialize_token_deploy_init(
+                            state,
+                            &cfg,
+                            _frame_number,
+                            self.inclusion_prover.as_ref(),
+                        )?;
+                        self.config_resolver.invalidate(&derived);
                     }
                 }
                 crate::token_intrinsic::TYPE_TOKEN_UPDATE => {
@@ -1250,24 +960,22 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             let mut without_sig = update.clone();
                             without_sig.public_key_signature_bls48581 = Vec::new();
                             let signed_message = without_sig.to_canonical_bytes()?;
-                            // Extract the raw BLS signature from the
-                            // AggregateSignature envelope.
+                            // Post-quantum owner auth: a single FALCON signature
+                            // (no aggregation envelope — the field carries the
+                            // Falcon sig bytes directly now).
                             if update.public_key_signature_bls48581.is_empty() {
                                 return Err(QuilError::InvalidArgument(
                                     "token update: missing signature".into(),
                                 ));
                             }
-                            let agg = crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
-                                &update.public_key_signature_bls48581,
-                            )?;
                             let mut domain = Vec::with_capacity(32 + b"TOKEN_UPDATE".len());
                             domain.extend_from_slice(_address);
                             domain.extend_from_slice(b"TOKEN_UPDATE");
                             let ok = self.key_manager.validate_signature(
-                                quil_types::crypto::KeyType::Bls48581G1,
+                                quil_types::crypto::KeyType::Falcon512,
                                 &prior.owner_public_key,
                                 &signed_message,
-                                &agg.signature,
+                                &update.public_key_signature_bls48581,
                                 &domain,
                             )?;
                             if !ok {
@@ -1311,23 +1019,77 @@ impl ShardExecutionEngine for TokenExecutionEngine {
             Ok(())
         };
 
+        // Run one inner op, rolling its partial changeset writes back on
+        // error. invoke_token accumulates `state.set` calls as it goes
+        // (spent-markers, output coins, PoMW balance decrements); a
+        // failure partway through must not leave those half-applied. We
+        // snapshot the changeset length before the call and truncate
+        // back to it on `Err`. Errors stay non-fatal (logged, frame
+        // continues) — that part of the original behavior is correct.
+        let run_one = |inner_bytes: &[u8], inner_tp: u32| -> Result<()> {
+            let savepoint = self.state.as_ref().map(|s| s.changeset_len());
+            if let Err(e) = invoke_token(inner_bytes, inner_tp) {
+                // INFRASTRUCTURE/TRANSIENT failures (Store/Io) are replica-local:
+                // swallowing one here would let this node skip an op another node
+                // applies → silent state divergence under the same certified
+                // digest (audit Finding #4). Propagate them so the outer
+                // materializer treats the frame as fatal (retry, don't advance).
+                // DETERMINISTIC failures (bad sig/semantics) fail identically on
+                // every replica, so they stay non-fatal: roll back + continue.
+                if let (Some(s), Some(sp)) = (self.state.as_ref(), savepoint) {
+                    s.rollback_to(sp);
+                }
+                if matches!(e, QuilError::Store(_) | QuilError::Io(_)) {
+                    return Err(e);
+                }
+                eprintln!("[WARN] token invoke_step failed type=0x{:08x}: {}", inner_tp, e);
+            }
+            Ok(())
+        };
+
+        // Persist the frame's accepted token writes into the CRDT. The
+        // token engine previously never committed its HypergraphState,
+        // so spent-markers and output coins lived only in the in-memory
+        // changeset and never reached the CRDT (and thence the on-disk
+        // trees via `crdt.commit(frame)`): the spent-set was effectively
+        // empty on the next frame, making every spend replayable.
+        // Mirrors GlobalExecutionEngine's per-message `state.commit()`.
+        let commit_state = || -> Result<()> {
+            if let Some(s) = self.state.as_ref() {
+                match s.commit() {
+                    // Clear the committed changeset. The engine and its
+                    // HypergraphState are reused for the node's lifetime,
+                    // so leaving committed entries in place would
+                    // re-apply every prior message's writes on every
+                    // subsequent commit (unbounded growth + redundant
+                    // re-adds). The data is now in the CRDT; later reads
+                    // (even same-frame, later messages) see it via the
+                    // CRDT fallback in `HypergraphState::get`.
+                    Ok(()) => s.abort(),
+                    // A commit failure is infrastructure (Store/Io): propagate
+                    // it as fatal so the frame is retried, not silently advanced
+                    // with the writes lost (audit Finding #4).
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        };
+
         match tp {
             TYPE_MESSAGE_BUNDLE => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
                 for req in &bundle.requests {
                     if let Some(r) = req {
-                        if let Err(e) = invoke_token(&r.inner_bytes, r.inner_type_prefix) {
-                            eprintln!("[WARN] token invoke_step failed type=0x{:08x}: {}", r.inner_type_prefix, e);
-                        }
+                        run_one(&r.inner_bytes, r.inner_type_prefix)?;
                     }
                 }
+                commit_state()?;
                 Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
             }
             TYPE_MESSAGE_REQUEST => {
                 let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
-                if let Err(e) = invoke_token(&req.inner_bytes, req.inner_type_prefix) {
-                    eprintln!("[WARN] token invoke_step failed type=0x{:08x}: {}", req.inner_type_prefix, e);
-                }
+                run_one(&req.inner_bytes, req.inner_type_prefix)?;
+                commit_state()?;
                 Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
             }
             _ => Err(QuilError::InvalidArgument("token: unsupported message type".into())),
@@ -1683,28 +1445,19 @@ fn write_tx_result(
 pub struct ComputeExecutionEngine {
     mode: ExecutionMode,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
-    bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver>,
     key_manager: Arc<dyn quil_types::crypto::KeyManager>,
     circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler>,
 }
 
 impl ComputeExecutionEngine {
-    /// Build a `ComputeExecutionEngine` with all verification
-    /// dependencies. Production callers MUST supply real
-    /// implementations; tests pull noop stubs from `crate::testing`.
+    /// Build a `ComputeExecutionEngine`. Proof-of-payment now uses Falcon
+    /// (post-quantum) — no bulletproof/decaf dependency.
     pub fn new(
         mode: ExecutionMode,
-        bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver>,
         key_manager: Arc<dyn quil_types::crypto::KeyManager>,
         circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler>,
     ) -> Self {
-        Self {
-            mode,
-            state: None,
-            bulletproof_prover,
-            key_manager,
-            circuit_compiler,
-        }
+        Self { mode, state: None, key_manager, circuit_compiler }
     }
 
     /// Construct with hypergraph state so materialize writes the
@@ -1712,18 +1465,11 @@ impl ComputeExecutionEngine {
     pub fn new_with_state(
         mode: ExecutionMode,
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
-        bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver>,
         key_manager: Arc<dyn quil_types::crypto::KeyManager>,
         circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler>,
     ) -> Self {
         let state = Arc::new(crate::hypergraph_state::HypergraphState::new(crdt));
-        Self {
-            mode,
-            state: Some(state),
-            bulletproof_prover,
-            key_manager,
-            circuit_compiler,
-        }
+        Self { mode, state: Some(state), key_manager, circuit_compiler }
     }
 }
 
@@ -1771,7 +1517,6 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
             let state = self.state.as_deref();
             // Crypto/compiler are mandatory engine inputs — no
             // conditional verify gates.
-            let bp = self.bulletproof_prover.as_ref();
             let km = self.key_manager.as_ref();
             let cc = self.circuit_compiler.as_ref();
             match inner_tp {
@@ -1786,7 +1531,7 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
                 }
                 crate::compute_intrinsic::TYPE_CODE_EXECUTE => {
                     let ex = crate::compute_intrinsic::CodeExecute::from_canonical_bytes(inner_bytes)?;
-                    let ok = crate::compute_intrinsic::intrinsic::verify_code_execute(&ex, bp)?;
+                    let ok = crate::compute_intrinsic::intrinsic::verify_code_execute(&ex)?;
                     if !ok {
                         return Err(QuilError::InvalidArgument(
                             "code execute: verify failed".into(),
@@ -1839,17 +1584,29 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
                     )?;
                 }
                 crate::compute_intrinsic::config::TYPE_COMPUTE_DEPLOY => {
-                    // ComputeDeploy structural validation only (initial
-                    // deploy — no prior owner key to verify against).
-                    // Decode to confirm well-formed canonical bytes;
-                    // materialization of the compute config metadata
-                    // vertex isn't ported yet. Reject the message so
-                    // it doesn't silently slip past with no record
-                    // (fail-closed).
-                    let _ = crate::compute_intrinsic::config::ComputeDeploy::from_canonical_bytes(inner_bytes)?;
-                    return Err(QuilError::Internal(
-                        "ComputeDeploy materialization not implemented — rejecting".into(),
-                    ));
+                    // Initial deploy: derive the new compute app's domain
+                    // and write the full metadata vertex (config + RDF +
+                    // COMPUTE_INTRINSIC_DOMAIN type-domain) so the manager
+                    // routes the derived domain to the compute engine.
+                    // Mirrors Go ComputeIntrinsic.Deploy deploy branch.
+                    let deploy = crate::compute_intrinsic::config::ComputeDeploy::from_canonical_bytes(inner_bytes)?;
+                    if !deploy.config.is_empty() {
+                        let cfg = crate::compute_intrinsic::config::ComputeConfiguration::from_canonical_bytes(&deploy.config)?;
+                        let s = state.ok_or_else(|| QuilError::InvalidArgument(
+                            "compute deploy: hypergraph state not installed".into(),
+                        ))?;
+                        // The compute engine has no inclusion_prover field
+                        // of its own; commit metadata sub-trees with the
+                        // CRDT's prover (same one the frame commit uses).
+                        let prover = s.crdt().prover().clone();
+                        let _derived = crate::compute_intrinsic::materialize::materialize_compute_deploy_init(
+                            s,
+                            &cfg,
+                            &deploy.rdf_schema,
+                            frame_number,
+                            prover.as_ref(),
+                        )?;
+                    }
                 }
                 crate::compute_intrinsic::config::TYPE_COMPUTE_UPDATE => {
                     // BLS owner-key signature gate. Mirrors Go
@@ -1890,17 +1647,15 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
                             "compute update: missing signature".into(),
                         ));
                     }
-                    let agg = crate::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
-                        &update.public_key_signature_bls48581,
-                    )?;
+                    // Post-quantum owner auth: a single FALCON signature.
                     let mut domain_bytes = Vec::with_capacity(32 + b"COMPUTE_UPDATE".len());
                     domain_bytes.extend_from_slice(address);
                     domain_bytes.extend_from_slice(b"COMPUTE_UPDATE");
                     let ok = km.validate_signature(
-                        quil_types::crypto::KeyType::Bls48581G1,
+                        quil_types::crypto::KeyType::Falcon512,
                         &prior_owner_key,
                         &signed_message,
-                        &agg.signature,
+                        &update.public_key_signature_bls48581,
                         &domain_bytes,
                     )?;
                     if !ok {
@@ -1909,13 +1664,22 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
                              prior config's owner public key".into(),
                         ));
                     }
-                    // Signature verified; materialize is still not
-                    // ported. Reject so the message doesn't silently
-                    // pass with no on-disk effect (fail-closed).
-                    return Err(QuilError::Internal(
-                        "ComputeUpdate materialization not implemented — \
-                         rejecting after signature verify".into(),
-                    ));
+                    // Signature verified — materialize the config/RDF
+                    // update into the existing metadata vertex.
+                    let cfg = if update.config.is_empty() {
+                        None
+                    } else {
+                        Some(crate::compute_intrinsic::config::ComputeConfiguration::from_canonical_bytes(&update.config)?)
+                    };
+                    let prover = s.crdt().prover().clone();
+                    crate::compute_intrinsic::materialize::materialize_compute_update(
+                        s,
+                        address,
+                        cfg.as_ref(),
+                        &update.rdf_schema,
+                        frame_number,
+                        prover.as_ref(),
+                    )?;
                 }
                 _ => {
                     crate::compute_engine::peek_compute_message_kind(inner_bytes)?;
@@ -2087,20 +1851,15 @@ impl HypergraphExecutionEngine {
 
         match msg {
             hg_dispatch::DispatchedMessage::VertexAdd(v) => {
-                // Go writes a VECTOR-COMMITMENT TREE built from each
-                // proof's compressed Encrypted form
-                // (`EncryptedToVertexTree`). The Rust `v.data` field
-                // holds the wire-encoded list of proofs (u16 count +
-                // per-proof u16 size + bytes). Decode chunks, compress
-                // each VerEncProof, then build the tree.
+                // Build the vertex-data tree from the confidential-field chunk
+                // list. `v.data` is the wire-encoded list (u16 count + per-field
+                // u16 size + bytes); each field is a commit-and-encrypt
+                // ConfidentialField stored verbatim under its BE-u64 index.
                 let chunks =
                     crate::hypergraph_intrinsic::split_vertex_add_proof_chunks(&v.data)
                         .unwrap_or_default();
                 let tree =
-                    crate::hypergraph_intrinsic::encrypted_to_vertex_tree(
-                        &chunks,
-                        self.inclusion_prover().as_ref(),
-                    )?;
+                    crate::hypergraph_intrinsic::encrypted_to_vertex_tree(&chunks)?;
                 let blob =
                     crate::prover_registry::vertex_tree_to_blob(&tree);
                 state.set(&v.domain, &v.data_address, &va_disc, frame_number, blob)?;
@@ -2146,9 +1905,9 @@ impl HypergraphExecutionEngine {
     /// and Ed448-verify the op's signature. Behavior by resolver state:
     ///
     /// - `None` (no resolver configured): logs a warning and accepts.
-    ///   Existing system-shard gate is still enforced upstream.
+    /// Existing system-shard gate is still enforced upstream.
     /// - `Some` but `write_public_key(domain) == None`: rejects.
-    ///   An op against an undeployed hypergraph is always invalid.
+    /// An op against an undeployed hypergraph is always invalid.
     /// - `Some` and key resolves: rejects on signature mismatch.
     fn verify_op_authority(
         &self,
@@ -2222,17 +1981,46 @@ impl HypergraphExecutionEngine {
         // but engines should not assume the caller has done that check.
         self.validate_inner_op(address, inner_type_prefix, inner_bytes)?;
         match inner_type_prefix {
-            TYPE_HYPERGRAPH_DEPLOYMENT | TYPE_HYPERGRAPH_UPDATE => {
-                // Fail-closed: the materialization path for deploy and
-                // update (config vertex creation, owner-key install,
-                // RDF schema swap) hasn't been ported from Go yet.
-                // Returning Err here means a verified deploy/update
-                // is rejected at materialization rather than silently
-                // dropped — the production engine cannot accept
-                // either type until the materializer lands.
-                Err(QuilError::Internal(
-                    "hypergraph deploy/update materialization not yet implemented".into(),
-                ))
+            TYPE_HYPERGRAPH_DEPLOYMENT => {
+                // Derive the new hypergraph app's domain and write the
+                // full metadata vertex (config + RDF + HYPERGRAPH_BASE_
+                // DOMAIN type-domain) so the manager routes the derived
+                // domain to the hypergraph engine. Mirrors Go
+                // HypergraphIntrinsic.Deploy deploy branch.
+                let dispatched =
+                    crate::hypergraph_intrinsic::decode_and_validate_deploy(inner_bytes)?;
+                if let (Some(cfg), Some(state)) =
+                    (dispatched.deploy.config.as_ref(), self.state.as_ref())
+                {
+                    let _derived =
+                        crate::hypergraph_intrinsic::materialize_hypergraph_deploy_init(
+                            state,
+                            cfg,
+                            &dispatched.deploy.rdf_schema,
+                            frame_number,
+                            self.inclusion_prover.as_ref(),
+                        )?;
+                }
+                Ok(())
+            }
+            TYPE_HYPERGRAPH_UPDATE => {
+                // The owner-key signature was already verified in
+                // validate_inner_op → validate_hypergraph_update (run
+                // before this match). Materialize the config/RDF swap
+                // into the existing metadata vertex.
+                let dispatched =
+                    crate::hypergraph_intrinsic::dispatch::decode_and_validate_update(inner_bytes)?;
+                if let Some(state) = self.state.as_ref() {
+                    crate::hypergraph_intrinsic::materialize_hypergraph_update(
+                        state,
+                        address,
+                        dispatched.update.config.as_ref(),
+                        &dispatched.update.rdf_schema,
+                        frame_number,
+                        self.inclusion_prover.as_ref(),
+                    )?;
+                }
+                Ok(())
             }
             _ => {
                 // Vertex add/remove, hyperedge add/remove — existing
@@ -2370,31 +2158,17 @@ impl HypergraphExecutionEngine {
     /// pass on an essentially-empty extrinsic, and materialize would
     /// write garbage.
     fn compute_hyperedge_commit(&self, value: &[u8]) -> Result<Vec<u8>> {
-        use crate::hypergraph_intrinsic::hyperedge_ops::HYPEREDGE_MIN_VALUE_LEN;
-        if value.len() < HYPEREDGE_MIN_VALUE_LEN {
-            return Err(QuilError::InvalidArgument(
-                "hyperedge commit: value too short".into(),
-            ));
-        }
-        let tree_bytes = &value[HYPEREDGE_MIN_VALUE_LEN..];
-        if tree_bytes.is_empty() {
-            return Err(QuilError::InvalidArgument(
-                "hyperedge commit: extrinsic tree bytes empty".into(),
-            ));
-        }
-        let mut tree = quil_tries::VectorCommitmentTree::new();
-        tree.root = quil_tries::deserialize_go_tree(tree_bytes).map_err(|e| {
-            QuilError::InvalidArgument(format!(
-                "hyperedge commit: extrinsic tree failed structural deserialize: {e}"
-            ))
-        })?;
-        let commit = tree.commit(self.inclusion_prover.as_ref());
-        if commit.is_empty() {
-            return Err(QuilError::InvalidArgument(
-                "hyperedge commit: extrinsic tree commitment is empty — invalid tree".into(),
-            ));
-        }
-        Ok(commit)
+        // Single source of truth shared with the client's build path: the
+        // extrinsic tree is committed with the SHA-256 hash-Merkle prover
+        // (`ShaInclusionProver`), NOT KZG — matching how every other
+        // vertex/shard commitment is formed now (`quil_tries::vertex_commitment`
+        // / `hypergraph_state::tree_content_digest`). The wired
+        // `self.inclusion_prover` is a stale KZG leftover; committing with it
+        // here would make the client (which has no ceremony SRS) unable to
+        // reproduce the signed commitment. This was the ONLY live consensus
+        // caller of the wired prover, so delegating to the SHA path removes the
+        // last KZG dependency from the hyperedge-add auth path.
+        crate::hypergraph_intrinsic::hyperedge_ops::hyperedge_extrinsic_commit(value)
     }
 }
 
@@ -2429,32 +2203,57 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
         message: &[u8],
     ) -> Result<ProcessMessageResult> {
         let kind = crate::hypergraph_engine::peek_top_level_kind(message)?;
-        match kind {
-            crate::hypergraph_engine::MessageKindTopLevel::Bundle => {
-                let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        self.process_inner_op(
-                            frame_number,
-                            address,
-                            r.inner_type_prefix,
-                            &r.inner_bytes,
-                        )?;
+        // Process the message's op(s), accumulating writes into the
+        // HypergraphState changeset.
+        let result: Result<()> = (|| {
+            match kind {
+                crate::hypergraph_engine::MessageKindTopLevel::Bundle => {
+                    let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
+                    for req in &bundle.requests {
+                        if let Some(r) = req {
+                            self.process_inner_op(
+                                frame_number,
+                                address,
+                                r.inner_type_prefix,
+                                &r.inner_bytes,
+                            )?;
+                        }
                     }
                 }
-                Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
+                crate::hypergraph_engine::MessageKindTopLevel::Request => {
+                    let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
+                    self.process_inner_op(
+                        frame_number,
+                        address,
+                        req.inner_type_prefix,
+                        &req.inner_bytes,
+                    )?;
+                }
             }
-            crate::hypergraph_engine::MessageKindTopLevel::Request => {
-                let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
-                self.process_inner_op(
-                    frame_number,
-                    address,
-                    req.inner_type_prefix,
-                    &req.inner_bytes,
-                )?;
-                Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
+            Ok(())
+        })();
+
+        // Flush accepted writes to the CRDT (`state.commit()` → `crdt.add_vertex`
+        // / `remove_vertex` / `add_hyperedge` / `remove_hyperedge`), then clear
+        // the changeset. On ANY error, discard this message's partial changeset —
+        // mirrors GlobalExecutionEngine / TokenExecutionEngine's per-message
+        // commit/abort. Without this the hypergraph engine's writes (deploy
+        // metadata vertices AND vertex/hyperedge data) never reached the CRDT.
+        if let Some(state) = self.state.as_ref() {
+            match result {
+                Ok(()) => {
+                    state.commit()?;
+                    state.abort();
+                }
+                Err(e) => {
+                    state.abort();
+                    return Err(e);
+                }
             }
+        } else {
+            result?;
         }
+        Ok(ProcessMessageResult { messages: Vec::new(), state: Vec::new() })
     }
 
     fn prove(&self, _: &[u8], _: u64, message: &[u8]) -> Result<global::MessageRequest> {
@@ -2599,8 +2398,6 @@ mod tests {
         TokenExecutionEngine::new(
             mode,
             Arc::new(StubInclusionProver),
-            stubs.bulletproof_prover,
-            stubs.decaf_constructor,
             stubs.key_manager,
             stubs.clock_store,
         )
@@ -2609,12 +2406,7 @@ mod tests {
     /// Build a `ComputeExecutionEngine` for tests.
     fn compute_engine_test(mode: ExecutionMode) -> ComputeExecutionEngine {
         let stubs = crate::testing::NoopExecutionCrypto::new();
-        ComputeExecutionEngine::new(
-            mode,
-            stubs.bulletproof_prover,
-            stubs.key_manager,
-            stubs.circuit_compiler,
-        )
+        ComputeExecutionEngine::new(mode, stubs.key_manager, stubs.circuit_compiler)
     }
 
     // =================================================================
@@ -2954,15 +2746,18 @@ mod tests {
 
     fn make_vertex_add_canonical() -> Vec<u8> {
         use crate::hypergraph_intrinsic::conversions::pack_vertex_add_proof_chunks;
-        // Verify path enforces verenc proof shape; proofs must be
-        // either 9268-byte VerEncProof or 621-byte compressed verenc.
-        // Use 621-byte filler (compressed accepted as-is structurally
-        // — no crypto verify on this form). 9268-byte form would
-        // require valid Ed448 curve points (parse_verenc_proof_full
-        // rejects invalid bytes and the cryptographic verify would
-        // fail too).
+        // The validate path requires each chunk to decode as a well-formed
+        // commit-and-encrypt ConfidentialField — seal one to a throwaway reader.
+        let kp = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
+        let field = crate::hypergraph_intrinsic::confidential::seal(
+            b"vertex-field",
+            &kp.public,
+            &[0x11u8; 32],
+            &[0x22u8; 12],
+        )
+        .unwrap();
         let proofs: Vec<Vec<u8>> =
-            vec![vec![0u8; crate::hypergraph_intrinsic::VERENC_COMPRESSED_BYTES]];
+            vec![crate::hypergraph_intrinsic::confidential::encode(&field)];
         crate::hypergraph_intrinsic::VertexAdd {
             domain: vec![0xAAu8; 32],
             data_address: vec![0xBBu8; 32],
@@ -3067,9 +2862,8 @@ mod tests {
             .to_canonical_bytes()
             .unwrap();
         let cost = e.get_cost(&req).unwrap();
-        // make_vertex_add_canonical uses 1 valid 621-byte compressed
-        // verenc proof (engines.rs verify path requires valid
-        // verenc-length proofs). Cost = 1 × 55 = 55.
+        // make_vertex_add_canonical carries 1 confidential field; the cost
+        // model charges per field. Cost = 1 × 55 = 55.
         assert_eq!(cost, BigInt::from(55));
     }
 

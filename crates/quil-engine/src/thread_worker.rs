@@ -23,16 +23,16 @@ pub enum MasterToWorker {
     /// Assign a new filter (shard) to this worker.
     ///
     /// `start_consensus`:
-    ///   * `true`  — tear down any existing engine and (re)spawn the
-    ///     `AppConsensusEngine`. Used for `Active`/`Paused`
-    ///     allocations.
-    ///   * `false` — record the filter binding for TUI visibility,
-    ///     cancel any running engine, but do NOT spawn a new one.
-    ///     Used while an allocation is `Joining` and there is no
-    ///     Active prover under this filter yet (the engine's
-    ///     `leader_for_rank` would fail and the loop would die).
-    ///     Mirrors Go's `worker.Filter`-set / `worker.Allocated=false`
-    ///     state from `worker_allocator.go:421-440`.
+    ///   * `true` — tear down any existing engine and (re)spawn the
+    /// `AppConsensusEngine`. Used for `Active`/`Paused`
+    /// allocations.
+    /// * `false` — record the filter binding for TUI visibility,
+    /// cancel any running engine, but do NOT spawn a new one.
+    /// Used while an allocation is `Joining` and there is no
+    /// Active prover under this filter yet (the engine's
+    /// `leader_for_rank` would fail and the loop would die).
+    /// Mirrors Go's `worker.Filter`-set / `worker.Allocated=false`
+    /// state from `worker_allocator.go:421-440`.
     Respawn { filter: Vec<u8>, start_consensus: bool },
     /// Request the worker to compute a join proof.
     CreateJoinProof {
@@ -51,6 +51,14 @@ pub enum WorkerToMaster {
     Ready { core_id: u32 },
     /// Worker produced an app shard frame.
     FrameProduced {
+        core_id: u32,
+        filter: Vec<u8>,
+        frame_number: u64,
+        frame_data: Vec<u8>,
+    },
+    /// Worker finalized a full app shard frame (header+requests) for the
+    /// master to publish on `shard_frame_bitmask` (state distribution).
+    FullFrameProduced {
         core_id: u32,
         filter: Vec<u8>,
         frame_number: u64,
@@ -83,6 +91,15 @@ pub enum WorkerToMaster {
     ShardHeartbeat {
         core_id: u32,
         filter: Vec<u8>,
+    },
+    /// (P3) An outbound commonware-simplex message for a shard's committee.
+    /// The master publishes it on `shard_cw_bitmask(filter)` with the channel
+    /// tagged into the payload (`shard_cw_frame_payload(channel, bytes)`).
+    CwConsensus {
+        core_id: u32,
+        filter: Vec<u8>,
+        channel: u64,
+        bytes: Vec<u8>,
     },
     /// A shard worker has spun up an `AppConsensusEngine` for `filter`.
     /// The master uses this to populate a `filter → AppEngineHandle`
@@ -142,6 +159,10 @@ pub struct WorkerConsensusDeps {
     /// testnet=1 (single-prover clusters still progress). See
     /// `AppLeaderProvider::min_active_provers_for_propose`.
     pub min_active_provers_for_propose: u64,
+    /// (P3) Drive app-shard consensus with commonware-simplex + Falcon.
+    pub app_consensus_cw: bool,
+    /// DB config → persistent per-shard simplex-journal dir (Go parity).
+    pub db_config: quil_config::DbConfig,
     /// Callback that publishes finalized canonical FrameHeader bytes
     /// on `GLOBAL_PROVER` so archives credit our shard work toward
     /// rewards. AppFollower invokes this directly from the consensus
@@ -209,18 +230,38 @@ pub struct ThreadWorkerManager {
 }
 
 impl ThreadWorkerManager {
+    /// Auto-size the worker pool to the available CPU cores (minus one for
+    /// the master). Equivalent to `new_with_count(0)`.
     pub fn new() -> Self {
+        Self::new_with_count(0)
+    }
+
+    /// Create a thread-worker manager with an explicit worker count.
+    ///
+    /// `configured` is `engine.data_worker_count` from config:
+    ///   * `> 0` → honor it exactly (the operator asked for N local workers);
+    ///     this is what makes a `dataWorkerCount: 1` localnet run a single
+    ///     worker instead of silently spinning up `cpu-1`.
+    ///   * `<= 0` (the default) → auto-size to `cpu_cores - 1` (the historical
+    ///     behavior; production configs that don't set the field are unchanged).
+    pub fn new_with_count(configured: i32) -> Self {
         let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-        let num_cores = if core_ids.len() > 1 {
+        let cpu_default = if core_ids.len() > 1 {
             (core_ids.len() - 1) as u32
         } else {
             0
+        };
+        let num_cores = if configured > 0 {
+            configured as u32
+        } else {
+            cpu_default
         };
 
         let (master_tx, master_rx) = mpsc::channel(256);
 
         info!(
             available_cores = core_ids.len(),
+            configured_worker_count = configured,
             worker_cores = num_cores,
             "thread worker manager initialized"
         );
@@ -364,6 +405,20 @@ impl ThreadWorkerManager {
                     let mut current_filter: Vec<u8> = Vec::new();
                     let mut engine_cancel: Option<tokio_util::sync::CancellationToken> = None;
 
+                    // Per-worker memory tick. Each worker owns its own RocksDB
+                    // (block cache + memtables + table readers) in this thread,
+                    // invisible to the master's structural snapshot. Logging it
+                    // here attributes the RocksDB share of process RSS per worker
+                    // — the key number when a node running N workers OOMs.
+                    let worker_db = worker_owned
+                        .as_ref()
+                        .and_then(|d| d.kv_db.clone());
+                    let mut mem_tick =
+                        tokio::time::interval(std::time::Duration::from_secs(60));
+                    mem_tick.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Skip,
+                    );
+
                     // Notify master we're ready
                     let _ = master_tx
                         .send(WorkerToMaster::Ready { core_id })
@@ -371,6 +426,17 @@ impl ThreadWorkerManager {
 
                     loop {
                         tokio::select! {
+                            _ = mem_tick.tick() => {
+                                if let Some(db) = worker_db.as_ref() {
+                                    let bytes = db.approximate_memory_bytes();
+                                    info!(
+                                        core_id,
+                                        worker_db_mb = bytes as f64 / (1024.0 * 1024.0),
+                                        filter = hex::encode(&current_filter),
+                                        "worker rocksdb memory",
+                                    );
+                                }
+                            }
                             cmd = rx.recv() => {
                                 match cmd {
                                     Some(MasterToWorker::Respawn { filter, start_consensus }) => {
@@ -416,7 +482,7 @@ impl ThreadWorkerManager {
                                             let filter_clone = filter.clone();
                                             let deps = consensus_deps.clone();
                                             let owned = worker_owned.clone();
-                                            // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+                                            // TODO
                                             tokio::spawn(async move {
                                                 info!(core_id, filter = hex::encode(&filter_clone), "app engine spawned");
 
@@ -448,6 +514,13 @@ impl ThreadWorkerManager {
                                                     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
                                                     let engine_deps = crate::app_engine::AppEngineDeps {
                                                         clock_store,
+                                                        // Global anchor ALWAYS comes from the master's
+                                                        // shared store (`deps.clock_store`), which the
+                                                        // frame poller fills with synced global frames.
+                                                        // The worker-owned `clock_store` above holds only
+                                                        // this shard's chain, so anchoring to it would give
+                                                        // `anchor_gfn = 0` → legacy VDF path → no rewards.
+                                                        global_anchor_store: Some(deps.clock_store.clone()),
                                                         prover_registry: deps.prover_registry.clone(),
                                                         frame_prover: deps.frame_prover.clone(),
                                                         message_collector: deps.message_collector.clone(),
@@ -459,9 +532,21 @@ impl ThreadWorkerManager {
                                                         min_active_provers_for_propose: deps.min_active_provers_for_propose,
                                                         coverage_publish: deps.coverage_publish.clone(),
                                                         hypergraph,
+                                                        // Storage-attestation SOURCE = the MASTER's
+                                                        // hypergraph (`deps.hypergraph`), which the
+                                                        // master's forest-sync fills with the covered
+                                                        // shard's committed coin data. The worker
+                                                        // replicates FROM this into its own replica_store
+                                                        // (per-prover PoRep possession). The per-worker
+                                                        // `hypergraph` above only holds this shard's own
+                                                        // materialized app-frames, so attesting from it
+                                                        // would find no coins.
+                                                        storage_source_hypergraph: deps.hypergraph.clone(),
                                                         execution_engine,
                                                         inclusion_prover,
                                                         kv_db,
+                                                        app_consensus_cw: deps.app_consensus_cw,
+                                                        db_config: deps.db_config.clone(),
                                                     };
                                                     let (engine, app_handle) = crate::app_engine::AppConsensusEngine::new(
                                                         core_id,
@@ -493,7 +578,7 @@ impl ThreadWorkerManager {
                                                     let master_tx_events = master_tx_clone.clone();
                                                     let loopback_handle = app_handle.clone();
                                                     let _filter_for_events = filter_clone.clone();
-                                                    // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+                                                    // TODO
                                                     tokio::spawn(async move {
                                                         while let Some(event) = event_rx.recv().await {
                                                             match event {
@@ -509,6 +594,19 @@ impl ThreadWorkerManager {
                                                                     );
                                                                     let _ = master_tx_events.send(
                                                                         WorkerToMaster::FrameProduced {
+                                                                            core_id,
+                                                                            filter,
+                                                                            frame_number,
+                                                                            frame_data,
+                                                                        }
+                                                                    ).await;
+                                                                }
+                                                                crate::app_engine::AppEngineEvent::FullFrameProduced { filter, frame_number, frame_data } => {
+                                                                    // Forward to the master to publish on
+                                                                    // shard_frame_bitmask (no loopback — the
+                                                                    // producing engine already self-materialized).
+                                                                    let _ = master_tx_events.send(
+                                                                        WorkerToMaster::FullFrameProduced {
                                                                             core_id,
                                                                             filter,
                                                                             frame_number,
@@ -556,6 +654,16 @@ impl ThreadWorkerManager {
                                                                         }
                                                                     ).await;
                                                                 }
+                                                                crate::app_engine::AppEngineEvent::CwOut { filter, channel, bytes } => {
+                                                                    let _ = master_tx_events.send(
+                                                                        WorkerToMaster::CwConsensus {
+                                                                            core_id,
+                                                                            filter,
+                                                                            channel,
+                                                                            bytes,
+                                                                        }
+                                                                    ).await;
+                                                                }
                                                                 _ => {
                                                                     // Equivocation/Halted/AncestorSyncRequested/
                                                                     // ParentSealed — informational; engine handles
@@ -572,10 +680,9 @@ impl ThreadWorkerManager {
                                                     // tasks spawned by the inner consensus event loop.
                                                     // Sharing a task via `tokio::select!` here was making
                                                     // the engine's own select starve under load.
-                                                    let bls_signer = (deps.bls_signer_factory)();
-                                                    // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+                                                    let signer_factory = deps.bls_signer_factory.clone();
                                                     let mut engine_handle = tokio::spawn(async move {
-                                                        engine.run(bls_signer).await;
+                                                        engine.run(signer_factory).await;
                                                     });
                                                     tokio::select! {
                                                         _ = ec.cancelled() => {
@@ -865,5 +972,96 @@ mod tests {
         assert_eq!(workers.len(), 1);
         assert!(workers[0].filter.is_empty());
         assert!(!workers[0].allocated);
+    }
+
+    // ---- master↔worker boundary coverage (2026-06-29) -----------------
+    use quil_types::store::WorkerStore as _;
+
+    /// In-memory `WorkerStore` for the persist-across-restart path.
+    #[derive(Default)]
+    struct MemWorkerStore(
+        std::sync::Mutex<HashMap<u32, quil_types::store::PersistedWorkerInfo>>,
+    );
+    impl quil_types::store::WorkerStore for MemWorkerStore {
+        fn get_worker(
+            &self,
+            core_id: u32,
+        ) -> quil_types::error::Result<Option<quil_types::store::PersistedWorkerInfo>> {
+            Ok(self.0.lock().unwrap().get(&core_id).cloned())
+        }
+        fn put_worker(
+            &self,
+            w: &quil_types::store::PersistedWorkerInfo,
+        ) -> quil_types::error::Result<()> {
+            self.0.lock().unwrap().insert(w.core_id, w.clone());
+            Ok(())
+        }
+        fn delete_worker(&self, core_id: u32) -> quil_types::error::Result<()> {
+            self.0.lock().unwrap().remove(&core_id);
+            Ok(())
+        }
+        fn range_workers(
+            &self,
+        ) -> quil_types::error::Result<Vec<quil_types::store::PersistedWorkerInfo>> {
+            Ok(self.0.lock().unwrap().values().cloned().collect())
+        }
+    }
+
+    /// `set_worker_filter` flushes the filter binding through to the wired
+    /// `WorkerStore` (the operator-intent-survives-restart path), and
+    /// `load_persisted` reads it back. Master→worker boundary, persistence leg.
+    #[tokio::test]
+    async fn set_worker_filter_persists_to_worker_store() {
+        let mgr = ThreadWorkerManager::new();
+        let store = Arc::new(MemWorkerStore::default());
+        mgr.set_worker_store(store.clone());
+        let _rx = mgr.take_master_rx();
+
+        mgr.set_worker_filter(1, b"shard-filter", false).unwrap();
+
+        let persisted = store.get_worker(1).unwrap().expect("worker persisted");
+        assert_eq!(persisted.filter, b"shard-filter");
+        assert!(!persisted.manually_managed);
+        // load_persisted reads through the same store.
+        let lp = mgr.load_persisted(1).expect("load_persisted hit");
+        assert_eq!(lp.filter, b"shard-filter");
+    }
+
+    /// Toggling manual-management mode flushes through to the store while
+    /// preserving the filter — operator pins survive a restart.
+    #[tokio::test]
+    async fn set_manually_managed_persists_and_keeps_filter() {
+        let mgr = ThreadWorkerManager::new();
+        let store = Arc::new(MemWorkerStore::default());
+        mgr.set_worker_store(store.clone());
+        let _rx = mgr.take_master_rx();
+
+        mgr.set_worker_filter(1, b"f", false).unwrap();
+        mgr.set_manually_managed(1, true).unwrap();
+
+        let p = store.get_worker(1).unwrap().expect("persisted");
+        assert!(p.manually_managed, "manual mode flushed");
+        assert_eq!(p.filter, b"f", "filter preserved across the mode flip");
+    }
+
+    /// `set_worker_filter(start_consensus=true)` spawns the worker thread,
+    /// which signals `Ready` back to the master and is listed with its filter.
+    /// Exercises the real master→worker `Respawn` send over the channel.
+    #[tokio::test]
+    async fn set_worker_filter_spawns_worker_and_signals_ready() {
+        let mgr = ThreadWorkerManager::new();
+        let mut rx = mgr.take_master_rx().unwrap();
+
+        mgr.set_worker_filter(1, b"active-filter", true).unwrap();
+
+        // The spawned worker thread sends Ready back over the boundary.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+        assert!(
+            matches!(msg, Ok(Some(WorkerToMaster::Ready { core_id: 1 }))),
+            "expected Ready from core 1, got {msg:?}"
+        );
+        let workers = mgr.range_workers().unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].filter, b"active-filter");
     }
 }

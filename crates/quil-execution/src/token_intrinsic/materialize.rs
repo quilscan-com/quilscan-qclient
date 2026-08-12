@@ -2,9 +2,32 @@
 //! and marks inputs as spent.
 
 use num_bigint::BigInt;
+use sha2::{Digest, Sha512};
 use quil_types::error::{QuilError, Result};
 
 use crate::token_intrinsic::transaction::RecipientBundle;
+
+/// Content-hash address for a coin vertex once KZG is retired from the token
+/// path (forest cutover). The legacy derivation was
+/// `poseidon(KZG_commitment_of_the_vertex_tree)` — a BLS48-581 G1 multiexp
+/// purely to produce a stable 32-byte id. The forest replacement hashes the
+/// coin's flat field set directly: `poseidon(SHA-512(field_key ‖ value …))`
+/// over the tree's leaves in nibble order (the same order the flatten commits
+/// them, so the address is a deterministic function of exactly the committed
+/// content). This removes the last BLS48-581 dependency from the token
+/// materialize path. Existing (pre-cutover) coins keep their opaque
+/// historical addresses — this only assigns addresses to newly minted coins.
+pub fn coin_content_address(tree: &quil_tries::VectorCommitmentTree) -> Result<[u8; 32]> {
+    let mut h = Sha512::new();
+    for (k, v) in tree.leaves() {
+        h.update((k.len() as u32).to_be_bytes());
+        h.update(&k);
+        h.update((v.len() as u32).to_be_bytes());
+        h.update(&v);
+    }
+    let digest = h.finalize();
+    quil_crypto::poseidon::hash_bytes_to_32(&digest)
+}
 
 /// A transaction output ready for materialization.
 pub struct TransactionOutput {
@@ -72,6 +95,123 @@ pub fn create_coin_vertex_tree(
     Ok(tree)
 }
 
+/// Create a **lattice** coin vertex tree. Unlike the decaf coin, it stores the
+/// PQ fields at their natural (variable) widths: the one-time key `P`, the
+/// SIS-compress value node `cv = H_B(C)`, an optional encrypted memo, and the
+/// type hash. `C` itself is never stored (the recipient reconstructs it from the
+/// memo). Layout: `0x00` FrameNumber, `1<<2` OneTimeKey(P), `2<<2` Commitment(cv),
+/// `3<<2` Memo(opt), `[0xFF;32]` type hash.
+pub fn create_lattice_coin_vertex_tree(
+    frame_number: &[u8],
+    one_time_key: &[u8],
+    cv: &[u8],
+    memo: &[u8],
+    coin_type_hash: &[u8; 32],
+) -> Result<quil_tries::VectorCommitmentTree> {
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    tree.insert(&[0x00], frame_number, &[], &BigInt::from(frame_number.len()))
+        .map_err(|e| QuilError::Internal(format!("lattice coin tree: {}", e)))?;
+    tree.insert(&[1u8 << 2], one_time_key, &[], &BigInt::from(one_time_key.len()))
+        .map_err(|e| QuilError::Internal(format!("lattice coin tree: {}", e)))?;
+    tree.insert(&[2u8 << 2], cv, &[], &BigInt::from(cv.len()))
+        .map_err(|e| QuilError::Internal(format!("lattice coin tree: {}", e)))?;
+    if !memo.is_empty() {
+        tree.insert(&[3u8 << 2], memo, &[], &BigInt::from(memo.len()))
+            .map_err(|e| QuilError::Internal(format!("lattice coin tree: {}", e)))?;
+    }
+    tree.insert(&[0xFFu8; 32], coin_type_hash, &[], &BigInt::from(32))
+        .map_err(|e| QuilError::Internal(format!("lattice coin tree: {}", e)))?;
+    Ok(tree)
+}
+
+/// Create a **lattice** escrow (pending) vertex. Holds the amount commitment
+/// `cv = H_B(C)`, two **Falcon** recipient keys (the claimant `to` and the
+/// refunder), an `expiration` frame, and an encrypted memo. Claim = a Falcon
+/// signature by `to` (anytime); refund = by `refund` (after `expiration`).
+/// Layout: `0x00` FrameNumber, `1<<2` Commitment(cv), `2<<2` ToKey, `3<<2`
+/// RefundKey, `4<<2` Expiration(8B), `5<<2` Memo(opt), `[0xFF;32]` type hash.
+#[allow(clippy::too_many_arguments)]
+pub fn create_lattice_pending_vertex_tree(
+    frame_number: &[u8],
+    cv: &[u8],
+    to_key: &[u8],
+    refund_key: &[u8],
+    expiration: u64,
+    memo: &[u8],
+    pending_type: &[u8; 32],
+) -> Result<quil_tries::VectorCommitmentTree> {
+    let mut tree = quil_tries::VectorCommitmentTree::new();
+    let ins = |t: &mut quil_tries::VectorCommitmentTree, k: &[u8], v: &[u8]| {
+        t.insert(k, v, &[], &BigInt::from(v.len()))
+            .map_err(|e| QuilError::Internal(format!("lattice pending tree: {}", e)))
+    };
+    ins(&mut tree, &[0x00], frame_number)?;
+    ins(&mut tree, &[1u8 << 2], cv)?;
+    ins(&mut tree, &[2u8 << 2], to_key)?;
+    ins(&mut tree, &[3u8 << 2], refund_key)?;
+    ins(&mut tree, &[4u8 << 2], &expiration.to_be_bytes())?;
+    if !memo.is_empty() {
+        ins(&mut tree, &[5u8 << 2], memo)?;
+    }
+    ins(&mut tree, &[0xFFu8; 32], pending_type)?;
+    Ok(tree)
+}
+
+/// Materialize a lattice escrow CREATE: the pending vertex + spent markers for
+/// the consumed input coins (key images). No coin is created yet — a coin is
+/// minted only when the escrow is claimed/refunded.
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_lattice_pending(
+    domain: &[u8],
+    frame_number: &[u8],
+    cv: &[u8],
+    to_key: &[u8],
+    refund_key: &[u8],
+    expiration: u64,
+    memo: &[u8],
+    key_images: &[Vec<u8>],
+) -> Result<TransactionMaterializeOutput> {
+    let ptype = pending_type_hash(domain)?;
+    let tree =
+        create_lattice_pending_vertex_tree(frame_number, cv, to_key, refund_key, expiration, memo, &ptype)?;
+    let addr = coin_content_address(&tree)?;
+    let mut spent_markers = Vec::with_capacity(key_images.len());
+    for ki in key_images {
+        let a = super::spent_check::key_image_spent_address(ki)?;
+        spent_markers.push((a, create_spent_marker_tree()?));
+    }
+    Ok(TransactionMaterializeOutput { coins: vec![(addr, tree)], spent_markers })
+}
+
+/// Materialize a **lattice** confidential transaction: build a coin vertex for
+/// every new output `(P, cv)` and a spent marker for every input key image (the
+/// nullifier). Returns the same `(address, tree)` shape the caller writes to the
+/// CRDT — mirrors [`materialize_transaction`] for the PQ path.
+pub fn materialize_lattice_transaction(
+    domain: &[u8],
+    frame_number: &[u8],
+    new_coins: &[(Vec<u8>, Vec<u8>)], // (P, cv) per output
+    key_images: &[Vec<u8>],
+    memos: &[Vec<u8>],
+) -> Result<TransactionMaterializeOutput> {
+    let type_hash = coin_type_hash(domain)?;
+    let mut coins = Vec::with_capacity(new_coins.len());
+    for (i, (p, cv)) in new_coins.iter().enumerate() {
+        let memo = memos.get(i).map(|m| m.as_slice()).unwrap_or(&[]);
+        let tree = create_lattice_coin_vertex_tree(frame_number, p, cv, memo, &type_hash)?;
+        let addr = coin_content_address(&tree)?;
+        coins.push((addr, tree));
+    }
+    // Nullifier markers keyed on the KEY IMAGE (not poseidon(vk)).
+    let mut spent_markers = Vec::with_capacity(key_images.len());
+    for ki in key_images {
+        let addr = super::spent_check::key_image_spent_address(ki)?;
+        let marker = create_spent_marker_tree()?;
+        spent_markers.push((addr, marker));
+    }
+    Ok(TransactionMaterializeOutput { coins, spent_markers })
+}
+
 /// Compute the coin type hash for a domain.
 /// `poseidon(domain || "coin:Coin")` → 32 bytes.
 pub fn coin_type_hash(domain: &[u8]) -> Result<[u8; 32]> {
@@ -104,24 +244,24 @@ pub fn pending_type_hash(domain: &[u8]) -> Result<[u8; 32]> {
 /// Mirrors Go `buildPendingTransactionTrees` at
 /// `token_intrinsic_pending_transaction.go:1085-1297`. Layout:
 ///
-/// | Index | Field                         | Size |
+/// | Index | Field | Size |
 /// |-------|-------------------------------|------|
-/// | 0     | FrameNumber                   |   8  |
-/// | 1<<2  | Commitment                    |  56  |
-/// | 2<<2  | To.OneTimeKey                 |  56  |
-/// | 3<<2  | Refund.OneTimeKey             |  56  |
-/// | 4<<2  | To.VerificationKey            |  56  |
-/// | 5<<2  | Refund.VerificationKey        |  56  |
-/// | 6<<2  | To.CoinBalance                |  56  |
-/// | 7<<2  | Refund.CoinBalance            |  56  |
-/// | 8<<2  | To.Mask                       |  56  |
-/// | 9<<2  | Refund.Mask                   |  56  |
-/// | 10<<2 | To.AdditionalReference (opt)  |  56  |
-/// | 11<<2 | To.AdditionalReferenceKey     |  56  |
-/// | 12<<2 | Refund.AdditionalReference    |  56  |
-/// | 13<<2 | Refund.AdditionalReferenceKey |  56  |
-/// | 14<<2 | Expiration (when Expirable)   |   8  |
-/// | 0xFF*32 | type hash (pending:PT)      |  32  |
+/// | 0 | FrameNumber                   |   8  |
+/// | 1<<2 | Commitment                    |  56  |
+/// | 2<<2 | To.OneTimeKey                 |  56  |
+/// | 3<<2 | Refund.OneTimeKey             |  56  |
+/// | 4<<2 | To.VerificationKey            |  56  |
+/// | 5<<2 | Refund.VerificationKey        |  56  |
+/// | 6<<2 | To.CoinBalance                |  56  |
+/// | 7<<2 | Refund.CoinBalance            |  56  |
+/// | 8<<2 | To.Mask                       |  56  |
+/// | 9<<2 | Refund.Mask                   |  56  |
+/// | 10<<2 | To.AdditionalReference (opt) |  56  |
+/// | 11<<2 | To.AdditionalReferenceKey |  56  |
+/// | 12<<2 | Refund.AdditionalReference |  56  |
+/// | 13<<2 | Refund.AdditionalReferenceKey | 56  |
+/// | 14<<2 | Expiration (when Expirable) |   8  |
+/// | 0xFF*32 | type hash (pending:PT) |  32  |
 ///
 /// The To-side AdditionalReference branch occupies indices 10-13 and
 /// pushes Expiration (when Expirable) to index 14. Without
@@ -209,14 +349,14 @@ pub const TOKEN_CONFIG_OUTER_KEY: [u8; 1] = [16u8 << 2]; // 0x40
 ///
 /// Mirrors Go `TokenIntrinsic.Deploy` at `token_intrinsic.go:208-248`:
 /// 1. Read existing metadata vertex tree (or start a fresh one for
-///    initial deploy).
+/// initial deploy).
 /// 2. Build the inner `TokenConfigurationMetadata` tree from the
-///    `TokenConfiguration`.
+/// `TokenConfiguration`.
 /// 3. Commit the inner tree, serialize via the same Go-tree format the
-///    consensus layer reads back, insert at outer key `[0x40]` with
-///    the inner-commitment as commit metadata.
+/// consensus layer reads back, insert at outer key `[0x40]` with
+/// the inner-commitment as commit metadata.
 /// 4. Write the resulting outer tree under
-///    `(domain, HYPERGRAPH_METADATA_ADDRESS)` in vertex-adds.
+/// `(domain, HYPERGRAPH_METADATA_ADDRESS)` in vertex-adds.
 ///
 /// Returns the address of the metadata vertex that was written.
 pub fn materialize_token_deploy(
@@ -243,9 +383,10 @@ pub fn materialize_token_deploy(
         _ => quil_tries::VectorCommitmentTree::new(),
     };
 
-    // Build the inner config tree.
-    let mut inner = super::metadata_schema::build_token_configuration_metadata_tree(config)?;
-    let inner_commit = inner.commit(inclusion_prover);
+    // Build the inner config tree. hash_target = SHA-512 content digest (retired
+    // from KZG; a vestigial go-tree annotation, not a forest leaf).
+    let inner = super::metadata_schema::build_token_configuration_metadata_tree(config)?;
+    let inner_commit = crate::hypergraph_state::tree_content_digest(&inner);
     let inner_blob = quil_tries::serialize_go_tree(inner.root.as_ref()).map_err(|e| {
         QuilError::Internal(format!("token deploy: inner tree serialize: {e}"))
     })?;
@@ -255,16 +396,69 @@ pub fn materialize_token_deploy(
         .insert(&TOKEN_CONFIG_OUTER_KEY, &inner_blob, &inner_commit, &inner_size)
         .map_err(|e| QuilError::Internal(format!("token deploy: outer insert: {e}")))?;
 
-    // Re-commit the outer tree so the materialized blob carries the
-    // updated inclusion proofs.
-    let _ = outer.commit(inclusion_prover);
-
+    // Node commitments retired to non-KZG (forest-irrelevant); serialize as-is.
     let outer_blob = quil_tries::serialize_go_tree(outer.root.as_ref()).map_err(|e| {
         QuilError::Internal(format!("token deploy: outer serialize: {e}"))
     })?;
 
     state.set(domain, &metadata_addr, &va_disc, frame_number, outer_blob)?;
     Ok(metadata_addr)
+}
+
+/// Materialize a **new** TokenDeploy — Go `TokenIntrinsic.Deploy` deploy
+/// branch (`token_intrinsic.go:255-307`, the `domain == TOKEN_BASE_DOMAIN`
+/// path). Unlike `materialize_token_deploy` (the update path, which writes
+/// the config into an existing metadata vertex at a known address), a
+/// deploy DERIVES the new token's domain from its config and builds the
+/// full metadata vertex via `init_metadata_vertex`:
+/// 1. build the config (`additionalData[13]`) tree,
+/// 2. derive `domain = poseidon(TOKEN_PREFIX ‖ config_tree.commit)`,
+/// 3. build the RDF schema templated by `(domain, behavior)`,
+/// 4. `init_metadata_vertex(domain, empty, empty, rdf, [13]=config,
+/// TOKEN_BASE_DOMAIN, ...)` — which records the `0xff*32`
+/// type-domain so the manager can route this domain to the token
+/// engine.
+/// Returns the derived domain.
+pub fn materialize_token_deploy_init(
+    state: &crate::hypergraph_state::HypergraphState,
+    config: &super::config::TokenConfiguration,
+    frame_number: u64,
+    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
+) -> Result<[u8; 32]> {
+    // 1. Config tree (additionalData[13]).
+    let config_tree = super::metadata_schema::build_token_configuration_metadata_tree(config)?;
+
+    // 2. Derive the domain from the config CONTENT digest (retired from the KZG
+    //    commit → SHA-512 of the config's flat leaves; PQ-safe, no BLS48-581).
+    let config_commit = crate::hypergraph_state::tree_content_digest(&config_tree);
+    let mut preimage =
+        Vec::with_capacity(super::constants::TOKEN_PREFIX.len() + config_commit.len());
+    preimage.extend_from_slice(super::constants::TOKEN_PREFIX);
+    preimage.extend_from_slice(&config_commit);
+    let domain = quil_crypto::poseidon::hash_bytes_to_32(&preimage)?;
+
+    // 3. RDF schema (templated by domain + behavior).
+    let rdf = super::rdf_schema::prepare_rdf_schema_from_config(&domain, config.behavior);
+
+    // 4. Full metadata vertex with the TOKEN_BASE_DOMAIN type-domain.
+    let mut consensus = quil_tries::VectorCommitmentTree::new();
+    let mut sumcheck = quil_tries::VectorCommitmentTree::new();
+    let mut additional: Vec<Option<quil_tries::VectorCommitmentTree>> =
+        (0..14).map(|_| None).collect();
+    additional[13] = Some(config_tree);
+
+    let token_base = super::constants::token_base_domain();
+    state.init_metadata_vertex(
+        &domain,
+        &mut consensus,
+        &mut sumcheck,
+        &rdf,
+        &mut additional,
+        &token_base,
+        frame_number,
+        inclusion_prover,
+    )?;
+    Ok(domain)
 }
 
 /// Extract the verification key from a standard transaction input
@@ -298,11 +492,14 @@ pub fn materialize_transaction(
 ) -> Result<TransactionMaterializeOutput> {
     let type_hash = coin_type_hash(domain)?;
 
+    // KZG is retired from the token path: the coin address is now a SHA-512
+    // content hash of the flat field set, not `poseidon(KZG_commit)`. The
+    // `inclusion_prover` is no longer consulted for addressing.
+    let _ = inclusion_prover;
     let mut coins = Vec::with_capacity(outputs.len());
     for output in outputs {
-        let mut tree = create_coin_vertex_tree(output, &type_hash)?;
-        let commit = tree.commit(inclusion_prover);
-        let addr = quil_crypto::poseidon::hash_bytes_to_32(&commit)?;
+        let tree = create_coin_vertex_tree(output, &type_hash)?;
+        let addr = coin_content_address(&tree)?;
         coins.push((addr, tree));
     }
 
@@ -336,6 +533,136 @@ mod tests {
                 additional_reference_key: vec![],
             },
         }
+    }
+
+    /// Byte-parity (structure) verification of the deploy metadata vertex
+    /// against Go `hgstate.Init`'s layout: a deployed token's metadata
+    /// vertex must carry, at the prover-independent keys, exactly:
+    ///   [0<<2] empty consensus sub-tree  → serialize_go_tree(None) = [0x00]
+    ///   [1<<2] empty sumcheck sub-tree   → [0x00]
+    ///   [2<<2] the templated RDF schema (raw)
+    /// [16<<2] the config sub-tree (sealed, non-empty)
+    /// 0xff*32 the type-domain = TOKEN_BASE_DOMAIN
+    /// The type-domain assertion is the critical consensus link: it is
+    /// exactly what the manager's select_engine reads back to route this
+    /// domain to the token engine. (Commitment bytes depend on the
+    /// inclusion prover and are exercised separately.)
+    #[test]
+    fn lattice_materialize_builds_coins_and_key_image_markers() {
+        let domain = &[0x51u8; 32][..];
+        let frame = 7u64.to_be_bytes();
+        // Two new coins (P, cv) of lattice-node width, two spent key images.
+        let new_coins = vec![
+            (vec![0xA1u8; 200], vec![0xB1u8; 180]),
+            (vec![0xA2u8; 200], vec![0xB2u8; 180]),
+        ];
+        let key_images = vec![vec![0x5Au8; 190], vec![0x6Bu8; 190]];
+        let out = materialize_lattice_transaction(domain, &frame, &new_coins, &key_images, &[]).unwrap();
+        assert_eq!(out.coins.len(), 2, "one coin vertex per output");
+        assert_eq!(out.spent_markers.len(), 2, "one marker per key image");
+        // Spent markers are keyed on the key image.
+        for (i, ki) in key_images.iter().enumerate() {
+            let want = super::super::spent_check::key_image_spent_address(ki).unwrap();
+            assert_eq!(out.spent_markers[i].0, want, "marker keyed on key image");
+        }
+        // Coin vertex carries P at 1<<2 and cv at 2<<2, at their real widths.
+        let (_, tree) = &out.coins[0];
+        assert_eq!(tree.get(&[1u8 << 2]).unwrap(), &new_coins[0].0[..], "P stored");
+        assert_eq!(tree.get(&[2u8 << 2]).unwrap(), &new_coins[0].1[..], "cv stored");
+    }
+
+    #[test]
+    fn token_deploy_metadata_vertex_matches_go_init_layout() {
+        use crate::hypergraph_state::{
+            vertex_adds_discriminator, HypergraphState, HYPERGRAPH_METADATA_ADDRESS,
+        };
+        use std::sync::Arc;
+
+        let prover = Arc::new(NoopInclusionProver);
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            prover.clone(),
+        ));
+        let state = HypergraphState::new(crdt);
+
+        let cfg = super::super::config::TokenConfiguration {
+            behavior: (super::super::constants::DIVISIBLE
+                | super::super::constants::ACCEPTABLE
+                | super::super::constants::EXPIRABLE) as u32,
+            owner_public_key: vec![0x01u8; 32],
+            ..Default::default()
+        };
+        let domain =
+            materialize_token_deploy_init(&state, &cfg, 1, prover.as_ref()).unwrap();
+
+        let va = vertex_adds_discriminator().unwrap();
+        let blob = state
+            .get(&domain, &HYPERGRAPH_METADATA_ADDRESS, &va)
+            .unwrap()
+            .unwrap();
+        let outer = quil_tries::VectorCommitmentTree {
+            root: quil_tries::deserialize_go_tree(&blob).unwrap(),
+        };
+
+        // Type-domain (the routing link).
+        assert_eq!(
+            outer.get(&[0xFFu8; 32]).unwrap(),
+            &super::super::constants::token_base_domain()[..]
+        );
+        // RDF schema, raw at [2<<2].
+        let expected_rdf =
+            super::super::rdf_schema::prepare_rdf_schema_from_config(&domain, cfg.behavior);
+        assert_eq!(outer.get(&[2u8 << 2]).unwrap(), expected_rdf.as_bytes());
+        // Empty consensus + sumcheck sub-trees sealed at [0<<2]/[1<<2].
+        assert_eq!(outer.get(&[0u8 << 2]).unwrap(), &[0x00u8][..]);
+        assert_eq!(outer.get(&[1u8 << 2]).unwrap(), &[0x00u8][..]);
+        // Config sub-tree sealed at [16<<2] (non-empty).
+        assert!(outer.get(&[16u8 << 2]).is_some());
+        // Derived domain is deterministic (poseidon of prefix‖config_commit).
+        let domain2 =
+            materialize_token_deploy_init(&state, &cfg, 2, prover.as_ref()).unwrap();
+        assert_eq!(domain, domain2);
+    }
+
+    /// TRUE byte-parity of the KZG prover + quil-tries commit/serialize
+    /// against Go. The (key,value) tree below is committed in Go with the
+    /// real KZG inclusion prover (bls48581) and serialized via
+    /// SerializeNonLazyTree (node test TestPrintKZGCommitVector); the
+    /// expected hex is that Go output. This is the missing prover-DEPENDENT
+    /// half of deploy-metadata-vertex parity: it proves Rust's
+    /// KzgInclusionProver (same libbls48581) + VectorCommitmentTree::commit
+    /// + serialize_go_tree produce byte-identical commitments and serialized
+    /// trees to Go's tries.Commit + SerializeNonLazyTree. Combined with the
+    /// RDF Go-vectors and the Init-layout test, the full metadata vertex is
+    /// byte-parity-verified.
+    #[test]
+    fn kzg_tree_commit_matches_go_vector() {
+        use num_bigint::BigInt;
+
+        quil_crypto::init(); // load the KZG SRS (idempotent across calls)
+        let prover = quil_crypto::KzgInclusionProver;
+
+        let mut tree = quil_tries::VectorCommitmentTree::new();
+        tree.insert(&[0u8 << 2], b"hello world", &[], &BigInt::from(11))
+            .unwrap();
+        tree.insert(&[1u8 << 2], &[0xABu8; 56], &[], &BigInt::from(56))
+            .unwrap();
+        tree.insert(&[16u8 << 2], &[0xCDu8; 32], &[], &BigInt::from(32))
+            .unwrap();
+
+        let commit = tree.commit(&prover);
+        assert_eq!(
+            hex::encode(&commit),
+            "020f8e94f575785f6ca4260ee36dee3370f226af96a0f5ad2727c6e2335fb01defa026b7d6696d802dd035f276f8c7cbd04987313415fb206882a06e337561dca0ee675a9d370cb2b20a",
+            "KZG root commitment must match Go bls48581"
+        );
+
+        let ser = quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap();
+        assert_eq!(
+            hex::encode(&ser),
+            "020000000001000000000000000100000000000000000b68656c6c6f20776f726c6400000000000000000000000000000040b30d43f7820dea2998631be4af2e0a5665de80dca55b547a4ce637db8add468d3353f46b2f91f31c3d25e1fc664249c7f92c3b6cd03f300c9becd75f44544b2900000000000000010b010000000000000001040000000000000038abababababababababababababababababababababababababababababababababababababababababababababababababababababababab000000000000000000000000000000407941c8dc10a26dad206aabee1f7c73886bf3161c25360cf5eb11adc3b90c5128fe4cd54483412eb2bbd6c3b6d4efa1ca43ece88d200d8d676f2c7c9692c555180000000000000001380000000000000000000000000000010000000000000001400000000000000020cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00000000000000000000000000000040c8234b7610cb08164ece21a18803b3fb7a5ca6c7dd3659c5de974ae279f87fc1e5d567153f60304e22d6cf84959bdb4172190dc48ea4a3e3b3f92cc32ad458c90000000000000001200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004a020f8e94f575785f6ca4260ee36dee3370f226af96a0f5ad2727c6e2335fb01defa026b7d6696d802dd035f276f8c7cbd04987313415fb206882a06e337561dca0ee675a9d370cb2b20a000000000000000163000000000000000300000001",
+            "serialized committed tree must match Go SerializeNonLazyTree"
+        );
     }
 
     #[test]

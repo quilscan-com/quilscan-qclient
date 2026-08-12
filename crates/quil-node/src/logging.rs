@@ -1,7 +1,7 @@
 //! Tab-separated log lines with a JSON tail; `coreId` always present.
 //!
 //! ```text
-//! 2026-04-22T01:00:00Z  info  quil_node:490  P2P identity ready  {"coreId": 0, "peer_id": "Qm..."}
+//! 2026-04-22T01:00:00Z info  quil_node:490  P2P identity ready  {"coreId": 0, "peer_id": "Qm..."}
 //! ```
 //!
 //! Per-core file separation (`master.log` / `worker-N.log`) plus
@@ -48,12 +48,34 @@ struct PerCoreFiles {
     max_backups: i32,
     max_age: i32,
     compress: bool,
-    /// Held to keep the master appender alive for the process
-    /// lifetime.
-    _master_guard: tracing_appender::non_blocking::WorkerGuard,
 }
 
 static PER_CORE_FILES: OnceLock<Arc<PerCoreFiles>> = OnceLock::new();
+
+/// Appender guards for every non-blocking file writer (master +
+/// workers). Dropping a guard blocks until its writer thread drains,
+/// so they must live for the process lifetime and be dropped exactly
+/// once, at exit, via [`shutdown_logging`].
+static LOG_GUARDS: OnceLock<std::sync::Mutex<Vec<tracing_appender::non_blocking::WorkerGuard>>> =
+    OnceLock::new();
+
+fn hold_guard(guard: tracing_appender::non_blocking::WorkerGuard) {
+    LOG_GUARDS
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(guard);
+}
+
+/// Drop all appender guards, flushing buffered log lines to disk.
+/// Call as the last thing before process exit — the final error/info
+/// lines explaining WHY the node stopped are exactly the ones still
+/// sitting in the non-blocking writer's channel.
+pub fn shutdown_logging() {
+    if let Some(guards) = LOG_GUARDS.get() {
+        guards.lock().unwrap().clear();
+    }
+}
 
 /// First call wins per `core_id`; subsequent calls are a no-op.
 pub fn register_worker_log_file(core_id: u32) {
@@ -78,8 +100,7 @@ pub fn register_worker_log_file(core_id: u32) {
         files.compress,
     );
     let (nb, guard) = tracing_appender::non_blocking(rotate);
-    // `WorkerGuard` must outlive emission for the worker's lifetime.
-    Box::leak(Box::new(guard));
+    hold_guard(guard);
     let mut map = files.workers.write().unwrap();
     map.entry(core_id).or_insert(nb);
 
@@ -313,6 +334,24 @@ pub fn build_env_filter(
     directives.push("libp2p_quic=warn".to_string());
     directives.push("libp2p_tcp=warn".to_string());
     directives.push("libp2p_swarm=warn".to_string());
+    // Stock gossipsub emits "Send Queue full" (per-peer outbound backpressure)
+    // at WARN. Under load that is routine and NOT operator-actionable, but the
+    // message lives in the dependency so we can't relabel that one line without
+    // vendoring the crate. Treat it as debug-level instead: cap gossipsub's WARN
+    // floor at `error` in normal (info) runs so it's hidden, but leave it (and
+    // the rest of gossipsub) visible under `--debug` for diagnosis. Overridable
+    // via config `logFilters` / `--log-filter` (appended after this).
+    if !debug {
+        directives.push("libp2p_gossipsub=error".to_string());
+    }
+    // The HTTP/2 + gRPC stack (h2 codec frame send/received, hyper, tonic
+    // service, and tower buffer/ready) logs thousands of per-frame debug lines
+    // that bury the node's own output under `--debug`. Cap at warn unless opted
+    // back in.
+    directives.push("h2=warn".to_string());
+    directives.push("hyper=warn".to_string());
+    directives.push("tonic=warn".to_string());
+    directives.push("tower=warn".to_string());
 
     for (component, level) in config_filters {
         directives.push(format!("{}={}", component, level));
@@ -341,10 +380,10 @@ pub fn log_filename_for_core(core_id: u32) -> String {
 /// at `<cfg.path>/<core>.log` and keeps stderr as a mirror.
 ///
 /// Rotation:
-///   * `max_size` MB — rotation trigger (0 → daily).
-///   * `max_backups` — rotated files retained (0 → 1024 cap).
-///   * `max_age` days — reaper deletes older rotations.
-///   * `compress` — gzip on rotation.
+/// * `max_size` MB — rotation trigger (0 → daily).
+/// * `max_backups` — rotated files retained (0 → 1024 cap).
+/// * `max_age` days — reaper deletes older rotations.
+/// * `compress` — gzip on rotation.
 pub fn init_logging(
     cfg: &quil_config::LogConfig,
     core_id: u32,
@@ -379,6 +418,7 @@ pub fn init_logging(
     );
 
     let (non_blocking, guard) = tracing_appender::non_blocking(rotate);
+    hold_guard(guard);
 
     let _ = PER_CORE_FILES.set(Arc::new(PerCoreFiles {
         master: non_blocking.clone(),
@@ -388,7 +428,6 @@ pub fn init_logging(
         max_backups: cfg.max_backups,
         max_age: cfg.max_age,
         compress: cfg.compress,
-        _master_guard: guard,
     }));
     let files = PER_CORE_FILES.get().expect("PerCoreFiles just set").clone();
 
@@ -404,7 +443,8 @@ pub fn init_logging(
         .with(stderr_layer)
         .with(file_layer)
         .init();
-    // Master appender is held by `PER_CORE_FILES`.
+    // Master appender is held by `PER_CORE_FILES`; its guard lives in
+    // `LOG_GUARDS` until `shutdown_logging`.
     None
 }
 

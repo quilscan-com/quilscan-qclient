@@ -56,8 +56,30 @@ pub struct WorkerNodeConfig {
     pub master_endpoint: String,
     /// This worker's gRPC listen address (for Respawn commands).
     pub listen_addr: String,
+    /// mTLS materials for the master↔worker (DataIpc) channel, derived from the
+    /// node's Falcon key (`quil_rpc::quil_tls::build_worker_channel_cert`) and
+    /// threaded in by the node layer. When all three are `Some`, the DataIpc
+    /// server REQUIRES a client cert chaining to `channel_tls_ca_pem` — so only a
+    /// master holding the node's key can connect. `None` (e.g. tests) = plaintext.
+    pub channel_tls_ca_pem: Option<String>,
+    pub channel_tls_leaf_pem: Option<String>,
+    pub channel_tls_key_pem: Option<String>,
     /// Parent process ID (for monitoring).
     pub parent_pid: Option<u32>,
+    /// Whether app-shard consensus runs on commonware-simplex (CW) rather than
+    /// the legacy path — mirrors thread mode's `config.engine.app_consensus_cw`.
+    /// Threaded here so a cluster (separate-process) worker's `AppConsensusEngine`
+    /// activates the same CW path the in-process thread worker does, instead of
+    /// the previously hardcoded `false` (which pinned cluster workers to legacy).
+    pub app_consensus_cw: bool,
+    /// This worker's on-disk data directory. Used as the base for the app-shard
+    /// commonware-simplex journal (`<data_dir>/cw-app-consensus/app-<addr>`) so a
+    /// cluster worker's CW journal is PERSISTENT — matching thread mode. With no
+    /// dir the runtime falls back to a random temp journal, whose prune path
+    /// panics with `BlobMissing` (the ephemeral journal was never exercised
+    /// before cluster CW reached a real 2-member committee). `None` keeps the old
+    /// ephemeral behavior (tests / master-less bring-up).
+    pub data_dir: Option<std::path::PathBuf>,
     /// Builds a fresh gRPC channel to the master. main.rs wires this
     /// to a closure that uses quil-rpc's `build_quil_client_config` +
     /// `QuilTlsConnector` so the worker presents the same Ed448 cert
@@ -125,6 +147,14 @@ pub struct WorkerOnlyNode {
     /// Tracked so a Respawn that swaps filters drops the old
     /// subscriptions before adding new ones.
     active_shard_subscriptions: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Peer-id → committee Falcon public-key, learned from inbound
+    /// `GLOBAL_PEER_INFO`. Mirrors the master's PeerInfo cache: inbound app-shard
+    /// CW messages (`shard_cw_bitmask`) carry only the gossip sender's PeerId,
+    /// but the engine's `CwIn` handler needs the raw committee key
+    /// (`FalconPublicKey::from_bytes`) and DROPS any message whose `from` doesn't
+    /// resolve. Without this a cluster worker would receive CW votes and silently
+    /// drop every one → its simplex engine never reaches quorum.
+    peer_key_by_id: std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>,
     /// Worker-local mirror of the master's coverage-halt verdict
     /// (set via the `SetHalted` IPC RPC). The publish pump consults
     /// this to drop in-flight FrameProduced / VoteProduced /
@@ -136,9 +166,26 @@ pub struct WorkerOnlyNode {
     /// local root. Without this, remote workers start with an empty
     /// CRDT and can't resolve leader rotation or verify FrameHeaders.
     prover_tree_syncer: Option<Arc<dyn crate::prover_tree_syncer::ProverTreeSyncer>>,
+    /// Repopulate the prover-registry cache from the just-synced store. The
+    /// trait `ProverRegistry::refresh()` is a deliberate no-op (avoids O(N)
+    /// rescans on the shared registry), so a cluster worker — which owns its
+    /// registry and must reload it after a prover-tree sync — needs a real
+    /// `refresh_from_store` hook. Without it the worker's registry stays empty
+    /// and `build_app_committee` fails ("this node's key not in the active
+    /// set"), leaving the shard engine in passive mode.
+    registry_refresh: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Cooldown frame to avoid sync-storms: after a sync attempt,
     /// skip further attempts until frame_number >= cooldown_until.
     sync_cooldown_until: std::sync::atomic::AtomicU64,
+    /// The prover-tree roots (phase 0 = `prover_tree_commitment`, phases
+    /// 1/2/3 = `prover_tree_aux_roots`) from the most recent global frame
+    /// header the worker has seen on the master stream. The periodic
+    /// background sync uses these as its anchor so it verifies the peer's
+    /// served tree against a consensus-certified root instead of blindly
+    /// trusting the peer (hardening #6). Empty until the first global frame
+    /// arrives — the periodic sync falls back to trust-the-peer only for
+    /// that initial window.
+    latest_prover_tree_anchor: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 impl WorkerOnlyNode {
@@ -178,9 +225,12 @@ impl WorkerOnlyNode {
             publish_fn: None,
             worker_p2p: None,
             active_shard_subscriptions: std::sync::Mutex::new(Vec::new()),
+            peer_key_by_id: std::sync::Mutex::new(std::collections::HashMap::new()),
             local_halted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             prover_tree_syncer: None,
+            registry_refresh: None,
             sync_cooldown_until: std::sync::atomic::AtomicU64::new(0),
+            latest_prover_tree_anchor: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -208,6 +258,23 @@ impl WorkerOnlyNode {
     ) -> Self {
         self.prover_tree_syncer = Some(syncer);
         self
+    }
+
+    /// Supply a real prover-registry refresh (`refresh_from_store`) to run after
+    /// a prover-tree sync. See `registry_refresh`.
+    pub fn with_registry_refresh(mut self, f: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.registry_refresh = Some(f);
+        self
+    }
+
+    /// Reload the prover registry from the synced store (real hook when wired,
+    /// else the trait no-op).
+    fn refresh_registry(&self) {
+        if let Some(f) = self.registry_refresh.as_ref() {
+            f();
+        } else {
+            let _ = self.prover_registry.refresh();
+        }
     }
 
     /// Supply a publish path (typically backed by a `ProxyPubSub`
@@ -247,9 +314,7 @@ impl WorkerOnlyNode {
             info!("performing initial prover-tree sync from archive");
             match syncer.sync_prover_tree(&[]).await {
                 Ok(_converged) => {
-                    if let Err(e) = self.prover_registry.refresh() {
-                        warn!(error = %e, "prover registry refresh after initial sync failed");
-                    }
+                    self.refresh_registry();
                     info!("initial prover-tree sync complete");
                 }
                 Err(e) => {
@@ -260,10 +325,47 @@ impl WorkerOnlyNode {
             warn!("no prover-tree syncer wired — worker will run with stale/empty prover state");
         }
 
+        // 0b. Periodic background prover-tree sync. The initial sync above runs
+        // BEFORE the shard's provers have joined/activated, so the worker's
+        // registry starts empty and its committee build fails. The
+        // materialize-gated `maybe_sync_before_global_frame` path can't recover
+        // it (it treats an empty local root as "matched" and skips), so a passive
+        // worker would never re-sync — a deadlock. This loop pulls the latest
+        // prover tree from the master and refreshes the registry on a fixed
+        // cadence, so the registry becomes current and the engine's CW retry can
+        // build the committee. Trust-the-peer sync (empty expected root).
+        if self.prover_tree_syncer.is_some() {
+            let this = self.clone();
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tick.tick() => {
+                            if let Some(syncer) = this.prover_tree_syncer.as_ref() {
+                                // Anchor against the last-seen global frame header's
+                                // certified prover-tree roots (hardening #6). Empty
+                                // only before the first global frame arrives, in which
+                                // case we fall back to trust-the-peer for that window.
+                                let anchor = {
+                                    this.latest_prover_tree_anchor.lock().unwrap().clone()
+                                };
+                                match syncer.sync_prover_tree(&anchor).await {
+                                    Ok(_) => this.refresh_registry(),
+                                    Err(e) => tracing::debug!(error = %e, "periodic prover-tree sync failed"),
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         // 1. Start parent process monitor (if parent PID given)
         if let Some(parent_pid) = self.config.parent_pid {
             let cancel = self.cancel.clone();
-            // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+            // TODO
             tokio::spawn(async move {
                 monitor_parent_process(parent_pid, cancel).await;
             });
@@ -277,10 +379,40 @@ impl WorkerOnlyNode {
             .map_err(|e| QuilError::Internal(format!("bad listen addr: {}", e)))?;
 
         let server_cancel = self.cancel.clone();
-        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+        // mTLS the master↔worker (DataIpc) channel when the node layer supplied
+        // cert materials (cluster mode). The server then REQUIRES a client cert
+        // chaining to our CA — only a master holding the node's Falcon key can
+        // connect. `None` (tests / not wired) keeps the old plaintext behavior.
+        let channel_tls: Option<tonic::transport::ServerTlsConfig> = match (
+            self.config.channel_tls_ca_pem.clone(),
+            self.config.channel_tls_leaf_pem.clone(),
+            self.config.channel_tls_key_pem.clone(),
+        ) {
+            (Some(ca), Some(leaf), Some(key)) => Some(
+                tonic::transport::ServerTlsConfig::new()
+                    .identity(tonic::transport::Identity::from_pem(leaf, key))
+                    .client_ca_root(tonic::transport::Certificate::from_pem(ca)),
+            ),
+            _ => None,
+        };
         let server_handle = tokio::spawn(async move {
-            info!("DataIPC gRPC server starting on {}", listen_addr);
-            if let Err(e) = Server::builder()
+            info!("DataIPC gRPC server starting on {} (mtls={})", listen_addr, channel_tls.is_some());
+            let mut builder = Server::builder()
+                // Reap dead master connections (h2 PING) so a master that
+                // dies without FIN doesn't leave the stream fd behind.
+                .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+                .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+                .tcp_keepalive(Some(std::time::Duration::from_secs(60)));
+            if let Some(tls) = channel_tls {
+                match builder.tls_config(tls) {
+                    Ok(b) => builder = b,
+                    Err(e) => {
+                        error!(error = %e, "DataIPC gRPC TLS config invalid — server not started");
+                        return;
+                    }
+                }
+            }
+            if let Err(e) = builder
                 .add_service(
                     quil_types::proto::node::data_ipc_service_server::DataIpcServiceServer::new(
                         ipc_service,
@@ -299,7 +431,7 @@ impl WorkerOnlyNode {
             let master_endpoint = self.config.master_endpoint.clone();
             let worker_ref = self.clone();
             let stream_cancel = self.cancel.clone();
-            // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+            // TODO
             tokio::spawn(async move {
                 stream_global_messages_from_master(
                     &master_endpoint,
@@ -320,7 +452,24 @@ impl WorkerOnlyNode {
             if let Some(mut rx) = rx_opt {
                 let pump_cancel = self.cancel.clone();
                 let halt_flag = self.local_halted.clone();
-                // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+                // Captured so the pump can trigger a shard catch-up sync
+                // on `AncestorSyncRequested` (step 4).
+                let sync_for_pump = self.prover_tree_syncer.clone();
+                let clock_for_pump = self.clock_store.clone();
+                // The worker (for its engine_handle), so a completed sync
+                // can notify the engine to fast-forward its materialized
+                // cursor. Cloned Arc — the engine handle is read at sync
+                // completion (it may rotate across Respawn).
+                let worker_for_pump = self.clone();
+                // In-flight shard syncs keyed by filter. Gap detection
+                // re-fires `AncestorSyncRequested` on every subsequent
+                // frame until the cursor catches up, so without this the
+                // pump would spawn an unbounded pile of concurrent syncs
+                // against the archive. Shared with each spawned sync task
+                // so it clears its own slot on completion.
+                let syncing_filters: Arc<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>> =
+                    Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+                // TODO
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
@@ -348,6 +497,14 @@ impl WorkerOnlyNode {
                                         // (massive amplification for no benefit).
                                         publish(crate::bitmasks::shard_frame_bitmask(&filter), frame_data).await;
                                     }
+                                    FullFrameProduced { filter, frame_data, .. } => {
+                                        if halted {
+                                            continue;
+                                        }
+                                        // Full AppShardFrame (header+requests) for
+                                        // state distribution to followers/archives.
+                                        publish(crate::bitmasks::shard_frame_bitmask(&filter), frame_data).await;
+                                    }
                                     VoteProduced { filter, vote_data, .. } => {
                                         if halted {
                                             tracing::debug!(filter = %hex::encode(&filter),
@@ -367,10 +524,79 @@ impl WorkerOnlyNode {
                                         }
                                         publish(crate::bitmasks::shard_consensus_bitmask(&filter), timeout_data).await;
                                     }
+                                    // (P3) Commonware-simplex message → one shard CW
+                                    // gossip topic, channel tagged in the payload.
+                                    CwOut { filter, channel, bytes } => {
+                                        if halted {
+                                            continue;
+                                        }
+                                        publish(
+                                            crate::bitmasks::shard_cw_bitmask(&filter),
+                                            crate::bitmasks::shard_cw_frame_payload(channel, &bytes),
+                                        )
+                                        .await;
+                                    }
+                                    // Shard catch-up: a frame gap was detected
+                                    // (step 4). Pull the shard's vertex-adds
+                                    // subtree from the archive, pinning to the
+                                    // vertex-adds root of the latest finalized
+                                    // header we hold.
+                                    AncestorSyncRequested { filter, .. } => {
+                                        if let Some(syncer) = sync_for_pump.clone() {
+                                            // Dedup: skip if a sync for this
+                                            // filter is already running.
+                                            {
+                                                let mut g = syncing_filters.lock().unwrap();
+                                                if !g.insert(filter.clone()) {
+                                                    continue;
+                                                }
+                                            }
+                                            // Pin ALL FOUR phases to the latest
+                                            // finalized header's `state_roots`
+                                            // (audit #5 — not just vertex-adds).
+                                            // Those roots are the PRE-materialization
+                                            // state of frame L = POST-materialization
+                                            // of L-1, so a converged sync brings the
+                                            // tree to frame L-1. We report
+                                            // `synced_to_frame = L-1` to the engine.
+                                            let latest = clock_for_pump
+                                                .get_latest_shard_clock_frame(&filter)
+                                                .ok()
+                                                .and_then(|f| f.header)
+                                                .map(|h| (h.frame_number, h.state_roots));
+                                            let (pinned_frame, expected_roots) = match latest {
+                                                Some((n, r)) => (n, r),
+                                                None => {
+                                                    syncing_filters.lock().unwrap().remove(&filter);
+                                                    continue;
+                                                }
+                                            };
+                                            let synced_to_frame = pinned_frame.saturating_sub(1);
+                                            let syncing = syncing_filters.clone();
+                                            let worker = worker_for_pump.clone();
+                                            tokio::spawn(async move {
+                                                match syncer.sync_shard_tree(&filter, &expected_roots).await {
+                                                    Ok(true) => {
+                                                        tracing::info!(synced_to_frame, "shard catch-up sync converged");
+                                                        // Tell the engine to fast-forward
+                                                        // its materialized cursor + drop
+                                                        // stale buffers.
+                                                        if let Some(h) = worker.engine_handle.lock().unwrap().clone() {
+                                                            if h.filter == filter {
+                                                                h.send(AppEngineMessage::ShardSyncCompleted { synced_to_frame });
+                                                            }
+                                                        }
+                                                    }
+                                                    Ok(false) => tracing::warn!("shard catch-up sync did not converge"),
+                                                    Err(e) => tracing::warn!(error = %e, "shard catch-up sync failed"),
+                                                }
+                                                syncing.lock().unwrap().remove(&filter);
+                                            });
+                                        }
+                                    }
                                     // Internal signals — no network publish.
                                     EquivocationDetected { .. }
                                     | Halted { .. }
-                                    | AncestorSyncRequested { .. }
                                     | ParentSealed { .. }
                                     | ShardFrameFinalized { .. } => {
                                         // Proxy mode: master handles
@@ -422,6 +648,12 @@ impl WorkerOnlyNode {
         // Create new AppConsensusEngine
         let deps = AppEngineDeps {
             clock_store: self.clock_store.clone(),
+            // Cluster-mode worker: its own store currently holds only shard
+            // frames, so the global anchor is unavailable here the same way it
+            // was for thread mode. Fall back to `clock_store` for now; cluster
+            // mode needs a master→worker global-frame feed to fully fix (thread
+            // mode is fixed via the master's shared store in `thread_worker`).
+            global_anchor_store: None,
             prover_registry: self.prover_registry.clone(),
             frame_prover: self.frame_prover.clone(),
             message_collector: self.message_collector.clone(),
@@ -443,12 +675,42 @@ impl WorkerOnlyNode {
             // `db.worker_path_prefix`) and therefore its own
             // CRDT/exec-mgr instance, mirroring Go's cluster mode.
             hypergraph: self.hypergraph.clone(),
+            // Cluster-mode worker: falls back to `hypergraph` for the storage
+            // source (per-worker possession in cluster mode needs the same
+            // master-source wiring as thread mode — separate follow-up).
+            storage_source_hypergraph: None,
             execution_engine: self.execution_engine.clone(),
             inclusion_prover: self.inclusion_prover.clone(),
             // Cluster mode: worker process owns its own DB and can
             // back this with a real KV handle once the wiring is in
             // place. Until then, fall through to the in-memory store.
             kv_db: None,
+            // (P3) Cluster-mode app-shard CW: mirror thread mode by honoring the
+            // configured flag. The worker's own p2p subscribes to
+            // `shard_cw_bitmask` and routes inbound CW to the engine (see
+            // `route_message` / `subscribe_to_shard_bitmasks`).
+            app_consensus_cw: self.config.app_consensus_cw,
+            // App-shard CW journal path for THIS cluster worker. A cluster worker
+            // is its OWN process with a UNIQUE on-disk data dir, and is ALWAYS
+            // core_id 1. `DbConfig::default().worker_path_prefix` is the RELATIVE
+            // "worker-store/%d" → "worker-store/1" for EVERY node's worker; since
+            // all worker processes share a cwd, they would all resolve the SAME
+            // app-CW journal dir. Two simplex Manager instances (separate
+            // processes) on one partition delete each other's section files →
+            // commonware's `journal.prune` panics with `BlobMissing`, killing the
+            // voter before consensus can finalize. Seed `db.path` from the
+            // worker's own (unique) data dir AND clear the prefix/paths so
+            // `cw_app_storage_base` resolves to that unique `db.path`
+            // (`<data_dir>/cw-app-consensus/app-<addr>`), never the shared prefix.
+            db_config: {
+                let mut d = quil_config::DbConfig::default();
+                if let Some(dir) = self.config.data_dir.as_ref() {
+                    d.path = dir.to_string_lossy().into_owned();
+                }
+                d.worker_path_prefix = String::new();
+                d.worker_paths = Vec::new();
+                d
+            },
         };
 
         let (engine, handle) = AppConsensusEngine::new(
@@ -464,11 +726,12 @@ impl WorkerOnlyNode {
             *h = Some(handle);
         }
 
-        // Run engine in background
-        let bls_signer = (self.bls_signer_factory)();
-        // TODO https://github.com/QuilibriumNetwork/monorepo/issues/563
+        // Run engine in background. Pass the signer FACTORY so the engine can
+        // retry starting CW (obtaining a fresh signer each attempt) until its
+        // committee is buildable.
+        let signer_factory = self.bls_signer_factory.clone();
         tokio::spawn(async move {
-            engine.run(bls_signer).await;
+            engine.run(signer_factory).await;
         });
 
         // Subscribe to per-shard bitmasks on the worker's own p2p so
@@ -479,7 +742,7 @@ impl WorkerOnlyNode {
         Ok(())
     }
 
-    /// Subscribe to all four per-shard bitmasks for `filter` on the
+    /// Subscribe to all per-shard bitmasks for `filter` on the
     /// worker-owned p2p handle. Tracks the subscriptions so the next
     /// respawn can unsubscribe them.
     async fn subscribe_to_shard_bitmasks(&self, filter: &[u8]) {
@@ -489,6 +752,16 @@ impl WorkerOnlyNode {
             crate::bitmasks::shard_consensus_bitmask(filter),
             crate::bitmasks::shard_prover_bitmask(filter),
             crate::bitmasks::shard_dispatch_bitmask(filter),
+            // App-shard CW consensus rides its own per-shard topic. The app
+            // engine ALWAYS starts commonware-simplex (`app_engine::run` →
+            // `start_consensus_cw`, ungated — Jolteon is gone), so this
+            // subscription must be unconditional too: without it the worker
+            // publishes CW out (`CwOut` → `shard_cw_bitmask`) to a topic it
+            // never joined ("not subscribed to bitmask") AND never receives
+            // peers' votes/certs/blocks → its simplex engine can't reach
+            // quorum. Gating this on `config.app_consensus_cw` (default false,
+            // a vestige of the removed legacy path) was the bug.
+            crate::bitmasks::shard_cw_bitmask(filter),
         ];
         for bm in &bitmasks {
             p2p.subscribe(bm.clone()).await;
@@ -533,6 +806,14 @@ impl WorkerOnlyNode {
         if expected.is_empty() {
             return;
         }
+        // Cache the certified prover-tree roots so the periodic background sync
+        // can anchor against them instead of trusting the peer (hardening #6).
+        {
+            let mut anchor = self.latest_prover_tree_anchor.lock().unwrap();
+            anchor.clear();
+            anchor.push(header.prover_tree_commitment.clone());
+            anchor.extend(header.prover_tree_aux_roots.iter().cloned());
+        }
         // Compute local root from CRDT.
         let local_root = match self.hypergraph.as_ref() {
             Some(hg) => {
@@ -545,11 +826,18 @@ impl WorkerOnlyNode {
             }
             None => Vec::new(),
         };
-        if local_root.is_empty() || local_root == expected.as_slice() {
+        let matched = local_root.is_empty() || local_root == expected.as_slice();
+        crate::metrics::record_root_verification(matched);
+        if matched {
             return;
         }
-        // Root mismatch — sync.
-        self.perform_blocking_prover_sync(header.frame_number, expected).await;
+        // Root mismatch — sync. Pin ALL FOUR phases (audit #5): phase 0 =
+        // prover_tree_commitment, phases 1/2/3 = prover_tree_aux_roots.
+        let mut expected_roots = Vec::with_capacity(4);
+        expected_roots.push(header.prover_tree_commitment.clone());
+        expected_roots.extend(header.prover_tree_aux_roots.iter().cloned());
+        self.perform_blocking_prover_sync(header.frame_number, &expected_roots)
+            .await;
     }
 
     /// Blocking prover-tree sync. Mirrors Go's
@@ -560,7 +848,7 @@ impl WorkerOnlyNode {
     async fn perform_blocking_prover_sync(
         &self,
         frame_number: u64,
-        expected_root: &[u8],
+        expected_roots: &[Vec<u8>],
     ) {
         const MAX_ATTEMPTS: usize = 3;
         const RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -583,7 +871,8 @@ impl WorkerOnlyNode {
 
         info!(
             frame = frame_number,
-            expected = hex::encode(expected_root),
+            expected = expected_roots.first().map(hex::encode).unwrap_or_default(),
+            phases = expected_roots.len(),
             "performing blocking prover tree sync before materialization"
         );
 
@@ -595,16 +884,14 @@ impl WorkerOnlyNode {
                     "retrying prover tree sync"
                 );
             }
-            match syncer.sync_prover_tree(expected_root).await {
+            match syncer.sync_prover_tree(expected_roots).await {
                 Ok(true) => {
                     info!(
                         attempt = attempt + 1,
                         "prover tree sync converged"
                     );
                     // Refresh the prover registry from the just-synced store.
-                    if let Err(e) = self.prover_registry.refresh() {
-                        warn!(error = %e, "prover registry refresh after sync failed");
-                    }
+                    self.refresh_registry();
                     self.sync_cooldown_until.store(
                         frame_number.saturating_add(COOLDOWN_FRAMES),
                         std::sync::atomic::Ordering::Relaxed,
@@ -640,15 +927,30 @@ impl WorkerOnlyNode {
 
     /// Route an incoming message from the master to the active engine.
     /// Bitmask dispatch:
-    ///   - `[0x00, 0x00, 0x00, 0x00]` → global peer info
-    ///   - `[0x00, 0x00, 0x00]`       → global prover
-    ///   - `[0x00, 0x00]`             → global frame
-    ///   - `[0x00]`                   → global consensus
-    ///   - `shard_frame_bitmask(f)`     → Frame
-    ///   - `shard_consensus_bitmask(f)` → Consensus
-    ///   - `shard_prover_bitmask(f)`    → Prover
-    ///   - `shard_dispatch_bitmask(f)`  → Dispatch
-    pub fn route_message(&self, data: &[u8], bitmask: &[u8]) {
+    /// - `[0x00, 0x00, 0x00, 0x00]` → global peer info
+    ///   - `[0x00, 0x00, 0x00]` → global prover
+    ///   - `[0x00, 0x00]` → global frame
+    ///   - `[0x00]` → global consensus
+    ///   - `shard_frame_bitmask(f)` → Frame
+    /// - `shard_consensus_bitmask(f)` → Consensus
+    ///   - `shard_prover_bitmask(f)` → Prover
+    ///   - `shard_dispatch_bitmask(f)` → Dispatch
+    pub fn route_message(&self, data: &[u8], bitmask: &[u8], from: &[u8]) {
+        // Learn peer-id → committee key from PeerInfo regardless of engine state,
+        // so the mapping is warm before this shard's CW traffic arrives. The
+        // peer_id + public_key live INSIDE the PeerInfo payload (not the transport
+        // `from`), so this works whether the message came via the worker's own
+        // p2p or the master stream.
+        if bitmask == crate::bitmasks::GLOBAL_PEER_INFO {
+            if let Ok(info) = quil_p2p::decode_canonical_peer_info(data) {
+                if !info.peer_id.is_empty() && !info.public_key.is_empty() {
+                    self.peer_key_by_id
+                        .lock()
+                        .unwrap()
+                        .insert(info.peer_id, info.public_key);
+                }
+            }
+        }
         let handle = {
             let guard = self.engine_handle.lock().unwrap();
             guard.clone()
@@ -688,6 +990,27 @@ impl WorkerOnlyNode {
             h.send(AppEngineMessage::Prover(data.to_vec()));
         } else if bitmask == crate::bitmasks::shard_dispatch_bitmask(filter).as_slice() {
             h.send(AppEngineMessage::Dispatch(data.to_vec()));
+        } else if bitmask == crate::bitmasks::shard_cw_bitmask(filter).as_slice() {
+            // App-shard commonware-simplex traffic: unpack the channel tag, then
+            // resolve the gossip sender's PeerId → its committee Falcon key so
+            // the engine's `CwIn` can attribute (and not drop) it. The BLOCK
+            // channel needs no key (self-describing), so an unresolved sender is
+            // only fatal for votes/certs — a benign transient until the peer's
+            // PeerInfo propagates. Mirrors the master's inbound CW routing.
+            if let Some((channel, cw_bytes)) = crate::bitmasks::shard_cw_split_payload(data) {
+                let from_key = self
+                    .peer_key_by_id
+                    .lock()
+                    .unwrap()
+                    .get(from)
+                    .cloned()
+                    .unwrap_or_default();
+                h.send(AppEngineMessage::CwIn {
+                    channel,
+                    from: from_key,
+                    data: cw_bytes.to_vec(),
+                });
+            }
         }
         // Unknown bitmask shape — silently drop. Logging every drop
         // is noisy because the master fans out all peer pubsub to
@@ -822,7 +1145,11 @@ async fn stream_global_messages_from_master(
                                             if resp.bitmask.as_slice() == crate::bitmasks::GLOBAL_FRAME {
                                                 worker.maybe_sync_before_global_frame(&resp.data).await;
                                             }
-                                            worker.route_message(&resp.data, &resp.bitmask);
+                                            // Master stream carries no sender id;
+                                            // it fans out GLOBAL_* traffic only, so
+                                            // shard-CW (which needs `from`) never
+                                            // arrives here — an empty sender is fine.
+                                            worker.route_message(&resp.data, &resp.bitmask, &[]);
                                         }
                                         Ok(None) => {
                                             info!("master stream ended");
@@ -905,14 +1232,14 @@ fn is_process_alive(_pid: u32) -> bool {
 /// preprocessing.
 ///
 /// Resolution order (decreasing preference):
-///   1. `data_worker_stream_multiaddrs[core_id - 1]` if set. Accepts
-///      either `host:port` directly or a libp2p multiaddr
-///      `/ip4/HOST/tcp/PORT` (extracted into `HOST:PORT`).
-///   2. `data_worker_base_listen_multiaddr` template with `%d` →
-///      `data_worker_base_stream_port + (core_id - 1)`. Core 1 gets
-///      `base_stream_port` itself.
-///   3. Same as (2) but with the serde defaults for those two fields
-///      (which is what you get when the config doesn't set them).
+/// 1. `data_worker_stream_multiaddrs[core_id - 1]` if set. Accepts
+/// either `host:port` directly or a libp2p multiaddr
+/// `/ip4/HOST/tcp/PORT` (extracted into `HOST:PORT`).
+/// 2. `data_worker_base_listen_multiaddr` template with `%d` →
+/// `data_worker_base_stream_port + (core_id - 1)`. Core 1 gets
+/// `base_stream_port` itself.
+/// 3. Same as (2) but with the serde defaults for those two fields
+/// (which is what you get when the config doesn't set them).
 pub fn worker_listen_addr(
     core_id: u32,
     base_listen: &str,

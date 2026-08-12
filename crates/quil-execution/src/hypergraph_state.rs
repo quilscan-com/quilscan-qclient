@@ -8,8 +8,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use num_bigint::BigInt;
 use quil_crypto::poseidon::hash_bytes_to_32;
-use quil_tries::get_full_path;
+use quil_tries::{get_full_path, serialize_go_tree, VectorCommitmentTree};
+use quil_types::crypto::InclusionProver;
 use quil_types::error::{QuilError, Result};
 use quil_types::execution::{StateChange, StateChangeEvent};
 
@@ -19,6 +21,22 @@ use quil_hypergraph::addressing::Location;
 // =====================================================================
 // Discriminator constants
 // =====================================================================
+
+/// A PQ-safe content digest of a vector-commitment tree: `SHA-512` over its flat
+/// `(field_key, value)` leaves. Replaces the KZG/BLS48-581 `commit()` for the
+/// vestigial metadata `hash_target` and the compute-deploy domain — hashes tree
+/// CONTENT, not a curve commitment. Deterministic ⇒ consensus-safe.
+pub(crate) fn tree_content_digest(tree: &VectorCommitmentTree) -> Vec<u8> {
+    use sha2::{Digest, Sha512};
+    let mut h = Sha512::new();
+    for (k, v) in tree.leaves() {
+        h.update((k.len() as u32).to_be_bytes());
+        h.update(&k);
+        h.update((v.len() as u32).to_be_bytes());
+        h.update(&v);
+    }
+    h.finalize().to_vec()
+}
 
 /// `poseidon("vertex:adds")` — 32 bytes.
 pub fn vertex_adds_discriminator() -> Result<[u8; 32]> {
@@ -46,6 +64,40 @@ pub const HYPERGRAPH_METADATA_ADDRESS: [u8; 32] = [0xFF; 32];
 
 /// Vertex data deletion interval (ms). ~600 frames after deletion.
 pub const VERTEX_DATA_DELETION_INTERVAL_MS: i64 = 10 * 60 * 1000;
+
+/// Seal a sub-tree into the metadata tree at key `[index << 2]`, mirroring
+/// Go `HypergraphState.sealMetadataStateAtIndex`
+/// (hypergraph_state.go:395-432): commit the sub-tree, serialize it with
+/// the non-lazy (Go-wire) format, and insert `(value=serialized,
+/// hash_target=commitment, size=sub-tree size)`. `index` must be ≤ 63.
+/// The key is shifted up two bits so the index lives in the first nibble.
+pub fn seal_metadata_state_at_index(
+    metadata: &mut VectorCommitmentTree,
+    sub_data: &mut VectorCommitmentTree,
+    index: u8,
+    _prover: &(dyn InclusionProver + Sync),
+) -> Result<()> {
+    if index > 63 {
+        return Err(QuilError::InvalidArgument(
+            "seal metadata state at index: index out of range".into(),
+        ));
+    }
+    // hash_target = SHA-512 content digest (retired from the KZG commit; it is a
+    // vestigial go-tree leaf annotation, not a forest L3 leaf, so this only
+    // changes stored-blob bytes, never a state root).
+    let sub_commit = tree_content_digest(sub_data);
+    let sub_bytes = serialize_go_tree(sub_data.root.as_ref())
+        .map_err(|e| QuilError::Internal(format!("seal metadata: serialize: {e}")))?;
+    let sub_size = sub_data
+        .root
+        .as_ref()
+        .map(|n| n.size().clone())
+        .unwrap_or_else(|| BigInt::from(0));
+    metadata
+        .insert(&[index << 2], &sub_bytes, &sub_commit, &sub_size)
+        .map_err(|e| QuilError::Internal(format!("seal metadata: insert: {e}")))?;
+    Ok(())
+}
 
 // =====================================================================
 // HypergraphState
@@ -166,6 +218,99 @@ impl HypergraphState {
         Ok(())
     }
 
+    /// Initialize a deployed intrinsic's metadata vertex — the Rust port
+    /// of Go `HypergraphState.Init` (hypergraph_state.go:531-630). Builds
+    /// the `publicStateInformation` tree:
+    ///   - `[0<<2]` consensus metadata sub-tree (sealed; empty for all
+    /// current intrinsics)
+    ///   - `[1<<2]` sumcheck info sub-tree (sealed; empty)
+    ///   - `[2<<2]` RDF schema, raw string bytes
+    /// - `[(i+3)<<2]` each `additional_data[i]` with `i+3 >= 16`
+    /// (sealed). `additional_data[13]` → key `[0x40]` is the
+    /// intrinsic's configuration tree. Indices `i+3 < 16` are
+    /// reserved and MUST be `None`.
+    /// - `0xff*32` the `intrinsic_type` (base domain), raw
+    /// then writes it as a vertex at `(domain, HYPERGRAPH_METADATA_ADDRESS)`
+    /// in the vertex-adds set. `domain` must be 32 bytes. The metadata
+    /// vertex is committed before serialization so the stored blob carries
+    /// node commitments (mirroring the existing deploy materialize path).
+    #[allow(clippy::too_many_arguments)]
+    pub fn init_metadata_vertex(
+        &self,
+        domain: &[u8],
+        consensus_metadata: &mut VectorCommitmentTree,
+        sumcheck_info: &mut VectorCommitmentTree,
+        rdf_schema: &str,
+        additional_data: &mut [Option<VectorCommitmentTree>],
+        intrinsic_type: &[u8],
+        frame_number: u64,
+        prover: &(dyn InclusionProver + Sync),
+    ) -> Result<()> {
+        if domain.len() != 32 {
+            return Err(QuilError::InvalidArgument(
+                "init metadata vertex: domain must be 32 bytes".into(),
+            ));
+        }
+
+        let mut public = VectorCommitmentTree::new();
+
+        // Index 0 / 1: consensus + sumcheck sub-trees (empty today).
+        seal_metadata_state_at_index(&mut public, consensus_metadata, 0, prover)?;
+        seal_metadata_state_at_index(&mut public, sumcheck_info, 1, prover)?;
+
+        // Index 2 (key [0x08]): RDF schema, raw bytes (nil commitment in Go).
+        let rdf_bytes = rdf_schema.as_bytes();
+        public
+            .insert(&[2u8 << 2], rdf_bytes, &[], &BigInt::from(rdf_bytes.len()))
+            .map_err(|e| QuilError::Internal(format!("init metadata: rdf insert: {e}")))?;
+
+        // additionalData: indices 3..15 reserved (must be None), 16.. sealed.
+        for (i, add) in additional_data.iter_mut().enumerate() {
+            let index = i + 3;
+            if index < 16 {
+                if add.is_some() {
+                    return Err(QuilError::InvalidArgument(
+                        "init metadata vertex: reserved metadata index".into(),
+                    ));
+                }
+                continue;
+            }
+            match add {
+                Some(t) => seal_metadata_state_at_index(&mut public, t, index as u8, prover)?,
+                None => {
+                    return Err(QuilError::InvalidArgument(format!(
+                        "init metadata vertex: nil additional data at index {index}"
+                    )));
+                }
+            }
+        }
+
+        // Type-domain at key 0xff*32 (nil commitment in Go).
+        public
+            .insert(
+                &[0xFFu8; 32],
+                intrinsic_type,
+                &[],
+                &BigInt::from(intrinsic_type.len()),
+            )
+            .map_err(|e| QuilError::Internal(format!("init metadata: type-domain insert: {e}")))?;
+
+        // Node commitments in the serialized blob are no longer KZG-computed
+        // (retired — they are forest-irrelevant; the flattened leaf values, not
+        // node commitments, form the state root). Serialize as-is.
+        let public_blob = serialize_go_tree(public.root.as_ref())
+            .map_err(|e| QuilError::Internal(format!("init metadata: serialize: {e}")))?;
+        let va_disc = vertex_adds_discriminator()?;
+        self.set(
+            domain,
+            &HYPERGRAPH_METADATA_ADDRESS,
+            &va_disc,
+            frame_number,
+            public_blob,
+        )?;
+        Ok(())
+    }
+
     /// Delete a state entry. Appends a delete event to the changeset.
     pub fn delete(
         &self,
@@ -251,6 +396,22 @@ impl HypergraphState {
         self.changeset.lock().unwrap().clear();
     }
 
+    /// Discard changeset entries appended after `savepoint` (a value
+    /// previously returned by [`changeset_len`]), undoing a single
+    /// failed message's partial writes while preserving earlier
+    /// accepted ones. A savepoint beyond the current length is a no-op.
+    ///
+    /// This is the rollback the execution engine needs when a token
+    /// operation fails midway: e.g. a PoMW mint that decrements several
+    /// prover balances via `set` and then hits a bad input would
+    /// otherwise leave those decrements in the committed changeset.
+    pub fn rollback_to(&self, savepoint: usize) {
+        let mut cs = self.changeset.lock().unwrap();
+        if savepoint < cs.len() {
+            cs.truncate(savepoint);
+        }
+    }
+
     /// Number of pending changes.
     pub fn changeset_len(&self) -> usize {
         self.changeset.lock().unwrap().len()
@@ -334,7 +495,7 @@ impl quil_types::store::HypergraphStore for InMemoryHypergraphStore {
     fn load_vertex_underlying_raw(&self, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.nodes.lock().unwrap().get(&Self::key(s, p, sk, k)).cloned())
     }
-    fn save_vertex_underlying(&self, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8], d: &[u8]) -> Result<()> {
+    fn save_vertex_underlying(&self, _txn: &dyn quil_types::store::Transaction, s: &str, p: &str, sk: &quil_types::store::ShardKey, k: &[u8], d: &[u8]) -> Result<()> {
         self.nodes.lock().unwrap().insert(Self::key(s, p, sk, k), d.to_vec());
         self.per_vertex.lock().unwrap().insert((Self::scope(s, p, sk), k.to_vec()), d.to_vec());
         Ok(())

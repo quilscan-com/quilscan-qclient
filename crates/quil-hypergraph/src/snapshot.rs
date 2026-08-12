@@ -14,16 +14,16 @@
 //! Behavioural parity with Go:
 //!
 //! - `publish(root, frame)` adds a new generation. Duplicate roots
-//!   are no-ops (matches Go's "same root → no change").
+//! are no-ops (matches Go's "same root → no change").
 //! - `publish_with_snapshot(root, frame, snap)` is the same but
-//!   binds an opaque DB-snapshot reference to the generation, which
-//!   `acquire` returns to the caller for point-in-time reads.
+//! binds an opaque DB-snapshot reference to the generation, which
+//! `acquire` returns to the caller for point-in-time reads.
 //! - `acquire(expected_root)` returns the matching generation handle
-//!   or `None` if the requested root is unknown. With no
-//!   `expected_root`, returns the latest generation.
+//! or `None` if the requested root is unknown. With no
+//! `expected_root`, returns the latest generation.
 //! - Up to `MAX_GENERATIONS` retained — older entries evicted FIFO.
-//!   Evicted generations drop their snapshot Arc, releasing the
-//!   underlying frozen bytes.
+//! Evicted generations drop their snapshot Arc, releasing the
+//! underlying frozen bytes.
 //! - Closed managers reject all subsequent operations.
 
 use std::collections::VecDeque;
@@ -32,8 +32,37 @@ use std::sync::{Arc, RwLock};
 use quil_types::store::SnapshotReadable;
 
 /// Maximum number of historical snapshot generations retained.
-/// Mirrors Go's `maxSnapshotGenerations = 10`.
-pub const MAX_GENERATIONS: usize = 10;
+///
+/// Go uses `maxSnapshotGenerations = 10`, but with publishing roughly
+/// once per frame that's only ~10 frames of retention. A follower whose
+/// prover-tree sync runs on a multi-minute cadence (tens of frames apart)
+/// then requests a root the archive has already evicted, gets
+/// `failed to acquire snapshot`, and falls back to a perpetually-lagging
+/// incremental sync — leaving its registry stale and the node stuck in
+/// degraded-coverage prover-only mode (observed 2026-06-16). Widened to
+/// 64 (~64 frames ≈ ~10 min at 10s/frame) so a follower a sync-cycle or
+/// two behind can still acquire the snapshot for a clean full resync.
+///
+/// Widened again to 128 (~128 frames ≈ ~21 min at 10s/frame) to support the
+/// far-behind archive STATE-JUMP: that recovery syncs the prover tree PLUS
+/// every app-shard tree (× 4 phases) — all pinned to a SINGLE target frame's
+/// snapshot generation for cross-tree consistency — which is a sequential,
+/// multi-minute operation. The target generation must survive on the SERVING
+/// archive for the whole jump, so retention has to comfortably exceed the jump
+/// duration (a mismatch would evict the generation mid-jump → `failed to
+/// acquire snapshot`, aborting the jump). 128 leaves ample headroom over a
+/// realistic sequential jump (mostly-small shards + one QUIL shard).
+///
+/// Each generation now binds a REAL RocksDB point-in-time snapshot (see
+/// `RocksHypergraphSnapshot`), which pins the superseded key versions it
+/// covers until released. Release is driven by `Drop`: a generation
+/// evicted past this cap (FIFO `pop_back`) or cleared on `close()` drops
+/// its handle and releases the snapshot — unless an in-flight sync
+/// session still holds an `Arc` clone, in which case release waits for
+/// that session to finish. So this count bounds disk-version retention;
+/// raising it widens the catch-up window at the cost of pinning more
+/// versions on a busy archive. Tunable.
+pub const MAX_GENERATIONS: usize = 128;
 
 /// One snapshot generation: a (root, frame_number) pair the manager
 /// has seen, plus an optional point-in-time snapshot of the underlying
@@ -156,7 +185,7 @@ impl SnapshotManager {
     ///
     /// - If `expected_root` is empty, returns the latest generation.
     /// - Otherwise, returns the generation matching `expected_root`,
-    ///   or `None` if no such generation exists.
+    /// or `None` if no such generation exists.
     pub fn acquire(&self, expected_root: &[u8]) -> Option<GenerationHandle> {
         let g = self.inner.read().unwrap();
         if g.closed || g.generations.is_empty() {

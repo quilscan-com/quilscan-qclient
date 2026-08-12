@@ -17,6 +17,9 @@ pub(crate) struct GrpcArgs {
     pub prover_address: [u8; 32],
     pub token_store: Arc<quil_store::RocksTokenStore>,
     pub prover_registry: Arc<quil_execution::SharedProverRegistry>,
+    /// Peer→prover-key registry (KeyRegistry gossip), used to gate submit RPCs to
+    /// ACTIVE provers (Go `authenticateProverFromContext`).
+    pub signer_registry: Arc<quil_p2p::SignerRegistry>,
     pub prover_pipeline: Arc<quil_engine::prover_pipeline::ProverPipeline>,
     pub worker_manager: Arc<dyn quil_engine::worker::WorkerManager>,
     pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
@@ -35,6 +38,204 @@ pub(crate) struct GrpcArgs {
     >,
     pub archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
     pub spawner: quil_lifecycle::DetachedSpawner<anyhow::Error>,
+    /// Receive side of the direct global-consensus transport: peers'
+    /// `SubmitGlobalConsensus` RPCs inject `(bitmask, data)` here, the
+    /// same channel BlossomSub self-loopback uses, so the existing
+    /// GLOBAL_FRAME / GLOBAL_CONSENSUS message-loop arms process them.
+    pub consensus_loopback_tx:
+        tokio::sync::mpsc::Sender<quil_p2p::node::ReceivedMessage>,
+}
+
+/// Serves forest-sync JMT nodes/values from the local CRDT's forest — the
+/// server half of the efficient Merkle-diff sync ([`quil_forest::diff_leaves`]).
+struct CrdtForestServer(Arc<quil_hypergraph::HypergraphCrdt>);
+
+impl quil_rpc::global_service::ForestServer for CrdtForestServer {
+    fn serve_node(&self, shard_id: &[u8], phase: u32, node_key: &[u8]) -> Option<Vec<u8>> {
+        self.0.serve_forest_node(shard_id, phase as usize, node_key)
+    }
+    fn serve_value(
+        &self,
+        shard_id: &[u8],
+        phase: u32,
+        version: u64,
+        key_hash: [u8; 32],
+    ) -> Option<Vec<u8>> {
+        self.0.serve_forest_value(shard_id, phase as usize, version, key_hash)
+    }
+    fn serve_head(&self, shard_id: &[u8], phase: u32) -> Option<(u64, [u8; 32])> {
+        self.0.serve_forest_head(shard_id, phase as usize)
+    }
+    fn serve_preimage(&self, shard_id: &[u8], phase: u32, key_hash: [u8; 32]) -> Option<Vec<u8>> {
+        self.0.serve_forest_preimage(shard_id, phase as usize, key_hash)
+    }
+    fn serve_vertex_blob(
+        &self,
+        shard_key: &[u8],
+        phase: u32,
+        id: &[u8],
+        version: u64,
+    ) -> Option<Vec<u8>> {
+        if shard_key.len() < 35 {
+            return None;
+        }
+        let shard = quil_types::store::ShardKey {
+            l1: [shard_key[0], shard_key[1], shard_key[2]],
+            l2: shard_key[3..35].try_into().ok()?,
+        };
+        self.0.serve_vertex_blob(&shard, phase as usize, id, version)
+    }
+    fn resolve_root(&self, shard_id: &[u8], phase: u32, root: [u8; 32]) -> Option<(u64, u64)> {
+        self.0.resolve_root(shard_id, phase as usize, root)
+    }
+    fn serve_app_manifest(
+        &self,
+        app_address: &[u8],
+        phase: u32,
+        app_root: [u8; 32],
+    ) -> Option<Vec<(Vec<u8>, [u8; 32], u64)>> {
+        self.0.serve_app_manifest(app_address, phase as usize, app_root)
+    }
+}
+
+/// Serves the lattice confidential-transaction wallet RPCs
+/// (`GetCoinSpendWitness` / `ListDomainCoins`) by rebuilding a token domain's
+/// coin accumulator from the live CRDT's committed coin vertices — the node-side
+/// backing a wallet uses to build ring-CT spends (per-input membership witness)
+/// and to enumerate/scan a domain's coins.
+struct CrdtCoinWitness(
+    Arc<quil_hypergraph::HypergraphCrdt>,
+    Arc<dyn quil_types::store::ClockStore>,
+);
+
+impl quil_types::store::CoinWitnessProvider for CrdtCoinWitness {
+    fn coin_spend_witnesses(
+        &self,
+        domain: &[u8],
+        one_time_keys: &[Vec<u8>],
+    ) -> quil_types::error::Result<(u32, Vec<u8>, Vec<quil_types::store::CoinWitnessData>)> {
+        let state = quil_execution::hypergraph_state::HypergraphState::new(self.0.clone());
+        let (depth, root, witnesses) =
+            quil_execution::token_intrinsic::shadow_accumulator::coin_spend_witnesses(
+                &state,
+                domain,
+                one_time_keys,
+            )?;
+        let out = witnesses
+            .into_iter()
+            .map(|w| quil_types::store::CoinWitnessData {
+                one_time_key: w.one_time_key,
+                found: w.found,
+                leaf_index: w.leaf_index,
+                auth_path: w.auth_path,
+            })
+            .collect();
+        Ok((depth as u32, root, out))
+    }
+
+    fn list_domain_coins(
+        &self,
+        domain: &[u8],
+    ) -> quil_types::error::Result<Vec<quil_types::store::DomainCoinData>> {
+        let state = quil_execution::hypergraph_state::HypergraphState::new(self.0.clone());
+        let coins = quil_execution::token_intrinsic::shadow_accumulator::scan_domain_coins(
+            &state, domain,
+        )?;
+        Ok(coins
+            .into_iter()
+            .map(
+                |(address, one_time_key, commitment, memo)| quil_types::store::DomainCoinData {
+                    address,
+                    one_time_key,
+                    commitment,
+                    memo,
+                },
+            )
+            .collect())
+    }
+
+    fn list_domain_escrows(
+        &self,
+        domain: &[u8],
+    ) -> quil_types::error::Result<Vec<quil_types::store::DomainEscrowData>> {
+        let state = quil_execution::hypergraph_state::HypergraphState::new(self.0.clone());
+        let escrows = quil_execution::token_intrinsic::shadow_accumulator::scan_domain_escrows(
+            &state, domain,
+        )?;
+        Ok(escrows
+            .into_iter()
+            .map(|e| quil_types::store::DomainEscrowData {
+                address: e.address,
+                cv: e.cv,
+                to_key: e.to_key,
+                refund_key: e.refund_key,
+                expiration: e.expiration,
+                memo: e.memo,
+            })
+            .collect())
+    }
+
+    fn prover_reward_witness(
+        &self,
+        domain: &[u8],
+        owner: &[u8],
+    ) -> quil_types::error::Result<quil_types::store::RewardWitnessData> {
+        use quil_hypergraph::addressing::{shard_key_for_location, Location};
+
+        let is_quil = domain == quil_execution::domains::QUIL_TOKEN;
+        // Reward vertex addressing (mirrors the engine's mint verify).
+        let (prover_root_domain, leaf_owner) =
+            quil_execution::token_intrinsic::mint::derive_pomw_addressing(domain, owner)?;
+        let reward_domain: Vec<u8> = if is_quil {
+            quil_execution::domains::GLOBAL.to_vec()
+        } else {
+            domain.to_vec()
+        };
+
+        let state = quil_execution::hypergraph_state::HypergraphState::new(self.0.clone());
+        let va_disc = quil_execution::hypergraph_state::vertex_adds_discriminator()?;
+        let blob = match state.get(&reward_domain, &leaf_owner, &va_disc)? {
+            Some(b) => b,
+            None => return Ok(quil_types::store::RewardWitnessData::default()),
+        };
+        // Claimable value = the reward vertex's Balance (low 16 bytes as u128).
+        let tree = quil_execution::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+        let bal = quil_execution::global_intrinsic::materialize::read_reward_balance(&tree);
+        let mut buf = [0u8; 16];
+        if bal.len() >= 16 {
+            buf.copy_from_slice(&bal[bal.len() - 16..]);
+        } else {
+            buf[16 - bal.len()..].copy_from_slice(&bal);
+        }
+        let value = u128::from_be_bytes(buf);
+        if value == 0 {
+            return Ok(quil_types::store::RewardWitnessData::default());
+        }
+
+        // Forest membership proof of the reward vertex against the committed root.
+        let mut app = [0u8; 32];
+        app.copy_from_slice(&prover_root_domain);
+        let mut data = [0u8; 32];
+        data.copy_from_slice(&leaf_owner);
+        let shard = shard_key_for_location(&Location { app_address: app, data_address: data });
+        let mut vertex_address = prover_root_domain.to_vec();
+        vertex_address.extend_from_slice(&leaf_owner);
+        let mp = self
+            .0
+            .build_membership_proof("vertex", "adds", &shard, &[(vertex_address, Vec::new())])?;
+        let forest_proof = mp.to_bytes();
+
+        // cited_frame = the latest committed global frame; its stored header
+        // `prover_tree_commitment` is the reward root the engine resolves.
+        let cited_frame = self
+            .1
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|f| f.header.map(|h| h.frame_number))
+            .unwrap_or(0);
+
+        Ok(quil_types::store::RewardWitnessData { found: true, forest_proof, value, cited_frame })
+    }
 }
 
 pub(crate) fn spawn_all(
@@ -54,6 +255,7 @@ pub(crate) fn spawn_all(
         prover_address,
         token_store,
         prover_registry,
+        signer_registry,
         prover_pipeline,
         worker_manager,
         inclusion_prover,
@@ -68,10 +270,61 @@ pub(crate) fn spawn_all(
         global_msg_tx,
         archive_pool,
         spawner,
+        consensus_loopback_tx,
     } = args;
 
+    // Prover authorizer (mirrors Go `authenticateProverFromContext`, used by
+    // `GetGlobalProposal`): allow ONLY (a) THIS node's own identity — its
+    // data-worker processes and pipeline, which dial with the node's own Ed448
+    // seed and thus authenticate as this peer_id — or (b) a peer that resolves,
+    // via its cross-signature-VERIFIED KeyRegistry binding, to an ACTIVE prover.
+    // The `SignerRegistry` binds peer_id → the prover's FALCON consensus key (the
+    // `bls_pubkey` field name is vestigial; it is verified with
+    // `FalconKeyConstructor`); `prover_address_from_pubkey` = poseidon(key) is the
+    // registry address. Unresolved / non-active ⇒ denied (strict, Go parity).
+    #[allow(clippy::type_complexity)]
+    let prover_authorizer: Arc<
+        dyn Fn(&quil_rpc::peer_auth_middleware::AuthenticatedPeer) -> bool + Send + Sync,
+    > = {
+        let self_peer = peer_id.to_bytes();
+        let sr = signer_registry.clone();
+        let pr: Arc<dyn quil_types::consensus::ProverRegistry> = prover_registry.clone();
+        Arc::new(move |auth| {
+            let caller = auth.peer_id.to_bytes();
+            if caller == self_peer {
+                return true; // (a) the node's own workers/pipeline.
+            }
+            // (b) resolve peer_id → Falcon prover key → address → ACTIVE.
+            let Some(prover_key) = sr.prover_key_for_peer_id(&caller) else {
+                return false;
+            };
+            let Ok(addr) =
+                quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(
+                    &prover_key,
+                )
+            else {
+                return false;
+            };
+            matches!(
+                pr.get_prover_info(&addr),
+                Ok(Some(info))
+                    if info.status == quil_types::consensus::ProverStatus::Active
+                        || info
+                            .allocations
+                            .iter()
+                            .any(|a| a.status == quil_types::consensus::ProverStatus::Active)
+            )
+        })
+    };
+
     let grpc_addr = if config.listen_grpc_multiaddr.is_empty() {
-        "0.0.0.0:8337".to_string()
+        // SECURITY: default to LOCALHOST, not 0.0.0.0. This NodeService exposes
+        // unauthenticated mutating RPCs (request_join, set_manually_managed, …) —
+        // its per-RPC no-auth assumes a local/trusted caller (as in Go, where an
+        // empty ListenGRPCMultiaddr leaves the server OFF). A world-open default
+        // bind turns it into a remotely-reachable control plane. Operators who
+        // need remote access set `listen_grpc_multiaddr` explicitly.
+        "127.0.0.1:8337".to_string()
     } else {
         let parts: Vec<&str> = config.listen_grpc_multiaddr
             .trim_start_matches('/')
@@ -80,7 +333,13 @@ pub(crate) fn spawn_all(
         if parts.len() >= 4 && parts[0] == "ip4" && parts[2] == "tcp" {
             format!("{}:{}", parts[1], parts[3])
         } else {
-            "0.0.0.0:8337".to_string()
+            // SECURITY: default to LOCALHOST, not 0.0.0.0. This NodeService exposes
+        // unauthenticated mutating RPCs (request_join, set_manually_managed, …) —
+        // its per-RPC no-auth assumes a local/trusted caller (as in Go, where an
+        // empty ListenGRPCMultiaddr leaves the server OFF). A world-open default
+        // bind turns it into a remotely-reachable control plane. Operators who
+        // need remote access set `listen_grpc_multiaddr` explicitly.
+        "127.0.0.1:8337".to_string()
         }
     };
 
@@ -92,6 +351,23 @@ pub(crate) fn spawn_all(
         }
         fn get_frame(&self, n: u64) -> Result<quil_types::proto::global::GlobalFrame, String> {
             self.0.get_global_frame(n).map_err(|e| e.to_string())
+        }
+        /// Assemble the full proposal for frame `n` from the clock store, mirroring
+        /// Go `GlobalConsensusEngine.GetGlobalProposal` (`services.go`): state + the
+        /// parent's QC + the prior-rank TC (optional) + the proposer vote (keyed by
+        /// `(filter, rank, frame-identity)`, where the frame identity is
+        /// `poseidon(header.output)`).
+        fn get_global_proposal(
+            &self,
+            n: u64,
+        ) -> Result<quil_types::proto::global::GlobalProposal, String> {
+            // Delegate to the shared, candidate-aware assembler so peers can
+            // fetch an uncommitted TIP candidate over `GetGlobalProposal`.
+            // Without the candidate fallback, a coordinated-halt tip (a frame
+            // some replicas produced but never committed) is invisible to sync
+            // and the chain can only be unstuck manually. See
+            // `archive_sync::load_committed_or_tip_candidate`.
+            super::archive_sync::reconstruct_local_proposal(self.0.as_ref(), n)
         }
     }
     // Submit handler
@@ -107,23 +383,140 @@ pub(crate) fn spawn_all(
                 quil_engine::metrics::inc_grpc_submits_rejected();
                 return Err("unauthenticated peer — submit requires a valid Ed448 client cert".into());
             };
+            // Presence-only, matching Go `SubmitGlobalMessage` (services.go:525):
+            // any authenticated peer may submit; message CONTENT is prover-validated
+            // downstream. (The self-OR-active-prover gate applies to
+            // `GetGlobalProposal`, not the submit path.)
             let data = request.into_inner().data;
             if data.is_empty() {
                 quil_engine::metrics::inc_grpc_submits_rejected();
                 return Err("empty payload".into());
             }
-            let rank = submit_cf.effective();
-            let accepted = submit_mc.add_message(rank, data);
-            if accepted {
-                tracing::debug!(peer = %auth.peer_id, rank, "accepted gRPC submit");
-                quil_engine::metrics::inc_grpc_submits_accepted();
-                Ok(())
-            } else {
-                quil_engine::metrics::inc_grpc_submits_rejected();
-                Err("message collector rejected".into())
+            // Tag with the CONSENSUS RANK (not the frame number) — the
+            // collector is keyed by rank and the leader collects via
+            // `collect_for_rank(rank)`. Tagging with `effective()` (the
+            // frame number, larger by the genesis offset) put messages
+            // out of the collect range, so they never landed.
+            let rank = submit_cf.effective_rank();
+            match submit_mc.add_message_outcome(rank, data) {
+                quil_engine::message_collector::SubmitOutcome::Accepted => {
+                    tracing::debug!(peer = %auth.peer_id, rank, "accepted gRPC submit");
+                    quil_engine::metrics::inc_grpc_submits_accepted();
+                    Ok(())
+                }
+                // Already delivered (or superseded by a newer shard frame) —
+                // the submitter's work is NOT lost, so report success. This is
+                // what stops a prover's idempotent bundle re-submission from
+                // being reported back to it as "message likely dropped" and
+                // triggering a wasteful gossip-fallback + retry.
+                quil_engine::message_collector::SubmitOutcome::Duplicate => {
+                    quil_engine::metrics::inc_grpc_submits_duplicate();
+                    Ok(())
+                }
+                quil_engine::message_collector::SubmitOutcome::Filtered => {
+                    quil_engine::metrics::inc_grpc_submits_rejected();
+                    Err("message collector rejected".into())
+                }
             }
         },
     );
+    // Direct global-consensus delivery handler. Peer archives call
+    // `SubmitGlobalConsensus(bitmask, data)`; we inject it into the same
+    // loopback channel the message loop reads, tagged with the original
+    // topic, so the existing GLOBAL_FRAME / GLOBAL_CONSENSUS arms process
+    // it exactly as they did for gossip. This is the receive half of
+    // moving global consensus off gossip (app consensus is unaffected).
+    let consensus_delivery: quil_rpc::global_service::ConsensusDeliveryHandler = {
+        let tx = consensus_loopback_tx.clone();
+        // Per-peer rate limit on direct :8340 consensus injection. Any Ed448-authed
+        // peer (not just the committee) can call this; without a cap one peer can
+        // force sustained downstream cert/signature verification. Generous vs the
+        // real consensus cadence (a few vote/cert/block msgs per view).
+        let cw_rate: Arc<std::sync::Mutex<std::collections::HashMap<Vec<u8>, (u64, u32)>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        Arc::new(
+            move |request: tonic::Request<quil_types::proto::global::SubmitGlobalConsensusRequest>| {
+                let auth = request
+                    .extensions()
+                    .get::<quil_rpc::peer_auth_middleware::AuthenticatedPeer>()
+                    .cloned();
+                let Some(auth) = auth else {
+                    return Err("unauthenticated peer — global consensus delivery requires a valid Ed448 client cert".into());
+                };
+                {
+                    const MAX_CONSENSUS_MSGS_PER_SEC_PER_PEER: u32 = 256;
+                    let now_s = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if let Ok(mut map) = cw_rate.lock() {
+                        if map.len() > 4096 {
+                            map.clear();
+                        }
+                        let e = map.entry(auth.peer_id.to_bytes()).or_insert((now_s, 0));
+                        if e.0 == now_s {
+                            e.1 = e.1.saturating_add(1);
+                        } else {
+                            *e = (now_s, 1);
+                        }
+                        if e.1 > MAX_CONSENSUS_MSGS_PER_SEC_PER_PEER {
+                            return Err("global consensus delivery rate limited".into());
+                        }
+                    }
+                }
+                let req = request.into_inner();
+                // Accept the two legacy global-consensus topics AND the
+                // commonware-simplex CW channels (vote/cert/resolver/block), which
+                // are also delivered point-to-point over this RPC.
+                let is_cw = quil_engine::bitmasks::global_cw_channel_of(&req.bitmask).is_some();
+                if !is_cw
+                    && req.bitmask.as_slice() != quil_engine::bitmasks::GLOBAL_FRAME
+                    && req.bitmask.as_slice() != quil_engine::bitmasks::GLOBAL_CONSENSUS
+                {
+                    return Err(format!(
+                        "unexpected consensus bitmask 0x{}",
+                        hex::encode(&req.bitmask)
+                    ));
+                }
+                // DIAGNOSTIC: log every inbound consensus message at the RPC
+                // boundary — peer, bitmask, size, and the peeked consensus type
+                // — to pin why peer PROPOSALS never reach the vote path while
+                // peer timeouts do. Remove once resolved.
+                {
+                    let tp = quil_engine::consensus_wire::peek_consensus_type(&req.data);
+                    let tp_name = match tp {
+                        Some(quil_engine::consensus_wire::GLOBAL_PROPOSAL_TYPE) => "proposal",
+                        Some(quil_engine::consensus_wire::PROPOSAL_VOTE_TYPE) => "vote",
+                        Some(quil_engine::consensus_wire::TIMEOUT_STATE_TYPE) => "timeout",
+                        Some(_) => "other",
+                        None => "unknown",
+                    };
+                    tracing::info!(
+                        peer = %auth.peer_id,
+                        bitmask = %hex::encode(&req.bitmask),
+                        bytes = req.data.len(),
+                        kind = tp_name,
+                        "inbound SubmitGlobalConsensus",
+                    );
+                }
+                let received = quil_p2p::node::ReceivedMessage {
+                    bitmask: req.bitmask,
+                    data: req.data,
+                    from: auth.peer_id.to_bytes(),
+                };
+                match tx.try_send(received) {
+                    Ok(()) => Ok(()),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        Err("consensus receive queue full".into())
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        Err("consensus receive queue closed".into())
+                    }
+                }
+            },
+        )
+    };
+
     let shards_store: Arc<dyn quil_types::store::ShardsStore> =
         Arc::new(quil_store::RocksShardsStore::new(db_arc.inner()));
 
@@ -202,16 +595,57 @@ pub(crate) fn spawn_all(
         })
     };
 
+    // Wrap the clock-store lookup in a bounded read-through cache. The
+    // peer-facing GlobalService serves frame/proposal reads to the whole
+    // network; hundreds of nodes polling the same recent frames every
+    // second would otherwise hit RocksDB (and re-assemble proposals) per
+    // request. Frames are immutable by number so by-number caching is
+    // always correct; the head is cached under a 1s TTL. 256 entries per
+    // map keeps the hot tip + recent catch-up range resident.
+    let cached_lookup = quil_rpc::global_service::CachingFrameLookup::new(
+        ClockStoreFrameLookup(clock_store.clone()),
+        256,
+        std::time::Duration::from_secs(1),
+    );
     let grpc_server = quil_rpc::GlobalRpcServer::new(
-        Arc::new(ClockStoreFrameLookup(clock_store.clone())),
+        Arc::new(cached_lookup),
     )
     .with_submit_handler(submit_handler.clone())
+    .with_consensus_delivery(consensus_delivery)
     .with_shards_store(shards_store.clone())
     .with_worker_snapshot(global_worker_snap)
     .with_global_shards_provider(global_shards_provider)
     .with_app_shards_provider(app_shards_provider)
-    .with_message_broadcast(global_msg_tx.clone());
-    let hypersync = quil_rpc::hypersync_server::HyperSyncServer::new(hg_store.clone());
+    .with_forest_server(Arc::new(CrdtForestServer(crdt.clone())))
+    .with_message_broadcast(global_msg_tx.clone())
+    // Gate worker-privileged RPCs (StreamGlobalMessages, GetWorkerInfo) to this
+    // node's OWN identity: only our data-worker processes — which dial with the
+    // node's Ed448 seed and thus authenticate as this same peer_id — may invoke
+    // them. A remote machine handshakes as a different peer_id and is denied.
+    .with_self_peer_id(peer_id.to_bytes())
+    // GetGlobalProposal: self OR an active prover (Go authenticateProverFromContext).
+    .with_prover_authorizer(prover_authorizer.clone());
+    // (The legacy KZG HyperSync serve side + its dedicated runtime were removed
+    // with the forest-sync cutover — forest sync serves via GlobalService's
+    // GetForest* RPCs, and the KZG PerformSync stream had no remaining clients.)
+
+    // Dedicated runtime for Ed448 TLS handshakes. Handshake tasks used to be
+    // spawned onto the peer-gRPC runtime itself, so a connect storm (e.g.
+    // every prover reconnecting the moment frames start moving again after a
+    // halt) ran an UNBOUNDED number of concurrent Ed448 handshakes — heavy
+    // CPU work — on the same 8 workers that carry latency-critical
+    // archive↔archive consensus delivery (SubmitGlobalConsensus votes /
+    // proposals). Isolating the handshake crypto here keeps a hammer of new
+    // connections from delaying vote delivery; completed connections are
+    // handed back to the peer-gRPC runtime for h2/RPC serving as before.
+    // Leaked for the same reason as `hypersync_rt`.
+    let tls_handshake_rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_name("tls-handshake")
+            .enable_all()
+            .build()?,
+    ));
 
     let node_submit_mc = message_collector.clone();
     let node_submit_cf = current_frame.clone();
@@ -220,11 +654,15 @@ pub(crate) fn spawn_all(
             if data.is_empty() {
                 return Err("empty message".into());
             }
-            let rank = node_submit_cf.effective();
-            if node_submit_mc.add_message(rank, data) {
-                Ok(())
-            } else {
-                Err("message collector rejected".into())
+            // Consensus rank, not frame number (see peer submit handler).
+            let rank = node_submit_cf.effective_rank();
+            match node_submit_mc.add_message_outcome(rank, data) {
+                // Duplicate = already delivered → success (not a drop).
+                quil_engine::message_collector::SubmitOutcome::Accepted
+                | quil_engine::message_collector::SubmitOutcome::Duplicate => Ok(()),
+                quil_engine::message_collector::SubmitOutcome::Filtered => {
+                    Err("message collector rejected".into())
+                }
             }
         },
     );
@@ -237,9 +675,26 @@ pub(crate) fn spawn_all(
         .with_prover_registry(prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>)
         .with_clock_store(clock_store.clone() as Arc<dyn quil_types::store::ClockStore>)
         .with_hypergraph_store(hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>)
+        .with_coin_witness_provider(Arc::new(CrdtCoinWitness(
+            crdt.clone(),
+            clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+        )))
         .with_submit_handler(user_submit_handler);
     if let Some(h) = metrics_handle.clone() {
-        node_rpc_builder = node_rpc_builder.with_metrics_renderer(Arc::new(move || h.render()));
+        // Unified exposition: the facade recorder's snapshot plus the p2p
+        // `prometheus-client` families (blossomsub_* / libp2p_*, registered
+        // via set_extra_metrics_render once networking is up).
+        node_rpc_builder = node_rpc_builder.with_metrics_renderer(Arc::new(move || {
+            let mut out = h.render();
+            let extra = crate::rpc_metrics::extra_metrics_render();
+            if !extra.is_empty() {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&extra);
+            }
+            out
+        }));
     }
     {
         let pic = peer_info_cache.clone();
@@ -260,6 +715,7 @@ pub(crate) fn spawn_all(
     {
         let store = hg_store.clone();
         let prover_for_tp = inclusion_prover.clone();
+        let crdt_for_tp = crdt.clone();
         let gen: quil_rpc::TraversalProofGenerator = Arc::new(
             move |domain: [u8; 32], atom: String, phase: String, keys: Vec<Vec<u8>>| -> Result<Vec<u8>, String> {
                 if keys.is_empty() {
@@ -269,6 +725,35 @@ pub(crate) fn spawn_all(
                     l1: quil_hypergraph::addressing::get_bloom_filter_indices(&domain, 256, 3),
                     l2: domain,
                 };
+                // Forest cutover: on a migrated node produce a
+                // `quil_forest::MembershipProof` (per-field JMT inclusion
+                // proofs) instead of the KZG multiproof. Each request key is
+                // `data_address(32) ‖ field_key`; the vertex's L3 id is
+                // `domain ‖ data_address` (`Location::to_id`), and keys sharing
+                // a data_address are grouped into one vertex proof.
+                if crdt_for_tp.has_forest() {
+                    let mut groups: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+                    for k in &keys {
+                        if k.len() <= 32 {
+                            return Err(format!(
+                                "forest proof key must be data_address(32) ‖ field_key, got {} bytes",
+                                k.len()
+                            ));
+                        }
+                        let mut vertex_id = Vec::with_capacity(64);
+                        vertex_id.extend_from_slice(&domain);
+                        vertex_id.extend_from_slice(&k[..32]);
+                        let field_key = k[32..].to_vec();
+                        match groups.iter_mut().find(|(a, _)| *a == vertex_id) {
+                            Some((_, fields)) => fields.push(field_key),
+                            None => groups.push((vertex_id, vec![field_key])),
+                        }
+                    }
+                    let mp = crdt_for_tp
+                        .build_membership_proof(&atom, &phase, &shard, &groups)
+                        .map_err(|e| format!("build_membership_proof: {e}"))?;
+                    return Ok(mp.to_bytes());
+                }
                 let blob = store
                     .load_tree_blob(&atom, &phase, &shard)
                     .map_err(|e| format!("load_tree_blob: {e}"))?
@@ -311,10 +796,22 @@ pub(crate) fn spawn_all(
             "Send authentication pubkey wired"
         );
         let send_p2p = p2p_handle.clone();
+        // Reuse the prover pipeline's transport for GLOBAL_PROVER-domain
+        // sends. The transport already implements the correct fan-out:
+        // gRPC to every known archive (so non-archive nodes have a
+        // delivery path) plus optional BlossomSub publish on archive
+        // nodes. A direct `p2p.publish(GLOBAL_PROVER, ...)` on a
+        // non-archive node fails — the node is not subscribed to that
+        // bitmask, so BlossomSub returns "not subscribed". This was the
+        // observed failure in the client prover-manage TUI: the Send
+        // RPC reached a non-archive node, which tried a raw BlossomSub
+        // publish and bounced.
+        let send_transport = prover_pipeline.transport.clone();
         let send_handler: quil_rpc::SendHandler = Arc::new(
             move |domain: Vec<u8>, payload: Vec<u8>, authentication: Vec<u8>|
             -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> {
                 let p2p = send_p2p.clone();
+                let transport = send_transport.clone();
                 let ed448_pub = peer_ed448_pub.clone();
                 Box::pin(async move {
                     if domain.len() != 32 {
@@ -345,12 +842,29 @@ pub(crate) fn spawn_all(
                         );
                         return Err(format!("authentication failed: {:?}", e));
                     }
-                    let bitmask: Vec<u8> = if domain.iter().all(|&b| b == 0xff) {
-                        quil_engine::bitmasks::GLOBAL_PROVER.to_vec()
+                    if domain.iter().all(|&b| b == 0xff) {
+                        // Global-prover-domain bundle (Join / Leave /
+                        // Confirm / Resume / Reject / AltShard /
+                        // Delegate). Route through the transport so a
+                        // non-archive node still reaches the network
+                        // via the archive gRPC fan-out.
+                        transport
+                            .publish_prover_bundle(payload)
+                            .await
+                            .map_err(|e| format!("prover transport publish failed: {}", e))?;
                     } else {
-                        quil_hypergraph::addressing::get_bloom_filter_indices(&domain, 256, 3).to_vec()
-                    };
-                    p2p.publish(bitmask, payload).await.map_err(|e| format!("p2p publish failed: {}", e))?;
+                        // Shard-domain message (token / app intrinsic).
+                        // Route via the shard's bloom-filter bitmask;
+                        // the local node is expected to be subscribed
+                        // there if it's participating in that shard.
+                        let bitmask = quil_hypergraph::addressing::get_bloom_filter_indices(
+                            &domain, 256, 3,
+                        )
+                        .to_vec();
+                        p2p.publish(bitmask, payload)
+                            .await
+                            .map_err(|e| format!("p2p publish failed: {}", e))?;
+                    }
                     Ok(())
                 })
             },
@@ -442,6 +956,11 @@ pub(crate) fn spawn_all(
         current_frame: Arc<quil_engine::current_frame::CurrentFrame>,
         key_store: Arc<dyn quil_types::store::KeyStore>,
         peer_info_lookup: Arc<dyn Fn(&[u8]) -> Vec<String> + Send + Sync>,
+        // The node's FALCON q-prover-key (1281 B) — the `:8340` PQNoise transport
+        // identity for the outbound shard-info dial. `ed448_seed` is the legacy
+        // Ed448 mTLS seed (57 B), kept only as a last-resort fallback: handing it
+        // to the Falcon transport fails to decode ("falcon feature not enabled").
+        falcon_signing_key: Option<Vec<u8>>,
         ed448_seed: Option<[u8; 57]>,
         archive_mode: bool,
         archive_pool: Arc<quil_rpc::ArchiveEndpointPool>,
@@ -484,7 +1003,19 @@ pub(crate) fn spawn_all(
                 Err(_) => true,
             };
             if !local_incomplete { return local_result; }
-            let Some(seed) = self.ed448_seed else { return local_result; };
+            // The :8340 transport decodes a FALCON signing key on both ends, so the
+            // outbound dial MUST present the node's Falcon q-prover-key (1281 B),
+            // NOT the legacy Ed448 seed (57 B) — the latter fails to decode as
+            // Falcon and the dial dies with "falcon keypair: ... feature not
+            // enabled". Fall back to the Ed448 seed only if the Falcon key is
+            // unavailable, matching the server side.
+            let Some(seed) = self
+                .falcon_signing_key
+                .clone()
+                .or_else(|| self.ed448_seed.map(|s| s.to_vec()))
+            else {
+                return local_result;
+            };
 
             use std::collections::HashMap;
             let key_store = self.key_store.clone();
@@ -574,6 +1105,13 @@ pub(crate) fn spawn_all(
         current_frame: current_frame.clone(),
         key_store: key_store.clone() as Arc<dyn quil_types::store::KeyStore>,
         peer_info_lookup,
+        // Falcon transport identity for the outbound shard-info dial (gated by a
+        // transport identity being present, same as the onion dialer / server).
+        falcon_signing_key: if mtls_seed.is_some() {
+            file_key_manager.get_secret_key_bytes_by_id("q-prover-key").ok()
+        } else {
+            None
+        },
         ed448_seed: mtls_seed,
         archive_mode,
         archive_pool: archive_pool.clone(),
@@ -595,6 +1133,12 @@ pub(crate) fn spawn_all(
         sup.spawn("node-grpc-server", move |node_grpc_token| async move {
             info!(addr = %addr, "starting NodeService gRPC (plaintext, qclient-facing)");
             tonic::transport::Server::builder()
+                // h2 PING-based reaping of dead clients. Without it a
+                // peer that vanishes without FIN holds its fd forever
+                // and the fd count grows monotonically.
+                .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+                .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+                .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
                 .add_service(node_rpc_service)
                 .serve_with_shutdown(addr, async move { node_grpc_token.cancelled().await; })
                 .await
@@ -606,11 +1150,14 @@ pub(crate) fn spawn_all(
 
     if let Ok(addr) = stream_addr.parse::<std::net::SocketAddr>() {
         let global_service = tonic::service::interceptor::InterceptedService::new(
-            quil_types::proto::global::global_service_server::GlobalServiceServer::new(grpc_server),
-            quil_rpc::peer_auth_middleware::peer_auth_interceptor,
-        );
-        let hypersync_service = tonic::service::interceptor::InterceptedService::new(
-            quil_types::proto::application::hypergraph_comparison_service_server::HypergraphComparisonServiceServer::new(hypersync),
+            // 64 MiB decode/encode (tonic defaults to 4 MiB). Inbound
+            // submits are small, but full global-frame / app-shard
+            // responses this server encodes can exceed 4 MiB; the default
+            // truncated them, surfacing as `h2 protocol error: error
+            // reading a body` on the client. Mirrors the client limits.
+            quil_types::proto::global::global_service_server::GlobalServiceServer::new(grpc_server)
+                .max_decoding_message_size(64 * 1024 * 1024)
+                .max_encoding_message_size(64 * 1024 * 1024),
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
         let app_shard_service = tonic::service::interceptor::InterceptedService::new(
@@ -633,6 +1180,19 @@ pub(crate) fn spawn_all(
         );
 
         let inbox_store = Arc::new(quil_store::RocksInboxStore::new(db_arc.inner()));
+        // Construct permissive (`responsible_filters = None` => responsible
+        // for ALL filters). This keeps external dispatch working while the
+        // responsibility guard is PRESENT and ENFORCED-when-set. Archives
+        // legitimately store all filters, so they stay `None`.
+        //
+        // TODO(non-archive coverage): a non-archive node should only accept
+        // dispatch puts/gets for the shards it actually covers. Once the
+        // lifecycle cleanly exposes its live covered-shard set, call
+        // `dispatch.set_responsible_filters(Some(covered_shard_bloom_filters))`
+        // (3-byte `get_bloom_filter_indices(addr,256,3)` filters) to enforce
+        // it. Archives must remain `None` (store all). Getting this set
+        // wrong (empty/stale) would reject-all and break messaging
+        // network-wide, so we default permissive rather than Go's reject-all.
         let dispatch_service = tonic::service::interceptor::InterceptedService::new(
             quil_types::proto::global::dispatch_service_server::DispatchServiceServer::new(
                 quil_rpc::dispatch_service::DispatchRpcServer::new(inbox_store.clone()),
@@ -643,6 +1203,153 @@ pub(crate) fn spawn_all(
         let mixnet_service = tonic::service::interceptor::InterceptedService::new(
             quil_types::proto::global::mixnet_service_server::MixnetServiceServer::new(
                 quil_rpc::mixnet_service::MixnetRpcServer::new(),
+            ),
+            quil_rpc::peer_auth_middleware::peer_auth_interceptor,
+        );
+
+        // Onion routing link-layer transport (OnionService.Connect). Mirrors Go
+        // `RegisterOnionServiceServer(server, e.onionService)`: a peer that
+        // advertises the routing capability can open a bidi cell stream through
+        // us. Routing eligibility = peer is in the PeerInfo cache AND advertises
+        // `PROTOCOL_ROUTING`; the lookup returns its stream multiaddrs (as Go's
+        // `validatePeer` + `ConnectToPeer` do). The circuit crypto is the PQ
+        // sntrup761 KEM + AES-GCM stack in `quil_p2p::onion`.
+        let pic_for_onion = peer_info_cache.clone();
+        let onion_peer_lookup: quil_rpc::onion_service::PeerRoutingLookup =
+            Arc::new(move |peer_id: &[u8]| {
+                let map = pic_for_onion.read();
+                let info = map.get(peer_id)?;
+                let has_routing = info.capabilities.iter().any(|c| {
+                    c.protocol_identifier == quil_rpc::onion_service::PROTOCOL_ROUTING
+                });
+                if !has_routing {
+                    return None;
+                }
+                Some(
+                    info.reachability
+                        .first()
+                        .map(|r| r.stream_multiaddrs.clone())
+                        .unwrap_or_default(),
+                )
+            });
+        // With the node's ed448 seed the transport gains an OUTBOUND dialer
+        // (`ensure_connected` opens pqnoise client streams to peers), so this node
+        // can proactively build circuits and forward to hops that haven't dialed
+        // it. Without a seed it's server-only (relays/replies for inbound diallers).
+        // Onion dialer identity = the Falcon network key (present iff this node
+        // has a transport identity, gated by mtls_seed presence as before).
+        let onion_dialer_falcon: Option<Vec<u8>> = if mtls_seed.is_some() {
+            file_key_manager.get_secret_key_bytes_by_id("q-prover-key").ok()
+        } else {
+            None
+        };
+        let onion_transport = match onion_dialer_falcon.clone() {
+            Some(sk) => quil_rpc::onion_service::OnionTransport::new_with_dialer(
+                peer_id.to_bytes(),
+                onion_peer_lookup.clone(),
+                sk,
+            ),
+            None => quil_rpc::onion_service::OnionTransport::new(
+                peer_id.to_bytes(),
+                onion_peer_lookup.clone(),
+            ),
+        };
+
+        // Activate the unified onion node: install the CREATE/forward/EXTEND/
+        // backward dispatcher on the transport, keyed by this node's sntrup761
+        // `q-onion-key` secret so it can decapsulate CREATE cells. This turns the
+        // node into a live PQ onion relay (and exit) for peers that build circuits
+        // through it. `OnionNode` shares the transport's inner state, so the
+        // dispatcher and the served `OnionService` operate on the same streams.
+        // The node handle is intentionally not retained: the dispatcher closure it
+        // installs owns its own relay/originator Arcs, so relaying continues for
+        // the transport's lifetime; a handle is only needed once this node also
+        // *originates* circuits (no such driver yet).
+        // On by default; `p2p.disableOnionRouting: true` turns the relay off (the
+        // transport is still served, but no dispatcher runs and the routing
+        // capability is not advertised, so no circuits traverse this node).
+        if config.p2p.disable_onion_routing {
+            info!("onion routing disabled by config (p2p.disableOnionRouting)");
+        } else {
+            match file_key_manager.get_secret_key_bytes_by_id("q-onion-key") {
+                Ok(onion_secret) => {
+                    let onion_dyn: Arc<dyn quil_p2p::onion::Transport> =
+                        Arc::new(onion_transport.clone());
+                    // DEFENSE: next-hop / endpoint validator — a peer is a valid
+                    // onion hop only if it's in the PeerInfo cache AND advertises
+                    // PROTOCOL_ROUTING. Circuits therefore stay inside the network;
+                    // an open-web address is never a hop. (Self-connection is
+                    // rejected separately by OnionNode + the transport.)
+                    let pic_for_validator = peer_info_cache.clone();
+                    let onion_peer_validator: quil_p2p::onion::PeerValidator =
+                        Arc::new(move |peer_id: &[u8]| {
+                            let map = pic_for_validator.read();
+                            map.get(peer_id).is_some_and(|info| {
+                                info.capabilities.iter().any(|c| {
+                                    c.protocol_identifier
+                                        == quil_rpc::onion_service::PROTOCOL_ROUTING
+                                })
+                            })
+                        });
+                    // Exit consumer: when a circuit terminates here, proxy its
+                    // payload to another peer's gRPC and relay the response back.
+                    // AUTHORIZATION allow-list — only these methods may be reached
+                    // through the tunnel (anonymous circuit traffic must not be able
+                    // to hit consensus submits, self-gated, or streaming RPCs). The
+                    // target peer still applies its own per-caller auth to this
+                    // exit's authenticated pqnoise identity. Needs the ed448 seed to
+                    // dial; without it we fall back to log-and-drop.
+                    let (exit_handler, exit_proxy): (quil_p2p::onion::OnData, _) = match onion_dialer_falcon.clone() {
+                        Some(seed) => {
+                            let allowed: std::collections::HashSet<String> = [
+                                "/quilibrium.node.global.pb.DispatchService/PutInboxMessage",
+                                "/quilibrium.node.global.pb.DispatchService/GetInboxMessages",
+                                "/quilibrium.node.global.pb.GlobalService/GetGlobalFrame",
+                                "/quilibrium.node.global.pb.GlobalService/GetAppShards",
+                            ]
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect();
+                            let proxy = quil_rpc::onion_exit::OnionExitProxy::new(
+                                seed,
+                                onion_peer_lookup.clone(),
+                                allowed,
+                            );
+                            (proxy.clone().into_on_data(), Some(proxy))
+                        }
+                        None => {
+                            let h: quil_p2p::onion::OnData =
+                                Arc::new(|_up_peer: &[u8], circ_id, payload: Vec<u8>| {
+                                    debug!(circ_id, bytes = payload.len(), "onion exit: no dialer seed; dropping");
+                                });
+                            (h, None)
+                        }
+                    };
+                    let onion_node = quil_p2p::onion::node::OnionNode::new(
+                        onion_dyn,
+                        peer_id.to_bytes(),
+                        Some(onion_secret),
+                        Some(onion_peer_validator),
+                        Some(exit_handler),
+                        None,
+                    );
+                    // Give the exit proxy a reply handle (self-sufficient: it holds
+                    // the relay + transport Arcs, so the node itself may be dropped).
+                    if let Some(proxy) = exit_proxy {
+                        proxy.set_reply_handle(onion_node.reply_handle());
+                    }
+                    let _ = onion_node;
+                    info!("onion routing active: node is a live PQ onion relay + RPC-proxy exit");
+                }
+                Err(e) => {
+                    warn!(error = %e, "q-onion-key unavailable; onion relay dispatcher disabled (transport still served)");
+                }
+            }
+        }
+
+        let onion_service = tonic::service::interceptor::InterceptedService::new(
+            quil_types::proto::global::onion_service_server::OnionServiceServer::new(
+                onion_transport,
             ),
             quil_rpc::peer_auth_middleware::peer_auth_interceptor,
         );
@@ -756,35 +1463,158 @@ pub(crate) fn spawn_all(
         let seed = mtls_seed.ok_or_else(|| anyhow::anyhow!(
             "peer gRPC requires an Ed448 identity — set `p2p.peerPrivKey` to a 57-byte hex seed (or 114-byte seed+pubkey). Without it no peer can authenticate against this node.",
         ))?;
-        let tls_config = quil_rpc::build_quil_server_tls_config(&seed)
-            .map_err(|e| anyhow::anyhow!("peer gRPC mTLS config init failed: {} — check `p2p.peerPrivKey`", e))?;
         sup.spawn("peer-grpc-server", move |peer_grpc_token| async move {
-            info!(addr = %addr, "starting peer gRPC (mTLS)");
+            // The peer-facing gRPC server (:8340) runs on its OWN dedicated
+            // multi-threaded runtime. The main runtime carries consensus,
+            // commit (which holds the CRDT write lock across KZG+I/O),
+            // materialization and frame production — bursts of that heavy,
+            // .await-free work saturate every main-runtime worker and starve
+            // this network-facing path: field captures showed get_global_frame
+            // (a single frame read) AND even the Ed448 TLS handshake timing
+            // out at 10-15s while the node was busy, which blocked prover
+            // submission and archive↔archive sync network-wide. Isolating the
+            // accept loop / handshakes / RPC handlers onto separate worker
+            // threads keeps :8340 responsive regardless of main-runtime load.
+            //
+            // Driven via spawn_blocking so (a) we don't pin a main-runtime
+            // async worker for the server's whole lifetime and (b) dropping
+            // the dedicated runtime happens in a blocking context (dropping a
+            // runtime inside an async context panics).
+            let serve = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                // 8 threads (was 4): this runtime drives the TLS accept loop,
+                // Ed448 handshakes, and latency-critical archive↔archive
+                // consensus delivery. Heavy hypersync `perform_sync` producers
+                // are spawned onto their OWN dedicated runtime (see
+                // `hypersync_rt` above), so a flood of sync streams can't
+                // occupy these workers and stall the accept/consensus path —
+                // that starvation was timing out consensus dials network-wide.
+                // The extra headroom keeps the accept loop draining even while
+                // this runtime still streams sync RESPONSES (light channel
+                // piping; the heavy work happens on the sync runtime).
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(8)
+                    .thread_name("peer-grpc")
+                    .enable_all()
+                    .build()
+                    .map_err(anyhow::Error::from)?;
+                let res = rt.block_on(async move {
+            info!(addr = %addr, "starting peer gRPC (mTLS) on dedicated runtime");
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(anyhow::Error::from)?;
-            let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-            let incoming = async_stream::stream! {
+            // Post-quantum :8340 transport: each connection runs a sntrup761
+            // PQNoise handshake (replacing Ed448-mTLS) that authenticates the
+            // peer's identity by its signature over the channel-binding hash.
+            // The server identity is the FALCON network key (`q-prover-key`) —
+            // the migrated transport decodes a Falcon signing key on BOTH ends;
+            // handing it the legacy Ed448 seed makes the server's own keypair
+            // setup fail and it drops the connection (client sees EOF). Fall
+            // back to the Ed448 seed only if the Falcon key is unavailable.
+            let pq_seed: Vec<u8> = file_key_manager
+                .get_secret_key_bytes_by_id("q-prover-key")
+                .unwrap_or_else(|_| seed.to_vec());
+            // TLS handshakes run in per-connection tasks with a deadline,
+            // never inline in the accept loop — one peer stalling
+            // mid-handshake must not block new accepts, and a handshake
+            // that never completes must not hold its fd forever.
+            //
+            // The archive RPC connection limit is intentionally UNBOUNDED:
+            // neither the accept backlog nor the concurrent-handshake count
+            // is capped, so a legitimate connection (a peer hypersync, an
+            // archive↔archive consensus dial) is never dropped because a
+            // count was hit. Protection against a connect / TLS-handshake
+            // flood is instead time- and fd-bounded: each handshake has a
+            // 10 s deadline (half-open sockets self-clean), `raise_fd_limit`
+            // lifts RLIMIT_NOFILE, and the h2/tcp keepalives below reap dead
+            // peers so fds don't leak. The previous count-based semaphore was
+            // belt-and-suspenders once permits were released the instant the
+            // crypto finished (no permit is ever held across the enqueue, so
+            // the old starvation cascade can't recur regardless).
+            let (conn_tx, mut conn_rx) = tokio::sync::mpsc::unbounded_channel::<
+                quil_rpc::pqnoise_channel::PqServerStream,
+            >();
+            let accept_token = peer_grpc_token.clone();
+            tokio::spawn(async move {
                 loop {
-                    let (tcp, _peer) = match listener.accept().await {
-                        Ok(v) => v,
-                        Err(e) => { warn!(error = %e, "peer gRPC accept failed"); continue; }
+                    let (tcp, _peer) = tokio::select! {
+                        r = listener.accept() => match r {
+                            Ok(v) => v,
+                            Err(e) => {
+                                // EMFILE lands here — sleep so fd
+                                // exhaustion doesn't become a hot loop.
+                                warn!(error = %e, "peer gRPC accept failed");
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                continue;
+                            }
+                        },
+                        _ = accept_token.cancelled() => return,
                     };
-                    let acceptor = tls_acceptor.clone();
-                    match acceptor.accept(tcp).await {
-                        Ok(tls) => yield Ok::<_, std::io::Error>(tls),
-                        Err(e) => { debug!(error = %e, "TLS handshake failed"); continue; }
-                    }
+                    let tx = conn_tx.clone();
+                    let pq_seed = pq_seed.clone();
+                    crate::rpc_metrics::inc_connection_accepted();
+                    // Handshake runs on the dedicated tls-handshake runtime
+                    // (see `tls_handshake_rt`), NOT on the peer-gRPC workers —
+                    // Ed448 handshake crypto from a connect storm must never
+                    // compete with consensus vote/proposal delivery. The
+                    // socket's readiness events still flow through the
+                    // peer-gRPC runtime's IO driver (where it was accepted);
+                    // only the task execution moves.
+                    tls_handshake_rt.spawn(async move {
+                        let pq = match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            quil_rpc::pqnoise_channel::pq_server_handshake(tcp, &pq_seed),
+                        )
+                        .await
+                        {
+                            Ok(Ok(pq)) => {
+                                crate::rpc_metrics::inc_tls_handshake("ok");
+                                pq
+                            }
+                            Ok(Err(e)) => {
+                                crate::rpc_metrics::inc_tls_handshake("failed");
+                                debug!(error = %e, "PQNoise handshake failed");
+                                return;
+                            }
+                            Err(_) => {
+                                crate::rpc_metrics::inc_tls_handshake("timeout");
+                                debug!("PQNoise handshake timed out");
+                                return;
+                            }
+                        };
+                        // Hand off to tonic. The backlog is unbounded, so this
+                        // never blocks and never sheds a completed handshake;
+                        // `send` only errors if the receiver (tonic serve loop)
+                        // is gone, i.e. the listener is shutting down.
+                        if let Err(e) = tx.send(pq) {
+                            debug!(error = %e, "peer gRPC accept receiver closed — dropping connection (shutdown)");
+                        }
+                    });
+                }
+            });
+            let incoming = async_stream::stream! {
+                while let Some(tls) = conn_rx.recv().await {
+                    yield Ok::<_, std::io::Error>(tls);
                 }
             };
             let mut builder = tonic::transport::Server::builder()
+                // h2 PING-based reaping of dead peers. This server faces
+                // the whole network; without keepalive every peer that
+                // disappears without FIN (crash, NAT timeout) leaks one
+                // fd permanently — the node eventually dies of EMFILE
+                // regardless of how high the ulimit is.
+                .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+                .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+                // Count every inbound RPC by method path
+                // (`rpc_requests_total{path=...}`) — cheap counter bump, no
+                // request buffering.
+                .layer(crate::rpc_metrics::RpcMetricsLayer)
                 .add_service(global_service)
-                .add_service(hypersync_service)
                 .add_service(app_shard_service)
                 .add_service(key_registry_service)
                 .add_service(connectivity_service)
                 .add_service(dispatch_service)
-                .add_service(mixnet_service);
+                .add_service(mixnet_service)
+                .add_service(onion_service);
             if let Some(pp) = pubsub_proxy_service {
                 info!("registering PubSubProxy on peer gRPC listener");
                 builder = builder.add_service(pp);
@@ -793,6 +1623,18 @@ pub(crate) fn spawn_all(
                 .serve_with_incoming_shutdown(incoming, async move { peer_grpc_token.cancelled().await; })
                 .await
                 .map_err(anyhow::Error::from)
+                });
+                // `rt` is dropped here, inside the blocking thread — legal
+                // (dropping a runtime in an async context would panic).
+                res
+            })
+            .await;
+            match serve {
+                Ok(r) => r,
+                Err(join_err) => Err(anyhow::anyhow!(
+                    "peer-grpc dedicated runtime thread panicked: {join_err}"
+                )),
+            }
         });
     } else {
         warn!(addr = %stream_addr, "invalid peer gRPC listen address, server disabled");

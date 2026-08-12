@@ -5,32 +5,32 @@
 //! What's ported:
 //!
 //! - [`MessageKind`] — type-prefix enum spanning the four mutating ops
-//!   (vertex add/remove, hyperedge add/remove).
+//! (vertex add/remove, hyperedge add/remove).
 //! - [`peek_message_kind`] — pure 4-byte peek at the wire-format type
-//!   prefix, matching Go's `binary.BigEndian.Uint32(input[:4])`.
+//! prefix, matching Go's `binary.BigEndian.Uint32(input[:4])`.
 //! - [`DispatchedMessage`] — decoded form of the four message types.
 //! - [`decode_message`] / [`decode_and_validate`] — canonical-bytes
-//!   decode + optional structural validation.
+//! decode + optional structural validation.
 //! - [`lock_addresses_for_input`] — computes the (reads, writes)
-//!   address pair that the lock manager needs, without actually
-//!   taking the lock.
+//! address pair that the lock manager needs, without actually
+//! taking the lock.
 //! - [`HypergraphLockState`] — parallel to Go's
-//!   `lockedReads`/`lockedWrites` maps with the same conflict rules.
+//! `lockedReads`/`lockedWrites` maps with the same conflict rules.
 //! - [`HypergraphDispatchCosts`] — constant/opaque cost helpers that
-//!   collapse onto the per-op helpers in `vertex_ops`/`hyperedge_ops`.
+//! collapse onto the per-op helpers in `vertex_ops`/`hyperedge_ops`.
 //! - [`check_sufficient_fee`] — mirror of Go's
-//!   `feePaid.Cmp(cost*feeMultiplier) < 0` check.
+//! `feePaid.Cmp(cost*feeMultiplier) < 0` check.
 //!
 //! What's NOT ported here:
 //!
 //! - `Deploy` — requires RDF schema parser + lazy tree + key manager.
 //! - `Validate` signature-check path — requires Ed448 verify wiring.
 //! - `InvokeStep` materialize path — requires HypergraphState bridge
-//!   (task #64).
+//! .
 //! - `Commit` — thin forwarding layer, waits on state bridge.
 //! - Prometheus metrics plumbing — we leave that for a later
-//!   observability port; the dispatch logic itself is the
-//!   interesting part.
+//! observability port; the dispatch logic itself is the
+//! interesting part.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -281,17 +281,17 @@ pub fn check_sufficient_fee(
 /// Semantics (matched byte-for-byte to `Lock`/`Unlock` in Go):
 ///
 /// - Taking a write lock on an address is a conflict if the address is
-///   **already locked for writing** OR **already locked for reading**.
+/// **already locked for writing** OR **already locked for reading**.
 /// - Taking a read lock is a conflict only if the address is already
-///   locked for writing (a second reader is fine).
+/// locked for writing (a second reader is fine).
 /// - On successful lock, writes bump both the write set AND the read
-///   counter — the Go code adds a write address to `lockedReads` too,
-///   so future readers see an existing "reader" and concurrent
-///   readers on top of a writer remain safe.
+/// counter — the Go code adds a write address to `lockedReads` too,
+/// so future readers see an existing "reader" and concurrent
+/// readers on top of a writer remain safe.
 /// - Reads increment the read counter; writes always counts as +1
-///   read on top.
+/// read on top.
 /// - `unlock` wipes both maps. The Go implementation takes a
-///   per-frame approach — same transaction-scoped behaviour here.
+/// per-frame approach — same transaction-scoped behaviour here.
 ///
 /// Returns the deduplicated set of locked addresses as a `Vec<Vec<u8>>`.
 /// Order is not stable (matches Go's map iteration).
@@ -496,11 +496,11 @@ pub fn decode_and_validate_deploy(input: &[u8]) -> Result<DispatchedDeploy> {
 ///
 /// 1. Non-empty + valid UTF-8 + ≤ 10_000 bytes (Go fuzz-test cap)
 /// 2. At least one `PREFIX` / `@prefix` declaration (every Quilibrium
-///    schema declares `rdf:`/`rdfs:`/`qcl:`/...)
+/// schema declares `rdf:`/`rdfs:`/`qcl:`/...)
 /// 3. At least one `rdfs:Class` declaration (every schema has at least
-///    one type)
+/// one type)
 /// 4. Every `qcl:size N` and `qcl:order N` parses as a non-negative
-///    integer
+/// integer
 /// 5. Triple terminators (`.`) present
 /// 6. Brace/bracket balance: balanced `<...>` IRIs and `"..."` strings
 ///
@@ -508,20 +508,17 @@ pub fn decode_and_validate_deploy(input: &[u8]) -> Result<DispatchedDeploy> {
 /// hash fields against the schema; this validator just rejects
 /// blatantly-broken documents so deploy fails fast instead of
 /// poisoning every subsequent vertex op.
-fn validate_rdf_schema_bytes(schema: &[u8]) -> Result<()> {
+pub(crate) fn validate_rdf_schema_bytes(schema: &[u8]) -> Result<()> {
     if schema.is_empty() {
         return Err(QuilError::InvalidArgument(
             "hypergraph deploy: empty RDF schema".into(),
         ));
     }
-    const MAX_SCHEMA_BYTES: usize = 10_000;
-    if schema.len() > MAX_SCHEMA_BYTES {
-        return Err(QuilError::InvalidArgument(format!(
-            "hypergraph deploy: RDF schema too large ({} > {} bytes)",
-            schema.len(),
-            MAX_SCHEMA_BYTES
-        )));
-    }
+    // NOTE: no byte-size cap here. Go's deploy gate
+    // (rdfMultiprover.GetSchemaMap → TurtleRDFParser.GetTagsByClass via
+    // rdf2go) imposes none, so a Rust-only cap would reject large schemas
+    // Go accepts and fork. Schema size is bounded upstream by the
+    // consensus message-size limits.
     let text = std::str::from_utf8(schema).map_err(|_| {
         QuilError::InvalidArgument("hypergraph deploy: RDF schema is not valid UTF-8".into())
     })?;
@@ -1273,10 +1270,47 @@ mod tests {
         assert!(validate_rdf_schema_bytes(schema).is_err());
     }
 
+    /// Parity with Go's deploy gate (TurtleRDFParser.GetTagsByClass via
+    /// rdf2go), captured by running node test TestPrintRDFParseVector
+    /// against the FFI-linked Go build. Go results:
+    /// quil (Divisible|Acceptable|Expirable) → accept, 2 classes, 17 fields
+    ///   no_prefix / classless / bad_int → reject (parse error)
+    /// The Rust validator (full parse_turtle_schema + structural heuristics)
+    /// must match these accept/reject outcomes AND extract the same
+    /// class/field structure for the real schema.
     #[test]
-    fn rdf_validator_rejects_too_large() {
-        let schema = vec![b'.'; 10_001];
-        assert!(validate_rdf_schema_bytes(&schema).is_err());
+    fn rdf_validator_matches_go_gettagsbyclass_vectors() {
+        let quil = crate::token_intrinsic::rdf_schema::prepare_rdf_schema_from_config(
+            &[0x42u8; 32],
+            (crate::token_intrinsic::constants::DIVISIBLE
+                | crate::token_intrinsic::constants::ACCEPTABLE
+                | crate::token_intrinsic::constants::EXPIRABLE) as u32,
+        );
+        assert!(validate_rdf_schema_bytes(quil.as_bytes()).is_ok(), "quil accept");
+        let parsed = crate::turtle::parse_turtle_schema(&quil).unwrap();
+        let nclasses = parsed.classes.len();
+        let nfields: usize = parsed.classes.values().map(|c| c.fields.len()).sum();
+        assert_eq!(nclasses, 2, "Go: 2 classes (coin + pending)");
+        assert_eq!(nfields, 17, "Go: 17 fields total");
+
+        assert!(
+            validate_rdf_schema_bytes(b":Foo a rdfs:Class .").is_err(),
+            "no_prefix → Go rejects (undeclared prefixes)"
+        );
+        assert!(
+            validate_rdf_schema_bytes(
+                b"@prefix qcl: <https://types.quilibrium.com/qcl/> .\n:X qcl:order 0 ."
+            )
+            .is_err(),
+            "classless → Go rejects"
+        );
+        assert!(
+            validate_rdf_schema_bytes(
+                b"@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n@prefix qcl: <https://types.quilibrium.com/qcl/> .\n:Foo a rdfs:Class ; qcl:order abc ."
+            )
+            .is_err(),
+            "bad_int → Go rejects"
+        );
     }
 
     #[test]

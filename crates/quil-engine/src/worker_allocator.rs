@@ -45,23 +45,23 @@ pub struct ConfigFilterApplyStats {
 /// Behavior:
 ///
 /// - Empty / whitespace entries are skipped — they encode "operator
-///   deliberately wants worker (i+1) left idle / auto-managed."
+/// deliberately wants worker (i+1) left idle / auto-managed."
 /// - Invalid hex is logged and counted as `invalid`. Decoding is
-///   tolerant: leading `0x` (any case) is stripped first.
+/// tolerant: leading `0x` (any case) is stripped first.
 /// - If no worker exists at `core_id` (the operator declared more
-///   filters than CPU cores), the entry is skipped with a warning.
+/// filters than CPU cores), the entry is skipped with a warning.
 /// - **Persisted state wins**: if a worker already has a non-empty
-///   `filter` (restored from the worker store from a prior gRPC edit,
-///   or already pinned by some earlier startup step), config does NOT
-///   override it. This means an operator who flipped the assignment
-///   via `NodeService::set_manually_managed` + `request_join` keeps
-///   their runtime decision across restarts.
+/// `filter` (restored from the worker store from a prior gRPC edit,
+/// or already pinned by some earlier startup step), config does NOT
+/// override it. This means an operator who flipped the assignment
+/// via `NodeService::set_manually_managed` + `request_join` keeps
+/// their runtime decision across restarts.
 /// - Otherwise: pin the filter with `set_worker_filter(core_id,
-///   filter, start_consensus=false)` and mark the worker
-///   `manually_managed=true`. `start_consensus=false` because we
-///   don't yet know whether a matching registry allocation exists —
-///   the auto-allocator will start the consensus engine when it
-///   observes the alloc transition to Active.
+/// filter, start_consensus=false)` and mark the worker
+/// `manually_managed=true`. `start_consensus=false` because we
+/// don't yet know whether a matching registry allocation exists —
+/// the auto-allocator will start the consensus engine when it
+/// observes the alloc transition to Active.
 ///
 /// **NOTE on parity with Go.** Go's reference uses
 /// `engine.DataWorkerFilters` only to build per-shard PeerInfo
@@ -250,6 +250,15 @@ pub struct WorkerAllocator {
     /// Go's `estimateSeniorityFromConfig` return value. `u64::MAX`
     /// sentinel means "not yet computed"; lifecycle treats that as 0.
     config_seniority_estimate: std::sync::atomic::AtomicU64,
+    /// Self-leave confirm window, kept in lockstep with
+    /// `ProverLifecycle::confirm_window_frames` (default 360; testnet
+    /// overrides to a shorter value). A Leaving allocation is still
+    /// participating until its leave confirms at `leave_frame +
+    /// confirm_window`, so on recovery (e.g. after a store wipe) we
+    /// reestablish a worker for it while it is within this window, and
+    /// stop past it (the lifecycle confirms the leave instead). Must
+    /// match the lifecycle value or the bind/confirm handoff would gap.
+    confirm_window_frames: std::sync::atomic::AtomicU64,
 }
 
 impl WorkerAllocator {
@@ -268,7 +277,23 @@ impl WorkerAllocator {
                 std::sync::atomic::AtomicU64::new(0),
             ],
             config_seniority_estimate: std::sync::atomic::AtomicU64::new(u64::MAX),
+            confirm_window_frames: std::sync::atomic::AtomicU64::new(
+                crate::provers::lifecycle::DEFAULT_CONFIRM_WINDOW_FRAMES,
+            ),
         }
+    }
+
+    /// Override the self-leave confirm window. Call alongside
+    /// `ProverLifecycle::set_confirm_window_frames` so the recovery
+    /// reestablish cutoff matches when leaves actually confirm.
+    pub fn set_confirm_window_frames(&self, frames: u64) {
+        self.confirm_window_frames
+            .store(frames, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn confirm_window_frames(&self) -> u64 {
+        self.confirm_window_frames
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Cached config-derived seniority estimate. Computed once at
@@ -342,17 +367,27 @@ impl WorkerAllocator {
             .prover_registry
             .get_prover_info(&self.local_prover_address)?;
 
-        let Some(prover) = prover_info else {
-            // Not registered — nothing to reconcile
-            return Ok(());
-        };
-
-        // Build lookup from filter → allocation status
-        let alloc_by_filter: HashMap<Vec<u8>, &quil_types::consensus::ProverAllocationInfo> = prover
-            .allocations
-            .iter()
-            .map(|a| (a.confirmation_filter.clone(), a))
-            .collect();
+        // Do NOT early-return when unregistered. A worker carrying a
+        // `pending_filter_frame` from a ProposeJoin that never landed must
+        // still be swept below — otherwise `free_auto()` stays empty,
+        // `allow_proposals` is false, and the lifecycle never retries the
+        // join, leaving the node permanently unregistered with idle
+        // workers (observed production wedge: a single failed join pins
+        // every worker forever). Matches Go `OnNewFrame`, which proceeds
+        // with `self == nil` and clears stale/pending filters regardless.
+        // When unregistered, `alloc_by_filter` is empty → every
+        // filter-pinned worker hits the `None` arm → the 10-frame
+        // pending-timeout sweep frees it so the lifecycle can re-propose.
+        let alloc_by_filter: HashMap<Vec<u8>, &quil_types::consensus::ProverAllocationInfo> =
+            prover_info
+                .as_ref()
+                .map(|p| {
+                    p.allocations
+                        .iter()
+                        .map(|a| (a.confirmation_filter.clone(), a))
+                        .collect()
+                })
+                .unwrap_or_default();
 
         // Get current worker assignments
         let workers = self.worker_manager.range_workers()?;
@@ -463,8 +498,29 @@ impl WorkerAllocator {
                             self.worker_manager.deallocate_worker(worker.core_id)?;
                         }
                         ProverStatus::Leaving => {
-                            // Leave in flight — keep the worker bound
-                            // until Confirm/Reject resolves.
+                            // Live Leave (within 720-frame grace) →
+                            // keep the worker bound until
+                            // Confirm/Reject resolves. Expired Leave
+                            // (no Confirm/Reject within grace) →
+                            // protocol treats it as terminal; clear
+                            // the worker so it becomes a free auto
+                            // candidate again. Without this, an
+                            // operator-submitted Leave that the
+                            // network never confirmed would pin the
+                            // worker to a shard the operator
+                            // explicitly asked to leave, forever.
+                            if alloc.effective_status(frame_number)
+                                == quil_types::consensus::EffectiveStatus::ExpiredLeaving
+                            {
+                                desired_allocated = false;
+                                info!(
+                                    core_id = worker.core_id,
+                                    filter = hex::encode(&worker.filter),
+                                    leave_frame = alloc.leave_frame_number,
+                                    "leave expired after 720 frames, clearing worker"
+                                );
+                                self.worker_manager.deallocate_worker(worker.core_id)?;
+                            }
                         }
                         _ => {}
                     }
@@ -563,7 +619,18 @@ impl WorkerAllocator {
             .collect();
         manual_pending.sort();
 
-        for alloc in &prover.allocations {
+        // Track allocations that need a worker but couldn't get one
+        // (idle pool empty + no manual-pending available). Without
+        // surfacing this we have no signal that an alloc landed
+        // without a worker binding — the symptom of the orphan-
+        // Joining failure mode that requires the lifecycle-side
+        // per-filter Join cooldown to prevent at the source.
+        let mut orphan_filters: Vec<(Vec<u8>, ProverStatus)> = Vec::new();
+        for alloc in prover_info
+            .as_ref()
+            .map(|p| p.allocations.as_slice())
+            .unwrap_or(&[])
+        {
             // Bind the filter for any non-expired allocation —
             // including Joining — so the TUI and the user can see
             // which worker owns which filter from the moment the
@@ -580,6 +647,26 @@ impl WorkerAllocator {
                 EffectiveStatus::Active
                 | EffectiveStatus::Paused
                 | EffectiveStatus::Joining => {}
+                EffectiveStatus::Leaving => {
+                    // A Leaving allocation is still participating in its
+                    // shard until the leave confirms (at `leave_frame +
+                    // confirm_window`). On recovery (e.g. after a store
+                    // wipe) the worker is idle, so reestablish it here so
+                    // the shard keeps producing while the leave is still
+                    // in flight. Once we're past the confirm window, the
+                    // lifecycle's `ready_leave_filters` confirms the leave
+                    // (ConfirmLeaves) — don't bind a worker we're about to
+                    // release. (frame >= leave + window is guaranteed for
+                    // EffectiveStatus::Leaving only when window < 720; the
+                    // 720 grace fallback still applies via ExpiredLeaving.)
+                    if frame_number
+                        >= alloc
+                            .leave_frame_number
+                            .saturating_add(self.confirm_window_frames())
+                    {
+                        continue;
+                    }
+                }
                 _ => continue,
             }
             if assigned_filters.contains(&alloc.confirmation_filter) {
@@ -589,9 +676,11 @@ impl WorkerAllocator {
             // falling back to the auto-managed idle pool.
             let pick = manual_pending.pop().or_else(|| idle_workers.pop());
             if let Some(core_id) = pick {
+                // Leaving counts as participating — the worker must run
+                // the shard's consensus engine until the leave confirms.
                 let start_consensus = matches!(
                     alloc.status,
-                    ProverStatus::Active | ProverStatus::Paused
+                    ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
                 );
                 let manual = !manual_pending
                     .contains(&core_id)  // we just popped it
@@ -615,7 +704,40 @@ impl WorkerAllocator {
                     &alloc.confirmation_filter,
                     start_consensus,
                 )?;
+            } else {
+                // No idle worker available — the alloc is on-chain
+                // but has no local worker bound. This is a
+                // worker-budget overflow, almost always caused by
+                // overlapping ProposeJoin cycles materializing more
+                // distinct filters than we have worker slots for.
+                // The lifecycle's per-filter Join cooldown prevents
+                // the upstream cause; this branch logs the symptom
+                // so the operator (or a future regression) can spot
+                // it. Collected and logged in aggregate below so a
+                // batch of 9 orphans produces one log line, not 9.
+                orphan_filters.push((alloc.confirmation_filter.clone(), alloc.status));
             }
+        }
+
+        if !orphan_filters.is_empty() {
+            let count = orphan_filters.len();
+            let sample: Vec<String> = orphan_filters
+                .iter()
+                .take(8)
+                .map(|(f, s)| format!("{}:{:?}", hex::encode(f), s))
+                .collect();
+            warn!(
+                orphan_count = count,
+                frame_number,
+                ?sample,
+                "allocations with no worker bound — idle pool exhausted; \
+                 likely overlapping ProposeJoin cycles produced more \
+                 distinct Joining filters than worker slots. The orphan \
+                 alloc stays in the registry until its 720-frame grace \
+                 expires (Joining) or until the network confirms/rejects \
+                 it. Lifecycle's `JOIN_FILTER_COOLDOWN_FRAMES` is the \
+                 upstream guard against this."
+            );
         }
 
         Ok(())
@@ -718,6 +840,8 @@ mod tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: 100,
+            epoch: 0,
+            ring: 0,
             vertex_address: vec![],
         }
     }
@@ -729,6 +853,45 @@ mod tests {
         let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
         alloc.on_new_frame(100).unwrap();
         assert!(wm.range_workers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clears_stuck_pending_join_when_unregistered() {
+        // Regression (production wedge): a ProposeJoin whose submit never
+        // landed leaves workers carrying a `pending_filter_frame` while the
+        // prover is NOT in the registry (the join never confirmed). If
+        // `on_new_frame` early-returns when unregistered, the marker never
+        // clears → `free_auto()` stays empty → `allow_proposals = false` →
+        // the lifecycle never re-proposes → the node sits permanently idle
+        // with 0 allocations. The sweep must run regardless of registration.
+        let wm = Arc::new(MockWorkerManager::new());
+        // Idle worker (empty filter) carrying a stale pending-join marker.
+        wm.add(crate::worker::WorkerInfo {
+            core_id: 1,
+            filter: Vec::new(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 100,
+            allocated: false,
+        });
+
+        // Empty registry: our prover never registered (join never landed).
+        let reg = Arc::new(TestProverRegistry::new());
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+
+        // Well past the 10-frame proposal timeout.
+        alloc
+            .on_new_frame(100 + PROPOSAL_TIMEOUT_FRAMES + 1)
+            .unwrap();
+
+        let workers = wm.range_workers().unwrap();
+        assert_eq!(workers.len(), 1, "worker must still exist");
+        assert_eq!(
+            workers[0].pending_filter_frame, 0,
+            "stuck pending-join marker must be cleared so the worker is free \
+             again and the lifecycle can re-propose"
+        );
     }
 
     #[test]
@@ -761,6 +924,72 @@ mod tests {
         let assigned: Vec<Vec<u8>> = workers.iter().map(|w| w.filter.clone()).collect();
         assert!(assigned.contains(&vec![0x01; 32]));
         assert!(assigned.contains(&vec![0x02; 32]));
+    }
+
+    #[test]
+    fn recovery_reestablishes_active_and_leaving_within_window() {
+        // Store-wipe recovery: workers are idle but the registry (synced
+        // from the network) still holds our allocations. on_new_frame must
+        // rebind a worker to each Active allocation AND each Leaving
+        // allocation still within the confirm window (still participating),
+        // but NOT a Leaving allocation past the window (the lifecycle
+        // confirms that leave instead of us reassigning a doomed worker).
+        let wm = Arc::new(MockWorkerManager::new());
+        for c in 0..3u32 {
+            wm.allocate_worker(c, &[]).unwrap(); // 3 idle workers
+        }
+
+        let window = crate::provers::lifecycle::DEFAULT_CONFIRM_WINDOW_FRAMES; // 360
+        let frame = 10_000u64;
+
+        let mut active = make_alloc(vec![0x01; 32]); // status Active, leave_frame 0
+        // Confirmed for the current epoch so always-on epoch expiry keeps it
+        // Active (eval frame 10_000 is well past the first epoch boundary).
+        active.epoch = quil_types::consensus::epoch_for_frame(frame);
+
+        let mut leaving_in = make_alloc(vec![0x02; 32]);
+        leaving_in.status = ProverStatus::Leaving;
+        leaving_in.leave_frame_number = frame - 10; // 10 frames in — within window
+
+        let mut leaving_out = make_alloc(vec![0x03; 32]);
+        leaving_out.status = ProverStatus::Leaving;
+        leaving_out.leave_frame_number = frame - window - 5; // past confirm window
+
+        let prover = ProverInfo {
+            public_key: vec![0xBB; 585],
+            address: vec![0xAA; 32],
+            status: ProverStatus::Active,
+            kick_frame_number: 0,
+            allocations: vec![active, leaving_in, leaving_out],
+            available_storage: 0,
+            seniority: 100,
+            delegate_address: vec![],
+        };
+
+        let reg = Arc::new(TestProverRegistry::with_prover(prover));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAAu8; 32]);
+        alloc.on_new_frame(frame).unwrap();
+
+        let assigned: Vec<Vec<u8>> = wm
+            .range_workers()
+            .unwrap()
+            .iter()
+            .filter(|w| !w.filter.is_empty())
+            .map(|w| w.filter.clone())
+            .collect();
+        assert!(
+            assigned.contains(&vec![0x01; 32]),
+            "Active allocation must be reestablished"
+        );
+        assert!(
+            assigned.contains(&vec![0x02; 32]),
+            "Leaving allocation within the confirm window must be reestablished"
+        );
+        assert!(
+            !assigned.contains(&vec![0x03; 32]),
+            "Leaving allocation past the confirm window must NOT be reestablished \
+             (the lifecycle confirms the leave instead)"
+        );
     }
 
     #[test]

@@ -9,15 +9,15 @@
 //! **Precision strategy.** We use a hybrid approach:
 //!
 //! - Pure big-integer ops where Go uses pure big-integer ops
-//!   (`GetBaselineFee`'s Sub/Exp/Quo pipeline).
+//! (`GetBaselineFee`'s Sub/Exp/Quo pipeline).
 //! - Integer nth-root for the `result^(1/2^n)` step in `pomw_basis`
-//!   (`num_integer::Roots::nth_root`). For `n=1` (mainnet typical)
-//!   this is an integer square root. For larger `n` it's integer
-//!   2^n-th root.
+//! (`num_integer::Roots::nth_root`). For `n=1` (mainnet typical)
+//! this is an integer square root. For larger `n` it's integer
+//! 2^n-th root.
 //! - Scaling by a large fixed-point factor (`POMW_SCALE = 1 << 53`)
-//!   inside the root so we retain ~53 bits of fractional precision,
-//!   then dividing back out after the final multiply. This matches
-//!   shopspring/decimal's effective precision bound.
+//! inside the root so we retain ~53 bits of fractional precision,
+//! then dividing back out after the final multiply. This matches
+//! shopspring/decimal's effective precision bound.
 //!
 //! This approach is **not guaranteed** byte-identical to Go in the
 //! least-significant digits under all inputs, because shopspring's
@@ -108,12 +108,12 @@ pub fn pomw_basis(difficulty: u64, world_state_bytes: u64, units: u64) -> BigInt
 ///
 /// The math is:
 /// ```text
-/// current  = pomw_basis(difficulty, world_state_bytes, units)
+/// current = pomw_basis(difficulty, world_state_bytes, units)
 /// affected = pomw_basis(difficulty, world_state_bytes + total_added, units)
-/// delta    = current - affected
-/// lhs      = delta^2 / world_state_bytes
-/// rhs      = total_added
-/// result   = max(lhs, rhs)
+/// delta = current - affected
+/// lhs = delta^2 / world_state_bytes
+/// rhs = total_added
+/// result = max(lhs, rhs)
 /// ```
 pub fn get_baseline_fee(
     difficulty: u64,
@@ -362,5 +362,100 @@ mod tests {
             .unwrap()[0]
             .clone();
         assert_eq!(&big, &(&small * 2), "big={} small={}", big, small);
+    }
+
+    // ---- Gap coverage (audit 2026-06-28): issuance-path ring + shard scaling.
+    // The 2^(ring+1) divisor and the sqrt-shards branch were untested in the
+    // ACTUAL issuance path (every prior opt_reward test used ring=0, shards=1 —
+    // only the `shard_info` estimate copy covered them). Relationships are exact
+    // by the floor-division identity floor(floor(N/a)/b) == floor(N/(ab)).
+
+    fn one_alloc(
+        ring: u8,
+        shards: u64,
+        state_size: u64,
+    ) -> Vec<HashMap<String, quil_types::consensus::ProverAllocation>> {
+        use quil_types::consensus::ProverAllocation;
+        let mut m = HashMap::new();
+        m.insert("s".to_string(), ProverAllocation { ring, shards, state_size });
+        vec![m]
+    }
+
+    #[test]
+    fn opt_reward_halves_each_ring() {
+        let r = OptRewardIssuance;
+        // Large state so rewards stay non-zero through ring 2.
+        let calc =
+            |ring| r.calculate(5_000, 1 << 30, 1_000_000, &one_alloc(ring, 1, 1 << 28)).unwrap()[0].clone();
+        let r0 = calc(0);
+        let r1 = calc(1);
+        let r2 = calc(2);
+        assert!(!r0.is_zero(), "ring-0 reward must be positive");
+        assert_eq!(r1, &r0 / 2, "ring 1 = ring 0 / 2 (divisor 2^(ring+1))");
+        assert_eq!(r2, &r1 / 2, "ring 2 = ring 1 / 2");
+    }
+
+    /// Generation 2 (difficulty >= 1e8) exercises the 2^k-th-root branch
+    /// (`nth_root(4)`), previously untested (only gen 0/1 covered). More roots
+    /// → strictly smaller basis, so gen0 > gen1 > gen2 for the same world.
+    #[test]
+    fn pomw_basis_generation_two_fourth_root() {
+        let world = 1u64 << 30;
+        let units = 1_000_000u64;
+        let g0 = pomw_basis(5_000, world, units); // gen 0 (no root)
+        let g1 = pomw_basis(50_000, world, units); // gen 1 (sqrt)
+        let g2 = pomw_basis(100_000_000, world, units); // gen 2 (4th root)
+        assert!(g2 > BigInt::zero(), "gen-2 basis must be positive, got {g2}");
+        assert!(g0 > g1 && g1 > g2, "more roots → smaller basis: g0={g0} g1={g1} g2={g2}");
+    }
+
+    #[test]
+    fn opt_reward_scales_inversely_with_sqrt_shards() {
+        let r = OptRewardIssuance;
+        // Perfect-square shard counts → exact integer sqrt, so reward ∝ 1/sqrt(shards).
+        let calc =
+            |shards| r.calculate(5_000, 1 << 30, 1_000_000, &one_alloc(0, shards, 1 << 28)).unwrap()[0].clone();
+        let s1 = calc(1);
+        let s4 = calc(4); // sqrt = 2
+        let s16 = calc(16); // sqrt = 4
+        assert!(!s1.is_zero());
+        assert_eq!(s4, &s1 / 2, "shards=4 (sqrt 2) → half");
+        assert_eq!(s16, &s1 / 4, "shards=16 (sqrt 4) → quarter");
+    }
+
+    /// PoMW rewards STORED DATA: a shard with materialized state earns a
+    /// positive reward, while an EMPTY shard (state_size==0) — the localnet's
+    /// case — correctly earns ZERO. This confirms rewards_visited=0 on the
+    /// empty-shard localnet is the RIGHT answer, not a bug: inject shard data
+    /// (state_size>0) and the exact same path pays out. Covers both zero
+    /// sources: empty shard allocation AND empty world.
+    #[test]
+    fn opt_reward_zero_for_empty_nonzero_for_data() {
+        let r = OptRewardIssuance;
+        let world: u64 = 1 << 30;
+        let units = 1_000_000u64;
+        let difficulty = 5_000u64;
+
+        // Data present (state_size > 0, world > 0) → positive reward.
+        let with_data =
+            r.calculate(difficulty, world, units, &one_alloc(0, 1, 1 << 28)).unwrap()[0].clone();
+        assert!(
+            with_data > BigInt::zero(),
+            "a shard with materialized state must earn a reward, got {with_data}"
+        );
+
+        // Empty shard (state_size == 0) → zero. This is exactly the localnet:
+        // no token/compute/hg data → state_size 0 → no PoMW reward.
+        let empty_shard =
+            r.calculate(difficulty, world, units, &one_alloc(0, 1, 0)).unwrap()[0].clone();
+        assert!(
+            empty_shard.is_zero(),
+            "empty shard (state_size=0) must earn 0, got {empty_shard}"
+        );
+
+        // Empty world (world_state_bytes == 0) → zero for everyone (early return).
+        let empty_world =
+            r.calculate(difficulty, 0, units, &one_alloc(0, 1, 1 << 28)).unwrap()[0].clone();
+        assert!(empty_world.is_zero(), "empty world → 0 reward, got {empty_world}");
     }
 }

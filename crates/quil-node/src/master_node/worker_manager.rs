@@ -4,6 +4,8 @@ use tracing::{debug, info, warn};
 
 // Import KeyManager trait for get_signer
 use quil_keys::KeyManager as _;
+// ClockStore trait — mirror worker-finalized app-shard frames into the master store.
+use quil_types::store::ClockStore as _;
 
 use quil_lifecycle::Supervisor;
 
@@ -107,9 +109,21 @@ pub(crate) fn init(
                     .unwrap_or(8340)
             };
             let master_ep = format!("http://0.0.0.0:{}", master_port);
+            // Derive the master↔worker mTLS materials from the node's Falcon key
+            // (workers derive the identical cert from the same key). Cluster mode
+            // without this would be a plaintext, unauthenticated control channel.
+            let channel_tls_pem = file_key_manager
+                .get_private_key(quil_types::crypto::KeyType::Falcon512)
+                .ok()
+                .and_then(|sk| quil_rpc::quil_tls::build_worker_channel_cert(&sk).ok())
+                .map(|t| (t.ca_cert_pem, t.leaf_cert_pem, t.leaf_key_pem));
+            if channel_tls_pem.is_none() {
+                warn!("cluster mode: could not build worker-channel mTLS cert — worker channel will be UNAUTHENTICATED plaintext");
+            }
             let remote_mgr = Arc::new(quil_engine::remote_worker::RemoteWorkerManager::from_config(
                 &config.engine.data_worker_stream_multiaddrs,
                 master_ep,
+                channel_tls_pem,
             ));
             info!(
                 remote_workers = config.engine.data_worker_stream_multiaddrs.len(),
@@ -118,10 +132,31 @@ pub(crate) fn init(
             // Publish to the halt broadcaster spawned above so it can
             // SetHalted across standalone workers when coverage halts.
             let _ = remote_worker_manager_for_halt.set(remote_mgr.clone());
+            // Establish (and maintain) the gRPC channels to the remote workers.
+            // `connect_all` was previously never called — cluster workers
+            // registered but the master never connected, so the Respawn stayed
+            // deferred forever and app-shard consensus never started. Poll so a
+            // worker that boots after the master (or restarts) gets connected and
+            // its owed Respawn re-issued (see RemoteWorkerManager::connect_all).
+            {
+                let cm = remote_mgr.clone();
+                spawner.detach("remote-worker-connect", async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                    loop {
+                        tick.tick().await;
+                        cm.connect_all().await;
+                    }
+                });
+            }
             remote_mgr as Arc<dyn quil_engine::worker::WorkerManager>
         } else {
             // LOCAL MODE: core-pinned threads
-            let thread_mgr = Arc::new(quil_engine::thread_worker::ThreadWorkerManager::new());
+            // Honor an explicit `dataWorkerCount` in local thread mode (0/unset
+            // → auto-size to cpu-1). Without this the config field was ignored
+            // and every node ran cpu-1 workers regardless of what was requested.
+            let thread_mgr = Arc::new(quil_engine::thread_worker::ThreadWorkerManager::new_with_count(
+                config.engine.data_worker_count,
+            ));
             // Persistent worker registry — survives restarts so the
             // operator's `manually_managed` flag and the
             // worker→filter binding don't reset every reboot.
@@ -238,30 +273,32 @@ pub(crate) fn init(
                 let clock_store: Arc<dyn quil_types::store::ClockStore> = Arc::new(
                     quil_store::RocksClockStore::new(db_arc.inner()),
                 );
-                let hg_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(
-                    quil_store::RocksHypergraphStore::new(db_arc.inner()),
-                );
+                let hg_store_concrete =
+                    Arc::new(quil_store::RocksHypergraphStore::new(db_arc.inner()));
+                let hg_store: Arc<dyn quil_types::store::HypergraphStore> =
+                    hg_store_concrete.clone();
                 let inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver> =
-                    Arc::new(quil_crypto::KzgInclusionProver);
+                    Arc::new(quil_tries::ShaInclusionProver);
                 let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
                     hg_store,
                     inclusion_prover.clone(),
                 ));
+                // Phase-3: migrated DB → commit this worker shard's state to
+                // the JMT forest. No-op on a non-migrated DB.
+                if quil_forest_migrate::install_forest_if_migrated(
+                    crdt.as_ref(),
+                    hg_store_concrete.as_ref(),
+                ) {
+                    tracing::info!("Phase-3 JMT forest installed on worker-manager CRDT");
+                }
                 // Workers don't sign or verify identities — a default
                 // key manager satisfies the execution engine's
                 // `KeyManager` requirement for state materialization.
-                let bls_constructor: Arc<dyn quil_types::crypto::BlsConstructor> =
-                    Arc::new(quil_crypto::Bls48581KeyConstructor);
                 let worker_key_manager: Arc<dyn quil_types::crypto::KeyManager> =
-                    Arc::new(quil_crypto::DefaultKeyManager::new(bls_constructor));
-                // Bulletproof prover is real; Decaf448 / circuit
-                // compiler still use the noop stubs (no production
-                // impl yet). See the analogous block in the master
-                // setup above for the rationale.
-                let bulletproof_prover: Arc<dyn quil_types::crypto::BulletproofProver> =
-                    Arc::new(quil_crypto::Decaf448BulletproofProver);
-                let decaf_constructor: Arc<dyn quil_types::crypto::DecafConstructor> =
-                    Arc::new(quil_execution::testing::NoopDecafConstructor);
+                    Arc::new(quil_crypto::DefaultKeyManager::new());
+                // decaf448 bulletproof/decaf providers are retired (the
+                // confidential-value path is now lattice-CT); the circuit
+                // compiler still uses a noop stub (no production impl yet).
                 let circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler> =
                     Arc::new(quil_execution::testing::NoopCircuitCompiler);
                 let clock_store_for_exec: Arc<dyn quil_types::store::ClockStore> =
@@ -273,8 +310,6 @@ pub(crate) fn init(
                         inclusion_prover.clone(),
                         worker_key_manager,
                         crdt.clone(),
-                        bulletproof_prover,
-                        decaf_constructor,
                         circuit_compiler,
                         clock_store_for_exec,
                         hypergraph_resolver,
@@ -307,11 +342,16 @@ pub(crate) fn init(
                 local_prover_address: prover_address.to_vec(),
                 local_bls_pubkey: bls_pubkey.clone(),
                 bls_signer_factory: Arc::new(move || {
-                    fkm_for_factory.get_signer(quil_types::crypto::KeyType::Bls48581G1)
+                    fkm_for_factory.get_signer(quil_types::crypto::KeyType::Falcon512)
                         .expect("BLS signer should be available")
                 }),
                 reward_greedy,
                 min_active_provers_for_propose,
+                app_consensus_cw: config.engine.app_consensus_cw,
+                // Persistent per-shard simplex-journal base (Go parity): master
+                // core 0 → db.path, worker core N → worker path. Threaded so
+                // app-shard consensus resumes across restarts.
+                db_config: config.db.clone(),
                 coverage_publish: Some(coverage_publish),
                 // Master's global state, used as fallback when the
                 // per-worker builder fails or isn't wired.
@@ -347,6 +387,11 @@ pub(crate) fn init(
                 let drain_halt = halt_state.clone();
                 let drain_spawner = spawner.clone();
                 let drain_transport_cell = prover_message_transport.clone();
+                // Master clock store — worker-finalized app-shard frames are mirrored
+                // here so `AppShardService` (and any master-side reader) can serve
+                // them. Workers commit into their OWN per-worker store, which the
+                // master-store-backed service otherwise can't see.
+                let drain_clock_store = clock_store.clone();
                 sup.run_until_cancelled("worker-master-drain", move |_token| async move {
                     loop {
                         let Some(event) = master_rx.recv().await else { break };
@@ -446,16 +491,68 @@ pub(crate) fn init(
                                         }
                                     }
                                     WorkerToMaster::FrameProduced { core_id, filter, frame_data, .. } => {
-                                        // Per-shard frame bitmask = filter itself.
-                                        // Self-loopback is handled in thread_worker
-                                        // before we get here.
+                                        // `FrameProduced` carries the proposal-time
+                                        // `AppShardProposal` (0x0318), NOT a finalized frame.
+                                        // It MUST go on the per-shard CONSENSUS bitmask so peers
+                                        // route it through `handle_consensus_message` →
+                                        // `handle_app_shard_proposal`, which submits the proposal's
+                                        // parent QC + the proposal to their event loop so they
+                                        // VOTE and ADVANCE. Publishing it on the frame bitmask
+                                        // sent it to `handle_frame_message` (finalized-frame
+                                        // materialization only), which can't decode 0x0318 and
+                                        // drops it — so followers never voted, the chain wedged at
+                                        // rank 1, no 2-chain, no finalization, no reward. Mirrors
+                                        // Go publishing proposals on `getConsensusMessageBitmask`.
+                                        // (`FullFrameProduced` below stays on the frame bitmask.)
                                         if drain_halt.any_halted() {
                                             debug!(core_id, filter = %hex::encode(&filter),
-                                                "suppressing shard frame publish — coverage halt active");
+                                                "suppressing shard proposal publish — coverage halt active");
                                             continue;
                                         }
                                         let p2p = drain_p2p.clone();
-                                        drain_spawner.detach("shard-frame-publish", async move {
+                                        drain_spawner.detach("shard-proposal-publish", async move {
+                                            if let Err(e) = p2p
+                                                .publish(
+                                                    quil_engine::bitmasks::shard_consensus_bitmask(&filter),
+                                                    frame_data,
+                                                )
+                                                .await
+                                            {
+                                                warn!(core_id, filter = %hex::encode(&filter),
+                                                    error = %e, "shard proposal publish failed");
+                                            }
+                                            Ok(())
+                                        });
+                                    }
+                                    WorkerToMaster::FullFrameProduced { core_id, filter, frame_data, .. } => {
+                                        // Full AppShardFrame (header+requests) — publish on
+                                        // the per-shard frame bitmask for state distribution
+                                        // to followers/archives.
+                                        if drain_halt.any_halted() {
+                                            continue;
+                                        }
+                                        // Mirror the finalized frame into the MASTER clock store
+                                        // so `AppShardService::get_app_shard_frame` (which reads
+                                        // the master store) serves real frames — the worker
+                                        // commits it only into its OWN per-worker store. Mirrors
+                                        // the engine's own commit (stage by selector =
+                                        // poseidon(header.output), so `get_latest_shard_clock_frame`
+                                        // resolves). Best-effort; failure never blocks the publish.
+                                        if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(&frame_data[..]) {
+                                            if let Some(header) = frame.header.as_ref() {
+                                                let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+                                                    .map(|h| h.to_vec())
+                                                    .unwrap_or_default();
+                                                if let Ok(txn) = drain_clock_store.new_transaction(false) {
+                                                    match drain_clock_store.stage_shard_clock_frame(&selector, &frame, txn.as_ref()) {
+                                                        Ok(()) => { let _ = txn.commit(); }
+                                                        Err(e) => warn!(core_id, filter = %hex::encode(&filter), error = %e, "mirror app-shard frame to master store failed"),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let p2p = drain_p2p.clone();
+                                        drain_spawner.detach("shard-full-frame-publish", async move {
                                             if let Err(e) = p2p
                                                 .publish(
                                                     quil_engine::bitmasks::shard_frame_bitmask(&filter),
@@ -464,7 +561,28 @@ pub(crate) fn init(
                                                 .await
                                             {
                                                 warn!(core_id, filter = %hex::encode(&filter),
-                                                    error = %e, "shard frame publish failed");
+                                                    error = %e, "full shard frame publish failed");
+                                            }
+                                            Ok(())
+                                        });
+                                    }
+                                    WorkerToMaster::CwConsensus { core_id, filter, channel, bytes } => {
+                                        // (P3) commonware-simplex message → one shard CW
+                                        // gossip topic; channel tagged into the payload.
+                                        if drain_halt.any_halted() {
+                                            continue;
+                                        }
+                                        let p2p = drain_p2p.clone();
+                                        drain_spawner.detach("shard-cw-publish", async move {
+                                            if let Err(e) = p2p
+                                                .publish(
+                                                    quil_engine::bitmasks::shard_cw_bitmask(&filter),
+                                                    quil_engine::bitmasks::shard_cw_frame_payload(channel, &bytes),
+                                                )
+                                                .await
+                                            {
+                                                warn!(core_id, filter = %hex::encode(&filter),
+                                                    error = %e, "shard cw publish failed");
                                             }
                                             Ok(())
                                         });
@@ -541,6 +659,9 @@ pub(crate) fn init(
                                             p2p.subscribe(quil_engine::bitmasks::shard_consensus_bitmask(&filter_for_sub)).await;
                                             p2p.subscribe(quil_engine::bitmasks::shard_prover_bitmask(&filter_for_sub)).await;
                                             p2p.subscribe(quil_engine::bitmasks::shard_dispatch_bitmask(&filter_for_sub)).await;
+                                            // (P3) Subscribe the shard's commonware-simplex topic so
+                                            // committee peers' votes/certs/blocks reach this engine.
+                                            p2p.subscribe(quil_engine::bitmasks::shard_cw_bitmask(&filter_for_sub)).await;
                                             Ok(())
                                         });
                                         info!(
@@ -663,12 +784,21 @@ pub(crate) fn init(
             Ok(ids) => ids.len() as u32,
             Err(_) => 0,
         };
-        // If no workers exist yet, create them for cores 1..N
+        // If no workers exist yet, create them for cores 1..N. Honor an explicit
+        // `dataWorkerCount` (>0); otherwise auto-size to `available_parallelism-1`
+        // (reserve core 0 for the master). Without honoring the config here, this
+        // loop would spawn cpu-1 worker threads even when the operator asked for
+        // a specific count (e.g. a single-worker localnet).
         if num_cores == 0 {
-            let total = std::thread::available_parallelism()
-                .map(|n| n.get() as u32)
-                .unwrap_or(4);
-            let worker_count = total.saturating_sub(1).max(1); // reserve core 0 for master
+            let worker_count = if config.engine.data_worker_count > 0 {
+                config.engine.data_worker_count as u32
+            } else {
+                std::thread::available_parallelism()
+                    .map(|n| n.get() as u32)
+                    .unwrap_or(4)
+                    .saturating_sub(1)
+                    .max(1) // reserve core 0 for master
+            };
             for core_id in 1..=worker_count {
                 if let Err(e) = worker_manager.allocate_worker(core_id, &[]) {
                     warn!(core_id, error = %e, "failed to pre-allocate idle worker");

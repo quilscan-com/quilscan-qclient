@@ -14,16 +14,112 @@ use quil_types::proto::global::{AppShardFrame, GlobalFrame, GlobalFrameHeader};
 pub struct GlobalFrameVerifier {
     frame_prover: Arc<dyn FrameProver>,
     bls_constructor: Option<Arc<dyn BlsConstructor>>,
+    /// Fixed global committee (genesis archives' Falcon pubkeys). When set, a
+    /// CW-finalized global frame carrying the simplex FINALIZATION cert (CWCT
+    /// magic in the header sig field) is verified against it — defense-in-depth
+    /// over the VDF, which is publicly computable. Empty ⇒ cert check skipped
+    /// (legacy / callers that don't know the committee).
+    global_committee: Vec<Vec<u8>>,
+}
+
+/// True iff the request BODY hashes to the header's `requests_root`.
+///
+/// The header is authenticated (VDF binds `requests_root`; the finalization cert
+/// binds `output`), but `frame.requests` is a separate field an attacker can
+/// swap. Every path that ingests a global frame from an untrusted source — the
+/// gossip receiver, the CW consensus `verify`/`on_finalized` seams — MUST call
+/// this to bind the executed body to the certified header. Free function (no
+/// committee state needed) so the seams can reuse it without a verifier handle.
+/// Fails closed on any decode/length mismatch. Uses `ShaInclusionProver` — the
+/// prover the global producer commits with; it MUST match or roots won't agree.
+pub fn global_frame_body_matches_requests_root(
+    header: &GlobalFrameHeader,
+    requests: &[quil_types::proto::global::MessageBundle],
+) -> bool {
+    let canonical: Vec<Vec<u8>> = requests
+        .iter()
+        .filter_map(|b| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(b).ok())
+        .collect();
+    if canonical.len() != requests.len() {
+        return false;
+    }
+    let recomputed = crate::leader_provider::compute_global_requests_root(
+        &canonical,
+        &quil_tries::ShaInclusionProver,
+    );
+    recomputed == header.requests_root
 }
 
 impl GlobalFrameVerifier {
     pub fn new(frame_prover: Arc<dyn FrameProver>) -> Self {
-        Self { frame_prover, bls_constructor: None }
+        Self { frame_prover, bls_constructor: None, global_committee: Vec::new() }
     }
 
     /// Create with BLS signature verification enabled.
     pub fn with_bls(frame_prover: Arc<dyn FrameProver>, bls_constructor: Arc<dyn BlsConstructor>) -> Self {
-        Self { frame_prover, bls_constructor: Some(bls_constructor) }
+        Self { frame_prover, bls_constructor: Some(bls_constructor), global_committee: Vec::new() }
+    }
+
+    /// Attach the fixed global committee so CW finalization certs are verified.
+    pub fn with_global_committee(mut self, committee: Vec<Vec<u8>>) -> Self {
+        self.global_committee = committee;
+        self
+    }
+
+    /// Strict authentication for global frames arriving over the UNTRUSTED
+    /// gossip mesh. The frame MUST carry a simplex FINALIZATION cert (CWCT magic
+    /// in the header sig field) that verifies against the fixed global committee.
+    ///
+    /// This differs from [`Self::validate`], which trusts its mTLS-authenticated
+    /// poller/archive source and — for backward/bootstrap compatibility — accepts
+    /// a frame on its VDF alone when no cert is present. On the gossip path the
+    /// source is any mesh peer and the VDF is publicly computable, so VDF-only
+    /// acceptance would let an attacker who knows the public chain head forge a
+    /// frame and inject it into our state. This check FAILS CLOSED: no committee,
+    /// no cert, or an invalid cert ⇒ reject. Callers should run it BEFORE the
+    /// (more expensive) VDF verify so forged frames are dropped cheaply.
+    pub fn verify_global_finalization_cert(&self, header: &GlobalFrameHeader) -> bool {
+        if self.global_committee.is_empty() {
+            // A node that doesn't know the committee cannot authenticate a
+            // gossiped frame — refuse it and let the mTLS poller be the source.
+            return false;
+        }
+        let Some(cert) = header
+            .public_key_signature_bls48581
+            .as_ref()
+            .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))
+        else {
+            return false;
+        };
+        let output_digest =
+            quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap_or_default();
+        quil_cw_consensus::app_cert::verify_finalization(
+            cert,
+            &self.global_committee,
+            b"global",
+            output_digest,
+        )
+        .is_some()
+    }
+
+    /// Bind a global frame's request BODY to its authenticated header.
+    ///
+    /// The cert + VDF authenticate the header (including `requests_root`), but the
+    /// executed `frame.requests` list is a separate field. Without this check an
+    /// attacker could take a real frame's valid header+cert+VDF and swap in a
+    /// different (individually intrinsic-valid) request set, diverging a receiver's
+    /// state from the real chain. We recompute the root from the carried requests
+    /// and require it to equal the authenticated `header.requests_root`.
+    ///
+    /// Uses `ShaInclusionProver` — the prover the global producer commits with
+    /// (see `GlobalLeaderProvider::compute_requests_root`); it MUST match or the
+    /// roots won't agree. Fails closed on any decode/length mismatch.
+    pub fn verify_global_requests_root(
+        &self,
+        header: &GlobalFrameHeader,
+        requests: &[quil_types::proto::global::MessageBundle],
+    ) -> bool {
+        global_frame_body_matches_requests_root(header, requests)
     }
 
     /// Decode raw bytes into a GlobalFrame.
@@ -55,6 +151,39 @@ impl GlobalFrameVerifier {
                     "frame VDF proof invalid"
                 );
                 return Ok(false);
+            }
+        }
+
+        // CW-finalized global frame: the header sig field carries the simplex
+        // FINALIZATION cert (CWCT magic) over Poseidon(output), signed by the
+        // fixed global committee (genesis archives). Verify it when we know the
+        // committee — this proves the committee finalized the frame, not just
+        // that someone solved the (publicly computable) VDF. No committee ⇒ skip
+        // (legacy behavior); a present-but-invalid cert is rejected.
+        if !self.global_committee.is_empty() {
+            if let Some(cert) = header
+                .public_key_signature_bls48581
+                .as_ref()
+                .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))
+            {
+                let output_digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+                    .unwrap_or_default();
+                if quil_cw_consensus::app_cert::verify_finalization(
+                    cert,
+                    &self.global_committee,
+                    b"global",
+                    output_digest,
+                )
+                .is_none()
+                {
+                    warn!(
+                        frame = header.frame_number,
+                        "global CW finalization cert verification failed",
+                    );
+                    return Ok(false);
+                }
+                debug!(frame = header.frame_number, "global CW finalization cert verified");
+                return Ok(true);
             }
         }
 
@@ -197,7 +326,7 @@ pub const GLOBAL_FRAME_OUTPUT_LEN: usize = 516;
 /// 1. Checking structural fields on the header.
 /// 2. Running the VDF proof through `FrameProver`.
 /// 3. Aggregating the public keys of active provers selected by the
-///    VDF's returned bitmask and comparing to the claimed aggregate.
+/// VDF's returned bitmask and comparing to the claimed aggregate.
 ///
 /// Genesis frames (frame_number == 0) skip signature checks entirely.
 pub struct BlsGlobalFrameValidator {
@@ -290,7 +419,7 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
         // Go uses `proverRegistry.GetActiveProvers(nil)` for the
         // global filter case, which for our Rust impl means an
         // empty byte slice.
-        let active = self.prover_registry.get_active_provers(&[])?;
+        let active = self.prover_registry.get_active_provers(&[], header.frame_number)?;
         let mut active_public_keys: Vec<&[u8]> = Vec::new();
         let mut throwaway: Vec<&[u8]> = Vec::new();
         for (i, prover) in active.iter().enumerate() {
@@ -372,14 +501,19 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
 /// `node/consensus/validator/bls_app_shard_frame_validator.go`.
 /// Validates an `AppShardFrame` by:
 /// 1. Checking structural fields (non-empty address, exactly 4 state
-///    roots of length 64 or 74).
+/// roots of length 64 or 74).
 /// 2. Running the VDF proof through `FrameProver::verify_frame_header`.
 /// 3. Aggregating public keys of active provers under the app shard's
-///    address filter whose indices are in the VDF bitmask.
+/// address filter whose indices are in the VDF bitmask.
 pub struct BlsAppFrameValidator {
     prover_registry: Arc<dyn ProverRegistryTrait>,
     bls_constructor: Arc<dyn BlsConstructor>,
     frame_prover: Arc<dyn FrameProver>,
+    /// Optional global clock store, needed only to verify storage attestations
+    /// (it supplies `global_frame[N].output` for the beacon). When absent, the
+    /// storage-attestation check is skipped (e.g. pre-storage-attestation
+    /// frames, where `storage_attestation_root` is empty anyway).
+    clock_store: Option<Arc<dyn quil_types::store::ClockStore>>,
 }
 
 impl BlsAppFrameValidator {
@@ -392,12 +526,30 @@ impl BlsAppFrameValidator {
             prover_registry,
             bls_constructor,
             frame_prover,
+            clock_store: None,
         }
+    }
+
+    /// Attach a clock store so storage attestations can be verified (supplies
+    /// the global VDF output for the per-frame beacon).
+    pub fn with_clock_store(
+        mut self,
+        clock_store: Arc<dyn quil_types::store::ClockStore>,
+    ) -> Self {
+        self.clock_store = Some(clock_store);
+        self
     }
 }
 
-impl AppFrameValidator for BlsAppFrameValidator {
-    fn validate(&self, frame: &AppShardFrame) -> Result<bool> {
+impl BlsAppFrameValidator {
+    /// Shared validation. `require_signature = true` for finalized frames (the
+    /// full committee quorum signature is mandatory). `false` for **proposal
+    /// gating**: a proposed frame is not yet certified — it has no aggregate
+    /// signature (votes haven't formed the QC), and the proposer's authenticity
+    /// is verified separately by `gate_proposal`/`validate_vote`. In proposal
+    /// mode we still verify the VDF and structural shape (and any signature that
+    /// IS present), but don't *require* one.
+    fn validate_with(&self, frame: &AppShardFrame, require_signature: bool) -> Result<bool> {
         let header = frame
             .header
             .as_ref()
@@ -413,7 +565,9 @@ impl AppFrameValidator for BlsAppFrameValidator {
             )));
         }
         for (i, root) in header.state_roots.iter().enumerate() {
-            if root.len() != 64 && root.len() != 74 {
+            // 32 = Phase-3 forest (JMT) root; 64 = empty/placeholder phase;
+            // 74 = legacy KZG commitment (tests / pre-migration).
+            if root.len() != 32 && root.len() != 64 && root.len() != 74 {
                 return Err(QuilError::InvalidArgument(format!(
                     "invalid state root length at index {}: {}",
                     i,
@@ -431,18 +585,119 @@ impl AppFrameValidator for BlsAppFrameValidator {
         // on `BlsGlobalFrameValidator::validate` above for why the
         // previous behavior (treating the VDF output as a bitmask)
         // was a soundness bug.
-        if let Err(e) = self.frame_prover.verify_frame_header(header) {
-            debug!(
-                frame_number = header.frame_number,
-                address = %hex::encode(&header.address),
-                parent_selector = %hex::encode(&header.parent_selector),
-                error = %e,
-                "frame verification failed"
+        if header.global_frame_number > 0 {
+            // Storage attestation is always-on: any frame anchored to a real
+            // global frame (`global_frame_number > 0`) is a storage frame and
+            // omits the app-shard VDF. Only genesis/no-chain frames (== 0) keep
+            // the legacy VDF. (keyed on the GLOBAL frame the header anchors to.)
+            // Recompute the deterministic ρ_N-bound output (the producer's
+            // Recompute the deterministic ρ_N-bound output (the producer's
+            // identity basis) and require it to match the header. ρ_N is derived
+            // from the anchored global frame's VDF output, resolved from our own
+            // clock store (never trusting the wire).
+            let global_anchor = self
+                .clock_store
+                .as_ref()
+                .and_then(|cs| cs.get_global_clock_frame(header.global_frame_number).ok())
+                .and_then(|gf| gf.header.map(|h| (h.output, h.timestamp)));
+            let (global_output, global_timestamp) = match global_anchor {
+                Some(o) => o,
+                None => {
+                    return Err(QuilError::Crypto(
+                        "storage frame: anchored global frame unavailable for ρ_N".into(),
+                    ));
+                }
+            };
+            let rho_n = quil_crypto::porep::derive_storage_beacon(
+                header.global_frame_number,
+                &global_output,
             );
-            return Err(QuilError::Crypto(format!(
-                "frame header verification: {}",
-                e
-            )));
+            let expected = quil_crypto::porep::deterministic_app_frame_output(
+                &header.parent_selector,
+                &header.requests_root,
+                &header.state_roots,
+                &rho_n,
+                header.frame_number,
+                header.rank,
+                &header.prover,
+                header.difficulty,
+                header.fee_multiplier_vote,
+                header.timestamp,
+                &header.storage_attestation_root,
+            );
+            if expected != header.output {
+                return Err(QuilError::Crypto(
+                    "storage frame: deterministic output does not match header".into(),
+                ));
+            }
+
+            // Timestamp sanity (hardening #3). Now that `timestamp` is bound into
+            // the deterministic output (fix C), a malicious leader can still stamp
+            // an arbitrary value and have the committee certify it unless voters
+            // reject out-of-range timestamps before signing.
+            //
+            // Two independent bounds:
+            //  * Future bound (wall clock, Bitcoin-style ±tolerance). The window
+            //    is far wider than any honest clock skew, so honest leaders never
+            //    trip it, and catch-up replay of already-finalized frames — whose
+            //    timestamps are in the PAST — always passes. A strict deterministic
+            //    verdict isn't required here (borderline-future frames don't occur
+            //    honestly), which is the standard approach for block timestamps.
+            //  * Backdating bound against the consensus-certified anchored global
+            //    frame, applied ONLY when that anchor carries a real timestamp.
+            //    This is deterministic (resolved from our own clock store) and is
+            //    skipped for timestampless genesis anchors (global frame with
+            //    timestamp 0), which otherwise have no meaningful time reference.
+            if header.timestamp <= 0 {
+                return Err(QuilError::InvalidArgument(
+                    "storage frame: non-positive timestamp".into(),
+                ));
+            }
+            const MAX_FUTURE_MS: i64 = 2 * 60 * 60 * 1000; // 2h ahead of wall clock
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if now_ms > 0 && header.timestamp > now_ms.saturating_add(MAX_FUTURE_MS) {
+                return Err(QuilError::InvalidArgument(format!(
+                    "storage frame: timestamp {} too far in the future (now {}, >{}ms)",
+                    header.timestamp, now_ms, MAX_FUTURE_MS,
+                )));
+            }
+            const MAX_BEHIND_MS: i64 = 60 * 60 * 1000; // 1h behind the anchor
+            if global_timestamp > 0
+                && header.timestamp < global_timestamp.saturating_sub(MAX_BEHIND_MS)
+            {
+                return Err(QuilError::InvalidArgument(format!(
+                    "storage frame: timestamp {} too far behind anchored global frame {} (>{}ms)",
+                    header.timestamp, global_timestamp, MAX_BEHIND_MS,
+                )));
+            }
+        } else {
+            // Genesis / no global anchor. App-shard frames use NO VDF at all
+            // (removed): recompute the deterministic output with a ZERO-ANCHOR ρ_N
+            // (`derive_storage_beacon(0, &[])`, matching the producer) and require
+            // it to match the header — the same check as the storage branch above,
+            // minus the ρ_N global anchor which does not exist pre-global-chain.
+            let rho_n = quil_crypto::porep::derive_storage_beacon(0, &[]);
+            let expected = quil_crypto::porep::deterministic_app_frame_output(
+                &header.parent_selector,
+                &header.requests_root,
+                &header.state_roots,
+                &rho_n,
+                header.frame_number,
+                header.rank,
+                &header.prover,
+                header.difficulty,
+                header.fee_multiplier_vote,
+                header.timestamp,
+                &header.storage_attestation_root,
+            );
+            if expected != header.output {
+                return Err(QuilError::Crypto(
+                    "genesis app-shard frame: deterministic output does not match header".into(),
+                ));
+            }
         }
 
         // 2. Aggregate-key check. Required for every post-genesis
@@ -454,12 +709,53 @@ impl AppFrameValidator for BlsAppFrameValidator {
         // Genesis frames carry no signature by design (mirroring
         // `BlsGlobalFrameValidator` above which exempts
         // `frame_number == 0`).
-        if header.frame_number != 0 && header.public_key_signature_bls48581.is_none() {
+        if require_signature
+            && header.frame_number != 0
+            && header.public_key_signature_bls48581.is_none()
+        {
             return Err(QuilError::InvalidArgument(
                 "app shard frame missing BLS signature (post-genesis frames must be signed)".into(),
             ));
         }
-        if let Some(sig) = header.public_key_signature_bls48581.as_ref() {
+        // A commonware-simplex-finalized shard frame carries the simplex
+        // FINALIZATION certificate (magic-prefixed) in the sig field's
+        // `signature` bytes — NOT a header aggregate. Verify it against the shard
+        // committee over `poseidon(output)` (namespace `b"appshard" ++ address`),
+        // mirroring the global reward path (`prover_shard_update.rs`) and the
+        // finalize-side attach in `app_engine::handle_cw_finalized_frame`. This
+        // is how a follower / archive (non-committee member) accepts a CW frame.
+        let cw_cert: Option<&[u8]> = header
+            .public_key_signature_bls48581
+            .as_ref()
+            .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature));
+        if let Some(cert_bytes) = cw_cert {
+            let committee_frame = if header.global_frame_number > 0 {
+                header.global_frame_number
+            } else {
+                header.frame_number
+            };
+            let active = self
+                .prover_registry
+                .get_active_provers(&header.address, committee_frame)?;
+            let committee_pubkeys: Vec<Vec<u8>> =
+                active.iter().map(|p| p.public_key.clone()).collect();
+            let mut namespace = b"appshard".to_vec();
+            namespace.extend_from_slice(&header.address);
+            let output_digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+                .map_err(|e| QuilError::Crypto(format!("cw cert: poseidon(output): {e}")))?;
+            if quil_cw_consensus::app_cert::verify_finalization(
+                cert_bytes,
+                &committee_pubkeys,
+                &namespace,
+                output_digest,
+            )
+            .is_none()
+            {
+                return Err(QuilError::InvalidSignature(
+                    "app shard frame CW finalization cert verification failed".into(),
+                ));
+            }
+        } else if let Some(sig) = header.public_key_signature_bls48581.as_ref() {
             let Some(pk) = sig.public_key.as_ref() else {
                 return Err(QuilError::InvalidArgument(
                     "signature has no public key".into(),
@@ -469,7 +765,17 @@ impl AppFrameValidator for BlsAppFrameValidator {
             let participant_indices: Vec<usize> =
                 quil_consensus::bitmask::set_bit_indices(&sig.bitmask).collect();
 
-            let active = self.prover_registry.get_active_provers(&header.address)?;
+            // Committee epoch is GLOBAL-frame-defined — reconstruct it at the
+            // frame's stamped `global_frame_number` (the proposer's `anchor_gfn`),
+            // NOT the app-shard-local `frame_number` (unrelated to global). Using
+            // the app-shard counter here compared app-shard epochs to the
+            // proposer's global epoch → committee/index mismatch on verify.
+            let committee_frame = if header.global_frame_number > 0 {
+                header.global_frame_number
+            } else {
+                header.frame_number // genesis/legacy: no anchor, epoch 0 either way
+            };
+            let active = self.prover_registry.get_active_provers(&header.address, committee_frame)?;
 
             // Generate a throwaway key pair once — Go does this via
             // `blsConstructor.New()`. The throwaway signature bytes
@@ -544,6 +850,75 @@ impl AppFrameValidator for BlsAppFrameValidator {
             }
         }
 
+        // Storage-attestation verification (full-frame holder / committee
+        // member): recompute the committed root from the carried openings,
+        // re-verify possession 100%, and cross-check every opening against the
+        // member's registered leaf root for the active epoch. Skipped when the
+        // header carries no storage attestation (pre-fork frames) or no clock
+        // store is attached (the beacon source).
+        if !header.storage_attestation_root.is_empty() {
+            if let Some(clock_store) = self.clock_store.as_ref() {
+            let global = clock_store
+                .get_global_clock_frame(header.global_frame_number)
+                .map_err(|e| QuilError::Crypto(format!(
+                    "storage attestation: global frame {} unavailable: {}",
+                    header.global_frame_number, e
+                )))?;
+            let global_output = global
+                .header
+                .as_ref()
+                .map(|h| h.output.clone())
+                .unwrap_or_default();
+            let rho_n = quil_crypto::porep::derive_storage_beacon(
+                header.global_frame_number,
+                &global_output,
+            );
+            let active_epoch =
+                quil_types::consensus::epoch_for_frame(header.global_frame_number);
+            let attestation = frame.storage_attestation.clone().unwrap_or_default();
+            let bitmask = header
+                .public_key_signature_bls48581
+                .as_ref()
+                .map(|s| s.bitmask.clone())
+                .unwrap_or_default();
+            let registry = self.prover_registry.clone();
+            let ok = quil_crypto::porep::verify_frame_storage_attestation_registered(
+                &header.storage_attestation_root,
+                &attestation,
+                header.frame_number,
+                &rho_n,
+                &bitmask,
+                // Must match the poly_size every producer/audit/encode site
+                // uses (app_glue, app_shard_metadata, prover_pipeline,
+                // intrinsic reward audit). derive_challenge_index folds
+                // poly_size into both the challenge point and the modulus, so
+                // a mismatch here re-derives different points than the producer
+                // and rejects every storage-bearing frame. The crypto-layer
+                // sdr::BLOCK_POLY_SIZE (256) is the SDR block partition, NOT the
+                // consensus opening domain.
+                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+                active_epoch,
+                |member: &[u8], leaf_id: &[u8]| {
+                    registry.get_leaf_root(member, leaf_id).ok().flatten()
+                },
+            );
+            if !ok {
+                return Err(QuilError::Crypto(
+                    "app shard frame storage attestation rejected".into(),
+                ));
+            }
+            } else {
+                // No beacon source (e.g. the archive-ingest validator): skip —
+                // the storage attestation is verified by full-frame holders on
+                // the gossip path, and the archive re-materializes the frame.
+                debug!(
+                    frame_number = header.frame_number,
+                    address = %hex::encode(&header.address),
+                    "storage attestation present but no clock store — skipping storage verification"
+                );
+            }
+        }
+
         debug!(
             frame_number = header.frame_number,
             address = %hex::encode(&header.address),
@@ -551,6 +926,21 @@ impl AppFrameValidator for BlsAppFrameValidator {
             "app shard frame verification passed"
         );
         Ok(true)
+    }
+
+    /// Gate an inbound **proposal**: structural + VDF validation (and any
+    /// signature that is present), but the committee quorum signature is NOT
+    /// required — a proposed frame is not yet certified. The proposer's
+    /// authenticity is verified separately by `gate_proposal`/`validate_vote`.
+    pub fn validate_proposal(&self, frame: &AppShardFrame) -> Result<bool> {
+        self.validate_with(frame, false)
+    }
+}
+
+impl AppFrameValidator for BlsAppFrameValidator {
+    /// Validate a **finalized** frame: full quorum signature required.
+    fn validate(&self, frame: &AppShardFrame) -> Result<bool> {
+        self.validate_with(frame, true)
     }
 }
 
@@ -629,9 +1019,345 @@ mod tests {
         let frame = AppShardFrame {
             header: Some(header),
             requests: Vec::new(),
+            storage_attestation: None,
         };
         let err = v.validate(&frame).unwrap_err();
         assert!(err.to_string().contains("invalid state roots count"));
+    }
+
+    #[test]
+    fn global_frame_post_genesis_without_signature_rejected() {
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        let v = BlsGlobalFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let header = GlobalFrameHeader {
+            output: vec![0u8; GLOBAL_FRAME_OUTPUT_LEN],
+            frame_number: 5,
+            public_key_signature_bls48581: None,
+            ..Default::default()
+        };
+        let frame = GlobalFrame {
+            header: Some(header),
+            requests: Vec::new(),
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("no bls signature"));
+    }
+
+    #[test]
+    fn global_frame_empty_signature_bytes_rejected() {
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        use quil_types::proto::keys::{Bls48581AggregateSignature, Bls48581g2PublicKey};
+        let v = BlsGlobalFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let header = GlobalFrameHeader {
+            output: vec![0u8; GLOBAL_FRAME_OUTPUT_LEN],
+            frame_number: 5,
+            public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+                signature: Vec::new(), // empty signature
+                public_key: Some(Bls48581g2PublicKey { key_value: vec![0x01u8; 96] }),
+                bitmask: vec![0x01],
+            }),
+            ..Default::default()
+        };
+        let frame = GlobalFrame {
+            header: Some(header),
+            requests: Vec::new(),
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("signature or public key is nil"));
+    }
+
+    #[test]
+    fn global_frame_empty_bitmask_rejected() {
+        use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
+        use quil_types::proto::keys::{Bls48581AggregateSignature, Bls48581g2PublicKey};
+        let v = BlsGlobalFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let header = GlobalFrameHeader {
+            output: vec![0u8; GLOBAL_FRAME_OUTPUT_LEN],
+            frame_number: 5,
+            public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+                signature: vec![0xAAu8; 74],
+                public_key: Some(Bls48581g2PublicKey { key_value: vec![0x01u8; 96] }),
+                bitmask: Vec::new(), // empty bitmask
+            }),
+            ..Default::default()
+        };
+        let frame = GlobalFrame {
+            header: Some(header),
+            requests: Vec::new(),
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("bitmask is nil"));
+    }
+
+    #[test]
+    fn app_frame_empty_address_rejected() {
+        use quil_types::proto::global::{AppShardFrame, FrameHeader};
+        let v = BlsAppFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let header = FrameHeader {
+            address: Vec::new(), // empty
+            state_roots: vec![vec![0u8; 64]; 4],
+            ..Default::default()
+        };
+        let frame = AppShardFrame {
+            header: Some(header),
+            requests: Vec::new(),
+            storage_attestation: None,
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("address is empty"));
+    }
+
+    #[test]
+    fn app_frame_bad_state_root_length_rejected() {
+        use quil_types::proto::global::{AppShardFrame, FrameHeader};
+        let v = BlsAppFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let header = FrameHeader {
+            address: vec![0x01u8; 32],
+            // correct count (4) but one root is the wrong length.
+            state_roots: vec![vec![0u8; 64], vec![0u8; 64], vec![0u8; 10], vec![0u8; 64]],
+            ..Default::default()
+        };
+        let frame = AppShardFrame {
+            header: Some(header),
+            requests: Vec::new(),
+            storage_attestation: None,
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("invalid state root length"));
+    }
+
+    #[test]
+    fn app_frame_nil_header_rejected() {
+        use quil_types::proto::global::AppShardFrame;
+        let v = BlsAppFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let frame = AppShardFrame {
+            header: None,
+            requests: Vec::new(),
+            storage_attestation: None,
+        };
+        assert!(v.validate(&frame).is_err());
+    }
+
+    #[test]
+    fn app_frame_post_genesis_without_signature_rejected() {
+        use quil_types::proto::global::{AppShardFrame, FrameHeader};
+        let v = BlsAppFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls::default()),
+            Arc::new(StubFrameProver::default()),
+        );
+        let mut header = FrameHeader {
+            address: vec![0x01u8; 32],
+            state_roots: vec![vec![0u8; 64]; 4],
+            frame_number: 3,
+            public_key_signature_bls48581: None,
+            ..Default::default()
+        };
+        // App-shard frames use NO VDF: the (genesis, global_frame_number==0)
+        // verify path recomputes the deterministic zero-anchor ρ_N output and
+        // requires it to match. Stamp the correct output so validation gets PAST
+        // the output check and reaches the BLS-signature requirement this test
+        // exercises. (Previously this hit the now-removed VDF branch.)
+        let rho_n = quil_crypto::porep::derive_storage_beacon(0, &[]);
+        header.output = quil_crypto::porep::deterministic_app_frame_output(
+            &header.parent_selector,
+            &header.requests_root,
+            &header.state_roots,
+            &rho_n,
+            header.frame_number,
+            header.rank,
+            &header.prover,
+            header.difficulty,
+            header.fee_multiplier_vote,
+            header.timestamp,
+            &header.storage_attestation_root,
+        );
+        let frame = AppShardFrame {
+            header: Some(header),
+            requests: Vec::new(),
+            storage_attestation: None,
+        };
+        let err = v.validate(&frame).unwrap_err();
+        assert!(err.to_string().contains("missing BLS signature"));
+    }
+
+    #[test]
+    fn validate_header_fields_rejects_empty_output() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        let header = GlobalFrameHeader {
+            output: Vec::new(),
+            prover: vec![0x01u8; 32],
+            ..Default::default()
+        };
+        let err = GlobalFrameVerifier::validate_header_fields(&header).unwrap_err();
+        assert!(err.to_string().contains("empty output"));
+    }
+
+    #[test]
+    fn validate_header_fields_rejects_empty_prover() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        let header = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: Vec::new(),
+            ..Default::default()
+        };
+        let err = GlobalFrameVerifier::validate_header_fields(&header).unwrap_err();
+        assert!(err.to_string().contains("empty prover"));
+    }
+
+    #[test]
+    fn validate_header_fields_rejects_nongenesis_empty_parent_selector() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        let header = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            parent_selector: Vec::new(),
+            frame_number: 7,
+            ..Default::default()
+        };
+        let err = GlobalFrameVerifier::validate_header_fields(&header).unwrap_err();
+        assert!(err.to_string().contains("empty parent selector"));
+    }
+
+    #[test]
+    fn validate_header_fields_accepts_genesis_empty_parent_selector() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        let header = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            parent_selector: Vec::new(),
+            frame_number: 0,
+            ..Default::default()
+        };
+        assert!(GlobalFrameVerifier::validate_header_fields(&header).is_ok());
+    }
+
+    #[test]
+    fn decode_frame_rejects_garbage() {
+        // Random bytes are not a valid protobuf GlobalFrame in general;
+        // ensure the decode path surfaces a serialization error rather
+        // than panicking.
+        let res = GlobalFrameVerifier::decode_frame(&[0xFFu8; 8]);
+        assert!(res.is_err());
+    }
+
+    // ---- gossip untrusted-source cert gate (Finding 1) ----
+
+    #[test]
+    fn gossip_cert_gate_rejects_when_committee_empty() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        // No committee configured ⇒ cannot authenticate a gossiped frame ⇒
+        // must fail closed even if the frame otherwise looks fine.
+        let v = GlobalFrameVerifier::with_bls(
+            Arc::new(StubFrameProver::default()),
+            Arc::new(StubBls::default()),
+        );
+        let header = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            ..Default::default()
+        };
+        assert!(!v.verify_global_finalization_cert(&header));
+    }
+
+    #[test]
+    fn gossip_cert_gate_rejects_absent_and_garbage_cert() {
+        use quil_types::proto::global::GlobalFrameHeader;
+        use quil_types::proto::keys::{Bls48581AggregateSignature, Bls48581g2PublicKey};
+        // Committee is set, so the ONLY thing standing between a forged frame and
+        // acceptance is a real cert. A frame with no sig, and a frame with a
+        // bogus (non-CWCT / unverifiable) sig, must both be rejected.
+        let v = GlobalFrameVerifier::with_bls(
+            Arc::new(StubFrameProver::default()),
+            Arc::new(StubBls::default()),
+        )
+        .with_global_committee(vec![vec![0x09u8; 897]]);
+
+        // (a) no signature field at all — the exact VDF-only forgery vector.
+        let no_sig = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            ..Default::default()
+        };
+        assert!(
+            !v.verify_global_finalization_cert(&no_sig),
+            "a frame with no committee cert must be rejected on the gossip path"
+        );
+
+        // (b) a signature field that is not a valid CWCT cert (random bytes).
+        let garbage_sig = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            public_key_signature_bls48581: Some(Bls48581AggregateSignature {
+                public_key: Some(Bls48581g2PublicKey { key_value: Vec::new() }),
+                signature: vec![0xAAu8; 128],
+                bitmask: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !v.verify_global_finalization_cert(&garbage_sig),
+            "a frame with a bogus/unverifiable cert must be rejected"
+        );
+    }
+
+    #[test]
+    fn requests_root_gate_binds_body_to_header() {
+        use quil_types::proto::global::{GlobalFrameHeader, MessageBundle};
+        let v = GlobalFrameVerifier::with_bls(
+            Arc::new(StubFrameProver::default()),
+            Arc::new(StubBls::default()),
+        );
+        // A header whose requests_root is the authentic root of an EMPTY body.
+        let empty_root = crate::leader_provider::compute_global_requests_root(
+            &[],
+            &quil_tries::ShaInclusionProver,
+        );
+        let header = GlobalFrameHeader {
+            output: vec![0x01u8; 516],
+            prover: vec![0x01u8; 32],
+            requests_root: empty_root,
+            ..Default::default()
+        };
+        // Matching (empty) body ⇒ accept.
+        assert!(v.verify_global_requests_root(&header, &[]));
+        // A body swapped in under the SAME authenticated header ⇒ its root no
+        // longer matches ⇒ reject (this is the forgery we're closing).
+        let swapped = vec![MessageBundle::default()];
+        assert!(
+            !v.verify_global_requests_root(&header, &swapped),
+            "a body that doesn't hash to the authenticated requests_root must be rejected"
+        );
+        // A header claiming a bogus root with an empty body ⇒ reject.
+        let bad_header = GlobalFrameHeader {
+            requests_root: vec![0xEEu8; 32],
+            ..header.clone()
+        };
+        assert!(!v.verify_global_requests_root(&bad_header, &[]));
     }
 
     // ---- test stubs ----
@@ -700,6 +1426,8 @@ mod tests {
             _: u32,
             _: u64,
             _: u64,
+            _: &[u8],
+            _: u64,
         ) -> Result<quil_types::proto::global::FrameHeader> {
             Err(QuilError::Internal("stub".into()))
         }
@@ -714,6 +1442,7 @@ mod tests {
             _: &quil_types::proto::global::GlobalFrameHeader,
             _: &[Vec<u8>],
             _: &[u8],
+            _: &[Vec<u8>],
             _: &[u8],
             _: &dyn quil_types::crypto::Signer,
             _: i64,
