@@ -32,8 +32,21 @@ RUN apt-get update && apt-get install -y \
 FROM base AS gmp-builder
 
 ARG GMP_VERSION=6.3.0
-RUN wget https://ftp.gnu.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz && \
-    tar -xf gmp-${GMP_VERSION}.tar.xz && \
+ARG GMP_SHA256=a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898
+RUN archive="gmp-${GMP_VERSION}.tar.xz" && \
+    for base_url in \
+        https://mirrors.kernel.org/gnu/gmp \
+        https://mirrors.ocf.berkeley.edu/gnu/gmp \
+        https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/gmp \
+        https://ftp.gnu.org/gnu/gmp; do \
+      if wget --timeout=20 --tries=2 -O "${archive}" "${base_url}/${archive}"; then \
+        break; \
+      fi; \
+      rm -f "${archive}"; \
+    done && \
+    test -s "${archive}" && \
+    echo "${GMP_SHA256}  ${archive}" | sha256sum -c - && \
+    tar -xf "${archive}" && \
     cd gmp-${GMP_VERSION} && \
     ./configure \
         --prefix=/usr/local \
