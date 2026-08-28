@@ -21,6 +21,7 @@ use crate::rpc::ConnectOpts;
 mod account;
 mod address;
 mod balance;
+mod claimable_rewards;
 mod coins;
 mod lattice;
 mod merge;
@@ -57,6 +58,12 @@ pub enum TokenCommand {
     Balance,
     /// Lists all coins under control of the managing account.
     Coins,
+    /// Show the claimable prover reward balance.
+    ClaimableRewards {
+        /// Emit the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Transfer a confidential amount to a recipient lattice address.
     Transfer {
         /// Recipient address: hex(kem_pk ‖ wire(B)).
@@ -196,11 +203,17 @@ fn get_or_create_agreement(km: &FileKeyManager, id: &str) -> anyhow::Result<Vec<
 }
 
 pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
+    if let TokenCommand::ClaimableRewards { json } = &args.command {
+        return claimable_rewards::run(global, &args.common, *json).await;
+    }
     let tc = TokenCtx::load(global, &args.common)?;
     match &args.command {
         TokenCommand::Account => account::run(&tc),
         TokenCommand::Balance => balance::run(&tc).await,
         TokenCommand::Coins => coins::run(&tc).await,
+        TokenCommand::ClaimableRewards { .. } => {
+            unreachable!("claimable rewards handled before TokenCtx load")
+        }
         TokenCommand::Transfer { recipient, amount } => transfer::run(&tc, recipient, amount).await,
         TokenCommand::ConfidentialAddress => address::run(&tc),
         TokenCommand::Merge { coins } => merge::run(&tc, coins).await,
