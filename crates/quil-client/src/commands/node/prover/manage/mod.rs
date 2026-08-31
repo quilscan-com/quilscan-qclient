@@ -22,10 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyEventKind};
-use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use crossterm::execute;
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -35,7 +35,7 @@ use tonic::transport::Channel;
 use quil_keys::FileKeyManager;
 use quil_types::proto::node::node_service_client::NodeServiceClient;
 
-use self::model::Model;
+use self::model::{materialization_lag, materialization_state, Model};
 use self::msg::Msg;
 use self::update::{apply_msg, handle_key, Cmd};
 use super::ProverCtx;
@@ -101,7 +101,7 @@ fn format_once(model: &Model) -> String {
         format!("Allocated Workers: {}", model.allocated_workers),
         String::new(),
         format!("Allocations ({}):", allocations.len()),
-        "Select  Filter  Provers  Ring  Size [MB]  Shards  Reward [Q/f]  Worker  Status  Mode  Next Action  Default Action".to_string(),
+        "Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]  Worker  Status  Mode  Next Action  Default Action".to_string(),
     ];
 
     for row in allocations {
@@ -113,13 +113,19 @@ fn format_once(model: &Model) -> String {
         let mode = if row.manually_managed { "M" } else { "A" };
         let next_action = empty_placeholder(&row.next_action);
         let default_action = empty_placeholder(&row.default_action);
+        let lag = materialization_lag(row.materialized_frame, row.latest_frame)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
         lines.push(format!(
-            "[ ] {} {} {} {} {} ~{} {} {} {} {} {}",
+            "[ ] {} {} {} {} {} {} {} {} ~{} {} {} {} {} {}",
             row.filter_hex,
             row.active_provers,
             row.ring,
-            format_size_mb(&row.shard_size),
+            super::format_mb(&row.shard_size),
             row.data_shards,
+            row.materialized_frame,
+            lag,
+            materialization_state(row.materialized_frame, row.latest_frame),
             super::format_quil_reward(&row.estimated_reward),
             worker,
             row.status_name,
@@ -131,26 +137,30 @@ fn format_once(model: &Model) -> String {
 
     lines.push(String::new());
     lines.push(format!("Available Shards ({}):", available.len()));
-    lines.push("Select  Filter  Provers  Ring  Size [MB]  Shards  Reward [Q/f]".to_string());
+    lines.push(
+        "Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]"
+            .to_string(),
+    );
     for row in available {
+        let lag = materialization_lag(row.materialized_frame, row.latest_frame)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
         lines.push(format!(
-            "[ ] {} {} {} {} {} ~{}",
+            "[ ] {} {} {} {} {} {} {} {} ~{}",
             row.filter_hex,
             row.active_provers,
             row.ring,
-            format_size_mb(&row.shard_size),
+            super::format_mb(&row.shard_size),
             row.data_shards,
+            row.materialized_frame,
+            lag,
+            materialization_state(row.materialized_frame, row.latest_frame),
             super::format_quil_reward(&row.estimated_reward),
         ));
     }
 
     lines.push(String::new());
     lines.join("\n")
-}
-
-fn format_size_mb(value: &num_bigint::BigInt) -> String {
-    let bytes = value.to_string().parse::<f64>().unwrap_or_default();
-    format!("{:.1}", bytes / (1024.0 * 1024.0))
 }
 
 fn empty_placeholder(value: &str) -> &str {
@@ -161,11 +171,7 @@ fn empty_placeholder(value: &str) -> &str {
     }
 }
 
-async fn event_loop(
-    terminal: &mut Term,
-    client: Client,
-    km: Arc<FileKeyManager>,
-) -> anyhow::Result<()> {
+async fn event_loop(terminal: &mut Term, client: Client, km: Arc<FileKeyManager>) -> anyhow::Result<()> {
     let mut model = Model::new();
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 
@@ -274,7 +280,7 @@ mod tests {
     use num_bigint::BigInt;
 
     use super::format_once;
-    use super::model::{AllocationRow, Model};
+    use super::model::{AllocationRow, Model, ShardRow};
 
     #[test]
     fn format_once_uses_the_agent_allocation_table() {
@@ -289,6 +295,8 @@ mod tests {
             active_provers: 3,
             shard_size: BigInt::from(10 * 1024 * 1024),
             data_shards: 7,
+            materialized_frame: 41,
+            latest_frame: 43,
             estimated_reward: BigInt::from(100_000_000u64),
             join_frame: 0,
             leave_frame: 0,
@@ -301,12 +309,29 @@ mod tests {
             epoch: 0,
             last_active_frame: 0,
         });
+        model.available.push(ShardRow {
+            filter: vec![0xca, 0xfe],
+            filter_key: "cafe".to_string(),
+            filter_hex: "cafe".to_string(),
+            active_provers: 4,
+            ring: 1,
+            shard_size: BigInt::from(2048),
+            data_shards: 3,
+            materialized_frame: 0,
+            latest_frame: 43,
+            estimated_reward: BigInt::from(50_000_000u64),
+        });
 
         let output = format_once(&model);
 
         assert!(output.contains("Allocations (1):"));
-        assert!(output.contains("Select  Filter  Provers  Ring  Size [MB]  Shards  Reward [Q/f]  Worker  Status  Mode  Next Action  Default Action"));
-        assert!(output.contains("[ ] deadbeef 3 0 10.0 7 ~1.00000000 2 Active A Confirm Reject"));
-        assert!(output.contains("Available Shards (0):"));
+        assert!(output.contains("Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]  Worker  Status  Mode  Next Action  Default Action"));
+        assert!(output
+            .contains("[ ] deadbeef 3 0 10.0 7 41 2 Lag ~1.00000000 2 Active A Confirm Reject"));
+        assert!(output.contains("Available Shards (1):"));
+        assert!(output.contains(
+            "Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]"
+        ));
+        assert!(output.contains("[ ] cafe 4 1 <0.1 3 0 43 Unmat ~0.50000000"));
     }
 }

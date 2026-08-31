@@ -57,6 +57,8 @@ pub struct ShardEntry {
     pub is_allocated: bool,
     /// Ring assignment (0-based).
     pub ring: u8,
+    pub materialized_frame: u64,
+    pub latest_frame: u64,
 }
 
 /// Raw shard size info returned by the size-fetching callbacks.
@@ -65,6 +67,8 @@ pub struct ShardSizeEntry {
     pub prefix: Vec<u32>,
     pub size: Vec<u8>,
     pub data_shards: u64,
+    pub materialized_frame: u64,
+    pub latest_frame: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -309,10 +313,9 @@ where
             } else {
                 &shard_key[..]
             };
-            let mut bp = l2.to_vec();
-            for &p in &shard.prefix {
-                bp.push(p as u8);
-            }
+            // Canonical prefix → filter (sentinel-aware) so `allocated_filters` /
+            // `get_provers` match a deep shard's real ConfirmationFilter.
+            let bp = quil_forest::shard_prefix_to_filter(l2, &shard.prefix);
 
             let is_alloc = allocated_filters.contains(&bp);
 
@@ -423,6 +426,8 @@ where
                 provers_on_ring: on_ring,
                 is_allocated: real_is_alloc,
                 ring,
+                materialized_frame: shard.materialized_frame,
+                latest_frame: shard.latest_frame,
             });
         }
     }
@@ -509,6 +514,8 @@ where
                 estimated_reward: est,
                 is_allocated: entry.is_allocated,
                 data_shards: entry.data_shards,
+                materialized_frame: entry.materialized_frame,
+                latest_frame: entry.latest_frame,
             }
         })
         .collect();
@@ -536,6 +543,8 @@ pub fn local_app_shard_get_sizes(
                     prefix: sub.prefix.clone(),
                     size: meta.size,
                     data_shards: meta.data_shards,
+                    materialized_frame: 0,
+                    latest_frame: 0,
                 });
             }
         }

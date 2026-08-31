@@ -117,10 +117,7 @@ fn dry_run_score(peer_ids: &[String]) -> anyhow::Result<()> {
         }
         // These rewards have no decimals, so the integer shortcut matches Go.
         let max = 157208i64;
-        let actual: i64 = f
-            .reward
-            .parse()
-            .map_err(|_| anyhow::anyhow!("bad reward {:?}", f.reward))?;
+        let actual: i64 = f.reward.parse().map_err(|_| anyhow::anyhow!("bad reward {:?}", f.reward))?;
         if actual == 0 {
             continue;
         }

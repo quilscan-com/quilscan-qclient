@@ -57,7 +57,7 @@ mod tests {
     fn center_trunc_elides_middle() {
         assert_eq!(center_trunc("abcdef", 10), "abcdef"); // fits
         assert_eq!(center_trunc("abcdefghij", 7), "ab...ij"); // 2 + 3 + 2
-                                                              // max_width <= 3 hard-truncates from the front.
+        // max_width <= 3 hard-truncates from the front.
         assert_eq!(center_trunc("abcdef", 3), "abc");
     }
 

@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::super::epoch::epoch_len;
 use super::model::{
-    AwaitFilterEntry, ColumnFilter, FilterColKind, Model, PanelFocus, PendingAction,
+    AwaitFilterEntry, ColumnFilter, ColumnSizing, FilterColKind, Model, PanelFocus, PendingAction,
     ACTION_FRAME_DELAY,
 };
 use super::msg::Msg;
+use super::super::epoch::epoch_len;
 
 const MAX_AWAIT_RETRIES: u32 = 3;
 
@@ -114,8 +114,7 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                 m.await_send_frame = send_frame;
             }
             if !m.action_queue.is_empty() {
-                m.status_msg =
-                    format!("{action} broadcast ({}/{})", m.action_index, m.action_total);
+                m.status_msg = format!("{action} broadcast ({}/{})", m.action_index, m.action_total);
                 if let Some(cmd) = advance_queue(m) {
                     return vec![cmd];
                 }
@@ -184,10 +183,8 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                     return vec![Cmd::ScheduleAwaitCheck(backoff)];
                 }
                 finish_await(m);
-                m.status_msg = format!(
-                    "{action} check failed after {} retries: {e}",
-                    m.await_retries
-                );
+                m.status_msg =
+                    format!("{action} check failed after {} retries: {e}", m.await_retries);
                 m.status_is_error = true;
                 m.status_sticky = true;
                 return vec![Cmd::Fetch];
@@ -414,6 +411,13 @@ fn handle_normal_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             m.color_coding = !m.color_coding;
             return vec![];
         }
+        KeyCode::Char('w') => {
+            m.column_sizing = match m.column_sizing {
+                ColumnSizing::Dynamic => ColumnSizing::Fixed,
+                ColumnSizing::Fixed => ColumnSizing::Dynamic,
+            };
+            return vec![];
+        }
         KeyCode::Tab => {
             m.focus = if m.focus.is_alloc() {
                 PanelFocus::Available
@@ -562,8 +566,7 @@ fn action_join(m: &mut Model) -> Vec<Cmd> {
         return vec![];
     }
     if m.focus != PanelFocus::Available {
-        m.status_msg =
-            "Join is only available in the Available Shards panel (Tab to switch)".into();
+        m.status_msg = "Join is only available in the Available Shards panel (Tab to switch)".into();
         m.status_is_error = true;
         return vec![];
     }
@@ -732,10 +735,7 @@ fn start_multi_filter_action(
     m.action_in_flight = true;
     m.status_is_error = false;
     m.alloc_selected.clear();
-    m.status_msg = format!(
-        "Creating {action} message for {} allocation(s)...",
-        filters.len()
-    );
+    m.status_msg = format!("Creating {action} message for {} allocation(s)...", filters.len());
     let mut cmds = vec![Cmd::Lifecycle {
         action: action.to_string(),
         filters,
@@ -990,11 +990,7 @@ fn handle_filter_select_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             }
         }
         KeyCode::Char(' ') => {
-            if let Some(v) = m
-                .filter_edit_select_items
-                .get(m.filter_edit_select_cursor)
-                .cloned()
-            {
+            if let Some(v) = m.filter_edit_select_items.get(m.filter_edit_select_cursor).cloned() {
                 let e = m.filter_edit_select_state.entry(v).or_insert(false);
                 *e = !*e;
             }

@@ -43,33 +43,21 @@ fn addressed_sig(
 }
 
 /// ProverPause signature (single filter).
-pub fn pause_sig(
-    km: &FileKeyManager,
-    filter: &[u8],
-    frame: u64,
-) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn pause_sig(km: &FileKeyManager, filter: &[u8], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
     let msg = single_filter_signing_message(filter, frame);
     let domain = prover_pause_domain().map_err(|e| anyhow::anyhow!("pause domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
 }
 
 /// ProverResume signature (single filter).
-pub fn resume_sig(
-    km: &FileKeyManager,
-    filter: &[u8],
-    frame: u64,
-) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn resume_sig(km: &FileKeyManager, filter: &[u8], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
     let msg = single_filter_signing_message(filter, frame);
     let domain = prover_resume_domain().map_err(|e| anyhow::anyhow!("resume domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
 }
 
 /// ProverLeave signature (multi filter).
-pub fn leave_sig(
-    km: &FileKeyManager,
-    filters: &[Vec<u8>],
-    frame: u64,
-) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn leave_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
     let msg = multi_filter_signing_message(filters, frame);
     let domain = prover_leave_domain().map_err(|e| anyhow::anyhow!("leave domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
@@ -77,22 +65,14 @@ pub fn leave_sig(
 
 /// ProverConfirm signature (multi filter; CLI registers no leaf roots, so
 /// the confirm message is byte-identical to the multi-filter message).
-pub fn confirm_sig(
-    km: &FileKeyManager,
-    filters: &[Vec<u8>],
-    frame: u64,
-) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn confirm_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
     let msg = multi_filter_signing_message(filters, frame);
     let domain = prover_confirm_domain().map_err(|e| anyhow::anyhow!("confirm domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
 }
 
 /// ProverReject signature (multi filter).
-pub fn reject_sig(
-    km: &FileKeyManager,
-    filters: &[Vec<u8>],
-    frame: u64,
-) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn reject_sig(km: &FileKeyManager, filters: &[Vec<u8>], frame: u64) -> anyhow::Result<Bls48581AddressedSignature> {
     let msg = multi_filter_signing_message(filters, frame);
     let domain = prover_reject_domain().map_err(|e| anyhow::anyhow!("reject domain: {e}"))?;
     addressed_sig(km, &msg, &domain)
@@ -100,10 +80,7 @@ pub fn reject_sig(
 
 /// ProverUpdate (delegate) signature. The signed message is just the
 /// 32-byte delegate address.
-pub fn update_sig(
-    km: &FileKeyManager,
-    delegate_address: &[u8],
-) -> anyhow::Result<Bls48581AddressedSignature> {
+pub fn update_sig(km: &FileKeyManager, delegate_address: &[u8]) -> anyhow::Result<Bls48581AddressedSignature> {
     let domain = prover_update_domain().map_err(|e| anyhow::anyhow!("update domain: {e}"))?;
     addressed_sig(km, delegate_address, &domain)
 }
@@ -138,35 +115,20 @@ mod tests {
 
         let sig = leave_sig(&km, &filters, frame).unwrap();
 
-        let pubkey = km
-            .get_signer_by_id("q-prover-key")
-            .unwrap()
-            .public_key()
-            .to_vec();
+        let pubkey = km.get_signer_by_id("q-prover-key").unwrap().public_key().to_vec();
         let message = multi_filter_signing_message(&filters, frame);
         let domain = prover_leave_domain().unwrap();
 
         let ok = km
-            .validate_signature(
-                KeyType::Falcon512,
-                &pubkey,
-                &message,
-                &sig.signature,
-                &domain,
-            )
+            .validate_signature(KeyType::Falcon512, &pubkey, &message, &sig.signature, &domain)
             .unwrap();
-        assert!(
-            ok,
-            "leave signature must verify against KeyManager::validate_signature"
-        );
+        assert!(ok, "leave signature must verify against KeyManager::validate_signature");
 
         // Address is poseidon(pubkey), 32 bytes.
         assert_eq!(sig.address.len(), 32);
         assert_eq!(
             sig.address,
-            quil_crypto::poseidon::hash_bytes_to_32(&pubkey)
-                .unwrap()
-                .to_vec()
+            quil_crypto::poseidon::hash_bytes_to_32(&pubkey).unwrap().to_vec()
         );
     }
 
@@ -175,34 +137,18 @@ mod tests {
         let (km, _d) = km_with_prover_key();
         let filter = vec![0xAAu8; 32];
         let frame = 7u64;
-        let pubkey = km
-            .get_signer_by_id("q-prover-key")
-            .unwrap()
-            .public_key()
-            .to_vec();
+        let pubkey = km.get_signer_by_id("q-prover-key").unwrap().public_key().to_vec();
 
         let ps = pause_sig(&km, &filter, frame).unwrap();
         let pmsg = single_filter_signing_message(&filter, frame);
         assert!(km
-            .validate_signature(
-                KeyType::Falcon512,
-                &pubkey,
-                &pmsg,
-                &ps.signature,
-                &prover_pause_domain().unwrap()
-            )
+            .validate_signature(KeyType::Falcon512, &pubkey, &pmsg, &ps.signature, &prover_pause_domain().unwrap())
             .unwrap());
 
         let delegate = vec![0x11u8; 32];
         let us = update_sig(&km, &delegate).unwrap();
         assert!(km
-            .validate_signature(
-                KeyType::Falcon512,
-                &pubkey,
-                &delegate,
-                &us.signature,
-                &prover_update_domain().unwrap()
-            )
+            .validate_signature(KeyType::Falcon512, &pubkey, &delegate, &us.signature, &prover_update_domain().unwrap())
             .unwrap());
     }
 }

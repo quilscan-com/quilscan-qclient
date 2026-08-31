@@ -12,9 +12,7 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     let mut client = pc.connect().await?;
 
     let resp = client
-        .get_shard_info(tonic::Request::new(GetShardInfoRequest {
-            include_all: false,
-        }))
+        .get_shard_info(tonic::Request::new(GetShardInfoRequest { include_all: false }))
         .await
         .map_err(|e| anyhow::anyhow!("get shard info: {e}"))?
         .into_inner();

@@ -72,9 +72,7 @@ async fn fetch_rpc_data(
 
     let shard_info = match tokio::time::timeout(
         RPC_TIMEOUT,
-        client.get_shard_info(tonic::Request::new(GetShardInfoRequest {
-            include_all: true,
-        })),
+        client.get_shard_info(tonic::Request::new(GetShardInfoRequest { include_all: true })),
     )
     .await
     {

@@ -56,18 +56,26 @@ pub enum ProverCommand {
         filters: Vec<String>,
     },
     /// Confirm prover shard allocations for the given filters.
-    Confirm { filters: Vec<String> },
+    Confirm {
+        filters: Vec<String>,
+    },
     /// Reject prover shard allocations for the given filters.
-    Reject { filters: Vec<String> },
+    Reject {
+        filters: Vec<String>,
+    },
     /// Pause the prover for a shard filter.
     Pause {
         /// Hex-encoded 32-byte shard filter (default: all-0xFF).
         filter: Option<String>,
     },
     /// Resume the prover for a shard filter.
-    Resume { filter: Option<String> },
+    Resume {
+        filter: Option<String>,
+    },
     /// Update the reward delegate address (32-byte hex).
-    Delegate { address: String },
+    Delegate {
+        address: String,
+    },
     /// Submit an alt-shard-update: `<v-adds> <v-removes> <he-adds> <he-removes>` roots.
     AltShardUpdate {
         /// The four root hashes (hex), in order.
@@ -140,8 +148,13 @@ impl ProverCtx {
         client: &mut NodeServiceClient<Channel>,
         request: quil_types::proto::global::MessageRequest,
     ) -> anyhow::Result<()> {
-        crate::send::send_message_request(client, &self.key_manager, vec![0xFFu8; 32], request)
-            .await
+        crate::send::send_message_request(
+            client,
+            &self.key_manager,
+            vec![0xFFu8; 32],
+            request,
+        )
+        .await
     }
 }
 
@@ -170,9 +183,7 @@ pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> 
 }
 
 /// `workerByFilter` — map hex filter → core id from `GetWorkerInfo`.
-pub(crate) async fn worker_by_filter(
-    client: &mut NodeServiceClient<Channel>,
-) -> HashMap<String, u32> {
+pub(crate) async fn worker_by_filter(client: &mut NodeServiceClient<Channel>) -> HashMap<String, u32> {
     let mut m = HashMap::new();
     if let Ok(resp) = client
         .get_worker_info(tonic::Request::new(GetWorkerInfoRequest::default()))
@@ -202,6 +213,26 @@ pub(crate) fn format_storage(bytes: u64) -> String {
         format!("{:.1} KB", b / KB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+/// The `Size [MB]` cell — bytes as megabytes, one decimal, bare number.
+///
+/// The column states its unit in the header so the cells stay short and stay
+/// comparable at a glance; that is worth keeping. What it cost was the bottom
+/// of the range: one decimal of a megabyte resolves to ~52 KB, so every shard
+/// under that printed `0.0`, identical to an empty one.
+///
+/// A non-zero size that would round to `0.0` prints `<0.1` instead. It is an
+/// upper bound in the column's own unit, it right-aligns on the same decimal
+/// column as every other cell, and it sorts and filters as the byte value it
+/// really is — only the rendering changes.
+pub(crate) fn format_mb(v: &BigInt) -> String {
+    let mb = v.to_string().parse::<f64>().unwrap_or(0.0) / (1024.0 * 1024.0);
+    if v.sign() == Sign::Plus && mb < 0.05 {
+        "<0.1".to_string()
+    } else {
+        format!("{mb:.1}")
     }
 }
 
@@ -238,16 +269,21 @@ mod tests {
     }
 
     #[test]
+    fn format_mb_separates_a_small_shard_from_an_empty_one() {
+        assert_eq!(format_mb(&BigInt::from(0)), "0.0");
+        assert_eq!(format_mb(&BigInt::from(2048)), "<0.1");
+        // The rounding edge: 0.05 MB is where `{:.1}` starts printing `0.1`.
+        assert_eq!(format_mb(&BigInt::from(52_428)), "<0.1");
+        assert_eq!(format_mb(&BigInt::from(52_429)), "0.1");
+        assert_eq!(format_mb(&BigInt::from(5 * 1024 * 1024)), "5.0");
+        assert_eq!(format_mb(&BigInt::from(1024 * 1024 * 1024)), "1024.0");
+    }
+
+    #[test]
     fn format_quil_reward_8dp() {
         assert_eq!(format_quil_reward(&BigInt::from(0)), "0.00000000");
-        assert_eq!(
-            format_quil_reward(&BigInt::from(100_000_000u64)),
-            "1.00000000"
-        );
-        assert_eq!(
-            format_quil_reward(&BigInt::from(150_000_000u64)),
-            "1.50000000"
-        );
+        assert_eq!(format_quil_reward(&BigInt::from(100_000_000u64)), "1.00000000");
+        assert_eq!(format_quil_reward(&BigInt::from(150_000_000u64)), "1.50000000");
         assert_eq!(format_quil_reward(&BigInt::from(1u64)), "0.00000001");
     }
 }

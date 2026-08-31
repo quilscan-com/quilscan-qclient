@@ -40,16 +40,16 @@ impl EffectiveStatus {
     /// Display label (`effectiveStatus.String()`).
     pub fn label(self) -> &'static str {
         match self {
-            EffectiveStatus::Joining => "Joining",
-            EffectiveStatus::Active => "Active",
-            EffectiveStatus::Paused => "Paused",
-            EffectiveStatus::Leaving => "Leaving",
-            EffectiveStatus::ExpiredJoining => "ExpiredJoin",
-            EffectiveStatus::ExpiredLeaving => "ExpiredLeave",
-            EffectiveStatus::ExpiredEpoch => "Re-confirm!",
-            EffectiveStatus::Rejected => "Rejected",
-            EffectiveStatus::Kicked => "Kicked",
-            EffectiveStatus::Unknown => "Unknown",
+            EffectiveStatus::Joining => "joining",
+            EffectiveStatus::Active => "active",
+            EffectiveStatus::Paused => "paused",
+            EffectiveStatus::Leaving => "leaving",
+            EffectiveStatus::ExpiredJoining => "expiredJoin",
+            EffectiveStatus::ExpiredLeaving => "expiredLeave",
+            EffectiveStatus::ExpiredEpoch => "re-confirm!",
+            EffectiveStatus::Rejected => "rejected",
+            EffectiveStatus::Kicked => "kicked",
+            EffectiveStatus::Unknown => "unknown",
         }
     }
 
@@ -98,11 +98,7 @@ pub struct AllocationTiming<'a> {
 
 /// `computeEffectiveStatus` — map raw status + timing + current frame to
 /// the effective lifecycle state.
-pub fn compute_effective_status(
-    a: &AllocationTiming,
-    current_frame: u64,
-    epoch_length: u64,
-) -> EffectiveStatus {
+pub fn compute_effective_status(a: &AllocationTiming, current_frame: u64, epoch_length: u64) -> EffectiveStatus {
     let el = epoch_len(epoch_length);
     let current_epoch = current_frame / el;
 
@@ -250,7 +246,7 @@ mod tests {
     fn active_data_shard_expires_when_epoch_stale() {
         let mut t = timing(raw_status::ACTIVE);
         t.epoch = 1; // registered for epoch 1
-                     // current frame in epoch 3 -> stale
+        // current frame in epoch 3 -> stale
         assert_eq!(
             compute_effective_status(&t, 3 * 720, 720),
             EffectiveStatus::ExpiredEpoch
@@ -261,7 +257,7 @@ mod tests {
     fn joining_expires_past_confirm_epoch() {
         let mut t = timing(raw_status::JOINING);
         t.join_frame = 720; // epoch 1 -> must confirm epoch 2
-                            // current epoch 3 -> expired
+        // current epoch 3 -> expired
         assert_eq!(
             compute_effective_status(&t, 3 * 720, 720),
             EffectiveStatus::ExpiredJoining

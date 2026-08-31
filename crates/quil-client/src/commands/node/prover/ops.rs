@@ -50,8 +50,7 @@ pub async fn leave(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()>
         frame_number: frame,
         public_key_signature_bls48581: Some(sig),
     };
-    pc.send_global(&mut client, wrap(Request::Leave(op)))
-        .await?;
+    pc.send_global(&mut client, wrap(Request::Leave(op))).await?;
     println!("Prover leave sent successfully");
     Ok(())
 }
@@ -68,8 +67,7 @@ pub async fn confirm(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<(
         filters,
         leaf_roots: Vec::new(),
     };
-    pc.send_global(&mut client, wrap(Request::Confirm(op)))
-        .await?;
+    pc.send_global(&mut client, wrap(Request::Confirm(op))).await?;
     println!("Prover confirm sent successfully");
     Ok(())
 }
@@ -85,8 +83,7 @@ pub async fn reject(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()
         public_key_signature_bls48581: Some(sig),
         filters,
     };
-    pc.send_global(&mut client, wrap(Request::Reject(op)))
-        .await?;
+    pc.send_global(&mut client, wrap(Request::Reject(op))).await?;
     println!("Prover reject sent successfully");
     Ok(())
 }
@@ -101,8 +98,7 @@ pub async fn pause(pc: &ProverCtx, filter_arg: Option<&str>) -> anyhow::Result<(
         frame_number: frame,
         public_key_signature_bls48581: Some(sig),
     };
-    pc.send_global(&mut client, wrap(Request::Pause(op)))
-        .await?;
+    pc.send_global(&mut client, wrap(Request::Pause(op))).await?;
     println!("Prover pause sent successfully");
     Ok(())
 }
@@ -117,16 +113,15 @@ pub async fn resume(pc: &ProverCtx, filter_arg: Option<&str>) -> anyhow::Result<
         frame_number: frame,
         public_key_signature_bls48581: Some(sig),
     };
-    pc.send_global(&mut client, wrap(Request::Resume(op)))
-        .await?;
+    pc.send_global(&mut client, wrap(Request::Resume(op))).await?;
     println!("Prover resume sent successfully");
     Ok(())
 }
 
 pub async fn delegate(pc: &ProverCtx, address: &str) -> anyhow::Result<()> {
     let addr_hex = address.strip_prefix("0x").unwrap_or(address);
-    let delegate_address = hex::decode(addr_hex)
-        .map_err(|_| anyhow::anyhow!("Invalid delegate address: must be 32 bytes hex-encoded"))?;
+    let delegate_address =
+        hex::decode(addr_hex).map_err(|_| anyhow::anyhow!("Invalid delegate address: must be 32 bytes hex-encoded"))?;
     if delegate_address.len() != 32 {
         anyhow::bail!("Invalid delegate address: must be 32 bytes hex-encoded");
     }
@@ -139,12 +134,8 @@ pub async fn delegate(pc: &ProverCtx, address: &str) -> anyhow::Result<()> {
         delegate_address: delegate_address.clone(),
         public_key_signature_bls48581: Some(sig),
     };
-    pc.send_global(&mut client, wrap(Request::Update(op)))
-        .await?;
-    println!(
-        "Delegate address updated to 0x{}",
-        hex::encode(&delegate_address)
-    );
+    pc.send_global(&mut client, wrap(Request::Update(op))).await?;
+    println!("Delegate address updated to 0x{}", hex::encode(&delegate_address));
     Ok(())
 }
 
@@ -166,9 +157,7 @@ pub async fn alt_shard_update(pc: &ProverCtx, roots_hex: &[String]) -> anyhow::R
     ];
     let mut roots: Vec<Vec<u8>> = Vec::with_capacity(4);
     for (i, arg) in roots_hex.iter().enumerate() {
-        roots.push(
-            hex::decode(arg).map_err(|e| anyhow::anyhow!("invalid {} hex: {e}", root_names[i]))?,
-        );
+        roots.push(hex::decode(arg).map_err(|e| anyhow::anyhow!("invalid {} hex: {e}", root_names[i]))?);
     }
 
     let mut client = pc.connect().await?;
@@ -202,8 +191,7 @@ pub async fn alt_shard_update(pc: &ProverCtx, roots_hex: &[String]) -> anyhow::R
         hyperedge_removes_root: roots[3].clone(),
         signature,
     };
-    pc.send_global(&mut client, wrap(Request::AltShardUpdate(op)))
-        .await?;
+    pc.send_global(&mut client, wrap(Request::AltShardUpdate(op))).await?;
     println!("Alt shard update sent successfully");
     Ok(())
 }
