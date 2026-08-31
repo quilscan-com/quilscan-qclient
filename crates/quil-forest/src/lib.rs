@@ -318,6 +318,66 @@ pub fn prefix_to_bits(prefix: &[u32], bits_per_level: u32) -> Vec<bool> {
     bits
 }
 
+/// The 2-byte big-endian bit-length header that follows the app address.
+const SHARD_BIT_LEN_BYTES: usize = 2;
+
+/// Pack a bit-path into `ceil(n/8)` bytes, MSB-first, zero-padded.
+fn pack_bits(bit_path: &[bool]) -> Vec<u8> {
+    let mut out = vec![0u8; bit_path.len().div_ceil(8)];
+    for (i, &bit) in bit_path.iter().enumerate() {
+        if bit {
+            out[i / 8] |= 1 << (7 - (i % 8));
+        }
+    }
+    out
+}
+
+/// Encode a shard as `app ‖ bit_len(u16 BE) ‖ packed bits`.
+pub fn encode_shard_bit_path(app: &[u8], bit_path: &[bool]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(app.len() + SHARD_BIT_LEN_BYTES + bit_path.len().div_ceil(8));
+    out.extend_from_slice(app);
+    out.extend_from_slice(&(bit_path.len() as u16).to_be_bytes());
+    out.extend_from_slice(&pack_bits(bit_path));
+    out
+}
+
+/// Sentinel first `Vec<u32>` level marking a deep-bifurcation bit-path prefix.
+pub const BIT_PATH_PREFIX_SENTINEL: u32 = 0xFFFF_FFFF;
+
+/// If `prefix` is sentinel-tagged, decode its remaining `0`/`1` levels.
+pub fn shard_bit_path_from_prefix(prefix: &[u32]) -> Option<Vec<bool>> {
+    let (&head, rest) = prefix.split_first()?;
+    if head != BIT_PATH_PREFIX_SENTINEL {
+        return None;
+    }
+    let mut bits = Vec::with_capacity(rest.len());
+    for &level in rest {
+        match level {
+            0 => bits.push(false),
+            1 => bits.push(true),
+            _ => return None,
+        }
+    }
+    Some(bits)
+}
+
+/// Canonical `ShardInfo.prefix` to wire shard-filter conversion.
+///
+/// Legacy prefixes append their low bytes to `l2`. Sentinel-tagged deep
+/// prefixes use the bit-path encoding so the sentinel cannot be truncated to
+/// a bogus `0xFF` suffix.
+pub fn shard_prefix_to_filter(l2: &[u8], prefix: &[u32]) -> Vec<u8> {
+    if let Some(bits) = shard_bit_path_from_prefix(prefix) {
+        encode_shard_bit_path(l2, &bits)
+    } else {
+        let mut filter = l2.to_vec();
+        for &level in prefix {
+            filter.push(level as u8);
+        }
+        filter
+    }
+}
+
 /// Derive the canonical address **bit-path** of every shard in an app from the
 /// COMPLETE shard-prefix set, resolving the `ShardInfo.prefix` overload.
 ///
