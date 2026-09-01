@@ -3,3 +3,4 @@
 .env.signers
 target/
 crates/quil-client/build/
+/docs/
