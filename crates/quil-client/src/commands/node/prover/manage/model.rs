@@ -1075,8 +1075,13 @@ mod tests {
     #[test]
     fn defaults_and_navigation_follow_the_materialization_columns() {
         let mut model = Model::new();
-        assert_eq!(model.alloc_sort_col, 10); // Worker
-        assert_eq!(model.avail_sort_col, 9); // Reward [Q/f]
+        assert_eq!(ALLOC_COL_NAMES[model.alloc_sort_col as usize], "Worker");
+        assert!(model.alloc_sort_asc);
+        assert_eq!(
+            AVAIL_COL_NAMES[model.avail_sort_col as usize],
+            "Reward [Q/f]"
+        );
+        assert!(!model.avail_sort_asc);
         assert_eq!(model.active_panel_col_count(), ALLOC_COL_NAMES.len());
 
         model.focus = PanelFocus::Available;

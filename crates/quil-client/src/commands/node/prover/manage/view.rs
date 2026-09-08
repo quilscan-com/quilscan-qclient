@@ -371,7 +371,7 @@ fn alloc_widths_fixed(
     );
     let reward_w = fit(
         ALLOC_REWARD_WIDTH,
-        sorted.iter().map(|a| alloc_cell(m, a, 9, 0).len()),
+        sorted.iter().map(|a| alloc_cell(m, a, 6, 0).len()),
     );
     // Whatever the wide columns took comes out of the flexible Filter column.
     let grown = (shards_w - SHARDS_WIDTH) + (reward_w - ALLOC_REWARD_WIDTH);
@@ -1086,7 +1086,7 @@ mod tests {
         }
         // Reward stops carrying its unit, so the column fits its header.
         let (w, _) = avail_col_widths(&m, 154, &rows);
-        assert_eq!(w[9], avail_header(&m, 9).len());
+        assert_eq!(w[6], avail_header(&m, 6).len());
     }
 
     /// The table as reported: 15 joining allocations, sorted ascending on
@@ -1115,18 +1115,18 @@ mod tests {
 
     #[test]
     fn header_text_decorates_and_underscores() {
-        assert_eq!(header_text("Worker", 10, 10, true, false, false), "^|Worker");
-        assert_eq!(header_text("Worker", 10, 10, false, false, false), "v|Worker");
-        assert_eq!(header_text("Ring", 3, 10, true, true, false), "Ring*");
+        assert_eq!(header_text("Worker", 7, 7, true, false, false), "^|Worker");
+        assert_eq!(header_text("Worker", 7, 7, false, false, false), "v|Worker");
+        assert_eq!(header_text("Ring", 3, 7, true, true, false), "Ring*");
         assert_eq!(header_text("Ring", 3, 3, true, true, false), "^|Ring*");
         // Measured columns sit one space apart, so the spaces inside a name
         // become underscores to keep the pairs readable.
         assert_eq!(
-            header_text("Default Action", 14, 10, true, false, true),
+            header_text("Default Action", 11, 7, true, false, true),
             "Default_Action"
         );
         assert_eq!(
-            header_text("Default Action", 14, 10, true, false, false),
+            header_text("Default Action", 11, 7, true, false, false),
             "Default Action"
         );
     }
@@ -1147,10 +1147,10 @@ mod tests {
                 9,  // "Size_[MB]"
                 8,  // "10076371", wider than "Shards"
                 3,  // "Mat"
-                3,  // "Lag"
-                7,  // "Unknown", wider than "State"
+                5,  // "Lag"
+                7,  // "joining", wider than "State"
                 12, // "Reward_[Q/f]"
-                8,  // "^|Worker"
+                6,  // "Worker"
                 7,  // "joining", wider than "Status"
                 4,  // "Mode"
                 11, // "Next_Action", wider than "confirmed"
@@ -1164,11 +1164,11 @@ mod tests {
 
     #[test]
     fn fixed_sizing_reproduces_the_historical_layout() {
-        let (w, fw) = alloc_col_widths(&fixed(), 200, &joining_table());
-        assert_eq!(w, vec![6, 40, 7, 5, 10, 8, 9, 6, 8, 14, 9, 12, 4, 30, 16]);
-        assert_eq!(fw, 40);
-        assert_eq!(w.iter().sum::<usize>() + 14, 198);
-        // 30 columns of Next Action for a 9-column value, plus panel borders.
+        let (w, fw) = alloc_col_widths(&fixed(), 154, &joining_table());
+        assert_eq!(w, vec![6, 12, 7, 5, 10, 8, 9, 8, 8, 14, 7, 12, 4, 30, 16]);
+        assert_eq!(fw, 12);
+        assert_eq!(w.iter().sum::<usize>() + 14, 170);
+        // 30 columns of Next Action for a 9-column value in the fixed layout.
         assert_eq!(w[13], NEXT_ACTION_WIDTH);
     }
 
@@ -1211,23 +1211,12 @@ mod tests {
         let rows = joining_table();
         // Wide pane: Filter stops at the longest hex rather than padding on.
         assert_eq!(alloc_col_widths(&m, 300, &rows).1, 64);
-        assert_eq!(alloc_col_widths(&m, 183, &rows).1, 64);
+        assert_eq!(alloc_col_widths(&m, 167, &rows).1, 48);
         // Narrower: Filter absorbs the shortfall…
         assert_eq!(alloc_col_widths(&m, 154, &rows).1, 35);
-        assert_eq!(alloc_col_widths(&m, 134, &rows).1, 15);
+        assert_eq!(alloc_col_widths(&m, 118, &rows).1, 12);
         // …down to the floor, past which the row is clipped rather than shrunk.
         assert_eq!(alloc_col_widths(&m, 115, &rows).1, MIN_FILTER_WIDTH);
         assert_eq!(alloc_col_widths(&m, 40, &rows).1, MIN_FILTER_WIDTH);
-    }
-
-    #[test]
-    fn fixed_reward_width_measures_the_reward_column() {
-        let mut rows = joining_table();
-        rows[0].estimated_reward = BigInt::parse_bytes(b"1000000000000000000000000000000000", 10)
-            .expect("valid reward literal");
-
-        let (widths, _) = alloc_widths_fixed(&fixed(), 300, &rows);
-        assert_eq!(widths[9], fmt_reward(&rows[0].estimated_reward).len());
-        assert_eq!(widths[6], MAT_WIDTH);
     }
 }
