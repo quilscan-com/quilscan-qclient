@@ -37,20 +37,9 @@ fn format_claimable_rewards_output(
     cited_frame: u64,
     json: bool,
 ) -> anyhow::Result<String> {
-    let value = if witness_found {
-        if witness_value.len() != 16 {
-            anyhow::bail!("reward witness returned a malformed value");
-        }
-        let mut value_bytes = [0u8; 16];
-        value_bytes.copy_from_slice(witness_value);
-        u128::from_le_bytes(value_bytes)
-    } else {
-        0
-    };
-
-    // A zero balance is equivalent to no claimable reward.
-    let found = value != 0;
-    let balance_subunits = if found { value } else { 0 };
+    let value = super::balance::claimable_reward_value(witness_found, witness_value)?;
+    let found = value.is_some();
+    let balance_subunits = value.unwrap_or(0);
     let balance = BigInt::from(balance_subunits);
     let balance_quil = util::float_string_12(&balance, &BigInt::from(QUIL_TOKEN_UNITS));
 
@@ -150,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn json_output_normalizes_zero_witness_to_not_found() {
+    fn json_output_preserves_present_zero_witness() {
         let value = 0u128.to_le_bytes();
 
         let json = format_claimable_rewards_output(true, &value, 700_001, true)
@@ -158,7 +147,7 @@ mod tests {
 
         assert_eq!(
             json,
-            r#"{"found":false,"balance_subunits":"0","balance_quil":"0.000000000000","units_per_quil":100000000000,"cited_frame":700001}"#
+            r#"{"found":true,"balance_subunits":"0","balance_quil":"0.000000000000","units_per_quil":100000000000,"cited_frame":700001}"#
         );
     }
 
