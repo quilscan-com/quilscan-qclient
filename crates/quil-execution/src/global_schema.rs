@@ -119,6 +119,15 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // balance is credited twice and the prover-tree root forks
             // timing-dependently. FLAG-DAY: changes the reward vertex encoding.
             FieldTag { name: "LastRewardFrameNumber", order: 2, size: 8, rdf_type: RdfType::Uint },
+            // order 3 — the set of shard filters ALREADY credited at
+            // `LastRewardFrameNumber`, length-prefixed (`u16 BE len ‖ filter`),
+            // sorted. Reset whenever the frame advances. This makes the
+            // idempotency guard key on (frame, SHARD) instead of frame-only: a
+            // prover on multiple shards accrues each shard's reward at the same
+            // global frame (matching Go's per-shard `applyReward`), while a
+            // re-materialize of the SAME (frame, shard) by the archive's second
+            // path still skips. Variable length.
+            FieldTag { name: "RewardedShardsBlob", order: 3, size: 512, rdf_type: RdfType::ByteArray },
         ],
     },
     // NOTE: merge:SpentMerge is NOT in the Go GLOBAL_RDF_SCHEMA turtle.
@@ -166,6 +175,22 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             FieldTag { name: "NextLeafRoot",  order: 8, size: 128, rdf_type: RdfType::ByteArray },
             // order 9 — next-epoch slot: leaf block count.
             FieldTag { name: "NextNumBlocks", order: 9, size: 8,   rdf_type: RdfType::Uint },
+            // THIRD ("prev") slot (orders 10..12). The storage audit is
+            // anchor-lagged: for the first ~K frames of a new epoch it audits
+            // openings still anchored to the PREVIOUS epoch (the app-shard frame
+            // was produced ~K frames earlier). A two-slot {current,next} vertex
+            // evicts the previous epoch the instant a member re-confirms at the
+            // boundary, so those still-in-flight openings find no registration
+            // and the member is spuriously KICKED (Status=4, seniority zeroed).
+            // Retaining the previous epoch for one extra rotation covers the
+            // anchor lag. Only written once a third (older) epoch is retained, so
+            // 1/2-slot registrations stay byte-identical to the pre-change layout.
+            // order 10 — prev-epoch slot: replication epoch.
+            FieldTag { name: "PrevEpoch",     order: 10, size: 8,   rdf_type: RdfType::Uint },
+            // order 11 — prev-epoch slot: registered KZG leaf root.
+            FieldTag { name: "PrevLeafRoot",  order: 11, size: 128, rdf_type: RdfType::ByteArray },
+            // order 12 — prev-epoch slot: leaf block count.
+            FieldTag { name: "PrevNumBlocks", order: 12, size: 8,   rdf_type: RdfType::Uint },
         ],
     },
 ];

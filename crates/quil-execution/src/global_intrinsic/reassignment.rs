@@ -64,6 +64,19 @@ pub fn rewrite_allocation_filter(old_blob: &[u8], new_filter: &[u8]) -> Result<V
     Ok(vertex_tree_to_blob(&tree))
 }
 
+/// Rewrite an allocation vertex blob's `Status` byte, preserving every other
+/// field verbatim. Used to retire a vacated allocation slot to
+/// [`materialize::STATUS_HISTORIC`] IN PLACE when a reassignment moves the prover
+/// off this filter — instead of deleting the vertex, which would permanently
+/// tombstone its `allocation_address` (the removes-phase gate in
+/// `HypergraphCrdt::get_vertex_data`) and make the slot unrepresentable if the
+/// shard is ever re-formed (split→lose-coverage→merge-back).
+pub fn set_allocation_status(old_blob: &[u8], status: u8) -> Result<Vec<u8>> {
+    let mut tree = rebuild_vertex_tree_from_blob(old_blob);
+    write_field(&mut tree, ALLOCATION_CLASS, "Status", &[status])?;
+    Ok(vertex_tree_to_blob(&tree))
+}
+
 /// Rebuild a prover's allocation hyperedge blob, replacing the atom for
 /// `old_alloc_addr` with one for `new_alloc_addr` (built from
 /// `new_alloc_tree`) while keeping every other atom byte-identical.
@@ -116,6 +129,38 @@ pub fn rebuild_hyperedge_with_reassigned_atom(
         &BigInt::from(atom_bytes.len() as u64),
     )?;
 
+    Ok(vertex_tree_to_blob(&tree))
+}
+
+/// Rebuild a prover's allocation hyperedge blob WITHOUT the atom for
+/// `drop_alloc_addr`, keeping every other atom byte-identical — the removal
+/// counterpart of [`rebuild_hyperedge_with_reassigned_atom`], used when a
+/// surplus allocation is dropped outright (not moved) so the prover is no longer
+/// enumerated on that shard. An empty/absent existing blob yields an empty
+/// hyperedge. Like the reassign builder, the trie is a pure function of its
+/// `(key, value)` set, so re-inserting the survivors in any order reproduces an
+/// identical blob across nodes.
+pub fn rebuild_hyperedge_without_atom(
+    existing_blob: &[u8],
+    drop_alloc_addr: &[u8; 32],
+) -> Result<Vec<u8>> {
+    let mut drop_key = [0u8; 64];
+    drop_key[..32].copy_from_slice(&GLOBAL_INTRINSIC_ADDRESS);
+    drop_key[32..].copy_from_slice(drop_alloc_addr);
+
+    let mut tree = VectorCommitmentTree::new();
+    if !existing_blob.is_empty() {
+        if let Some(root) = quil_tries::deserialize_go_tree(existing_blob)? {
+            let mut src = VectorCommitmentTree::new();
+            src.root = Some(root);
+            for (key, value) in src.leaves() {
+                if key.as_slice() == drop_key.as_slice() {
+                    continue;
+                }
+                tree.insert(&key, &value, &[], &BigInt::from(value.len() as u64))?;
+            }
+        }
+    }
     Ok(vertex_tree_to_blob(&tree))
 }
 
@@ -176,6 +221,40 @@ mod tests {
     #[test]
     fn assign_child_index_empty_address_is_zero() {
         assert_eq!(assign_child_index(&[], 4), 0);
+    }
+
+    /// Why the split reassignment round-robins (post-cutover) instead of using
+    /// `assign_child_index`: for a SMALL committee whose addresses cluster on one
+    /// side of the split bit, `assign_child_index` sends everyone to the same
+    /// child and leaves the sibling permanently uncovered (the localnet
+    /// "child …80 never covered" artifact). Deterministic round-robin over the
+    /// address-sorted provers covers every child.
+    #[test]
+    fn round_robin_covers_children_where_assign_child_index_leaves_a_gap() {
+        // 4 provers, all with address byte < 0x80 → all hash to child 0.
+        let addrs: Vec<[u8; 32]> = [0x10u8, 0x20, 0x30, 0x40]
+            .iter()
+            .map(|&b| {
+                let mut a = [0u8; 32];
+                a[0] = b;
+                a
+            })
+            .collect();
+        let k = 2usize;
+
+        let mut hashed = vec![0usize; k];
+        for a in &addrs {
+            hashed[assign_child_index(a, k)] += 1;
+        }
+        assert_eq!(hashed, vec![4, 0], "assign_child_index leaves child 1 EMPTY for clustered small-N");
+
+        // Round-robin over the sorted provers (what reassign_shard_allocations
+        // does at/after the cutover) covers both children.
+        let mut rr = vec![0usize; k];
+        for i in 0..addrs.len() {
+            rr[i % k] += 1;
+        }
+        assert_eq!(rr, vec![2, 2], "round-robin covers both children evenly");
     }
 
     // ---- rewrite_allocation_filter ------------------------------------

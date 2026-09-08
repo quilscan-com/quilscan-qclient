@@ -33,8 +33,8 @@ use crate::global_engine::{
 };
 use crate::global_schema::{read_field, write_field, GLOBAL_INTRINSIC_ADDRESS};
 use crate::hypergraph_state::{
-    HypergraphState, hyperedge_adds_discriminator, vertex_adds_discriminator,
-    vertex_removes_discriminator,
+    HypergraphState, hyperedge_adds_discriminator,
+    vertex_adds_discriminator, vertex_removes_discriminator,
 };
 
 /// The global intrinsic: holds dependencies for signature
@@ -63,6 +63,29 @@ pub struct GlobalIntrinsic {
     prover_registry: Option<Arc<dyn quil_types::consensus::ProverRegistry>>,
     /// Reward issuance calculator for per-ring share computation.
     reward_issuance: Option<Arc<dyn quil_types::consensus::RewardIssuance>>,
+    /// The KEEP-set for the unified-tree split reset: prover addresses
+    /// (`poseidon(bls_pubkey)`) that survive the flag-day drop — the genesis
+    /// archives + beacon. Every other prover record is removed at the reset frame
+    /// so the corrupt post-split shard grid is rebuilt from the genesis topology
+    /// (see [`Self::maybe_apply_split_reset`]). Absent ⇒ the reset no-ops (a node
+    /// without the set syncs the post-reset state rather than computing it).
+    archive_prover_addresses: Option<Arc<std::collections::HashSet<Vec<u8>>>>,
+    /// The QUIL genesis shard-prefix set the split reset rebuilds the grid to —
+    /// NETWORK-specific (mainnet = 64-way `[[0]..[63]]`; testnet/localnet =
+    /// single `[[]]`), so it mirrors whatever `genesis` seeded on this net rather
+    /// than hardcoding mainnet's layout. Injected by the node; absent ⇒ reset
+    /// no-ops (paired with [`Self::archive_prover_addresses`]).
+    reset_genesis_prefixes: Option<Arc<Vec<Vec<u32>>>>,
+    /// Once-per-frame guard for [`Self::apply_due_shard_changes`]. It is called
+    /// BOTH once-per-frame standalone (`apply_global_due_shard_changes`) AND inline
+    /// per app-shard `FrameHeader` request (`invoke_frame_header`); with a backlog
+    /// of shard frames per shard the inline calls run the full pending-change
+    /// tombstone scan + reassign N times per global frame (the materialize balloon).
+    /// The due changes are frame-gated + idempotent, so the work only needs to run
+    /// once: this records the last global frame it completed for and short-circuits
+    /// any further call at the same frame. `u64::MAX` = "never run" so frame 0 still
+    /// applies. Set only on SUCCESS, so a failed/partial apply re-runs on retry.
+    last_due_apply_frame: std::sync::atomic::AtomicU64,
 }
 
 impl GlobalIntrinsic {
@@ -78,6 +101,9 @@ impl GlobalIntrinsic {
             inclusion_prover: None,
             prover_registry: None,
             reward_issuance: None,
+            archive_prover_addresses: None,
+            reset_genesis_prefixes: None,
+            last_due_apply_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -97,6 +123,9 @@ impl GlobalIntrinsic {
             inclusion_prover: None,
             prover_registry: None,
             reward_issuance: None,
+            archive_prover_addresses: None,
+            reset_genesis_prefixes: None,
+            last_due_apply_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -119,6 +148,9 @@ impl GlobalIntrinsic {
             inclusion_prover: None,
             prover_registry: None,
             reward_issuance: None,
+            archive_prover_addresses: None,
+            reset_genesis_prefixes: None,
+            last_due_apply_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -153,6 +185,29 @@ impl GlobalIntrinsic {
         self
     }
 
+    /// Install the archive KEEP-set for the unified-tree split reset — the
+    /// prover addresses (`poseidon(bls_pubkey)`) of the genesis archives + beacon
+    /// that survive the flag-day drop. Only nodes that materialize the reset
+    /// (global archives) need this; others sync the post-reset state.
+    pub fn with_archive_prover_addresses(
+        mut self,
+        archive_prover_addresses: Arc<std::collections::HashSet<Vec<u8>>>,
+    ) -> Self {
+        self.archive_prover_addresses = Some(archive_prover_addresses);
+        self
+    }
+
+    /// Install the QUIL genesis shard-prefix set the split reset rebuilds to
+    /// (network-specific: mainnet 64-way, testnet single). Paired with
+    /// [`Self::with_archive_prover_addresses`]; both required for the reset to run.
+    pub fn with_reset_genesis_prefixes(
+        mut self,
+        reset_genesis_prefixes: Arc<Vec<Vec<u32>>>,
+    ) -> Self {
+        self.reset_genesis_prefixes = Some(reset_genesis_prefixes);
+        self
+    }
+
     /// Install the VDF frame prover used by `invoke_frame_header`
     /// for the per-participant multi-proof attestation check.
     pub fn with_frame_prover(
@@ -172,6 +227,35 @@ impl GlobalIntrinsic {
         clock_store: Arc<dyn ClockStore>,
     ) -> Self {
         self.clock_store = Some(clock_store);
+        self
+    }
+
+    /// Install the shards store used by shard split/merge materialization.
+    /// Without it, `invoke_shard_split`/`invoke_shard_merge` validate but
+    /// record NO `PendingShardChange`, and `apply_due_shard_changes` no-ops —
+    /// so proposed splits "succeed" yet never take effect (the shard stays
+    /// overcrowded and provers re-propose every frame). Must be paired with
+    /// [`Self::with_shards_db`].
+    pub fn with_shards_store(mut self, shards_store: Arc<dyn ShardsStore>) -> Self {
+        self.shards_store = Some(shards_store);
+        self
+    }
+
+    /// Install the KvDb the shard-change records + topology flips are written
+    /// through. Must point at the SAME backing store as
+    /// [`Self::with_shards_store`]. Required for split/merge to persist.
+    pub fn with_shards_db(mut self, shards_db: Arc<dyn KvDb>) -> Self {
+        self.shards_db = Some(shards_db);
+        self
+    }
+
+    /// Install ONLY the hypergraph CRDT — the committed-state source the
+    /// deterministic reassignment / allocation re-home enumerate provers from.
+    /// The richer [`Self::with_kick_verify_deps`] also wires it but pulls in a
+    /// BLS constructor + inclusion prover; this is the minimal form for paths
+    /// (and tests) that need committed-state reads without equivocation checks.
+    pub fn with_hypergraph(mut self, hypergraph: Arc<quil_hypergraph::HypergraphCrdt>) -> Self {
+        self.hypergraph = Some(hypergraph);
         self
     }
 
@@ -368,7 +452,7 @@ impl GlobalIntrinsic {
                 // and consensus would split between nodes that did vs
                 // did not run materialization.
                 if let Some(pt) = prover_tree {
-                    verify::verify_prover_join_not_kicked(pt)?;
+                    verify::verify_prover_join_not_kicked(pt, frame_number)?;
                 }
                 // Existing-allocation expiry gate. For each filter
                 // in the join, check the prover's current allocation:
@@ -421,14 +505,27 @@ impl GlobalIntrinsic {
             }
             TYPE_SHARD_SPLIT => {
                 let op = super::prover_ops::ShardSplit::from_canonical_bytes(input)?;
+                tracing::debug!(
+                    frame = frame_number,
+                    shard = hex::encode(&op.shard_address),
+                    proposed = op.proposed_shards.len(),
+                    "validate_message: ShardSplit reached validation wall"
+                );
                 // Fail-closed. No prover_tree means we couldn't
                 // resolve the signer's BLS pubkey, so the BLS verify
                 // can't run. Reject rather than accept on faith.
                 let pt = prover_tree.ok_or_else(|| QuilError::InvalidArgument(
                     "ShardSplit: prover tree unavailable — cannot verify signature".into(),
                 ))?;
-                let sig_ok = verify::verify_shard_split(&op, pt, self.key_manager.as_ref())?;
+                let sig_ok = match verify::verify_shard_split(&op, pt, self.key_manager.as_ref()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(frame = frame_number, error = %e, "validate_message: ShardSplit verify ERRORED → rejected");
+                        return Err(e);
+                    }
+                };
                 if !sig_ok {
+                    tracing::warn!(frame = frame_number, "validate_message: ShardSplit sig_ok=false → rejected");
                     return Ok(false);
                 }
                 // Signer must be an active global prover. Mirrors Go
@@ -848,11 +945,21 @@ impl GlobalIntrinsic {
                                 read_field(alloc_tree, "allocation:ProverAllocation", "Status")
                                     .and_then(|b| b.first().copied())
                                     .unwrap_or(0);
+                            // A split-away parent is no longer in the
+                            // registered shard set; its provers bypass
+                            // the halt-risk floor so they can drain onto
+                            // the children (deep-split convergence).
+                            let shard_removed = self
+                                .shards_store
+                                .as_ref()
+                                .map(|s| !shard_filter_is_registered(s.as_ref(), filter))
+                                .unwrap_or(false);
                             check_leave_confirm_halt_risk(
                                 filter,
                                 current_status,
                                 self.prover_registry.as_deref(),
                                 fn_,
+                                shard_removed,
                             )?;
 
                             materialize::materialize_prover_confirm(alloc_tree, fn_)
@@ -1145,7 +1252,10 @@ impl GlobalIntrinsic {
                     .unwrap_or_default();
                 if kick_frame.len() == 8 {
                     let kf = u64::from_be_bytes(kick_frame.try_into().unwrap());
-                    if kf > 0 {
+                    // Spurious-kick amnesty (must mirror the validate-side gate in
+                    // `verify_prover_join_not_kicked` exactly): a kick before the
+                    // flag-day frame stops barring re-join once the chain reaches it.
+                    if materialize::kick_bars_rejoin(kf, frame_number) {
                         return Err(QuilError::InvalidArgument(
                             "invoke_step join: prover has been previously kicked".into(),
                         ));
@@ -1161,8 +1271,13 @@ impl GlobalIntrinsic {
                             let status = read_field(&alloc_tree, "allocation:ProverAllocation", "Status")
                                 .and_then(|b| b.first().copied())
                                 .unwrap_or(4);
-                            // Status 4 (left/kicked) is ok to rejoin
-                            if status != 4 {
+                            // Byte 4 (Rejected) and byte 6 (Historic) are ok to
+                            // rejoin — a Historic slot was vacated by a reassignment
+                            // and RETAINED for reactivation, so a fresh Join reclaims
+                            // it instead of being blocked by the 720-frame window.
+                            // MUST match the validate-side gate in
+                            // `verify_prover_join_allocations_expired`.
+                            if status != 4 && status != materialize::STATUS_HISTORIC {
                                 // Check if the allocation has expired (720 frame window)
                                 let join_frame = read_field(&alloc_tree, "allocation:ProverAllocation", "JoinFrameNumber")
                                     .unwrap_or_default();
@@ -1840,6 +1955,21 @@ impl GlobalIntrinsic {
         let unproven_storage = op.global_frame_number > 0
             && state_size_u64 > 0
             && op.storage_attestation.is_empty();
+        if unproven_storage {
+            // Previously silent: the reward basis is zeroed here WITHOUT halting
+            // or evicting, so from the operator seat the node looks healthy while
+            // being paid 0. Surface it — a persistent stream of these means the
+            // shard's producer is not attaching a storage attestation (see the
+            // app-engine "no storage openings built" log), so no reward proof is
+            // ever earned even though the shard carries committed data.
+            tracing::warn!(
+                address = %hex::encode(&op.address[..op.address.len().min(8)]),
+                frame_number = op.frame_number,
+                global_frame_number = op.global_frame_number,
+                state_size = state_size_u64,
+                "proof-of-storage gate: shard has committed data but frame carries NO storage attestation — WITHHOLDING reward (basis zeroed), frame NOT halted; prover silently paid 0 for this shard"
+            );
+        }
         let (state_size_u64, shard_count_u64) = if unproven_storage {
             (0u64, 0u64)
         } else {
@@ -1946,17 +2076,45 @@ impl GlobalIntrinsic {
     /// before message processing), so the check is deterministic across
     /// nodes. Fails closed: returns false when the registry is unavailable
     /// or the proposer is unknown.
-    fn proposer_is_active_global(&self, address: &[u8]) -> bool {
-        let Some(registry) = self.prover_registry.as_ref() else {
-            return false;
+    /// Authorize a shard split/merge signer as an ACTIVE GLOBAL prover, checked
+    /// against COMMITTED hypergraph state — IDENTICAL to `validate_message`'s
+    /// `verify_shard_op_signer_is_active_global`, so invoke and validate always
+    /// agree on the same node.
+    ///
+    /// FOLLOWER nodes (regular nodes, not the global committee) wire the intrinsic
+    /// with `install_frame_prover`, NOT `install_frame_header_deps`, so their
+    /// `hypergraph` slot is `None`. Like validate (whose check is `if let Some(hg)`
+    /// → skipped when absent), we then SKIP the authorization and trust the
+    /// FINALIZED frame's QC — the global committee already validated + authorized
+    /// the op before it finalized, and a follower has no committed global-prover
+    /// view to re-check against. The previous code instead consulted the ASYNC
+    /// `prover_registry` cache here, which lags on followers → they REJECTED (at
+    /// invoke) a finalized split their own validate had ACCEPTED → never recorded
+    /// the `PendingShardChange` → `apply_due_shard_changes` no-oped → the
+    /// follower's shards_store stayed single-shard forever (stale app_prefixes →
+    /// size-buckets → compute_shard_root: the deep-split empty-leaf churn).
+    fn proposer_is_active_global(
+        &self,
+        prover_tree: &quil_tries::VectorCommitmentTree,
+    ) -> bool {
+        let Some(hg) = self.hypergraph.as_ref() else {
+            // No committed state (follower) → trust the finalized frame, like validate.
+            return true;
         };
-        match registry.get_prover_info(address) {
-            Ok(Some(info)) => info.allocations.iter().any(|a| {
-                a.confirmation_filter.is_empty()
-                    && a.status == quil_types::consensus::ProverStatus::Active
-            }),
-            _ => false,
-        }
+        let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
+        let Ok(va_disc) = crate::hypergraph_state::vertex_adds_discriminator() else {
+            return true;
+        };
+        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+        verify::verify_shard_op_signer_is_active_global(
+            prover_tree,
+            |addr: &[u8; 32]| -> quil_types::error::Result<Option<quil_tries::VectorCommitmentTree>> {
+                let blob = hg_state.get(domain, addr, &va_disc)?;
+                Ok(blob.and_then(|b| if b.is_empty() { None }
+                    else { Some(crate::prover_registry::rebuild_vertex_tree_from_blob(&b)) }))
+            },
+        )
+        .is_ok()
     }
 
     /// ShardSplit invoke_step: register new sub-shard addresses.
@@ -1974,6 +2132,12 @@ impl GlobalIntrinsic {
         state: &HypergraphState,
         va_disc: &[u8; 32],
     ) -> Result<()> {
+        tracing::debug!(
+            frame = frame_number,
+            shard = hex::encode(&op.shard_address),
+            proposed = op.proposed_shards.len(),
+            "invoke_shard_split: received split op"
+        );
         // Defense-in-depth — re-verify the BLS signature against the
         // prover tree's pubkey. validate_message already ran this on
         // the bundle; this is the second wall.
@@ -2004,7 +2168,12 @@ impl GlobalIntrinsic {
         // ACTIVE GLOBAL prover (one with an allocation whose
         // confirmation_filter is empty + status Active) may propose a
         // shard split.
-        if !self.proposer_is_active_global(&prover_address) {
+        if !self.proposer_is_active_global(&prover_tree) {
+            tracing::warn!(
+                frame = frame_number,
+                proposer = hex::encode(&prover_address),
+                "invoke_shard_split: REJECTED — proposer is not an active global prover"
+            );
             return Err(QuilError::InvalidArgument(
                 "invoke_shard_split: proposer is not an active global prover".into(),
             ));
@@ -2015,7 +2184,15 @@ impl GlobalIntrinsic {
         // takes effect at the E+2 boundary so committee membership stays frozen
         // within an epoch. Record a pending change; `apply_due_shard_changes`
         // (run from invoke_frame_header) applies it when the chain reaches E+2.
-        let _ = materialize::materialize_shard_split(&op.shard_address, &op.proposed_shards)?;
+        // Deep-bifurcation: post-cutover proposals encode children as bit-path
+        // filters (validated as bit-prefix extensions); pre-cutover as byte
+        // suffixes. The proposal frame decides the format.
+        let bit_path_mode = frame_number >= super::materialize::unified_tree_cutover_frame();
+        let _ = materialize::materialize_shard_split(
+            &op.shard_address,
+            &op.proposed_shards,
+            bit_path_mode,
+        )?;
 
         if let (Some(ref store), Some(ref db)) = (&self.shards_store, &self.shards_db) {
             let change = PendingShardChange {
@@ -2028,6 +2205,18 @@ impl GlobalIntrinsic {
             let txn = db.new_batch(false)?;
             store.put_pending_shard_change(txn.as_ref(), &change)?;
             txn.commit()?;
+            tracing::info!(
+                frame = frame_number,
+                shard = hex::encode(&op.shard_address),
+                effective_epoch = change.effective_epoch,
+                bit_path_mode,
+                "invoke_shard_split: recorded pending split change (applies at E+2)"
+            );
+        } else {
+            tracing::warn!(
+                frame = frame_number,
+                "invoke_shard_split: no shards_store/db — split validated but NOT persisted"
+            );
         }
 
         Ok(())
@@ -2048,6 +2237,12 @@ impl GlobalIntrinsic {
         state: &HypergraphState,
         va_disc: &[u8; 32],
     ) -> Result<()> {
+        tracing::debug!(
+            frame = frame_number,
+            parent = hex::encode(&op.parent_address),
+            children = op.shard_addresses.len(),
+            "invoke_shard_merge: received merge op"
+        );
         // Defense-in-depth — see invoke_shard_split.
         let prover_address = op
             .public_key_signature_bls48581
@@ -2074,14 +2269,20 @@ impl GlobalIntrinsic {
         }
         // Authorization (Go parity, global_shard_merge.go:84-100): only an
         // ACTIVE GLOBAL prover may propose a shard merge.
-        if !self.proposer_is_active_global(&prover_address) {
+        if !self.proposer_is_active_global(&prover_tree) {
             return Err(QuilError::InvalidArgument(
                 "invoke_shard_merge: proposer is not an active global prover".into(),
             ));
         }
 
         // Validate now, defer the flip to the E+2 boundary (see invoke_shard_split).
-        let _ = materialize::materialize_shard_merge(&op.shard_addresses, &op.parent_address)?;
+        // Deep-bifurcation: the proposal frame decides the child filter format.
+        let bit_path_mode = frame_number >= super::materialize::unified_tree_cutover_frame();
+        let _ = materialize::materialize_shard_merge(
+            &op.shard_addresses,
+            &op.parent_address,
+            bit_path_mode,
+        )?;
 
         if let (Some(ref store), Some(ref db)) = (&self.shards_store, &self.shards_db) {
             let change = PendingShardChange {
@@ -2094,6 +2295,13 @@ impl GlobalIntrinsic {
             let txn = db.new_batch(false)?;
             store.put_pending_shard_change(txn.as_ref(), &change)?;
             txn.commit()?;
+            tracing::info!(
+                frame = frame_number,
+                parent = hex::encode(&op.parent_address),
+                effective_epoch = change.effective_epoch,
+                bit_path_mode,
+                "invoke_shard_merge: recorded pending merge change (applies at E+2)"
+            );
         }
 
         Ok(())
@@ -2106,7 +2314,29 @@ impl GlobalIntrinsic {
     /// `effective_epoch <= epoch_for_frame(frame_number)`, then removes it. The
     /// topology flip (put children / delete children) lands here at E+2, NOT at
     /// proposal time.
+    /// Once-per-frame wrapper (see `last_due_apply_frame`): the due-change apply is
+    /// invoked BOTH standalone once per frame AND inline per app-shard `FrameHeader`
+    /// request, so a backlog of shard frames would otherwise re-run the full
+    /// tombstone scan + reassign N times per global frame. The work is frame-gated
+    /// and idempotent, so run it once and short-circuit the rest. The flag is set
+    /// only on SUCCESS, so a failed/partial apply (frame aborts → retries) re-runs.
     pub fn apply_due_shard_changes(
+        &self,
+        frame_number: u64,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        if self.last_due_apply_frame.load(std::sync::atomic::Ordering::Relaxed) == frame_number {
+            return Ok(());
+        }
+        let result = self.apply_due_shard_changes_inner(frame_number, state);
+        if result.is_ok() {
+            self.last_due_apply_frame
+                .store(frame_number, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn apply_due_shard_changes_inner(
         &self,
         frame_number: u64,
         state: &HypergraphState,
@@ -2116,14 +2346,57 @@ impl GlobalIntrinsic {
             return Ok(());
         };
         let cur_epoch = quil_types::consensus::epoch_for_frame(frame_number);
-        let due: Vec<PendingShardChange> = store
-            .all_pending_shard_changes()?
+        let pending_scan_start = std::time::Instant::now();
+        let all_pending = store.all_pending_shard_changes()?;
+        let pending_scan_ms = pending_scan_start.elapsed().as_millis() as u64;
+        if pending_scan_ms > 500 {
+            // A slow scan that returns few/zero LIVE entries = tombstone
+            // accumulation in the pending-change keyspace (many create+delete
+            // cycles over the chain's life). This runs every frame (inline via
+            // invoke_frame_header on request frames, standalone otherwise), so it
+            // shows up as the per-frame materialize floor. A range compaction of
+            // the pending keyspace drops the tombstones.
+            tracing::warn!(
+                frame = frame_number,
+                ms = pending_scan_ms,
+                live = all_pending.len(),
+                "apply_due: all_pending_shard_changes scan SLOW (tombstone bloat in the pending-change keyspace)"
+            );
+        }
+        if !all_pending.is_empty() {
+            // Fires every frame while a change waits for its E+2 boundary — debug
+            // to avoid per-frame spam; the apply itself logs at info.
+            tracing::debug!(
+                frame = frame_number,
+                cur_epoch,
+                total_pending = all_pending.len(),
+                effective_epochs = ?all_pending.iter().map(|c| c.effective_epoch).collect::<Vec<_>>(),
+                "apply_due_shard_changes: pending shard changes present"
+            );
+        }
+        let due: Vec<PendingShardChange> = all_pending
             .into_iter()
             .filter(|c| c.effective_epoch <= cur_epoch)
             .collect();
         if due.is_empty() {
             return Ok(());
         }
+        // Wedge detector: a due change is only cleared (delete_pending) after the
+        // whole reassign+grid-flip txn commits below. Any error aborts the frame
+        // and leaves the record still due NEXT frame, re-running the O(provers)
+        // reassign forever with no grid change. Logging the due set every frame
+        // makes the recurrence visible — the SAME (parent, effective_epoch)
+        // appearing on consecutive frames is the wedge signature.
+        tracing::info!(
+            frame = frame_number,
+            cur_epoch,
+            due = due.len(),
+            changes = ?due
+                .iter()
+                .map(|c| (hex::encode(&c.parent), c.effective_epoch, c.kind))
+                .collect::<Vec<_>>(),
+            "apply_due_shard_changes: applying due shard changes"
+        );
 
         // 1. Reassign every affected prover's allocation onto the new
         //    topology (committed hypergraph state, via `state`). Done FIRST:
@@ -2131,8 +2404,34 @@ impl GlobalIntrinsic {
         //    the frame's state changeset is aborted before we mutate the
         //    local grid below, keeping the two views consistent.
         let va_disc = vertex_adds_discriminator()?;
+        // ONE committed-state prover-shard scan for the whole frame, shared across
+        // ALL due changes — instead of a full O(provers) scan per change (the
+        // N×full-scan cost that spikes to tens of seconds when a batch comes due at
+        // an epoch boundary). Committed state, so reassignment stays deterministic
+        // across nodes (do NOT swap for the async registry cache — that forks the
+        // prover tree). None when no hypergraph (reassign falls back to the cache).
+        let prover_scan = self
+            .hypergraph
+            .as_ref()
+            .map(|hg| crate::prover_registry::CommittedProverScan::scan(hg));
         for change in &due {
-            self.reassign_shard_allocations(state, &va_disc, change, frame_number)?;
+            if let Err(e) = self.reassign_shard_allocations(
+                state,
+                &va_disc,
+                change,
+                frame_number,
+                prover_scan.as_ref(),
+            ) {
+                tracing::error!(
+                    frame = frame_number,
+                    parent = hex::encode(&change.parent),
+                    effective_epoch = change.effective_epoch,
+                    kind = ?change.kind,
+                    error = %e,
+                    "apply_due_shard_changes: reassign FAILED — frame aborts, pending record NOT cleared (will re-fire next frame)"
+                );
+                return Err(e);
+            }
         }
 
         // 2. Flip the LOCAL grid topology + consume the pending records.
@@ -2146,12 +2445,154 @@ impl GlobalIntrinsic {
         };
 
         let txn = db.new_batch(false)?;
+        // Live grid entries, KEYED BY CANONICAL BIT-PATH (not the raw prefix) so the
+        // stale check is FORM-AGNOSTIC. A genesis shard is stored as a byte-suffix
+        // prefix (`[i]`), while `materialize_shard_split` reports `removed_parent` in
+        // SENTINEL bit-path form — comparing the raw prefixes never matches, which
+        // wrongly classified the FIRST split of every byte-suffix genesis shard as
+        // "stale" and skipped it (mainnet post-reset: QUIL stuck at 64-way, unable to
+        // split). Decode both sides to bits — sentinel via `shard_bit_path_from_prefix`,
+        // byte-suffix via the 6-bit-per-level binary (the mapping
+        // `decode_shard_filter_or_root` uses) — so the same shard compares equal in
+        // either encoding. A genuinely STALE duplicate (whose parent an earlier change
+        // already removed) still fails the membership test and is skipped. `live` is
+        // updated as we apply so a straddle that lands both the E+2 and E+3 record in
+        // ONE frame is caught too. The duplicate arises because the proposer used to
+        // re-emit a split every frame while the parent stayed over-crowded; a
+        // re-proposal crossing the epoch boundary stamps a later effective_epoch that
+        // coexists with the first — both would otherwise apply.
+        let canon_bits = |prefix: &[u32]| -> Vec<bool> {
+            quil_forest::shard_bit_path_from_prefix(prefix)
+                .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6))
+        };
+        let mut live: std::collections::HashSet<(Vec<u8>, Vec<bool>)> = store
+            .range_app_shards()?
+            .into_iter()
+            .map(|r| (r.shard_key, canon_bits(&r.prefix)))
+            .collect();
         for change in &due {
             match change.kind {
                 ShardChangeKind::Split => {
-                    let output =
-                        materialize::materialize_shard_split(&change.parent, &change.children)?;
-                    for (l2, path) in &output.new_shards {
+                    // Decode in the format the children were PROPOSED in (a split
+                    // that straddles the cutover keeps its original encoding).
+                    let bit_path_mode =
+                        change.proposed_frame >= super::materialize::unified_tree_cutover_frame();
+                    let output = materialize::materialize_shard_split(
+                        &change.parent,
+                        &change.children,
+                        bit_path_mode,
+                    )?;
+                    // Skip a stale duplicate whose parent no longer exists in the grid
+                    // (already split by an earlier change) — applying it would layer a
+                    // DIFFERENT partition on top of the real children (overlapping
+                    // shards → provers on "both sides"). Still consume the pending
+                    // record below so it stops re-firing.
+                    let parent_in_grid = output.removed_parent.as_ref().map_or(true, |(l2, path)| {
+                        live.contains(&(grid_key(l2), canon_bits(path)))
+                    });
+                    if !parent_in_grid {
+                        tracing::warn!(
+                            parent = hex::encode(&change.parent),
+                            effective_epoch = change.effective_epoch,
+                            proposed_frame = change.proposed_frame,
+                            frame = frame_number,
+                            "apply_due: SKIPPING stale split — parent already split (not in grid); consuming the duplicate pending record without re-registering overlapping children"
+                        );
+                    } else {
+                        tracing::info!(
+                            parent = hex::encode(&change.parent),
+                            bit_path_mode,
+                            // Total registered shards = 2 leaves + the co-path spine
+                            // (Option A); parent is removed.
+                            new_shards = output.new_shards.len(),
+                            removed_parent = output.removed_parent.is_some(),
+                            frame = frame_number,
+                            proposed_frame = change.proposed_frame,
+                            "applying shard split (E+2 flip)"
+                        );
+                        // Deep-bifurcation (b): the first deep split on an app must
+                        // convert that app's ENTIRE stored set to sentinel bit-path
+                        // prefixes (routing-preserving) so the set never goes mixed
+                        // (canonical can't resolve a mix). Idempotent + deterministic.
+                        if bit_path_mode && change.parent.len() >= 32 {
+                            materialize::migrate_app_shards_to_sentinel(
+                                store.as_ref(),
+                                txn.as_ref(),
+                                &grid_key(&change.parent[..32]),
+                            )?;
+                        }
+                        for (l2, path) in &output.new_shards {
+                            // Decode the registered sentinel prefix back to its bit-path
+                            // for observability (a deep path here proves the flip stored
+                            // the descended child, not an immediate-bit one).
+                            let bits = quil_forest::shard_bit_path_from_prefix(path);
+                            tracing::debug!(
+                                l2 = hex::encode(l2),
+                                prefix = ?path,
+                                bit_path = ?bits,
+                                "registering split child shard"
+                            );
+                            let shard = ShardInfo {
+                                shard_key: grid_key(l2),
+                                prefix: path.clone(),
+                                size: Vec::new(),
+                                data_shards: 0,
+                                commitment: Vec::new(),
+                            };
+                            store.put_app_shard(txn.as_ref(), &shard)?;
+                            live.insert((grid_key(l2), canon_bits(path)));
+                        }
+                        // Deep-bifurcation (Option A): the parent is REPLACED by the
+                        // partition (spine + leaves) — remove it so the set stays
+                        // prefix-free (else the parent shadows its own children).
+                        if let Some((l2, path)) = &output.removed_parent {
+                            tracing::debug!(
+                                l2 = hex::encode(l2),
+                                prefix = ?path,
+                                "removing split parent shard (replaced by partition)"
+                            );
+                            store.delete_app_shard(txn.as_ref(), &grid_key(l2), path)?;
+                            live.remove(&(grid_key(l2), canon_bits(path)));
+                        }
+                    }
+                }
+                ShardChangeKind::Merge => {
+                    // Decode in the format the children were PROPOSED in (mirrors
+                    // the Split branch's straddle-safe gate).
+                    let bit_path_mode =
+                        change.proposed_frame >= super::materialize::unified_tree_cutover_frame();
+                    let output = materialize::materialize_shard_merge(
+                        &change.children,
+                        &change.parent,
+                        bit_path_mode,
+                    )?;
+                    tracing::info!(
+                        parent = hex::encode(&change.parent),
+                        bit_path_mode,
+                        removed = output.removed_shards.len(),
+                        added_parent = output.added_parent.is_some(),
+                        frame = frame_number,
+                        "applying shard merge (E+2 flip)"
+                    );
+                    for (l2, path) in &output.removed_shards {
+                        let bits = quil_forest::shard_bit_path_from_prefix(path);
+                        tracing::debug!(
+                            l2 = hex::encode(l2),
+                            prefix = ?path,
+                            bit_path = ?bits,
+                            "removing merged child shard"
+                        );
+                        store.delete_app_shard(txn.as_ref(), &grid_key(l2), path)?;
+                    }
+                    // Deep-bifurcation (Option A): re-register the merged parent
+                    // (branch) as a leaf next to the retained spine.
+                    if let Some((l2, path)) = &output.added_parent {
+                        tracing::debug!(
+                            l2 = hex::encode(l2),
+                            prefix = ?path,
+                            bit_path = ?quil_forest::shard_bit_path_from_prefix(path),
+                            "registering merged parent shard"
+                        );
                         let shard = ShardInfo {
                             shard_key: grid_key(l2),
                             prefix: path.clone(),
@@ -2162,18 +2603,170 @@ impl GlobalIntrinsic {
                         store.put_app_shard(txn.as_ref(), &shard)?;
                     }
                 }
-                ShardChangeKind::Merge => {
-                    let output =
-                        materialize::materialize_shard_merge(&change.children, &change.parent)?;
-                    for (l2, path) in &output.removed_shards {
-                        store.delete_app_shard(txn.as_ref(), &grid_key(l2), path)?;
-                    }
-                }
             }
             store.delete_pending_shard_change(txn.as_ref(), &change.parent, change.effective_epoch)?;
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// Flag-day split reset, riding [`unified_tree_cutover_frame`]. The deep-split
+    /// machinery left the QUIL app with a NON-prefix-free shard grid: empty spine
+    /// descendants that alias their data-bearing ancestors. On that grid the
+    /// legacy whole-app aggregate PANICS (`app_root_from_shard_paths` needs
+    /// prefix-free) and, under unified, an empty alias shard's canonical bit-path
+    /// collapses onto its ancestor's — so it commits the ancestor's root while
+    /// holding no data (a prover placed there wedges). Rather than surgically
+    /// drain each alias, this rebuilds from the genesis topology at ONE
+    /// coordinated frame:
+    ///  1. Reset the QUIL shard rows to the 64-way genesis set (`[0]..[63]`),
+    ///     dropping every accumulated split/merge row and any pending change.
+    ///  2. Drop every NON-archive prover record (prover vertex + allocations +
+    ///     hyperedge). The archives (keep-set) stay up to serve/anchor; dropped
+    ///     provers re-join onto the clean grid. Their baseline seniority is
+    ///     restored on re-join from the embedded Ed448 seniority ledger (a
+    ///     re-merge — it is NOT stored in the dropped vertex), with
+    ///     [`super::materialize::UNIFIED_RESET_AMNESTY_FRAME`] covering any stale
+    ///     kick the drop missed.
+    ///
+    /// Runs ONCE, at exactly the cutover frame, on nodes that materialize the
+    /// global frame (archives): the prover-record deletes go onto `state` so they
+    /// ride the frame's commit batch and land in the cutover frame's committed
+    /// state root; regulars sync that state. `== cutover` (not `>=`) makes it
+    /// exactly-once per node — a sequential materializer hits the cutover frame
+    /// once, and a node that synced past it never materializes that frame. No-op
+    /// (returns `false`) without the shards store / hypergraph / archive keep-set.
+    pub fn maybe_apply_split_reset(
+        &self,
+        frame_number: u64,
+        state: &HypergraphState,
+    ) -> Result<bool> {
+        // Fires at the v1 unified cutover AND the v2 grid reset (mainnet 740_000).
+        // The grid reset is idempotent (delete all QUIL rows → rewrite genesis), so
+        // no marker is needed here — the exact-frame gate + idempotency make it safe
+        // even if the frame re-materializes. The prover-tree wipe that rides the same
+        // frame IS marker-guarded (it is not idempotent). See
+        // `materialize::quil_grid_reset_v2_frame`.
+        if frame_number != super::materialize::unified_tree_cutover_frame()
+            && frame_number != super::materialize::quil_grid_reset_v2_frame()
+            && frame_number != super::materialize::quil_prover_reset_v3_frame()
+            && frame_number != super::materialize::quil_prover_reset_v4_frame()
+            && frame_number != super::materialize::quil_prover_reset_v5_frame()
+        {
+            return Ok(false);
+        }
+        let (Some(store), Some(db), Some(hg), Some(keep), Some(genesis_prefixes)) = (
+            self.shards_store.as_ref(),
+            self.shards_db.as_ref(),
+            self.hypergraph.as_ref(),
+            self.archive_prover_addresses.as_ref(),
+            self.reset_genesis_prefixes.as_ref(),
+        ) else {
+            tracing::info!(
+                frame = frame_number,
+                "unified split reset: deps absent (shards/hg/keep-set/genesis-prefixes) — \
+                 skipping; this node syncs the post-reset state rather than computing it"
+            );
+            return Ok(false);
+        };
+
+        let quil = crate::domains::QUIL_TOKEN;
+        let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
+        let mut grid_key = Vec::with_capacity(3 + 32);
+        grid_key.extend_from_slice(&l1);
+        grid_key.extend_from_slice(&quil);
+
+        // ---- (1) Reset the QUIL shard grid to the 64-way genesis topology ----
+        let txn = db.new_batch(false)?;
+        let mut removed_rows = 0usize;
+        for s in store.range_app_shards()? {
+            if s.shard_key == grid_key {
+                store.delete_app_shard(txn.as_ref(), &s.shard_key, &s.prefix)?;
+                removed_rows += 1;
+            }
+        }
+        // Rewrite to the network's QUIL genesis topology. As of prover-reset v4 the
+        // genesis is seeded in SENTINEL bit-path form (`[SENTINEL, bits(i)]`), NOT the
+        // legacy byte-suffix `[i]` — this is THE fix for the byte-suffix-vs-sentinel
+        // divergence: `migrate_app_shards_to_sentinel` (which fires on the first deep
+        // split) then finds the set already sentinel and is a no-op, so the grid's
+        // encoding never changes under provers and the allocations (whose filters are
+        // derived from the grid via `shard_prefix_to_filter`) stay in the same form
+        // forever. v1/v2/v3 KEEP byte-suffix — those frames already committed with it,
+        // so re-encoding them would fork a replaying node's prover tree.
+        // v4 AND v5 seed SENTINEL. (As of the seeder unification the passed
+        // `genesis_prefixes` are already sentinel, so this conversion is a
+        // no-op safety net that keeps the reset correct even if a caller ever
+        // supplies byte-suffix genesis.)
+        let is_sentinel_reset = frame_number == super::materialize::quil_prover_reset_v4_frame()
+            || frame_number == super::materialize::quil_prover_reset_v5_frame();
+        let effective_prefixes: Vec<Vec<u32>> = if is_sentinel_reset {
+            genesis_prefixes
+                .iter()
+                .map(|p| {
+                    let bits = quil_forest::shard_bit_path_from_prefix(p)
+                        .unwrap_or_else(|| quil_forest::prefix_to_bits(p, 6));
+                    // The ROOT shard (empty bit-path) is canonically the BARE app
+                    // address (`shard_prefix_to_filter([]) == app`), NOT the sentinel
+                    // `encode_shard_bit_path(app, [])` (`app‖0x0000`). Sentinel-encoding
+                    // it would make the grid filter disagree with a root prover's
+                    // `confirmation_filter` (bare app) → reject. Only NON-root shards
+                    // (mainnet's 64-way `[i]`, 6 bits) convert to sentinel; a single-
+                    // shard root app stays byte-suffix (and is removed on its first
+                    // split anyway). Caught by localnet on the testnet single-shard.
+                    if bits.is_empty() {
+                        p.clone()
+                    } else {
+                        quil_forest::bit_path_to_prefix(&bits)
+                    }
+                })
+                .collect()
+        } else {
+            genesis_prefixes.iter().cloned().collect()
+        };
+        for prefix in &effective_prefixes {
+            store.put_app_shard(
+                txn.as_ref(),
+                &ShardInfo {
+                    shard_key: grid_key.clone(),
+                    prefix: prefix.clone(),
+                    size: Vec::new(),
+                    data_shards: 0,
+                    commitment: Vec::new(),
+                },
+            )?;
+        }
+        // Drop any pending QUIL split/merge so a staged change can't re-cascade
+        // onto the freshly-reset grid.
+        let mut removed_pending = 0usize;
+        for pc in store.all_pending_shard_changes()? {
+            if pc.parent.len() >= 32 && pc.parent[..32] == quil {
+                store.delete_pending_shard_change(txn.as_ref(), &pc.parent, pc.effective_epoch)?;
+                removed_pending += 1;
+            }
+        }
+        txn.commit()?;
+
+        // The GLOBAL PROVER TREE reset (wipe the prover shard's vertex + hyperedge
+        // trees and rebuild them from the genesis prover set) is NOT done here: it
+        // needs the genesis prover data + seeding logic that live in the engine
+        // layer (`quil_engine::genesis`), and it must REBUILD fresh trees (the
+        // forest JMT is put-only, so a per-vertex delete cannot shrink it). It
+        // rides the same cutover frame via the materializer's reset hook — see
+        // `quil_engine::genesis::reset_prover_tree_to_genesis`. Both land in the
+        // cutover frame's committed state, so the prover-tree commitment changes
+        // and propagates to syncing nodes (which is what makes dropped provers
+        // re-join). Here we only rebuild the QUIL shard grid.
+        let _ = (hg, keep);
+
+        tracing::info!(
+            frame = frame_number,
+            removed_rows,
+            removed_pending,
+            genesis_shards = genesis_prefixes.len(),
+            "unified split reset: QUIL shard grid rebuilt to genesis topology"
+        );
+        Ok(true)
     }
 
     /// Phase F deterministic reassignment: at the E+2 boundary, move every
@@ -2185,56 +2778,110 @@ impl GlobalIntrinsic {
     /// prover's address (frozen-committee, consensus-identical).
     /// - Merge: every ACTIVE prover on any child → the parent.
     ///
-    /// The active set is read from the SAME `prover_registry` the frame-header
-    /// attestation check already trusts at this point (so it's consistent with
-    /// committed state across nodes — otherwise attestation would already
-    /// fork). Leaving/joining allocations are NOT reassigned: a pending Leave
-    /// departs at E+2 by design, and joins to a frozen shard were rejected by
-    /// the join-freeze. When no `prover_registry` is installed (non-archive
-    /// fixtures), this is a no-op — the local grid still flips.
+    /// The active set is read DIRECTLY from committed hypergraph state via the
+    /// CRDT (`active_provers_on_filter_committed`), NOT from the async
+    /// `prover_registry` cache — so every node enumerates the identical prover
+    /// set for a given committed frame and the reassignment is a pure function
+    /// of that frame (the cache is refreshed on timing-dependent background
+    /// paths and could otherwise diverge → fork). Leaving/joining allocations
+    /// are NOT reassigned: a pending Leave departs at E+2 by design, and joins
+    /// to a frozen shard were rejected by the join-freeze. When no CRDT is
+    /// installed (non-archive fixtures) we fall back to the cache; when neither
+    /// is installed this is a no-op — the local grid still flips.
     fn reassign_shard_allocations(
         &self,
         state: &HypergraphState,
         va_disc: &[u8; 32],
         change: &PendingShardChange,
         frame_number: u64,
+        // ONE committed-state scan shared across all due changes this frame
+        // (built by the caller). `None` ⇒ scan on demand / fall back to the cache.
+        scan: Option<&crate::prover_registry::CommittedProverScan>,
     ) -> Result<()> {
-        let Some(pr) = self.prover_registry.as_ref() else {
+        let pr = self.prover_registry.as_ref();
+        // Proceed when EITHER committed-state (preferred) OR the cache is
+        // available; otherwise nothing to reassign.
+        if self.hypergraph.is_none() && pr.is_none() {
             return Ok(());
-        };
+        }
         let vr_disc = vertex_removes_discriminator()?;
         let ha_disc = hyperedge_adds_discriminator()?;
+
+        // Enumerate `(public_key, prover_address)` on `filter`: committed state
+        // via the CRDT when present (deterministic), else the async cache.
+        let enumerate = |filter: &[u8]| -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            if let Some(scan) = scan {
+                // Reuse the ONE per-frame committed scan (deterministic).
+                Ok(scan.active_on_filter(filter, frame_number))
+            } else if let Some(hg) = self.hypergraph.as_ref() {
+                // No shared scan supplied — scan on demand (still committed state).
+                Ok(crate::prover_registry::active_provers_on_filter_committed(
+                    hg, filter, frame_number,
+                ))
+            } else if let Some(pr) = pr {
+                let provers = pr.get_active_provers(filter, frame_number).map_err(|e| {
+                    QuilError::InvalidArgument(format!("reassign: get_active_provers failed: {e}"))
+                })?;
+                Ok(provers
+                    .into_iter()
+                    .map(|info| (info.public_key, info.address))
+                    .collect())
+            } else {
+                Ok(Vec::new())
+            }
+        };
 
         match change.kind {
             ShardChangeKind::Split => {
                 if change.children.is_empty() {
                     return Ok(());
                 }
-                let provers = pr.get_active_provers(&change.parent, frame_number).map_err(|e| {
-                    QuilError::InvalidArgument(format!(
-                        "reassign split: get_active_provers failed: {e}"
-                    ))
-                })?;
-                for info in &provers {
-                    let idx =
-                        reassignment::assign_child_index(&info.address, change.children.len());
+                let mut provers = enumerate(&change.parent)?;
+                let k = change.children.len();
+                tracing::info!(
+                    parent = hex::encode(&change.parent),
+                    enumerated = provers.len(),
+                    children = k,
+                    frame = frame_number,
+                    "reassign split: active provers enumerated on parent (0 ⇒ nothing moves)"
+                );
+                // Distribute the parent's provers EVENLY across the children.
+                // `assign_child_index` maps by the prover's address byte — ~even
+                // for a large committee, but for a SMALL one (a handful of
+                // provers) they can all hash to the same child, leaving the
+                // sibling child with ZERO provers → permanently uncovered / halt
+                // (the localnet "child …80 never covered" artifact). A
+                // deterministic round-robin over address-sorted provers
+                // guarantees every child gets ⌊N/k⌋..⌈N/k⌉ provers. State-
+                // affecting (the committed reassignment), so it's gated on the
+                // unified cutover flag day — a coordinated upgrade point where
+                // every node flips together (pre-cutover keeps the exact legacy
+                // `assign_child_index` mapping, so no fork on in-flight splits).
+                let even = frame_number
+                    >= super::materialize::unified_tree_cutover_frame();
+                if even {
+                    // Deterministic order independent of enumeration order.
+                    provers.sort_by(|a, b| a.1.cmp(&b.1));
+                }
+                for (i, (public_key, address)) in provers.iter().enumerate() {
+                    let idx = if even {
+                        i % k
+                    } else {
+                        reassignment::assign_child_index(address, k)
+                    };
                     let new_filter = &change.children[idx];
                     self.rekey_allocation(
-                        state, va_disc, &vr_disc, &ha_disc, &info.public_key, &info.address,
+                        state, va_disc, &vr_disc, &ha_disc, public_key, address,
                         &change.parent, new_filter, frame_number,
                     )?;
                 }
             }
             ShardChangeKind::Merge => {
                 for child in &change.children {
-                    let provers = pr.get_active_provers(child, frame_number).map_err(|e| {
-                        QuilError::InvalidArgument(format!(
-                            "reassign merge: get_active_provers failed: {e}"
-                        ))
-                    })?;
-                    for info in &provers {
+                    let provers = enumerate(child)?;
+                    for (public_key, address) in &provers {
                         self.rekey_allocation(
-                            state, va_disc, &vr_disc, &ha_disc, &info.public_key, &info.address,
+                            state, va_disc, &vr_disc, &ha_disc, public_key, address,
                             child, &change.parent, frame_number,
                         )?;
                     }
@@ -2271,9 +2918,23 @@ impl GlobalIntrinsic {
         // Read the existing (committed) allocation; nothing to move if absent.
         let old_blob = match state.get(domain, &old_addr, va_disc)? {
             Some(b) if !b.is_empty() => b,
-            _ => return Ok(()),
+            _ => {
+                tracing::info!(
+                    old_filter = hex::encode(old_filter),
+                    old_addr = hex::encode(old_addr),
+                    "rekey: NO allocation at old_addr via state.get (snapshot miss?) — NOTHING moved"
+                );
+                return Ok(());
+            }
         };
 
+        tracing::debug!(
+            old_filter = hex::encode(old_filter),
+            new_filter = hex::encode(new_filter),
+            new_addr = hex::encode(new_addr),
+            moved = (new_addr != old_addr),
+            "rekey: found old allocation → writing new (+deleting old if moved)"
+        );
         let new_blob = reassignment::rewrite_allocation_filter(&old_blob, new_filter)?;
         let new_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&new_blob);
 
@@ -2290,12 +2951,24 @@ impl GlobalIntrinsic {
         )?;
         state.set(domain, prover_address, ha_disc, frame_number, new_he)?;
 
-        // Remove the stale vertex only when the address actually changed.
+        // Retire the vacated slot as Historic instead of DELETING it, but only
+        // when the address actually changed (a poseidon-collision re-key already
+        // updated in place above). A hard delete writes a removes-phase tombstone
+        // that `get_vertex_data` honors forever and no later `add_vertex` clears —
+        // so a shard that splits, loses coverage, and merges back could never
+        // re-represent this allocation (the address is gone for good). Flipping
+        // Status to Historic keeps the vertex: committee/worker reads exclude it
+        // (`committee_eligible`), its hyperedge atom is already dropped above, and
+        // a future reassignment TO `old_filter` reactivates the same slot.
+        let _ = vr_disc;
         if new_addr != old_addr {
-            state.delete(domain, &old_addr, vr_disc, frame_number)?;
+            let historic_blob =
+                reassignment::set_allocation_status(&old_blob, materialize::STATUS_HISTORIC)?;
+            state.set(domain, &old_addr, va_disc, frame_number, historic_blob)?;
         }
         Ok(())
     }
+
 }
 
 /// Convert an Ed448 public key (57 bytes) to a base58-encoded libp2p
@@ -2353,15 +3026,54 @@ fn ed448_pubkey_to_peer_id_string(pubkey: &[u8]) -> String {
 /// that don't install one still work — without a registry there's no
 /// way to count and the gate degrades open (`Ok(())`). Production
 /// always wires the registry via `with_frame_header_deps`.
+/// Whether `filter` still corresponds to a registered app shard.
+///
+/// After a deep split, the parent shard is removed from the store
+/// (`delete_app_shard`) and replaced by its prefix-free children. Its
+/// provers' allocations linger (they drain via canonical leave), so
+/// `get_active_provers` still counts them — but the shard itself is
+/// gone. This reconstructs each registered shard's canonical wire
+/// filter (`shard_prefix_to_filter`, matching `build_shard_inventory`
+/// and the allocation `ConfirmationFilter`) and checks membership.
+///
+/// Degrades CLOSED (returns `true`, "still registered") on a store
+/// error so a read failure never spuriously bypasses the halt-risk gate.
+fn shard_filter_is_registered(store: &dyn ShardsStore, filter: &[u8]) -> bool {
+    let Ok(rows) = store.range_app_shards() else {
+        return true;
+    };
+    for s in rows {
+        if s.shard_key.len() < 35 {
+            continue;
+        }
+        let f = quil_forest::shard_prefix_to_filter(&s.shard_key[3..35], &s.prefix);
+        if f == filter {
+            return true;
+        }
+    }
+    false
+}
+
 fn check_leave_confirm_halt_risk(
     filter: &[u8],
     current_alloc_status: u8,
     registry: Option<&dyn quil_types::consensus::ProverRegistry>,
     frame_number: u64,
+    shard_removed: bool,
 ) -> Result<()> {
     // Only applies when we're confirming a leave. Join-confirms and
     // any pathological status pass through.
     if current_alloc_status != materialize::STATUS_LEAVING {
+        return Ok(());
+    }
+    // A split-away parent shard has been removed from the registered
+    // set (its data moved into the prefix-free children). It no longer
+    // needs coverage, so its provers MUST be allowed to fully drain —
+    // the halt-risk floor would otherwise deadlock all `active` of them
+    // on a shard that no longer exists (deep-split convergence bug).
+    // Removal is committed state (`delete_app_shard` in
+    // `apply_due_shard_changes`), so this is deterministic across nodes.
+    if shard_removed {
         return Ok(());
     }
     let Some(registry) = registry else {
@@ -2589,6 +3301,7 @@ mod tests {
             materialize::STATUS_JOINING,
             Some(&registry),
             0,
+            false,
         );
         assert!(result.is_ok(), "join-confirm must pass: {:?}", result.err());
     }
@@ -2605,6 +3318,7 @@ mod tests {
             materialize::STATUS_LEAVING,
             Some(&registry),
             0,
+            false,
         );
         assert!(result.is_ok(), "healthy shard leave-confirm must pass: {:?}", result.err());
     }
@@ -2624,6 +3338,7 @@ mod tests {
             materialize::STATUS_LEAVING,
             Some(&registry),
             0,
+            false,
         );
         assert!(result.is_err(),
             "leave-confirm at floor+1 must be rejected, got {:?}", result);
@@ -2643,7 +3358,8 @@ mod tests {
                 b"filterX",
                 materialize::STATUS_LEAVING,
                 Some(&registry),
-            0,
+                0,
+                false,
             );
             assert!(
                 result.is_err(),
@@ -2666,6 +3382,7 @@ mod tests {
             materialize::STATUS_LEAVING,
             Some(&registry),
             0,
+            false,
         );
         assert!(result.is_ok(),
             "leave-confirm at floor+2 must pass: {:?}", result.err());
@@ -2681,9 +3398,35 @@ mod tests {
             materialize::STATUS_LEAVING,
             None,
             0,
+            false,
         );
         assert!(result.is_ok(),
             "gate must degrade open when no registry: {:?}", result.err());
+    }
+
+    /// Leave-confirm on a shard at/below the halt-risk floor but which
+    /// has been REMOVED from the registered set (`shard_removed = true`)
+    /// — allowed. A split-away parent no longer needs coverage; its
+    /// provers must be able to fully drain onto the prefix-free
+    /// children (deep-split convergence). Without this bypass the
+    /// halt-risk floor deadlocks every prover on the removed parent.
+    #[test]
+    fn halt_risk_gate_allows_leave_confirm_on_removed_split_parent() {
+        for active_count in [0, 1, materialize::HALT_RISK_PROVER_COUNT + 1] {
+            let registry = ActiveCountRegistry { count: active_count };
+            let result = super::check_leave_confirm_halt_risk(
+                b"filterX",
+                materialize::STATUS_LEAVING,
+                Some(&registry),
+                0,
+                true, // shard removed → bypass
+            );
+            assert!(
+                result.is_ok(),
+                "removed split-parent leave-confirm at active={} must pass: {:?}",
+                active_count, result.err(),
+            );
+        }
     }
 
     #[test]
@@ -3442,4 +4185,627 @@ mod tests {
             );
         }
     }
+
+    /// Reproduction harness for the "duplicate ShardSplit re-proposal" concern:
+    /// the split proposer re-emits every frame because it never checks for an
+    /// existing pending change, so a split whose parent stays over-crowded through
+    /// epochs E and E+1 records a pending change at effective_epoch E+2 (from the
+    /// E proposals) AND E+3 (from the E+1 proposals). Both coexist (keyed by
+    /// `(effective_epoch, parent)`) and BOTH apply. This test shows exactly what
+    /// that does to the grid.
+    mod split_double_apply {
+        use super::*;
+        use crate::hypergraph_state::HypergraphState;
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_types::crypto::{InclusionProver, Multiproof};
+        use quil_types::store::{
+            KvDb, PendingShardChange, ShardChangeKind, ShardInfo, ShardsStore,
+        };
+
+        struct StubProver;
+        impl InclusionProver for StubProver {
+            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
+            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
+            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
+            fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+                Err(QuilError::Internal("batch not supported".into()))
+            }
+            fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        }
+        fn make_state() -> HypergraphState {
+            let store = Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new());
+            let crdt = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
+            HypergraphState::new(crdt)
+        }
+
+        #[test]
+        fn duplicate_pending_splits_across_epochs_stale_one_is_skipped() {
+            let app = [0x11u8; 32];
+            // Parent = the app-root shard (post-cutover ⇒ bit-path mode).
+            let parent = app.to_vec();
+            let grid_key = {
+                let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3);
+                let mut k = l1.to_vec();
+                k.extend_from_slice(&app);
+                k
+            };
+
+            // Real in-memory shards store (grid + pending changes) + its KvDb.
+            let shdb = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn ShardsStore> =
+                Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
+
+            // Seed the parent (root) grid entry (sentinel-form empty bit-path).
+            {
+                let txn = shards_db.new_batch(false).unwrap();
+                store
+                    .put_app_shard(
+                        txn.as_ref(),
+                        &ShardInfo {
+                            shard_key: grid_key.clone(),
+                            prefix: quil_forest::bit_path_to_prefix(&[]),
+                            size: Vec::new(),
+                            data_shards: 0,
+                            commitment: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            // Two pending splits for the SAME parent at DIFFERENT effective epochs,
+            // with DIFFERENT children (the bifurcation shifted as data grew between
+            // E and E+1): E+2 → 1-bit split [0],[1]; E+3 → deeper split of the
+            // 0-branch [0,0],[0,1]. Both post-cutover (proposed_frame > cutover).
+            let (e2, e3) = (1002u64, 1003u64);
+            let proposed = 800_000u64; // > UNIFIED_TREE_CUTOVER_FRAME ⇒ bit_path_mode
+            let child = |bits: &[bool]| quil_forest::encode_shard_bit_path(&app, bits);
+            let changes = [
+                (e2, vec![child(&[false]), child(&[true])]),
+                (e3, vec![child(&[false, false]), child(&[false, true])]),
+            ];
+            for (epoch, children) in &changes {
+                let txn = shards_db.new_batch(false).unwrap();
+                store
+                    .put_pending_shard_change(
+                        txn.as_ref(),
+                        &PendingShardChange {
+                            kind: ShardChangeKind::Split,
+                            parent: parent.clone(),
+                            children: children.clone(),
+                            effective_epoch: *epoch,
+                            proposed_frame: proposed,
+                        },
+                    )
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+            // Both coexist — keyed by (effective_epoch, parent), so nothing dedups
+            // the duplicate re-proposal that straddled the epoch boundary.
+            assert_eq!(
+                store.all_pending_shard_changes().unwrap().len(),
+                2,
+                "duplicate splits for one parent at E+2 and E+3 COEXIST"
+            );
+
+            // Wire the intrinsic (no hypergraph/registry ⇒ reassign no-ops; this
+            // isolates the GRID topology effect).
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_shards_store(store.clone())
+                .with_shards_db(shards_db.clone());
+            let state = make_state();
+
+            let prefixes = |s: &Arc<dyn ShardsStore>| -> Vec<Vec<u32>> {
+                let mut v: Vec<Vec<u32>> = s
+                    .range_app_shards()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|r| r.shard_key == grid_key)
+                    .map(|r| r.prefix)
+                    .collect();
+                v.sort();
+                v
+            };
+            let p_root = quil_forest::bit_path_to_prefix(&[]);
+            let p_0 = quil_forest::bit_path_to_prefix(&[false]);
+            let p_1 = quil_forest::bit_path_to_prefix(&[true]);
+            let p_00 = quil_forest::bit_path_to_prefix(&[false, false]);
+            let p_01 = quil_forest::bit_path_to_prefix(&[false, true]);
+
+            // Apply at E+2: parent → [0],[1], root removed. This is the CORRECT split.
+            let frame_e2 = e2 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10;
+            gi.apply_due_shard_changes(frame_e2, &state).unwrap();
+            let after_e2 = prefixes(&store);
+            println!("grid after E+2 apply: {after_e2:?}");
+            assert!(after_e2.contains(&p_0) && after_e2.contains(&p_1), "E+2 children present");
+            assert!(!after_e2.contains(&p_root), "root removed by the split");
+            assert!(!after_e2.contains(&p_00), "no deeper children yet");
+
+            // Apply at E+3: the STALE duplicate targets the already-removed parent.
+            let frame_e3 = e3 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10;
+            gi.apply_due_shard_changes(frame_e3, &state).unwrap();
+            let after_e3 = prefixes(&store);
+            println!("grid after E+3 apply (fixed — stale skipped): {after_e3:?}");
+
+            // FIXED: the apply-side guard sees the parent is no longer in the grid
+            // (already split at E+2) and SKIPS the stale duplicate — so the grid is
+            // unchanged, no overlapping [0,0]/[0,1] on top of [0]. No double coverage.
+            assert_eq!(after_e3, after_e2, "stale E+3 split skipped → grid unchanged from E+2");
+            assert!(after_e3.contains(&p_0) && after_e3.contains(&p_1), "the real E+2 children remain");
+            assert!(
+                !after_e3.contains(&p_00) && !after_e3.contains(&p_01),
+                "E+3's deeper children NOT registered — no overlapping shards",
+            );
+            // Both pending records are consumed (the stale one is not left to re-fire).
+            assert!(
+                store.all_pending_shard_changes().unwrap().is_empty(),
+                "both pending records consumed",
+            );
+        }
+
+        /// Regression: a GENESIS shard is stored as a byte-suffix prefix (`[i]`),
+        /// while `materialize_shard_split` reports `removed_parent` in SENTINEL form.
+        /// The stale-split guard must treat those as the SAME shard, or it wrongly
+        /// skips the FIRST split of every genesis shard (mainnet: QUIL stuck at 64-way
+        /// after the grid reset). This exercises the multi-shard byte-suffix path that
+        /// the single-shard localnet could not.
+        #[test]
+        fn fresh_byte_suffix_genesis_split_applies_and_removes_the_parent() {
+            use quil_types::store::{
+                KvDb, PendingShardChange, ShardChangeKind, ShardInfo, ShardsStore,
+            };
+            let app = crate::domains::QUIL_TOKEN;
+            let grid_key = {
+                let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3);
+                let mut k = l1.to_vec();
+                k.extend_from_slice(&app);
+                k
+            };
+            let shdb = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn ShardsStore> =
+                Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
+
+            // The full 64-way byte-suffix genesis grid (`[0]..[63]`), as the reset
+            // writes it — so `migrate_app_shards_to_sentinel` canonicalizes to the
+            // 6-bit paths that match `removed_parent` (a smaller set would give a
+            // narrower width and misrepresent mainnet).
+            for i in 0..64u32 {
+                let txn = shards_db.new_batch(false).unwrap();
+                store
+                    .put_app_shard(
+                        txn.as_ref(),
+                        &ShardInfo {
+                            shard_key: grid_key.clone(),
+                            prefix: vec![i],
+                            size: Vec::new(),
+                            data_shards: 0,
+                            commitment: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+                txn.commit().unwrap();
+            }
+
+            // FRESH split of the byte-suffix parent app‖[0] (6-bit path 000000) into
+            // its two 7-bit children 0000000 / 0000001.
+            let mut parent = app.to_vec();
+            parent.push(0x00);
+            let bits = |s: &str| -> Vec<bool> { s.chars().map(|c| c == '1').collect() };
+            let child = |b: &str| quil_forest::encode_shard_bit_path(&app, &bits(b));
+            let txn = shards_db.new_batch(false).unwrap();
+            store
+                .put_pending_shard_change(
+                    txn.as_ref(),
+                    &PendingShardChange {
+                        kind: ShardChangeKind::Split,
+                        parent: parent.clone(),
+                        children: vec![child("0000000"), child("0000001")],
+                        effective_epoch: 1002,
+                        proposed_frame: 800_000, // > cutover ⇒ bit_path_mode
+                    },
+                )
+                .unwrap();
+            txn.commit().unwrap();
+
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_shards_store(store.clone())
+                .with_shards_db(shards_db.clone());
+            let state = make_state();
+            gi.apply_due_shard_changes(1002 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10, &state)
+                .unwrap();
+
+            // The split APPLIED (was NOT skipped as stale): children present in
+            // canonical bits, and the parent 000000 is GONE — not left as a phantom.
+            let canon = |p: &Vec<u32>| {
+                quil_forest::shard_bit_path_from_prefix(p)
+                    .unwrap_or_else(|| quil_forest::prefix_to_bits(p, 6))
+            };
+            let present: Vec<Vec<bool>> = store
+                .range_app_shards()
+                .unwrap()
+                .into_iter()
+                .filter(|s| s.shard_key == grid_key)
+                .map(|s| canon(&s.prefix))
+                .collect();
+            assert!(
+                present.contains(&bits("0000000")) && present.contains(&bits("0000001")),
+                "children registered (split applied, not skipped)"
+            );
+            assert!(
+                !present.contains(&bits("000000")),
+                "byte-suffix genesis parent removed — no phantom overlapping its children"
+            );
+            // Untouched genesis siblings survive (migrated to sentinel by the split).
+            assert!(
+                present.contains(&bits("000001"))
+                    && present.contains(&bits("000010"))
+                    && present.contains(&bits("000011")),
+                "sibling genesis shards retained"
+            );
+            assert!(store.all_pending_shard_changes().unwrap().is_empty(), "pending consumed");
+        }
+    }
+
+    /// Delete-free reassignment — the fix for split→lose-coverage→merge-back. A
+    /// reassignment must NOT hard-delete the vacated allocation: that writes a
+    /// permanent removes-phase tombstone (`get_vertex_data` gate), so if the shard
+    /// is re-formed the slot could never be re-represented. `rekey_allocation`
+    /// retires the vacated slot to `Historic` in place; a later reassignment BACK
+    /// reactivates the SAME address. This asserts the full Active→Historic→Active
+    /// round-trip survives real CRDT commits (where a delete would be terminal).
+    mod delete_free_reassignment {
+        use super::*;
+        use crate::global_intrinsic::materialize::{
+            allocation_address, create_allocation_vertex_tree, create_prover_vertex_tree,
+            prover_address_from_pubkey, STATUS_ACTIVE, STATUS_HISTORIC,
+        };
+        use crate::global_schema::read_field;
+        use crate::hypergraph_state::{
+            hyperedge_adds_discriminator, vertex_adds_discriminator,
+            vertex_removes_discriminator, HypergraphState,
+        };
+        use crate::prover_registry::{rebuild_vertex_tree_from_blob, vertex_tree_to_blob};
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_types::crypto::{InclusionProver, Multiproof};
+
+        struct StubProver;
+        impl InclusionProver for StubProver {
+            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
+            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
+            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
+            fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+                Err(QuilError::Internal("batch not supported".into()))
+            }
+            fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        }
+
+        /// Read the allocation Status byte at `addr` from committed state (via the
+        /// CRDT), or `None` if the vertex is absent/tombstoned — so a hard delete
+        /// would surface here as `None`, a Historic retirement as `Some(6)`.
+        fn status_at(state: &HypergraphState, addr: &[u8; 32]) -> Option<u8> {
+            let va = vertex_adds_discriminator().unwrap();
+            let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], addr, &va).unwrap()?;
+            if blob.is_empty() {
+                return None;
+            }
+            let tree = rebuild_vertex_tree_from_blob(&blob);
+            read_field(&tree, "allocation:ProverAllocation", "Status").and_then(|b| b.first().copied())
+        }
+
+        #[test]
+        fn retires_to_historic_and_reactivates_on_merge_back() {
+            let store = Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new());
+            let crdt = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
+            let state = HypergraphState::new(crdt.clone());
+            let va = vertex_adds_discriminator().unwrap();
+            let vr = vertex_removes_discriminator().unwrap();
+            let ha = hyperedge_adds_discriminator().unwrap();
+
+            let pubkey = vec![0xAAu8; 897];
+            let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
+            let app = crate::domains::QUIL_TOKEN.to_vec();
+            // Parent = genesis shard 0 (byte-suffix); child = its 7-bit split.
+            let filter_a = {
+                let mut f = app.clone();
+                f.push(0x00);
+                f
+            };
+            let filter_b = quil_forest::encode_shard_bit_path(&app, &[false; 7]);
+            let addr_a = allocation_address(&pubkey, &filter_a).unwrap();
+            let addr_b = allocation_address(&pubkey, &filter_b).unwrap();
+            assert_ne!(addr_a, addr_b, "distinct filters ⇒ distinct addresses (no poseidon collision)");
+
+            // Seed prover + one Active allocation on A, commit into the CRDT.
+            state
+                .set(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &va, 1, vertex_tree_to_blob(&create_prover_vertex_tree(&pubkey, 100).unwrap()))
+                .unwrap();
+            let a_active = reassignment::set_allocation_status(
+                &vertex_tree_to_blob(&create_allocation_vertex_tree(&prover_addr, &filter_a, 1).unwrap()),
+                STATUS_ACTIVE,
+            )
+            .unwrap();
+            state
+                .set(&GLOBAL_INTRINSIC_ADDRESS[..], &addr_a, &va, 1, a_active)
+                .unwrap();
+            state.commit().unwrap();
+            crdt.commit(1).unwrap();
+            assert_eq!(status_at(&state, &addr_a), Some(STATUS_ACTIVE), "seeded Active on A");
+
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll)).with_hypergraph(crdt.clone());
+
+            // SPLIT: reassign A → B.
+            gi.rekey_allocation(&state, &va, &vr, &ha, &pubkey, &prover_addr, &filter_a, &filter_b, 10)
+                .unwrap();
+            state.commit().unwrap();
+            crdt.commit(2).unwrap();
+            assert_eq!(status_at(&state, &addr_b), Some(STATUS_ACTIVE), "B Active after split");
+            // The crux: A is RETAINED as Historic — a live vertex, not a tombstone.
+            assert_eq!(
+                status_at(&state, &addr_a),
+                Some(STATUS_HISTORIC),
+                "A retired to Historic (NOT deleted) after split"
+            );
+
+            // MERGE BACK: reassign B → A. A hard delete would have tombstoned addr_a
+            // permanently; delete-free retention lets this reactivate the SAME slot.
+            gi.rekey_allocation(&state, &va, &vr, &ha, &pubkey, &prover_addr, &filter_b, &filter_a, 20)
+                .unwrap();
+            state.commit().unwrap();
+            crdt.commit(3).unwrap();
+            assert_eq!(
+                status_at(&state, &addr_a),
+                Some(STATUS_ACTIVE),
+                "A REACTIVATED on merge-back — impossible had it been deleted"
+            );
+            assert_eq!(status_at(&state, &addr_b), Some(STATUS_HISTORIC), "B retired to Historic after merge-back");
+        }
+    }
+
+    /// prover-reset v4 seeds the QUIL genesis grid in SENTINEL form (not legacy
+    /// byte-suffix), so `migrate_app_shards_to_sentinel` is a permanent no-op and the
+    /// grid encoding never changes under provers — the fix for the byte-suffix-vs-
+    /// sentinel divergence. v1/v2/v3 KEEP byte-suffix (already-committed history).
+    mod v4_sentinel_genesis {
+        use super::*;
+        use crate::hypergraph_state::HypergraphState;
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_types::crypto::{InclusionProver, Multiproof};
+        use quil_types::store::{KvDb, ShardInfo, ShardsStore};
+
+        struct StubProver;
+        impl InclusionProver for StubProver {
+            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
+            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
+            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
+            fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+                Err(QuilError::Internal("batch not supported".into()))
+            }
+            fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+        }
+
+        fn setup() -> (Arc<dyn ShardsStore>, Arc<dyn KvDb>, GlobalIntrinsic, HypergraphState, Vec<u8>) {
+            let quil = crate::domains::QUIL_TOKEN;
+            let grid_key = {
+                let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
+                let mut k = l1.to_vec();
+                k.extend_from_slice(&quil);
+                k
+            };
+            let shdb = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
+            // Seed a legacy BYTE-SUFFIX 64-way genesis grid.
+            let txn = shards_db.new_batch(false).unwrap();
+            for i in 0..64u32 {
+                store.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: grid_key.clone(), prefix: vec![i], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+            }
+            txn.commit().unwrap();
+            let hstore = Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new());
+            let crdt = Arc::new(HypergraphCrdt::new(hstore, Arc::new(StubProver)));
+            let state = HypergraphState::new(crdt.clone());
+            let byte_suffix_genesis: Arc<Vec<Vec<u32>>> = Arc::new((0..64u32).map(|i| vec![i]).collect());
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_shards_store(store.clone())
+                .with_shards_db(shards_db.clone())
+                .with_hypergraph(crdt)
+                .with_archive_prover_addresses(Arc::new(std::collections::HashSet::new()))
+                .with_reset_genesis_prefixes(byte_suffix_genesis);
+            (store, shards_db, gi, state, grid_key)
+        }
+
+        fn quil_grid(store: &Arc<dyn ShardsStore>, gk: &[u8]) -> Vec<quil_types::store::ShardInfo> {
+            store.range_app_shards().unwrap().into_iter().filter(|s| s.shard_key == gk).collect()
+        }
+
+        #[test]
+        fn v5_reset_seeds_full_sentinel_grid_not_empty() {
+            // DIAGNOSTIC (post-v5 "no joins landed"): with the REAL mainnet config
+            // (reset_genesis_prefixes = genesis_grid_prefixes(0), already sentinel),
+            // the v5 reset must leave a NON-EMPTY 64-way sentinel grid — the shard
+            // set that plan_and_allocate needs to propose re-joins into. An empty
+            // grid here would mean the wipe deleted the rows and reseeded nothing,
+            // which is exactly what would produce empty /provers/shards + no joins.
+            let quil = crate::domains::QUIL_TOKEN;
+            let grid_key = {
+                let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
+                let mut k = l1.to_vec();
+                k.extend_from_slice(&quil);
+                k
+            };
+            let shdb = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
+            // Pre-state: a mixed grid (as mainnet had pre-v5), to be replaced.
+            let txn = shards_db.new_batch(false).unwrap();
+            for i in 0..10u32 {
+                store.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: grid_key.clone(), prefix: vec![i], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+            }
+            txn.commit().unwrap();
+            let hstore = Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new());
+            let crdt = Arc::new(HypergraphCrdt::new(hstore, Arc::new(StubProver)));
+            let state = HypergraphState::new(crdt.clone());
+            // REAL mainnet reset config: canonical sentinel genesis.
+            let mainnet_genesis: Arc<Vec<Vec<u32>>> = Arc::new(quil_forest::genesis_grid_prefixes(0));
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_shards_store(store.clone())
+                .with_shards_db(shards_db.clone())
+                .with_hypergraph(crdt)
+                .with_archive_prover_addresses(Arc::new(std::collections::HashSet::new()))
+                .with_reset_genesis_prefixes(mainnet_genesis);
+
+            let v5 = crate::global_intrinsic::materialize::quil_prover_reset_v5_frame();
+            assert!(gi.maybe_apply_split_reset(v5, &state).unwrap(), "v5 grid reset ran");
+            let rows = quil_grid(&store, &grid_key);
+            assert_eq!(rows.len(), 64, "v5 must leave a NON-EMPTY 64-way grid");
+            assert!(
+                rows.iter().all(|s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_some()),
+                "every v5 genesis shard is SENTINEL"
+            );
+            // And a prover can derive a joinable 35B filter from every row.
+            for s in &rows {
+                let f = quil_forest::shard_prefix_to_filter(&s.shard_key[3..35], &s.prefix);
+                assert_eq!(f.len(), 35, "each grid row yields a 35B sentinel join filter");
+            }
+        }
+
+        #[test]
+        fn v4_reset_seeds_sentinel_genesis_grid() {
+            let (store, _db, gi, state, gk) = setup();
+            let v4 = crate::global_intrinsic::materialize::quil_prover_reset_v4_frame();
+            assert!(gi.maybe_apply_split_reset(v4, &state).unwrap(), "v4 grid reset ran");
+
+            let rows = quil_grid(&store, &gk);
+            assert_eq!(rows.len(), 64, "64 genesis shards");
+            assert!(
+                rows.iter().all(|s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_some()),
+                "v4 seeds every genesis shard in SENTINEL form — NO byte-suffix"
+            );
+            // The grid filter a prover joins is `shard_prefix_to_filter` = the canonical
+            // sentinel `encode_shard_bit_path` form, which is exactly what `migrate`
+            // would produce — so after v4 the grid never changes encoding and the
+            // allocations (derived from it) stay matched.
+            let quil = crate::domains::QUIL_TOKEN;
+            for s in &rows {
+                let f = quil_forest::shard_prefix_to_filter(&s.shard_key[3..35], &s.prefix);
+                let bits = quil_forest::shard_bit_path_from_prefix(&s.prefix).unwrap();
+                assert_eq!(f, quil_forest::encode_shard_bit_path(&quil, &bits));
+                // And it is NOT the legacy byte-suffix `quil‖[i]`.
+                assert_ne!(f, { let mut b = quil.to_vec(); b.push(s.prefix[1] as u8); b });
+            }
+        }
+
+        #[test]
+        fn migrate_strands_byte_suffix_alloc_which_sentinel_genesis_avoids() {
+            // The EXACT mainnet mechanism, deterministic, using the real
+            // `migrate_app_shards_to_sentinel` + `shard_prefix_to_filter`.
+            let (store, db, _gi, _state, gk) = setup(); // byte-suffix 64-way genesis
+            let quil = crate::domains::QUIL_TOKEN;
+
+            // A prover on an UNSPLIT genesis shard (5) holds a byte-suffix filter,
+            // exactly as it does today after joining the legacy grid.
+            let alloc_byte_suffix = {
+                let mut f = quil.to_vec();
+                f.push(5);
+                f
+            };
+            // The archive builds its valid-shard set as {shard_prefix_to_filter(row)}.
+            let valid = |store: &Arc<dyn ShardsStore>| -> std::collections::HashSet<Vec<u8>> {
+                store
+                    .range_app_shards()
+                    .unwrap()
+                    .iter()
+                    .filter(|s| s.shard_key == gk)
+                    .map(|s| quil_forest::shard_prefix_to_filter(&s.shard_key[3..35], &s.prefix))
+                    .collect()
+            };
+
+            // Before the first deep split the grid is byte-suffix → the byte-suffix
+            // allocation is a valid shard address (aligned; proofs accepted).
+            assert!(valid(&store).contains(&alloc_byte_suffix), "aligned before migrate");
+
+            // The first deep split of ANY shard runs `migrate` → the WHOLE grid flips
+            // to sentinel, but this prover's allocation was never re-keyed.
+            let txn = db.new_batch(false).unwrap();
+            crate::global_intrinsic::materialize::migrate_app_shards_to_sentinel(
+                store.as_ref(),
+                txn.as_ref(),
+                &gk,
+            )
+            .unwrap();
+            txn.commit().unwrap();
+
+            // THE BUG: its byte-suffix address is no longer in the (now sentinel)
+            // valid set → every archive rejects its coverage/reward proofs → eviction.
+            assert!(
+                !valid(&store).contains(&alloc_byte_suffix),
+                "migrate strands the byte-suffix allocation — reproduces the mainnet reject"
+            );
+            // THE FIX: with a sentinel-genesis grid (prover-reset v4), a prover on
+            // shard 5 joins the SENTINEL filter, which IS in the sentinel valid set.
+            let bits5 = quil_forest::prefix_to_bits(&[5u32], 6);
+            let alloc_sentinel = quil_forest::encode_shard_bit_path(&quil, &bits5);
+            assert!(
+                valid(&store).contains(&alloc_sentinel),
+                "the sentinel-form allocation matches the sentinel grid — no strand"
+            );
+        }
+
+        #[test]
+        fn v3_reset_keeps_byte_suffix_genesis_grid() {
+            // Same reset machinery at the v3 frame must NOT re-encode — v3 already
+            // committed byte-suffix; changing it would fork a replaying prover tree.
+            let (store, _db, gi, state, gk) = setup();
+            let v3 = crate::global_intrinsic::materialize::quil_prover_reset_v3_frame();
+            assert!(gi.maybe_apply_split_reset(v3, &state).unwrap());
+            let rows = quil_grid(&store, &gk);
+            assert_eq!(rows.len(), 64);
+            assert!(
+                rows.iter().all(|s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_none() && s.prefix.len() == 1),
+                "v3 keeps byte-suffix genesis (single-element prefix, not sentinel)"
+            );
+        }
+
+        #[test]
+        fn v4_keeps_root_shard_byte_suffix() {
+            // A single-ROOT app (testnet single-shard): the root's canonical filter
+            // is the BARE app (`shard_prefix_to_filter([]) == app`), so v4 must NOT
+            // sentinel-encode it — doing so made the grid filter `app‖0x0000` disagree
+            // with a root prover's bare-app `confirmation_filter` → reject (localnet
+            // caught this). Only shards WITH bits (mainnet's 64-way `[i]`) convert.
+            let quil = crate::domains::QUIL_TOKEN;
+            let gk = {
+                let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
+                let mut k = l1.to_vec();
+                k.extend_from_slice(&quil);
+                k
+            };
+            let shdb = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
+            let txn = shards_db.new_batch(false).unwrap();
+            store.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: gk.clone(), prefix: vec![], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+            txn.commit().unwrap();
+            let hstore = Arc::new(crate::hypergraph_state::InMemoryHypergraphStore::new());
+            let crdt = Arc::new(HypergraphCrdt::new(hstore, Arc::new(StubProver)));
+            let state = HypergraphState::new(crdt.clone());
+            let root_genesis: Arc<Vec<Vec<u32>>> = Arc::new(vec![vec![]]);
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_shards_store(store.clone())
+                .with_shards_db(shards_db.clone())
+                .with_hypergraph(crdt)
+                .with_archive_prover_addresses(Arc::new(std::collections::HashSet::new()))
+                .with_reset_genesis_prefixes(root_genesis);
+
+            let v4 = crate::global_intrinsic::materialize::quil_prover_reset_v4_frame();
+            assert!(gi.maybe_apply_split_reset(v4, &state).unwrap());
+            let rows = quil_grid(&store, &gk);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].prefix.is_empty(), "root stays byte-suffix [] (not sentinel-encoded)");
+            // The grid filter equals the bare app — exactly a root prover's filter.
+            assert_eq!(quil_forest::shard_prefix_to_filter(&quil, &rows[0].prefix), quil.to_vec());
+        }
+    }
+
 }

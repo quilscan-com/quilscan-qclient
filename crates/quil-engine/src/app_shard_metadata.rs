@@ -482,7 +482,21 @@ pub fn partition_shard_leaves(
             None => 0,
         }
     };
-    partition_leaves(base_prefix, LEAF_MAX_BYTES, SHARD_TREE_BRANCH, 32, &size_of)
+    let leaves = partition_leaves(base_prefix, LEAF_MAX_BYTES, SHARD_TREE_BRANCH, 32, &size_of);
+    // DIAGNOSTIC: the committed size THIS crdt reports for the shard subtree.
+    // `root_size == 0` ⇒ this crdt holds NO data for the shard, so there are no
+    // leaves to seal/attest — distinct from "replicas not sealed yet". A
+    // data-bearing shard reading 0 here (while the global intrinsic sees size > 0)
+    // is the cluster-worker possession gap: the worker's own crdt is unsynced /
+    // unmaterialized, so it can't prove storage it can't see.
+    tracing::debug!(
+        shard_key = %hex::encode(shard_key),
+        base_prefix = ?base_prefix,
+        root_size = size_of(base_prefix),
+        leaves = leaves.len(),
+        "partition_shard_leaves: shard size seen by this crdt (0 => no data to attest)"
+    );
+    leaves
 }
 
 #[cfg(test)]
@@ -584,10 +598,10 @@ mod tests {
         assert_eq!(groups.filter, filter);
 
         // The registry the verifier would build from those (registered) roots.
-        let mut reg: HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)> = HashMap::new();
+        let mut reg: HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)> = HashMap::new();
         for e in &groups.entries {
             let lid = leaf_id_bytes(&filter, &e.prefix);
-            reg.insert((member.clone(), lid), (e.leaf_root.clone(), e.num_blocks, epoch));
+            reg.insert((member.clone(), lid, epoch), (e.leaf_root.clone(), e.num_blocks, epoch));
         }
 
         // E5: per-frame openings built from the stored replicas.
@@ -606,7 +620,7 @@ mod tests {
         );
 
         // C: the verifier accepts against the registered roots for this epoch.
-        let good = |m: &[u8], l: &[u8]| reg.get(&(m.to_vec(), l.to_vec())).cloned();
+        let good = |m: &[u8], l: &[u8], e: u64| reg.get(&(m.to_vec(), l.to_vec(), e)).cloned();
         assert!(
             quil_crypto::porep::verify_frame_storage_attestation_registered(
                 &root, &att, frame, &rho_n, &bitmask, poly_size, epoch, good,
@@ -663,10 +677,10 @@ mod tests {
         );
         assert_eq!(groups.entries.len(), 1);
 
-        let mut reg: HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)> = HashMap::new();
+        let mut reg: HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)> = HashMap::new();
         for e in &groups.entries {
             let lid = leaf_id_bytes(&filter, &e.prefix);
-            reg.insert((member.clone(), lid), (e.leaf_root.clone(), e.num_blocks, epoch));
+            reg.insert((member.clone(), lid, epoch), (e.leaf_root.clone(), e.num_blocks, epoch));
         }
         let mut openings = Vec::new();
         for (prefix, replica) in &replicas {
@@ -681,7 +695,7 @@ mod tests {
         let (att, root) = quil_crypto::porep::build_frame_storage_attestation(
             &openings, frame, &rho_n, &bitmask, poly_size,
         );
-        let good = |m: &[u8], l: &[u8]| reg.get(&(m.to_vec(), l.to_vec())).cloned();
+        let good = |m: &[u8], l: &[u8], e: u64| reg.get(&(m.to_vec(), l.to_vec(), e)).cloned();
         assert!(
             quil_crypto::porep::verify_frame_storage_attestation_registered(
                 &root, &att, frame, &rho_n, &bitmask, poly_size, epoch, good,
@@ -789,11 +803,11 @@ mod tests {
         )
         .unwrap();
 
-        let mut reg: HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)> = HashMap::new();
+        let mut reg: HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)> = HashMap::new();
         let mut prefixes: Vec<Vec<u32>> = Vec::new();
         for e in &roots[0].entries {
             let lid = leaf_id_bytes(&filter, &e.prefix);
-            reg.insert((member.clone(), lid), (e.leaf_root.clone(), e.num_blocks, epoch));
+            reg.insert((member.clone(), lid, epoch), (e.leaf_root.clone(), e.num_blocks, epoch));
             prefixes.push(e.prefix.clone());
         }
 
@@ -814,7 +828,7 @@ mod tests {
         let (att, root) = quil_crypto::porep::build_frame_storage_attestation(
             &openings, frame, &rho_n, &bitmask, poly_size,
         );
-        let good = |m: &[u8], l: &[u8]| reg.get(&(m.to_vec(), l.to_vec())).cloned();
+        let good = |m: &[u8], l: &[u8], e: u64| reg.get(&(m.to_vec(), l.to_vec(), e)).cloned();
         assert!(
             quil_crypto::porep::verify_frame_storage_attestation_registered(
                 &root, &att, frame, &rho_n, &bitmask, poly_size, epoch, good,
@@ -854,10 +868,10 @@ mod tests {
             &crdt, &replica_store, std::slice::from_ref(&filter), &member, epoch, poly_size, &params,
         )
         .unwrap();
-        let mut reg: HashMap<(Vec<u8>, Vec<u8>), (Vec<u8>, u64, u64)> = HashMap::new();
+        let mut reg: HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)> = HashMap::new();
         for e in &roots[0].entries {
             let lid = leaf_id_bytes(&filter, &e.prefix);
-            reg.insert((member.clone(), lid), (e.leaf_root.clone(), e.num_blocks, epoch));
+            reg.insert((member.clone(), lid, epoch), (e.leaf_root.clone(), e.num_blocks, epoch));
         }
 
         // Producer builds the vote blob; aggregator decodes it.
@@ -871,7 +885,7 @@ mod tests {
         let (att, root) = quil_crypto::porep::build_frame_storage_attestation(
             &openings, 100, &rho_n, &[0x01u8], poly_size,
         );
-        let good = |m: &[u8], l: &[u8]| reg.get(&(m.to_vec(), l.to_vec())).cloned();
+        let good = |m: &[u8], l: &[u8], e: u64| reg.get(&(m.to_vec(), l.to_vec(), e)).cloned();
         assert!(
             quil_crypto::porep::verify_frame_storage_attestation_registered(
                 &root, &att, 100, &rho_n, &[0x01u8], poly_size, epoch, good,

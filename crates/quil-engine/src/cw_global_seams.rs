@@ -117,6 +117,13 @@ pub struct GlobalSeamProposer {
     /// surfaces; building the next frame on it recovers liveness (any
     /// unfinalized candidates above it are simply re-derived).
     clock_store: Arc<dyn ClockStore>,
+    /// Invoked when `verify` nullifies a proposal on a prover-tree FORK. Wired to
+    /// the frame materializer's `flag_prover_root_mismatch` so a fork detected at
+    /// VOTE time — during the resulting halt, when nothing finalizes/materializes
+    /// — still sets the mismatch flag the archive prover-tree reconcile gates on.
+    /// Without it, #1 halts on the fork but #2 never hears about it → permanent
+    /// stall. `None` in tests / non-archive nodes.
+    on_prover_fork: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
 }
 
 impl GlobalSeamProposer {
@@ -125,6 +132,7 @@ impl GlobalSeamProposer {
         verifier: Arc<GlobalFrameVerifier>,
         filter: Vec<u8>,
         clock_store: Arc<dyn ClockStore>,
+        on_prover_fork: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
     ) -> Self {
         Self {
             leader_provider,
@@ -132,6 +140,7 @@ impl GlobalSeamProposer {
             filter,
             block_meta: Arc::new(Mutex::new(HashMap::new())),
             clock_store,
+            on_prover_fork,
         }
     }
 
@@ -253,6 +262,56 @@ impl GlobalProposer for GlobalSeamProposer {
                         "cw verify: request body does not match certified requests_root (nullify)"
                     );
                     return false;
+                }
+                // VERIFY THE PROVER ROOT AGAINST LOCAL STATE BEFORE SIGNING. The
+                // prover_tree_commitment is a deterministic function of committed
+                // state through N-1 — which a valid voter has already materialized —
+                // so reproducing it is a cheap local read. FAIL CLOSED: nullify if it
+                // differs (a genuine prover-tree FORK) OR if we can't reproduce it yet
+                // (not materialized to N-1). Previously the seam only checked the
+                // leader's proof was self-consistent with the leader's OWN declared
+                // root, so a divergent leader's frame finalized and every follower
+                // reconcile-stormed forever. Nullifying makes a fork HALT (no quorum
+                // forms) and paces production to materialization. Genesis (frame ≤ 1)
+                // is deterministic/degenerate — skip.
+                let n = header.frame_number;
+                if n > 1 {
+                    match self.leader_provider.local_prover_root(n) {
+                        Some(local) if local == header.prover_tree_commitment => {}
+                        Some(local) => {
+                            tracing::warn!(
+                                view,
+                                frame = n,
+                                local = %hex::encode(&local),
+                                declared = %hex::encode(&header.prover_tree_commitment),
+                                "cw verify: prover_tree_commitment != local computation \
+                                 (prover-tree FORK) — nullify"
+                            );
+                            // Route this vote-time fork detection to the archive
+                            // prover-tree reconcile: no frame will materialize during
+                            // the halt to set the mismatch flag the reconcile gates
+                            // on, so set it here. This is what makes the halt
+                            // self-healing (fork → flag → reconcile → converge →
+                            // unhalt) instead of a permanent stall.
+                            if let Some(cb) = self.on_prover_fork.as_ref() {
+                                // Pass the DECLARED root (the proposers' lineage) so
+                                // the archive reconcile targets it — a forked outlier
+                                // must converge to the proposers, not to its own
+                                // finalized root (which no peer holds).
+                                cb(header.prover_tree_commitment.clone());
+                            }
+                            return false;
+                        }
+                        None => {
+                            tracing::warn!(
+                                view,
+                                frame = n,
+                                "cw verify: cannot reproduce prover root — parent (N-1) not \
+                                 materialized locally (lag) — nullify",
+                            );
+                            return false;
+                        }
+                    }
                 }
                 self.block_meta.lock().unwrap().insert(digest, header.frame_number);
                 tracing::debug!(view, frame = header.frame_number, "cw verify: OK (vote)");
@@ -380,7 +439,17 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         }
     }
 
-    fn on_finalized(&self, _view: u64, _digest: Digest, bytes: Option<Vec<u8>>, cert: Option<Vec<u8>>) {
+    fn on_finalized(
+        &self,
+        _view: u64,
+        _digest: Digest,
+        bytes: Option<Vec<u8>>,
+        cert: Option<Vec<u8>>,
+        _locally_verified: bool,
+    ) {
+        // Certificate-only replicas may not have locally verified these bytes,
+        // so retain the context-free body re-bind check below at the persistence
+        // boundary regardless of `_locally_verified`.
         let Some(bytes) = bytes else { return };
         let Ok(mut frame) = decode_global_frame(&bytes) else { return };
         // Re-bind the body to the header at FINALIZE, not just at verify. The
@@ -520,6 +589,10 @@ pub fn activate_global_consensus_cw(
     // dissemination (regulars then rely on the RPC poller).
     global_frame_publisher: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
     local_prover_address: Vec<u8>,
+    // Called from the vote seam's `verify` when it nullifies on a prover-tree
+    // FORK — wired to the materializer's `flag_prover_root_mismatch` so the
+    // archive reconcile fires during the halt. `None` disables (tests/regulars).
+    on_prover_fork: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
 ) -> GlobalConsensusCwHandle {
     // Shared block store: `propose` inserts our own frame; the node inserts
     // peer-delivered frames via `ingest_block`; `verify`/`Relay`/`Reporter`
@@ -534,6 +607,7 @@ pub fn activate_global_consensus_cw(
         verifier,
         filter,
         clock_store.clone(),
+        on_prover_fork,
     ));
     // Seed the parent map so the FIRST proposal resolves the genesis parent's
     // frame number (block_meta is otherwise empty → prior_frame_number 0).

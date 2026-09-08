@@ -804,6 +804,7 @@ impl AppShardHarness {
                 kv_db: kv_db_dep,
                 app_consensus_cw: app_cw,
             db_config: quil_config::DbConfig { path: String::new(), worker_path_prefix: String::new(), worker_paths: vec![], ..Default::default() }, // ephemeral journal in tests
+            unified_cutover_hook: None,
             };
 
             let (engine, handle) = quil_engine::app_engine::AppConsensusEngine::new(
@@ -933,6 +934,15 @@ impl AppShardHarness {
                     }
                 }
             });
+        }
+
+        // The in-memory harness wires every CW peer directly through the event
+        // drains above, so its transport is ready as soon as those drains exist.
+        // Production releases this barrier only after BlossomSub observes a
+        // connected topic subscriber; make the equivalent condition explicit
+        // here rather than letting tests bypass the startup contract.
+        for handle in &all_handles {
+            handle.set_cw_transport_ready();
         }
 
         Self { filter, workers }
@@ -1291,6 +1301,8 @@ pub fn build_tier2_archive_rig_with_key_manager(
         transport: transport.clone() as Arc<dyn ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
+        local_message_collector: None,
+        current_frame: None,
     });
 
     let _ = all_provers; // unused in this builder — kept for API symmetry
@@ -1387,6 +1399,8 @@ pub fn build_test_pipeline_with_registry(
         transport: transport as Arc<dyn ProverMessageTransport>,
         hypergraph: None,
         replica_store: None,
+        local_message_collector: None,
+        current_frame: None,
     });
     TestPipelineRig {
         pipeline,

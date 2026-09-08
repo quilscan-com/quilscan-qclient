@@ -243,6 +243,9 @@ impl MessageCollector {
         // reject it during degraded coverage.
         if self.prover_only_mode.load(std::sync::atomic::Ordering::Relaxed) {
             if !is_prover_message(&data) {
+                tracing::debug!(
+                    "message collector: submit rejected — prover-only (degraded coverage) mode, non-prover message"
+                );
                 return SubmitOutcome::Filtered;
             }
         }
@@ -281,10 +284,31 @@ impl MessageCollector {
         if !checks.is_empty() {
             let valid = self.valid_shard_addresses.read().unwrap();
             for c in &checks {
+                // A storage frame with NO attestation is NOT invalid: the app-shard
+                // validator binds an empty `storage_attestation_root` into its
+                // deterministic output like any other value (frame_validator.rs),
+                // and the GLOBAL proof-of-storage gate withholds only the REWARD for
+                // a data-bearing shard WITHOUT halting (intrinsic.rs). Rejecting it
+                // here wedged the shard: its frames never entered the mempool → never
+                // got included → the shard could not advance (e.g. frame_number=1
+                // with no replicas yet to attest). So do NOT filter on a missing
+                // attestation — let it through; the intrinsic zeros the reward if the
+                // shard carries committed data, and the shard still progresses.
                 if c.global_frame_number > 0 && !c.has_attestation {
-                    return SubmitOutcome::Filtered;
+                    tracing::debug!(
+                        address = %hex::encode(&c.address[..c.address.len().min(8)]),
+                        frame_number = c.frame_number,
+                        global_frame_number = c.global_frame_number,
+                        "message collector: storage frame carries no attestation — ACCEPTING (reward withheld by the intrinsic if data-bearing; frame not wedged)"
+                    );
                 }
                 if !valid.is_empty() && !valid.contains(&c.address) {
+                    tracing::warn!(
+                        address = %hex::encode(&c.address[..c.address.len().min(8)]),
+                        frame_number = c.frame_number,
+                        valid_shard_count = valid.len(),
+                        "message collector: shard-frame submit REJECTED — address not in current valid-shard set (stale / pre-split / wrong-grid address)"
+                    );
                     return SubmitOutcome::Filtered;
                 }
             }
@@ -303,7 +327,13 @@ impl MessageCollector {
         match buffer.add(data) {
             AddOutcome::Added => SubmitOutcome::Accepted,
             AddOutcome::Duplicate => SubmitOutcome::Duplicate,
-            AddOutcome::Full => SubmitOutcome::Filtered,
+            AddOutcome::Full => {
+                tracing::warn!(
+                    rank,
+                    "message collector: submit rejected — rank buffer full (per-rank count/byte cap reached)"
+                );
+                SubmitOutcome::Filtered
+            }
         }
     }
 
@@ -550,7 +580,7 @@ fn extract_shard_frame_checks(data: &[u8]) -> Vec<ShardFrameCheck> {
     out
 }
 
-fn extract_shard_frame_keys(data: &[u8]) -> Vec<(Vec<u8>, u64)> {
+pub fn extract_shard_frame_keys(data: &[u8]) -> Vec<(Vec<u8>, u64)> {
     extract_shard_frame_checks(data)
         .into_iter()
         .map(|c| (c.address, c.frame_number))
