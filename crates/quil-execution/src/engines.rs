@@ -130,6 +130,26 @@ impl GlobalExecutionEngine {
         }
     }
 
+    /// Install the config the unified-tree split reset needs at the flag day: the
+    /// archive KEEP-set (records that survive the drop) and the network's QUIL
+    /// genesis shard-prefix set (the grid is rebuilt to it). See
+    /// [`crate::global_intrinsic::intrinsic::GlobalIntrinsic::maybe_apply_split_reset`].
+    /// Archive-materializing nodes only; without it the reset no-ops and the node
+    /// syncs the post-reset state.
+    pub fn install_split_reset_config(
+        &mut self,
+        archive_prover_addresses: Arc<std::collections::HashSet<Vec<u8>>>,
+        reset_genesis_prefixes: Arc<Vec<Vec<u32>>>,
+    ) {
+        if let Some(intrinsic) = self.intrinsic.take() {
+            self.intrinsic = Some(
+                intrinsic
+                    .with_archive_prover_addresses(archive_prover_addresses)
+                    .with_reset_genesis_prefixes(reset_genesis_prefixes),
+            );
+        }
+    }
+
     /// Install only the `frame_prover` on the intrinsic. This is the
     /// minimum needed to verify frame-header attestations
     /// (`verify_frame_header_signature` in `GlobalIntrinsic::validate`);
@@ -155,16 +175,75 @@ impl GlobalExecutionEngine {
         key_manager: Arc<dyn quil_types::crypto::KeyManager>,
         crdt: Arc<quil_hypergraph::HypergraphCrdt>,
         clock_store: Arc<dyn quil_types::store::ClockStore>,
+        shards_store: Option<Arc<dyn quil_types::store::ShardsStore>>,
+        shards_db: Option<Arc<dyn quil_types::store::KvDb>>,
     ) -> Self {
         let state = Arc::new(crate::hypergraph_state::HypergraphState::new(crdt.clone()));
-        let intrinsic = crate::global_intrinsic::intrinsic::GlobalIntrinsic::new(key_manager)
+        let mut intrinsic = crate::global_intrinsic::intrinsic::GlobalIntrinsic::new(key_manager)
             .with_clock_store(clock_store);
+        // Shard split/merge topology changes only persist/apply when BOTH the
+        // shards store and its KvDb are wired (see GlobalIntrinsic::with_shards_*).
+        if let Some(s) = shards_store {
+            intrinsic = intrinsic.with_shards_store(s);
+        }
+        if let Some(db) = shards_db {
+            intrinsic = intrinsic.with_shards_db(db);
+        }
         Self {
             inclusion_prover,
             intrinsic: Some(intrinsic),
             crdt: Some(crdt),
             state: Some(state),
         }
+    }
+
+    /// Apply epoch-aligned shard topology changes (split/merge) that have reached
+    /// their E+2 effective epoch, ONCE per global frame — decoupled from
+    /// `invoke_frame_header` so a staged `PendingShardChange` flips deterministically
+    /// at its boundary even when NO app-shard `FrameHeader` is materialized in the
+    /// frame. (Field failure mode: `apply_due_shard_changes` was reachable ONLY from
+    /// `invoke_frame_header`, so when app-shard header flow to the global chain
+    /// stalled, the flip never fired at the due frame and the split re-proposed
+    /// forever.) Writes go onto the frame's state changeset; `state.commit()` pushes
+    /// them into the in-memory CRDT trees exactly like `process_message`, so the
+    /// materializer's `commit_frame` flushes them durably. No-op when the
+    /// intrinsic/state is absent or nothing is due.
+    pub fn apply_due_shard_changes(&self, frame_number: u64) -> Result<()> {
+        if let (Some(ref intrinsic), Some(ref state)) = (&self.intrinsic, &self.state) {
+            intrinsic.apply_due_shard_changes(frame_number, state)?;
+            // The one-time unified-tree split reset rides the SAME per-frame,
+            // pre-commit hook so its prover-record deletes land in the cutover
+            // frame's commit batch. Runs AFTER apply_due so its deletes win over
+            // any reassignment written this frame; a no-op except at the cutover
+            // frame on a materializing archive.
+            intrinsic.maybe_apply_split_reset(frame_number, state)?;
+            // DIAGNOSTIC: `commit()` re-applies the WHOLE changeset and does NOT
+            // clear it (only `abort()` does). If this path never clears it, the
+            // changeset accumulates and re-commits every frame — a growing cost
+            // that matches the observed 5s→25s materialize climb. Log the size +
+            // time so we can confirm accumulation before changing the clearing.
+            let cs_len = state.changeset_len();
+            let commit_start = std::time::Instant::now();
+            state.commit()?;
+            let commit_ms = commit_start.elapsed().as_millis() as u64;
+            if commit_ms > 500 {
+                tracing::warn!(
+                    frame = frame_number,
+                    ms = commit_ms,
+                    changeset = cs_len,
+                    "apply_due: state.commit() SLOW — changeset size shown (large/growing ⇒ not cleared after commit)"
+                );
+            }
+            // CLEAR the changeset now that commit() has pushed it into the CRDT,
+            // matching the commit+abort pairing at every other site (e.g. the
+            // per-op path, engines.rs:1123). Without this the changeset was STUCK:
+            // a past frame's writes (observed constant at 3534) were re-applied
+            // every frame — idempotent, so the root stayed correct, but it burned
+            // ~4.7s/frame. The changes are already durable in the CRDT (which
+            // commit_frame flushes); the changeset is only a staging buffer.
+            state.abort();
+        }
+        Ok(())
     }
 }
 
@@ -691,6 +770,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         &env.escrow_range_proof,
                         &env.change_commitments,
                         &env.change_otks,
+                        &env.change_range_proofs,
                         &env.balance_proof,
                         env.fee,
                     ))? {
