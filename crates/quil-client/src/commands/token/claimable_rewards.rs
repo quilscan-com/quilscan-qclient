@@ -31,6 +31,43 @@ struct ClaimableRewardsOutput {
     cited_frame: u64,
 }
 
+fn format_claimable_rewards_output(
+    witness_found: bool,
+    witness_value: &[u8],
+    cited_frame: u64,
+    json: bool,
+) -> anyhow::Result<String> {
+    let value = if witness_found {
+        if witness_value.len() != 16 {
+            anyhow::bail!("reward witness returned a malformed value");
+        }
+        let mut value_bytes = [0u8; 16];
+        value_bytes.copy_from_slice(witness_value);
+        u128::from_le_bytes(value_bytes)
+    } else {
+        0
+    };
+
+    // A zero balance is equivalent to no claimable reward.
+    let found = value != 0;
+    let balance_subunits = if found { value } else { 0 };
+    let balance = BigInt::from(balance_subunits);
+    let balance_quil = util::float_string_12(&balance, &BigInt::from(QUIL_TOKEN_UNITS));
+
+    if json {
+        let output = ClaimableRewardsOutput {
+            found,
+            balance_subunits: balance_subunits.to_string(),
+            balance_quil,
+            units_per_quil: QUIL_TOKEN_UNITS,
+            cited_frame,
+        };
+        Ok(serde_json::to_string(&output)?)
+    } else {
+        Ok(format!("Claimable rewards: {balance_quil} QUIL"))
+    }
+}
+
 pub async fn run(global: GlobalArgs, common: &TokenCommonArgs, json: bool) -> anyhow::Result<()> {
     let ctx = Context::load(global)?;
     let (node_config, config_dir) = ctx.load_node_config(&common.config)?;
@@ -80,52 +117,25 @@ pub async fn run(global: GlobalArgs, common: &TokenCommonArgs, json: bool) -> an
         .map_err(|e| anyhow::anyhow!("GetProverRewardWitness: {e}"))?
         .into_inner();
 
-    let value = if response.found {
-        if response.value.len() != 16 {
-            anyhow::bail!("reward witness returned a malformed value");
-        }
-        let mut value_bytes = [0u8; 16];
-        value_bytes.copy_from_slice(&response.value);
-        u128::from_le_bytes(value_bytes)
-    } else {
-        0
-    };
-    // A zero balance is equivalent to no claimable reward.
-    let found = value != 0;
-    let balance_subunits = if found { value } else { 0 };
-    let balance = BigInt::from(balance_subunits);
-    let balance_quil = util::float_string_12(&balance, &BigInt::from(QUIL_TOKEN_UNITS));
-
-    if json {
-        let output = ClaimableRewardsOutput {
-            found,
-            balance_subunits: balance_subunits.to_string(),
-            balance_quil,
-            units_per_quil: QUIL_TOKEN_UNITS,
-            cited_frame: response.cited_frame,
-        };
-        println!("{}", serde_json::to_string(&output)?);
-    } else {
-        println!("Claimable rewards: {balance_quil} QUIL");
-    }
+    let output = format_claimable_rewards_output(
+        response.found,
+        &response.value,
+        response.cited_frame,
+        json,
+    )?;
+    println!("{output}");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ClaimableRewardsOutput;
+    use super::format_claimable_rewards_output;
 
     #[test]
-    fn json_output_has_exact_agent_contract_and_string_balances() {
-        let output = ClaimableRewardsOutput {
-            found: true,
-            balance_subunits: "1234500000000".to_string(),
-            balance_quil: "12.345000000000".to_string(),
-            units_per_quil: 100_000_000_000,
-            cited_frame: 700_000,
-        };
-
-        let json = serde_json::to_string(&output).expect("serialize claimable rewards output");
+    fn json_output_decodes_non_zero_witness_and_preserves_string_balances() {
+        let value = 1_234_500_000_000u128.to_le_bytes();
+        let json = format_claimable_rewards_output(true, &value, 700_000, true)
+            .expect("format claimable rewards JSON");
 
         assert_eq!(
             json,
@@ -137,5 +147,39 @@ mod tests {
         assert_eq!(object.len(), 5);
         assert!(object["balance_subunits"].is_string());
         assert!(object["balance_quil"].is_string());
+    }
+
+    #[test]
+    fn json_output_normalizes_zero_witness_to_not_found() {
+        let value = 0u128.to_le_bytes();
+
+        let json = format_claimable_rewards_output(true, &value, 700_001, true)
+            .expect("format zero claimable rewards JSON");
+
+        assert_eq!(
+            json,
+            r#"{"found":false,"balance_subunits":"0","balance_quil":"0.000000000000","units_per_quil":100000000000,"cited_frame":700001}"#
+        );
+    }
+
+    #[test]
+    fn json_output_formats_missing_witness_as_zero_without_a_value() {
+        let json = format_claimable_rewards_output(false, &[], 700_002, true)
+            .expect("format missing claimable rewards JSON");
+
+        assert_eq!(
+            json,
+            r#"{"found":false,"balance_subunits":"0","balance_quil":"0.000000000000","units_per_quil":100000000000,"cited_frame":700002}"#
+        );
+    }
+
+    #[test]
+    fn plain_output_uses_the_decoded_quil_balance() {
+        let value = 1_234_500_000_000u128.to_le_bytes();
+
+        let output = format_claimable_rewards_output(true, &value, 700_000, false)
+            .expect("format plain claimable rewards output");
+
+        assert_eq!(output, "Claimable rewards: 12.345000000000 QUIL");
     }
 }
