@@ -110,3 +110,32 @@ pub async fn run(global: GlobalArgs, common: &TokenCommonArgs, json: bool) -> an
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ClaimableRewardsOutput;
+
+    #[test]
+    fn json_output_has_exact_agent_contract_and_string_balances() {
+        let output = ClaimableRewardsOutput {
+            found: true,
+            balance_subunits: "1234500000000".to_string(),
+            balance_quil: "12.345000000000".to_string(),
+            units_per_quil: 100_000_000_000,
+            cited_frame: 700_000,
+        };
+
+        let json = serde_json::to_string(&output).expect("serialize claimable rewards output");
+
+        assert_eq!(
+            json,
+            r#"{"found":true,"balance_subunits":"1234500000000","balance_quil":"12.345000000000","units_per_quil":100000000000,"cited_frame":700000}"#
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("parse serialized claimable rewards output");
+        let object = value.as_object().expect("claimable rewards JSON object");
+        assert_eq!(object.len(), 5);
+        assert!(object["balance_subunits"].is_string());
+        assert!(object["balance_quil"].is_string());
+    }
+}

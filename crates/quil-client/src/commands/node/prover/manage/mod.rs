@@ -282,13 +282,58 @@ mod tests {
     use super::format_once;
     use super::model::{AllocationRow, Model, ShardRow};
 
+    const ALLOCATION_HEADER: &str = "Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]  Worker  Status  Mode  Next Action  Default Action";
+    const AVAILABLE_HEADER: &str =
+        "Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]";
+
     #[test]
-    fn format_once_uses_the_agent_allocation_table() {
+    fn format_once_uses_official_default_sorting_and_agent_table_contract() {
         let mut model = Model::new();
-        model.allocations.push(AllocationRow {
-            filter: vec![0xde, 0xad, 0xbe, 0xef],
-            filter_key: "deadbeef".to_string(),
-            filter_hex: "deadbeef".to_string(),
+        assert_eq!((model.alloc_sort_col, model.alloc_sort_asc), (10, true));
+        assert_eq!((model.avail_sort_col, model.avail_sort_asc), (9, false));
+        model
+            .allocations
+            .push(allocation_row("aaaa", 2, 100_000_000));
+        model
+            .allocations
+            .push(allocation_row("bbbb", 1, 200_000_000));
+        model.available.push(available_row("cccc", 50_000_000));
+        model.available.push(available_row("dddd", 200_000_000));
+
+        let output = format_once(&model);
+        let lines: Vec<_> = output.lines().collect();
+        let allocation_section = lines
+            .iter()
+            .position(|line| *line == "Allocations (2):")
+            .expect("allocation section");
+        let available_section = lines
+            .iter()
+            .position(|line| *line == "Available Shards (2):")
+            .expect("available section");
+
+        assert_eq!(lines[allocation_section + 1], ALLOCATION_HEADER);
+        assert_eq!(lines[available_section + 1], AVAILABLE_HEADER);
+        assert_eq!(
+            &lines[allocation_section + 2..allocation_section + 4],
+            &[
+                "[ ] bbbb 3 0 10.0 7 41 2 Lag ~2.00000000 1 Active A Confirm Reject",
+                "[ ] aaaa 3 0 10.0 7 41 2 Lag ~1.00000000 2 Active A Confirm Reject",
+            ]
+        );
+        assert_eq!(
+            &lines[available_section + 2..available_section + 4],
+            &[
+                "[ ] dddd 4 1 <0.1 3 0 43 Unmat ~2.00000000",
+                "[ ] cccc 4 1 <0.1 3 0 43 Unmat ~0.50000000",
+            ]
+        );
+    }
+
+    fn allocation_row(filter_hex: &str, worker_id: i64, estimated_reward: u64) -> AllocationRow {
+        AllocationRow {
+            filter: Vec::new(),
+            filter_key: filter_hex.to_string(),
+            filter_hex: filter_hex.to_string(),
             status: 2,
             status_name: "Active".to_string(),
             ring: 0,
@@ -297,10 +342,10 @@ mod tests {
             data_shards: 7,
             materialized_frame: 41,
             latest_frame: 43,
-            estimated_reward: BigInt::from(100_000_000u64),
+            estimated_reward: BigInt::from(estimated_reward),
             join_frame: 0,
             leave_frame: 0,
-            worker_id: 2,
+            worker_id,
             next_action: "Confirm".to_string(),
             default_action: "Reject".to_string(),
             manually_managed: false,
@@ -308,30 +353,21 @@ mod tests {
             leave_confirm_frame: 0,
             epoch: 0,
             last_active_frame: 0,
-        });
-        model.available.push(ShardRow {
-            filter: vec![0xca, 0xfe],
-            filter_key: "cafe".to_string(),
-            filter_hex: "cafe".to_string(),
+        }
+    }
+
+    fn available_row(filter_hex: &str, estimated_reward: u64) -> ShardRow {
+        ShardRow {
+            filter: Vec::new(),
+            filter_key: filter_hex.to_string(),
+            filter_hex: filter_hex.to_string(),
             active_provers: 4,
             ring: 1,
             shard_size: BigInt::from(2048),
             data_shards: 3,
             materialized_frame: 0,
             latest_frame: 43,
-            estimated_reward: BigInt::from(50_000_000u64),
-        });
-
-        let output = format_once(&model);
-
-        assert!(output.contains("Allocations (1):"));
-        assert!(output.contains("Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]  Worker  Status  Mode  Next Action  Default Action"));
-        assert!(output
-            .contains("[ ] deadbeef 3 0 10.0 7 41 2 Lag ~1.00000000 2 Active A Confirm Reject"));
-        assert!(output.contains("Available Shards (1):"));
-        assert!(output.contains(
-            "Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]"
-        ));
-        assert!(output.contains("[ ] cafe 4 1 <0.1 3 0 43 Unmat ~0.50000000"));
+            estimated_reward: BigInt::from(estimated_reward),
+        }
     }
 }
