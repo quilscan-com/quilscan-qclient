@@ -316,10 +316,16 @@ impl AllocationBuckets {
                 // into `allocated_descriptors` and `plan_leaves`
                 // may emit a Leave for an allocation that's already
                 // terminal on-chain.
+                // Historic: superseded by a reassignment. Treat as "doesn't
+                // exist" like the terminals — crucially NOT in `all_ours`, so the
+                // proposer is free to re-propose joining this shard, which
+                // reactivates the retained slot (the reversibility the status
+                // exists for) instead of hitting a permanent delete-tombstone.
                 EffectiveStatus::ExpiredJoining
                 | EffectiveStatus::ExpiredLeaving
                 | EffectiveStatus::Rejected
                 | EffectiveStatus::Kicked
+                | EffectiveStatus::Historic
                 | EffectiveStatus::Unknown => {}
             }
         }
@@ -352,10 +358,6 @@ pub struct LifecycleReadiness {
     /// The local prover-tree root commitment has been verified at
     /// or past `frame_number` against an archive snapshot.
     pub tree_verified: bool,
-    /// No coverage halt is currently active. While halted, the
-    /// lifecycle defers all propose/confirm actions to avoid making
-    /// allocation decisions on stale shard data.
-    pub no_halt: bool,
     /// Initial `GetAppShards` refresh has completed at least once.
     /// Gates auto-pick branches (Propose*) but NOT confirm/seniority
     /// branches (those depend only on local pending state).
@@ -981,7 +983,6 @@ impl ProverLifecycle {
                 let verified = self.prover_root_verified_frame.load(Ordering::Relaxed);
                 verified > 0 && verified >= frame_number
             },
-            no_halt: !self.halt_state.any_halted(),
             shard_info_loaded: self.shard_info_loaded(),
             join_cooldown_ok,
             identity_known: !self.prover_address.is_empty(),
@@ -1073,11 +1074,8 @@ impl ProverLifecycle {
                         // returns shard_key = L1(3) || L2(32); strip
                         // the leading 3 bytes of L1.
                         let l2_start = if s.shard_key.len() >= 3 { 3 } else { 0 };
-                        let mut filter = s.shard_key[l2_start..].to_vec();
-                        for p in &s.prefix {
-                            filter.push(*p as u8);
-                        }
-                        filter
+                        // Canonical prefix → filter (sentinel-aware).
+                        quil_forest::shard_prefix_to_filter(&s.shard_key[l2_start..], &s.prefix)
                     })
                     .filter(|f| !f.is_empty())
                     .collect(),
@@ -1194,6 +1192,43 @@ impl ProverLifecycle {
         // confirm and seniority-merge paths run regardless since
         // they depend on local pending state, not shard sizes.
         let shard_info_ready = readiness.shard_info_loaded;
+        if shard_info_ready {
+            // Publish this frame's ranking for the worker allocator.
+            // Scoring needs archive-sourced sizes, the world-byte
+            // total and the frame difficulty, none of which the
+            // allocator can reach — and its reconcile also runs from
+            // the archive poller and the frame-receive path, outside
+            // this function. Without the snapshot it binds workers in
+            // registry order, which decides arbitrarily which shards
+            // go unbound when we hold more allocations than workers.
+            let halt_risk_by_filter: HashMap<Vec<u8>, bool> = decide_all_descriptors
+                .iter()
+                .map(|d| {
+                    (
+                        d.filter.clone(),
+                        d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT,
+                    )
+                })
+                .collect();
+            let priority_entries: Vec<(Vec<u8>, bool, BigInt)> =
+                proposer::rank_allocated_by_score_ascending(
+                    &decide_all_descriptors,
+                    difficulty,
+                    &world_bytes,
+                    self.units,
+                    self.strategy,
+                    &std::collections::HashSet::new(),
+                )
+                .into_iter()
+                .map(|(filter, score)| {
+                    let halt_risk =
+                        halt_risk_by_filter.get(&filter).copied().unwrap_or(false);
+                    (filter, halt_risk, score)
+                })
+                .collect();
+            self.allocator
+                .publish_allocation_priority(frame_number, priority_entries);
+        }
         if !shard_info_ready {
             tracing::debug!(
                 frame = frame_number,
@@ -1691,6 +1726,36 @@ impl ProverLifecycle {
                 .cloned()
                 .collect();
 
+            // §6.1 Option-A: SPLIT-PARENT filters — an Active filter that has been
+            // SPLIT, i.e. some registered shard is a strict bit-path DESCENDANT of
+            // it. A deep split REMOVES the parent, so its shard no longer exists and
+            // the worker is stuck on a phantom (the E+2 reassignment that should
+            // have moved it does not survive re-materialization — see #127).
+            // Propose leave so `decide_joins` re-covers a real child via ProverJoin
+            // (canonical, persists). Detected purely from the shard-filter set, so
+            // it does not depend on the reassignment landing. A leaf has no
+            // descendants → not flagged → stable, no churn.
+            let split_parent_filters: Vec<Vec<u8>> = active_filters
+                .iter()
+                .filter(|f| !manually_managed_filters.contains(*f))
+                .filter(|f| !pending_leave_filters.contains(*f))
+                .filter(|f| {
+                    let Some((fa, fb)) = quil_forest::decode_shard_filter_or_root(f, 32) else {
+                        return false;
+                    };
+                    shard_sizes_snapshot.keys().any(|g| {
+                        matches!(
+                            quil_forest::decode_shard_filter_or_root(g, 32),
+                            Some((ga, gb))
+                                if ga == fa
+                                    && gb.len() > fb.len()
+                                    && quil_forest::bit_path_starts_with(&gb, &fb)
+                        )
+                    })
+                })
+                .cloned()
+                .collect();
+
             // Min-hold dwell: allocations confirmed within the last
             // `SCORE_LEAVE_MIN_HOLD_FRAMES` are exempt from pure-score
             // leaves so a freshly-established, producing holding isn't
@@ -1744,6 +1809,20 @@ impl ProverLifecycle {
             }
             let orphan_count =
                 leave_candidates.len() - score_driven_count - empty_shard_count;
+            for f in &split_parent_filters {
+                if !leave_candidates.contains(f) {
+                    leave_candidates.push(f.clone());
+                }
+            }
+            let split_parent_count =
+                leave_candidates.len() - score_driven_count - empty_shard_count - orphan_count;
+            if split_parent_count > 0 {
+                tracing::info!(
+                    split_parent_count,
+                    frame = frame_number,
+                    "lifecycle: proposing leave off split-away parent shard(s) → workers re-cover children"
+                );
+            }
 
             // Per-filter Leave cooldown: drop any filter we already
             // proposed Leave on within the last `LEAVE_COOLDOWN_FRAMES`
@@ -2479,6 +2558,188 @@ mod proposal_loop_tests {
                 _ => None,
             })
             .sum()
+    }
+
+    /// Collect the distinct shard filters a single `evaluate` cycle proposed
+    /// joins for (across all `ProposeJoin` actions).
+    fn proposed_join_filters(actions: &[LifecycleAction]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for a in actions {
+            if let LifecycleAction::ProposeJoin { filters, .. } = a {
+                out.extend(filters.iter().cloned());
+            }
+        }
+        out
+    }
+
+    /// REPRODUCTION of the "one prover ⇒ many allocations" multi-coverage that
+    /// the static reassign/rekey/proposer reads could not explain (the field
+    /// data showed 45/49/45 provers on three DIFFERENT-branch deep shards,
+    /// |00∩01| = 45 — i.e. the same ~45 nodes each covering many distinct-branch
+    /// shards at once). This is NOT reassignment and NOT a bug in any single
+    /// path: it's the coverage model. A node runs `worker_count` data workers,
+    /// and `decide_joins` greedily proposes a join for EVERY under-covered shard
+    /// up to its free-worker count in a SINGLE cycle. Give one node enough idle
+    /// workers and enough halt-risk shards spread across different top-of-tree
+    /// branches, and it lays claim to all of them at once.
+    #[test]
+    fn one_prover_covers_many_distinct_branch_shards_in_one_cycle() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // A real multi-core data-worker node: many idle workers.
+        for c in 1..=8u32 {
+            wm.add(idle_worker(c));
+        }
+
+        // Eight halt-risk shards, one per distinct top-2-bit branch
+        // (first byte 0x00, 0x20, .. 0xE0 → assign_child_index buckets
+        // 0,1,..7). Each is under-covered (active = 1 ≤ HALT_RISK+1) so it is
+        // a join target, and each has real size so the size>0 gate passes.
+        let branch_bytes = [0x00u8, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0];
+        let summaries: Vec<_> = branch_bytes
+            .iter()
+            .map(|b| shard_summary(filter_bytes(*b), 1))
+            .collect();
+        reg.set_summaries(summaries);
+        // The node starts with NO on-chain allocations — every join below is a
+        // fresh allocation this single prover is about to acquire.
+        reg.set_prover(prover(address.clone(), vec![]));
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let joined = proposed_join_filters(&actions);
+
+        // THE REPRODUCTION: one prover, one cycle, MANY shards.
+        assert!(
+            joined.len() > 1,
+            "expected one node to claim many shards at once, got {}",
+            joined.len()
+        );
+        // Every claimed shard is distinct and on a different top-2-bit branch —
+        // exactly the cross-branch overlap (|00∩01|) seen on mainnet.
+        let mut branches: Vec<u8> = joined.iter().map(|f| f[0] >> 6).collect();
+        branches.sort_unstable();
+        branches.dedup();
+        assert!(
+            branches.len() > 1,
+            "one prover should span multiple tree branches; spanned {:?}",
+            branches
+        );
+        println!(
+            "one prover proposed joins for {} shards across {} distinct branches \
+             in a single cycle — this is the multi-allocation source",
+            joined.len(),
+            branches.len()
+        );
+    }
+
+    /// SURPLUS-WORKER regime = the cascade. `lifecycle`'s join path has NO
+    /// crowding gate (the ≤ HALT_RISK+1 gate lives in the LEAVE/coverage path,
+    /// not here): a node fills every FREE worker with any shard it isn't already
+    /// on, however crowded. So a beefy multi-worker node re-covers post-split
+    /// children even at a healthy ~22 active — splitting sheds NO coverage,
+    /// per-shard count rebounds, the >32 trigger re-arms. This is mainnet
+    /// (|00∩01| = 45: nodes with spare workers on many different-branch shards).
+    #[test]
+    fn surplus_worker_node_recovers_post_split_children() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // Spare workers — MORE free workers than candidate shards.
+        for c in 1..=8u32 {
+            wm.add(idle_worker(c));
+        }
+
+        // Realistic post-split children: ~22/23 active each (a 45-prover shard
+        // halved). Not halt-risk, not crowded — the "healthy" band.
+        let child_a = filter_bytes(0x00);
+        let child_b = filter_bytes(0x40);
+        reg.set_summaries(vec![
+            shard_summary(child_a.clone(), 22),
+            shard_summary(child_b.clone(), 23),
+        ]);
+        reg.set_prover(prover(address.clone(), vec![]));
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let joined = proposed_join_filters(&actions);
+
+        // Re-covers BOTH — coverage does not shed across a split. Multiply over
+        // every spare-worker node and each child rebounds toward node-count →
+        // >32 → re-split → cascade.
+        assert!(
+            joined.iter().any(|f| f == &child_a) && joined.iter().any(|f| f == &child_b),
+            "surplus node should re-cover both children (no join crowding gate); got {:?}",
+            joined
+        );
+        println!(
+            "surplus-worker node re-covered BOTH post-split children (22/23 active) — \
+             no join crowding gate, coverage doesn't shed → cascade"
+        );
+    }
+
+    /// WORKER-CONSTRAINED regime = convergence — this is your 40-nodes/1-worker
+    /// case. The join cap is the FREE-WORKER count. Give the node fewer free
+    /// workers than candidate shards and it can only take a subset: with 1 free
+    /// worker and 2 post-split children it joins exactly ONE, leaving the other
+    /// at its reduced count. Aggregate: 40 one-worker nodes split 40→20/20 and
+    /// STAY there, because none has a spare worker to re-cover the sibling. The
+    /// distinguishing variable between cascade and convergence is free workers,
+    /// not any threshold.
+    #[test]
+    fn worker_constrained_node_covers_only_a_subset() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+
+        // Exactly ONE free worker — fewer than the candidate shards.
+        wm.add(idle_worker(1));
+
+        let child_a = filter_bytes(0x00);
+        let child_b = filter_bytes(0x40);
+        reg.set_summaries(vec![
+            shard_summary(child_a.clone(), 22),
+            shard_summary(child_b.clone(), 23),
+        ]);
+        reg.set_prover(prover(address.clone(), vec![]));
+
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+
+        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let joined = proposed_join_filters(&actions);
+
+        // Capped at the single free worker → covers exactly ONE child. The
+        // sibling keeps its reduced post-split coverage → split converges.
+        assert_eq!(
+            joined.len(),
+            1,
+            "one free worker must cap joins at 1 (constrained → converges); got {:?}",
+            joined
+        );
+        println!(
+            "worker-constrained node (1 free worker) covered only 1 of 2 children — \
+             free-worker cap is what makes 40→20/20 STICK (convergence)"
+        );
     }
 
     #[test]

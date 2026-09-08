@@ -152,6 +152,16 @@ pub struct HypergraphCrdt {
     /// the apps' real, possibly non-uniform, shard sets (matching the converter).
     #[allow(clippy::type_complexity)]
     app_shard_prefixes: RwLock<HashMap<[u8; 32], Vec<Vec<u32>>>>,
+    /// DEEP-BIFURCATION (Phase 2): each app's shard address BIT-PATHS, stored
+    /// DIRECTLY (not derived from `app_shard_prefixes` via
+    /// `canonical_shard_bit_paths`, which can't carry a bit-path that skips
+    /// uniform bits). When present for an app, [`Self::shard_bit_paths`] returns
+    /// these; absent ⇒ it falls back to canonical of `app_shard_prefixes`. MUST
+    /// be index-aligned with `app_shard_prefixes` (same order/count) — the routing
+    /// indexes both. Empty by default (canonical source); populated at the
+    /// deep-bifurcation flag day. See `DEEP_BIFURCATION_ENCODING_SCOPE.md`.
+    #[allow(clippy::type_complexity)]
+    app_shard_bit_paths: RwLock<HashMap<[u8; 32], Vec<Vec<bool>>>>,
     /// Staged L3 leaf deltas per (shard, phase index).
     pending: RwLock<HashMap<(ShardKey, usize), PhaseDeltas>>,
     /// Staged per-vertex blobs per (shard, phase index).
@@ -176,9 +186,102 @@ pub struct HypergraphCrdt {
     covered_prefix: RwLock<Vec<i32>>,
     /// Serializes commits against each other.
     commit_lock: std::sync::Mutex<()>,
+    /// UNIFIED-APP-TREE mode (Phase 2, `UNIFIED_APP_TREE_DESIGN.md`). When set,
+    /// every app commits ALL its vertices into ONE L3 tree per phase keyed by the
+    /// app address (leaves raw-key positioned), so a shard is the in-place subtree
+    /// at its prefix and the app-phase root is the JMT root over all shards — no
+    /// separate per-sub-shard trees, no `app_root_from_shard_paths` rollup, no
+    /// per-frame manifest. Per-shard commitments are read on demand via
+    /// [`Forest::app_subtree_root`]. DEFAULT off (legacy separate-tree path);
+    /// flipped at the flag-day frame AFTER the one-time consolidation (§9), since
+    /// a split app's existing data lives in the per-prefix trees until then.
+    unified_tree: AtomicBool,
+}
+
+/// READ-ONLY snapshot of where an app's forest leaves actually live — the
+/// UNIFIED app tree (keyed by the bare app address, post-699500 home of state)
+/// vs the LEGACY per-prefix byte-suffix sub-shard trees (`addr_path_shard_id(app,
+/// [i])`, where pre-cutover / freshly-migrated QUIL state was written). Lets an
+/// operator tell "unified tree populated" (healthy) apart from "data stranded in
+/// legacy trees, consolidation never drained it". Produced by
+/// [`HypergraphCrdt::dump_app_forest_stats`]; not on any consensus path.
+#[derive(Clone, Debug)]
+pub struct AppForestStats {
+    /// Unified app tree, per phase (0=VertexAdds .. 3=HyperedgeRemoves):
+    /// `(leaf_count, root, version_read_at)`.
+    pub unified: [(u64, [u8; 32], u64); 4],
+    /// Legacy byte-suffix trees `[i]` (i in 0..64) with ANY VertexAdds leaves —
+    /// `(i, vertex_adds_leaf_count)`. Empty once fully drained into the unified tree.
+    pub legacy_nonempty: Vec<(u32, u64)>,
+    /// Sum of VertexAdds leaves across ALL 64 legacy per-prefix trees.
+    pub legacy_total_vertex_adds: u64,
 }
 
 impl HypergraphCrdt {
+    /// READ-ONLY diagnostic: the PERSISTED per-sub-shard size buckets
+    /// (`SIZE_BUCKETS_KEY`) that `warm_sizes` restores and `sub_meta_for` /
+    /// GetAppShards / the reward basis read — returned for `app` as
+    /// `(bucket_key_len, raw_count, live_size)`. The key is
+    /// `addr_path_shard_id(app, prefix) = app(32) ‖ prefix_bytes`, so the LENGTH
+    /// reveals the ENCODING: 36 (`app ‖ [i]`, one u32) = byte-suffix, 60
+    /// (`app ‖ [SENTINEL, b×6]`, seven u32) = sentinel. If the buckets are
+    /// byte-suffix while the live CRDT prefixes (post-refresh) are sentinel, every
+    /// `sub_meta_for` fold misses → GetAppShards reports size 0 → the proposer sees
+    /// no join candidates and the reward basis is 0. Does NOT run `warm_sizes`
+    /// (no scan) — reads the cache verbatim.
+    pub fn dump_persisted_size_buckets(&self, app: &[u8; 32]) -> Vec<(usize, u64, i128)> {
+        let read_txn = match self.store.new_transaction(false) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let blob = match read_txn.get(SIZE_BUCKETS_KEY) {
+            Ok(Some(b)) => b,
+            _ => return Vec::new(),
+        };
+        let mut out: Vec<(usize, u64, i128)> = deserialize_buckets(&blob)
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(&app[..]))
+            .map(|(k, (c, s))| (k.len(), c, s))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// READ-ONLY diagnostic (see [`AppForestStats`]): resolve each tree's exact
+    /// committed version the same way the live reader does
+    /// ([`Self::read_shard_phase_root`]), then read the UNIFIED app tree (keyed by
+    /// the bare app address) and the 64 LEGACY per-prefix byte-suffix trees. If
+    /// the unified VertexAdds count is ~total and legacy is ~0, state is where the
+    /// live path reads it; if unified is ~0 while legacy holds the leaves, the
+    /// one-time consolidation never drained them.
+    pub fn dump_app_forest_stats(&self, app: &[u8; 32]) -> AppForestStats {
+        let forest = self.forest.read().unwrap();
+        let resolve = |sid: &[u8], pi: usize| -> u64 {
+            self.resolve_phase_version_with(&forest, sid, pi)
+                .unwrap_or_else(|| self.forest_version.load(Ordering::SeqCst))
+        };
+        let mut unified = [(0u64, [0u8; 32], 0u64); 4];
+        for (pi, slot) in unified.iter_mut().enumerate() {
+            let ver = resolve(app, pi);
+            let count = forest.shard_phase_leaf_count(app, PHASES[pi], ver).unwrap_or(0);
+            let root =
+                forest.shard_phase_root(app, PHASES[pi], ver).ok().flatten().unwrap_or([0u8; 32]);
+            *slot = (count, root, ver);
+        }
+        let mut legacy_nonempty = Vec::new();
+        let mut legacy_total_vertex_adds = 0u64;
+        for i in 0..64u32 {
+            let sid = Forest::addr_path_shard_id(app, &[i]);
+            let ver = resolve(&sid, 0); // phase 0 = VertexAdds = the state
+            let count = forest.shard_phase_leaf_count(&sid, PHASES[0], ver).unwrap_or(0);
+            if count > 0 {
+                legacy_nonempty.push((i, count));
+                legacy_total_vertex_adds += count;
+            }
+        }
+        AppForestStats { unified, legacy_nonempty, legacy_total_vertex_adds }
+    }
+
     pub fn new(store: Arc<dyn HypergraphStore>, prover: Arc<dyn InclusionProver>) -> Self {
         Self {
             store,
@@ -190,6 +293,7 @@ impl HypergraphCrdt {
             phase_versions: RwLock::new(HashMap::new()),
             global_versions: RwLock::new(HashMap::new()),
             app_shard_prefixes: RwLock::new(HashMap::new()),
+            app_shard_bit_paths: RwLock::new(HashMap::new()),
             pending: RwLock::new(HashMap::new()),
             pending_blobs: RwLock::new(HashMap::new()),
             shard_metadata: RwLock::new(HashMap::new()),
@@ -198,7 +302,20 @@ impl HypergraphCrdt {
             snapshot_mgr: SnapshotManager::new(),
             covered_prefix: RwLock::new(Vec::new()),
             commit_lock: std::sync::Mutex::new(()),
+            unified_tree: AtomicBool::new(false),
         }
+    }
+
+    /// Enable/disable [`unified_tree`](Self::unified_tree) mode. Flag-day gated in
+    /// production (set only after the one-time consolidation); tests flip it
+    /// directly on a fresh CRDT.
+    pub fn set_unified_tree(&self, on: bool) {
+        self.unified_tree.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether unified-app-tree mode is active.
+    pub fn unified_tree(&self) -> bool {
+        self.unified_tree.load(Ordering::Relaxed)
     }
 
     /// Install the state-commitment forest (production: the namespaced RocksDB
@@ -247,9 +364,39 @@ impl HypergraphCrdt {
     /// mixed depths). Each prefix is a `ShardInfo.prefix` exactly as the shards
     /// store holds it. The node populates this from the shards store; the set
     /// must be complete + prefix-free (every split writes all its children).
-    pub fn set_app_shard_prefixes(&self, app: [u8; 32], prefixes: Vec<Vec<u32>>) {
+    /// Returns `true` iff this TRANSITIONED an already-registered app to a
+    /// different prefix set (a split or merge just landed) — the caller uses that
+    /// to trigger [`rebucket_app`], re-partitioning the size buckets so
+    /// freshly-created leaves don't read 0. First-sight population (init /
+    /// post-restart priming) returns `false`: the buckets there come from
+    /// `warm_sizes` (persisted fast-path or cold scan), which must not be clobbered.
+    pub fn set_app_shard_prefixes(&self, app: [u8; 32], prefixes: Vec<Vec<u32>>) -> bool {
         let set = if prefixes.is_empty() { vec![Vec::new()] } else { prefixes };
-        self.app_shard_prefixes.write().unwrap().insert(app, set);
+        // Change-detection is ORDER-INDEPENDENT: a shard set is semantically a
+        // SET, and routing is value-matched (an address finds its matching prefix
+        // regardless of position), so a mere re-ordering must NOT read as a
+        // transition. Comparing the raw `Vec` order once made a boot where the
+        // shards-store range order differed from the seeded order (e.g. the forest
+        // default vs the reset grid) look like a split EVERY boot, triggering a
+        // full `rebucket_app` re-scan of all committed coins (the 30m-2hr hang).
+        // Storage keeps the caller's order (routing derives bit-paths from it).
+        let sorted = |v: &[Vec<u32>]| {
+            let mut s = v.to_vec();
+            s.sort();
+            s
+        };
+        let mut w = self.app_shard_prefixes.write().unwrap();
+        match w.get(&app) {
+            Some(existing) if sorted(existing) == sorted(&set) => false, // unchanged set
+            Some(_) => {
+                w.insert(app, set);
+                true // genuine split/merge transition
+            }
+            None => {
+                w.insert(app, set);
+                false // first sight — warm_sizes owns the initial buckets
+            }
+        }
     }
 
     /// The complete address-path shard prefix set for `app`: a single empty
@@ -264,6 +411,51 @@ impl HypergraphCrdt {
             .get(app)
             .cloned()
             .unwrap_or_else(|| vec![Vec::new()])
+    }
+
+    /// Declare `app`'s shard address BIT-PATHS directly (deep-bifurcation Phase 2).
+    /// MUST be index-aligned with the prefix set from [`set_app_shard_prefixes`]
+    /// (same order/count) — routing indexes both. Empty ⇒ clears the override
+    /// (back to canonical derivation).
+    pub fn set_app_shard_bit_paths(&self, app: [u8; 32], bit_paths: Vec<Vec<bool>>) {
+        let mut w = self.app_shard_bit_paths.write().unwrap();
+        if bit_paths.is_empty() {
+            w.remove(&app);
+        } else {
+            w.insert(app, bit_paths);
+        }
+    }
+
+    /// The canonical address bit-path of every shard of `app`, IN PREFIX ORDER —
+    /// the single source the routing (`address_shard_index`) and aggregation
+    /// (`app_root_from_shard_paths`) consume. Directly-stored bit-paths
+    /// ([`Self::set_app_shard_bit_paths`], the deep-bifurcation path) when present;
+    /// otherwise derived from the `Vec<u32>` prefixes via
+    /// [`canonical_shard_bit_paths`] (the default — lossless for every current
+    /// uniform/marker split, so swapping the source is a no-op until a deep split
+    /// stores a bit-path the `Vec<u32>` form can't express).
+    fn shard_bit_paths(&self, app: &[u8; 32]) -> Vec<Vec<bool>> {
+        if let Some(bp) = self.app_shard_bit_paths.read().unwrap().get(app) {
+            return bp.clone();
+        }
+        let prefixes = self.app_prefixes(app);
+        // Deep-bifurcation: a post-cutover app's shards are persisted as
+        // SENTINEL-tagged bit-path prefixes (`bit_path_to_prefix`, riding the
+        // existing `ShardInfo.prefix`). The migration converts an app's whole set
+        // ATOMICALLY, so it's all-sentinel or all-legacy — never mixed (canonical
+        // can't resolve a mixed set). All-sentinel ⇒ decode directly; otherwise
+        // resolve the legacy set via canonical.
+        if !prefixes.is_empty()
+            && prefixes
+                .iter()
+                .all(|p| quil_forest::shard_bit_path_from_prefix(p).is_some())
+        {
+            return prefixes
+                .iter()
+                .map(|p| quil_forest::shard_bit_path_from_prefix(p).unwrap())
+                .collect();
+        }
+        canonical_shard_bit_paths(&prefixes)
     }
 
     /// Commit one shard/phase tree's flattened L3 leaves, staging the forest node
@@ -365,10 +557,12 @@ impl HypergraphCrdt {
         prefixes: &[Vec<u32>],
         phase_idx: usize,
     ) -> Vec<u8> {
-        if prefixes.len() == 1 && prefixes[0].is_empty() {
+        // Unified mode: the app is one tree keyed by the app address, so the
+        // app-phase root is that tree's root directly (no sub-shard aggregation).
+        if self.unified_tree() || (prefixes.len() == 1 && prefixes[0].is_empty()) {
             return self.read_shard_phase_root(forest, app, phase_idx).to_vec();
         }
-        let bit_paths = canonical_shard_bit_paths(prefixes);
+        let bit_paths = self.shard_bit_paths(app);
         let shard_roots: Vec<(Vec<bool>, [u8; 32])> = prefixes
             .iter()
             .zip(bit_paths)
@@ -462,6 +656,34 @@ impl HypergraphCrdt {
         Ok(())
     }
 
+    /// Stage a removes-phase tombstone for `id` whose forest leaf carries the
+    /// removed vertex's `size` (its original add-blob length). Unlike an empty
+    /// `stage(.., &[])` — whose `vertex_leaf_value(&[])` has size 0 — this lets
+    /// the removes tree's subtree-size aggregate equal the sum of removed sizes,
+    /// so `forest_app_buckets` can net LIVE size as `adds − removes` in O(depth).
+    /// The blob store still holds an empty blob (a tombstone carries no data);
+    /// only the forest leaf's size field differs. Idempotent: re-removing stamps
+    /// the same original size (never a stale 0), so a double-remove is stable.
+    fn stage_sized_tombstone(
+        &self,
+        shard: &ShardKey,
+        phase_idx: usize,
+        id: &[u8],
+        size: u64,
+    ) -> Result<()> {
+        let data_address = if id.len() >= 64 { id[32..64].to_vec() } else { id.to_vec() };
+        let value = quil_tries::sized_tombstone_leaf_value(size)?;
+        {
+            let mut p = self.pending.write().unwrap();
+            p.entry((shard.clone(), phase_idx)).or_default().insert(data_address, value);
+        }
+        {
+            let mut b = self.pending_blobs.write().unwrap();
+            b.entry((shard.clone(), phase_idx)).or_default().insert(id.to_vec(), Vec::new());
+        }
+        Ok(())
+    }
+
     // ---- read helpers (KV blobs + tombstone check) ----------------------
 
     /// The staged-or-committed blob for `(shard, phase, id)`, or `None`.
@@ -493,7 +715,7 @@ impl HypergraphCrdt {
         if prefixes.len() == 1 && prefixes[0].is_empty() {
             Forest::addr_path_shard_id(app, &[])
         } else {
-            let bit_paths = quil_forest::canonical_shard_bit_paths(&prefixes);
+            let bit_paths = self.shard_bit_paths(app);
             let pi = quil_forest::address_shard_index(data_addr, &bit_paths);
             Forest::addr_path_shard_id(app, &prefixes[pi])
         }
@@ -545,8 +767,12 @@ impl HypergraphCrdt {
         if new_placeholder {
             self.stage(&shard, 0, &id, &[])?;
         }
-        // Tombstone in the removes phase.
-        self.stage(&shard, 1, &id, &[])?;
+        // Tombstone in the removes phase, carrying the ORIGINAL add size (from the
+        // committed/staged add blob, independent of `present` so a double-remove
+        // re-stamps the same size rather than zeroing it) so the forest removes
+        // subtree-size nets out the removed leaf in `forest_app_buckets`.
+        let orig_size = existing.as_ref().map(|b| b.len()).unwrap_or(0) as u64;
+        self.stage_sized_tombstone(&shard, 1, &id, orig_size)?;
 
         // Removing a present vertex frees its live size (adds MINUS removes).
         let d_size = if present { -(value_size as i128) } else { 0 };
@@ -583,7 +809,11 @@ impl HypergraphCrdt {
         if existing.is_none() {
             self.stage(&shard, 2, &id, &[])?;
         }
-        self.stage(&shard, 3, &id, &[])?;
+        // Tombstone carrying the original hyperedge-add size (see `remove_vertex`),
+        // so the forest HyperedgeRemoves subtree-size nets it out in
+        // `forest_app_buckets`.
+        let orig_size = existing.as_ref().map(|b| b.len()).unwrap_or(0) as u64;
+        self.stage_sized_tombstone(&shard, 3, &id, orig_size)?;
         // FIX: a removed hyperedge frees its live size — previously this was never
         // subtracted (hyperedges have only existed on the excluded prover shard,
         // so it was a latent no-op until now).
@@ -613,6 +843,21 @@ impl HypergraphCrdt {
         let location = Location { app_address: app, data_address: [0u8; 32] };
         let shard = shard_key_for_location(&location);
         self.store.for_each_vertex_underlying("vertex", "adds", &shard, cb)
+    }
+
+    /// Enumerate committed `(vertex_key, blob)` for an EXPLICIT shard/phase —
+    /// used to read the global prover shard ({l1:[0;3], l2:[0xff;32]}) whose
+    /// L1 is not derivable from a domain. Reads the committed underlying store
+    /// (identical across nodes at a given committed height), so callers get a
+    /// deterministic snapshot for consensus-critical enumeration.
+    pub fn for_each_vertex_underlying_shard(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard: &ShardKey,
+        cb: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<usize> {
+        self.store.for_each_vertex_underlying(set_type, phase_type, shard, cb)
     }
 
     // ---- commit ---------------------------------------------------------
@@ -671,7 +916,15 @@ impl HypergraphCrdt {
         for shard in &shard_keys {
             let cached_row = cached.get(shard);
             let prefixes = self.app_prefixes(&shard.l2);
-            let single_shard = prefixes.len() == 1 && prefixes[0].is_empty();
+            // UNIFIED mode commits every app as a SINGLE tree keyed by the app
+            // address (all vertices raw-key positioned) — the existing
+            // single-shard path IS the unified commit (one tree, root = app
+            // root, one version). Per-shard commitments are read separately via
+            // `Forest::app_subtree_root`. Legacy split apps keep the per-prefix
+            // trees + `app_root_from_shard_paths` rollup until the flag-day
+            // consolidation flips `unified_tree`.
+            let single_shard =
+                self.unified_tree() || (prefixes.len() == 1 && prefixes[0].is_empty());
             let mut roots: [Vec<u8>; 4] =
                 [empty_root.clone(), empty_root.clone(), empty_root.clone(), empty_root.clone()];
             let mut va_leaf_count: u64 = 0;
@@ -713,7 +966,7 @@ impl HypergraphCrdt {
                 let bit_paths = if single_shard {
                     Vec::new()
                 } else {
-                    canonical_shard_bit_paths(&prefixes)
+                    self.shard_bit_paths(&shard.l2)
                 };
                 // `sub_vers` maps a blob's routing → the version of the tree it
                 // belongs to (identity for single-shard; per-sub-shard for split),
@@ -957,11 +1210,43 @@ impl HypergraphCrdt {
     /// query `(app, prefix)` — an O(#sub-shards) read of the maintained buckets,
     /// no tree scan. `prefix` empty ⇒ whole app.
     fn sub_meta_for(&self, app: &[u8; 32], prefix: &[u32]) -> (u64, i128) {
+        // Match by CANONICAL bit-path, not raw `starts_with`: the lookup prefix
+        // and the CRDT's stored prefixes can be in DIFFERENT encodings (a byte-
+        // suffix `[i]` vs a sentinel `[SENTINEL, bits]` after a reset). A raw
+        // compare misses — a sentinel prefix never `starts_with([i])` — so every
+        // sentinel-shard lookup returned size 0, zeroing rewards and making
+        // GetAppShards report empty (post-v5 "no rewards / no join candidates").
+        // `shard_bit_paths` is the SPLIT-AWARE canonical decode (aligned with
+        // `app_prefixes`), so this handles non-uniform / non-6-bit splits too.
+        // `prefix` empty ⇒ whole app.
+        let prefixes = self.app_prefixes(app);
+        let bit_paths = self.shard_bit_paths(app);
+        // The lookup prefix's canonical bits: its entry in the set if it IS a
+        // current shard, else a best-effort decode (a parent prefix not itself a
+        // current shard — sentinel-tagged if present, else the 6-bit QUIL split).
+        let lookup_bits = prefixes
+            .iter()
+            .position(|p| p == prefix)
+            .and_then(|i| bit_paths.get(i).cloned())
+            .unwrap_or_else(|| {
+                if prefix.is_empty() {
+                    Vec::new()
+                } else {
+                    quil_forest::shard_bit_path_from_prefix(prefix)
+                        .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6))
+                }
+            });
         let m = self.sub_meta.read().unwrap();
-        self.app_prefixes(app)
-            .into_iter()
-            .filter(|p| p.starts_with(prefix))
-            .filter_map(|p| m.get(&Forest::addr_path_shard_id(app, &p)).copied())
+        prefixes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                bit_paths
+                    .get(*i)
+                    .map(|b| b.starts_with(&lookup_bits))
+                    .unwrap_or(false)
+            })
+            .filter_map(|(_, p)| m.get(&Forest::addr_path_shard_id(app, p)).copied())
             .fold((0u64, 0i128), |(c, s), (pc, ps)| (c + pc, s + ps))
     }
 
@@ -979,67 +1264,149 @@ impl HypergraphCrdt {
     /// bucket by the forest partition, then persist. `apps` is the COMPLETE set
     /// of committed app addresses (the node passes it from
     /// `shards_store.range_app_shards()`). Runs at most once ever.
+    /// Whether a size-bucket map is keyed consistently with each app's CURRENT
+    /// `app_prefixes` — every bucket key for an app must be one of that app's
+    /// current-prefix shard ids (`addr_path_shard_id(app, prefix)`). A cache
+    /// written under a since-replaced encoding (byte-suffix vs sentinel) or under
+    /// a pre-split parent prefix carries keys absent from the current set and
+    /// fails this, so [`warm_sizes`] rebuilds instead of restoring stale keys.
+    /// Missing expected keys are fine (a shard with no data has no bucket); only
+    /// UNEXPECTED keys (belonging to a prior encoding/partition) reject the cache.
+    fn buckets_match_current_prefixes(
+        &self,
+        apps: &[[u8; 32]],
+        m: &HashMap<Vec<u8>, (u64, i128)>,
+    ) -> bool {
+        for &app in apps {
+            if app == [0xFFu8; 32] {
+                continue; // prover shard excluded from world size (never bucketed)
+            }
+            let expected: std::collections::HashSet<Vec<u8>> = self
+                .app_prefixes(&app)
+                .iter()
+                .map(|p| Forest::addr_path_shard_id(&app, p))
+                .collect();
+            for k in m.keys() {
+                if k.starts_with(&app[..]) && !expected.contains(k) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Re-key a stale-encoded bucket map to the CURRENT prefixes by canonical
+    /// bit-path, WITHOUT rescanning committed state. A byte-suffix `[i]` bucket and
+    /// the sentinel `binary(i)` bucket describe the SAME shard and carry the same
+    /// `(raw_count, live_size)`, so an encoding flip is a pure key remap. Returns
+    /// `None` — signalling the caller to do a full rescan — if any app-owned bucket
+    /// maps to zero or more-than-one current prefix (a genuine partition change,
+    /// e.g. a split, needs real re-attribution, not a remap). Keys not owned by any
+    /// `apps` entry pass through unchanged.
+    fn transcode_buckets_to_current(
+        &self,
+        apps: &[[u8; 32]],
+        stale: &HashMap<Vec<u8>, (u64, i128)>,
+    ) -> Option<HashMap<Vec<u8>, (u64, i128)>> {
+        let per_app: HashMap<[u8; 32], (Vec<Vec<u32>>, Vec<Vec<bool>>)> = apps
+            .iter()
+            .map(|&app| (app, (self.app_prefixes(&app), self.shard_bit_paths(&app))))
+            .collect();
+        let mut out: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
+        for (k, v) in stale {
+            let Some(&app) = apps.iter().find(|a| k.starts_with(&a[..])) else {
+                out.insert(k.clone(), *v); // foreign key — keep verbatim
+                continue;
+            };
+            let (prefixes, bit_paths) = per_app.get(&app).unwrap();
+            // Already a current-prefix key ⇒ keep as-is.
+            if prefixes.iter().any(|p| Forest::addr_path_shard_id(&app, p) == *k) {
+                let e = out.entry(k.clone()).or_insert((0, 0));
+                e.0 += v.0;
+                e.1 += v.1;
+                continue;
+            }
+            // Decode the stale key's prefix (`app(32) ‖ u32-BE levels`) → bit-path,
+            // then find the single current prefix sharing those canonical bits.
+            let prefix_bytes = &k[app.len().min(k.len())..];
+            if prefix_bytes.len() % 4 != 0 {
+                return None;
+            }
+            let stale_prefix: Vec<u32> = prefix_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let stale_bits = quil_forest::shard_bit_path_from_prefix(&stale_prefix)
+                .unwrap_or_else(|| quil_forest::prefix_to_bits(&stale_prefix, 6));
+            let mut matched: Option<&Vec<u32>> = None;
+            for (i, b) in bit_paths.iter().enumerate() {
+                if *b == stale_bits {
+                    if matched.is_some() {
+                        return None; // ambiguous — needs a real scan
+                    }
+                    matched = prefixes.get(i);
+                }
+            }
+            let cur_prefix = matched?; // no current shard with these bits ⇒ rescan
+            let e = out
+                .entry(Forest::addr_path_shard_id(&app, cur_prefix))
+                .or_insert((0, 0));
+            e.0 += v.0;
+            e.1 += v.1;
+        }
+        Some(out)
+    }
+
     pub fn warm_sizes(&self, apps: &[[u8; 32]]) -> Result<()> {
         if self.sizes_warmed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        // Fast path: restore the persisted buckets.
-        let read_txn = self.store.new_transaction(false)?;
-        if let Some(blob) = read_txn.get(SIZE_BUCKETS_KEY)? {
-            *self.sub_meta.write().unwrap() = deserialize_buckets(&blob);
-            return Ok(());
+        // Fast path: restore the persisted buckets — but ONLY if their key
+        // encoding still matches the CURRENT prefixes. The cache is keyed
+        // `addr_path_shard_id(app, prefix)` for the prefixes in force when it was
+        // written; if the shard set has since been re-encoded (a byte-suffix →
+        // sentinel grid reset), a blind restore reinstates STALE keys that
+        // `sub_meta_for` — which folds by the current sentinel prefixes — can never
+        // match, zeroing GetAppShards sizes and the reward basis (post-reset
+        // "no join candidates / no rewards"). On mismatch: keep the current
+        // in-memory buckets if a `rebucket_app` this boot already re-keyed them to
+        // the current prefixes (the `refresh_crdt_shard_prefixes` path), re-persist,
+        // and skip the rescan; otherwise fall through to a fresh scan that re-keys.
+        let blob = {
+            let read_txn = self.store.new_transaction(false)?;
+            read_txn.get(SIZE_BUCKETS_KEY)?
+        };
+        if let Some(blob) = blob {
+            let restored = deserialize_buckets(&blob);
+            if self.buckets_match_current_prefixes(apps, &restored) {
+                *self.sub_meta.write().unwrap() = restored;
+                return Ok(());
+            }
+            // Stale encoding (a byte-suffix→sentinel grid flip since the cache was
+            // written). Prefer, in order: the already-rebuilt in-memory buckets (a
+            // `rebucket_app` this boot); a no-rescan TRANSCODE that re-keys the
+            // stale buckets to the current prefixes by canonical bit-path (a
+            // byte-suffix `[i]` bucket and the sentinel `binary(i)` bucket carry the
+            // same `(count,size)`); else fall through to a full cold scan.
+            let current = self.sub_meta.read().unwrap().clone();
+            let replacement = if !current.is_empty()
+                && self.buckets_match_current_prefixes(apps, &current)
+            {
+                Some(current)
+            } else {
+                self.transcode_buckets_to_current(apps, &restored)
+            };
+            if let Some(buckets) = replacement {
+                let txn = self.store.new_transaction(false)?;
+                txn.set(SIZE_BUCKETS_KEY, &serialize_buckets(&buckets))?;
+                txn.commit()?;
+                *self.sub_meta.write().unwrap() = buckets;
+                return Ok(());
+            }
         }
-        drop(read_txn);
         let mut buckets: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
         for &app in apps {
-            if app == [0xFFu8; 32] {
-                continue; // prover shard excluded from world size
-            }
-            let l1 = crate::addressing::get_bloom_filter_indices(&app, 256, 3);
-            let shard_key = ShardKey { l1, l2: app };
-            let prefixes = self.app_prefixes(&app);
-            let single = prefixes.len() == 1 && prefixes[0].is_empty();
-            let bit_paths = if single {
-                Vec::new()
-            } else {
-                quil_forest::canonical_shard_bit_paths(&prefixes)
-            };
-            let route = |vk: &[u8]| -> Vec<u8> {
-                let data: &[u8] = if vk.len() >= 64 { &vk[32..64] } else { vk };
-                let pi = if single {
-                    0
-                } else {
-                    quil_forest::address_shard_index(data, &bit_paths)
-                };
-                Forest::addr_path_shard_id(&app, &prefixes[pi])
-            };
-            // Load the tombstone sets ONCE (a streaming pass), so "present" is an
-            // O(1) membership test — NOT a per-leaf versioned store lookup, which
-            // on a large migrated shard is millions of reads and appears to hang.
-            let mut v_removed: std::collections::HashSet<Vec<u8>> =
-                std::collections::HashSet::new();
-            self.store.for_each_vertex_underlying("vertex", "removes", &shard_key, &mut |vk, _| {
-                v_removed.insert(vk);
-            })?;
-            let mut he_removed: std::collections::HashSet<Vec<u8>> =
-                std::collections::HashSet::new();
-            self.store.for_each_vertex_underlying("hyperedge", "removes", &shard_key, &mut |vk, _| {
-                he_removed.insert(vk);
-            })?;
-            // Vertex adds: raw count for every leaf; live size only if present.
-            self.store.for_each_vertex_underlying("vertex", "adds", &shard_key, &mut |vk, blob| {
-                let e = buckets.entry(route(&vk)).or_insert((0, 0));
-                e.0 += 1;
-                if !blob.is_empty() && !v_removed.contains(&vk) {
-                    e.1 += blob.len() as i128;
-                }
-            })?;
-            // Hyperedge adds: live size only (no vertex-count contribution).
-            self.store.for_each_vertex_underlying("hyperedge", "adds", &shard_key, &mut |vk, blob| {
-                if !blob.is_empty() && !he_removed.contains(&vk) {
-                    buckets.entry(route(&vk)).or_insert((0, 0)).1 += blob.len() as i128;
-                }
-            })?;
+            self.forest_app_buckets(&app, &mut buckets)?;
         }
         // Persist the freshly-computed baseline so subsequent restarts take the
         // fast path.
@@ -1047,6 +1414,204 @@ impl HypergraphCrdt {
         txn.set(SIZE_BUCKETS_KEY, &serialize_buckets(&buckets))?;
         txn.commit()?;
         *self.sub_meta.write().unwrap() = buckets;
+        Ok(())
+    }
+
+    /// Stream `app`'s committed vertex/hyperedge adds+removes and accumulate the
+    /// per-sub-shard `(raw_count, live_size)` buckets into `buckets`, routing each
+    /// leaf by the CURRENT prefix set (`app_prefixes` / `shard_bit_paths`). The
+    /// single scan pass mirrors the incremental [`bump_meta`] accounting so a fresh
+    /// scan reproduces the running totals. The global prover shard (`l2 == 0xff`)
+    /// is excluded from world size. Shared by [`warm_sizes`] (cold path) and
+    /// [`rebucket_app`] (post-split/-merge re-partition).
+    fn scan_app_buckets(
+        &self,
+        app: &[u8; 32],
+        buckets: &mut HashMap<Vec<u8>, (u64, i128)>,
+    ) -> Result<()> {
+        if *app == [0xFFu8; 32] {
+            return Ok(()); // prover shard excluded from world size
+        }
+        let l1 = crate::addressing::get_bloom_filter_indices(app, 256, 3);
+        let shard_key = ShardKey { l1, l2: *app };
+        let prefixes = self.app_prefixes(app);
+        let single = prefixes.len() == 1 && prefixes[0].is_empty();
+        let bit_paths = if single {
+            Vec::new()
+        } else {
+            self.shard_bit_paths(app)
+        };
+        let route = |vk: &[u8]| -> Vec<u8> {
+            let data: &[u8] = if vk.len() >= 64 { &vk[32..64] } else { vk };
+            let pi = if single {
+                0
+            } else {
+                quil_forest::address_shard_index(data, &bit_paths)
+            };
+            Forest::addr_path_shard_id(app, &prefixes[pi])
+        };
+        // Load the tombstone sets ONCE (a streaming pass), so "present" is an
+        // O(1) membership test — NOT a per-leaf versioned store lookup, which
+        // on a large migrated shard is millions of reads and appears to hang.
+        let mut v_removed: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
+        self.store.for_each_vertex_underlying("vertex", "removes", &shard_key, &mut |vk, _| {
+            v_removed.insert(vk);
+        })?;
+        let mut he_removed: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
+        self.store.for_each_vertex_underlying("hyperedge", "removes", &shard_key, &mut |vk, _| {
+            he_removed.insert(vk);
+        })?;
+        // Vertex adds: raw count for every leaf; live size only if present.
+        self.store.for_each_vertex_underlying("vertex", "adds", &shard_key, &mut |vk, blob| {
+            let e = buckets.entry(route(&vk)).or_insert((0, 0));
+            e.0 += 1;
+            if !blob.is_empty() && !v_removed.contains(&vk) {
+                e.1 += blob.len() as i128;
+            }
+        })?;
+        // Hyperedge adds: live size only (no vertex-count contribution).
+        self.store.for_each_vertex_underlying("hyperedge", "adds", &shard_key, &mut |vk, blob| {
+            if !blob.is_empty() && !he_removed.contains(&vk) {
+                buckets.entry(route(&vk)).or_insert((0, 0)).1 += blob.len() as i128;
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Forest-aggregate equivalent of [`scan_app_buckets`]: build `app`'s
+    /// per-sub-shard `(raw_count, live_size)` buckets from the unified app tree's
+    /// Merkle-sum aggregates — [`Forest::app_subtree_leaf_count`] (count) +
+    /// [`Forest::app_subtree_size`] (size) at each current shard's bit-path —
+    /// instead of a full O(all-leaves) leaf iteration. **O(shards × depth)**: the
+    /// epoch-boundary [`rebucket_app`] no longer rescans the whole tree (the ~2h
+    /// QUIL stall that stalled FrameHeader flow → froze rewards). `size` is the
+    /// LIVE size `(VertexAdds − VertexRemoves) + (HyperedgeAdds − HyperedgeRemoves)`
+    /// (the removes tombstones carry the removed sizes — see
+    /// [`Self::stage_sized_tombstone`]); `count` is the VertexAdds subtree leaf
+    /// count (incl. removed leaves, matching the scan's raw count). Produces
+    /// byte-identical buckets to `scan_app_buckets` — unit-validated for adds,
+    /// removes, and hyperedges. Falls back to the scan only when the app isn't on
+    /// the unified tree.
+    fn forest_app_buckets(
+        &self,
+        app: &[u8; 32],
+        buckets: &mut HashMap<Vec<u8>, (u64, i128)>,
+    ) -> Result<()> {
+        if *app == [0xFFu8; 32] {
+            return Ok(()); // prover shard excluded from world size
+        }
+        if !self.unified_tree() {
+            return self.scan_app_buckets(app, buckets);
+        }
+        let prefixes = self.app_prefixes(app);
+        let single = prefixes.len() == 1 && prefixes[0].is_empty();
+        let bit_paths = if single { Vec::new() } else { self.shard_bit_paths(app) };
+        let forest = self.forest.read().unwrap();
+        // Same version resolution as `unified_subtree_leaf_count` /
+        // `propose_split_children`: the per-phase head, else the global forest
+        // version (NOT 0, which reads an empty tree). Each phase tree resolves
+        // independently.
+        let fallback_ver = self.forest_version.load(Ordering::SeqCst);
+        let ver = |ph: usize| self.resolve_phase_version_with(&forest, app, ph).unwrap_or(fallback_ver);
+        let (ver_va, ver_vr, ver_ha, ver_hr) = (ver(0), ver(1), ver(2), ver(3));
+        let empty_bits: Vec<bool> = Vec::new();
+        for (i, prefix) in prefixes.iter().enumerate() {
+            let bits: &[bool] = if single { &empty_bits } else { &bit_paths[i] };
+            // COUNT: raw VertexAdds leaf count — INCLUDING removed leaves (whose add
+            // leaf, or an empty placeholder, is retained), matching
+            // `scan_app_buckets` (`e.0 += 1` for every add, no `v_removed` check).
+            let count = forest
+                .app_subtree_leaf_count(app, PHASES[0], ver_va, bits)
+                .unwrap_or(0);
+            // SIZE: LIVE size = adds − removes across both vertex and hyperedge
+            // phases. The forest add-trees RETAIN removed leaves (removes are a
+            // SEPARATE phase tree, not deletions), and each removes-phase tombstone
+            // now carries the removed leaf's original size (`stage_sized_tombstone`
+            // / `sized_tombstone_leaf_value`), so the removes subtree-size sums the
+            // removed sizes exactly. Thus `scan_app_buckets`'s present-only
+            // `blob.len()` sum == (VertexAdds − VertexRemoves) + (HyperedgeAdds −
+            // HyperedgeRemoves) — a pure O(depth) subtree subtraction, no leaf scan.
+            // Clamp at 0 (a shard can't have negative live size).
+            let va = forest.app_subtree_size(app, PHASES[0], ver_va, bits).unwrap_or(0) as i128;
+            let vr = forest.app_subtree_size(app, PHASES[1], ver_vr, bits).unwrap_or(0) as i128;
+            let ha = forest.app_subtree_size(app, PHASES[2], ver_ha, bits).unwrap_or(0) as i128;
+            let hr = forest.app_subtree_size(app, PHASES[3], ver_hr, bits).unwrap_or(0) as i128;
+            let size = ((va - vr) + (ha - hr)).max(0);
+            // Match `scan_app_buckets`, which only creates a bucket for a shard a
+            // leaf actually routes to — never an empty `(0, 0)` placeholder.
+            if count == 0 && size == 0 {
+                continue;
+            }
+            let e = buckets.entry(Forest::addr_path_shard_id(app, prefix)).or_insert((0, 0));
+            e.0 += count;
+            e.1 += size;
+        }
+        Ok(())
+    }
+
+    /// Re-partition `app`'s per-sub-shard size buckets against the CURRENT prefix
+    /// set. Called when a shard split/merge changes an app's registered shards:
+    /// the incremental [`bump_meta`] only routes NEW writes, so data written before
+    /// the split stays stranded in the now-removed parent bucket (a deep-split leaf
+    /// reads size 0 → provers churn, proposing to "leave" the data-bearing child).
+    /// This drops the app's existing buckets and rebuilds them from committed state
+    /// by the new routing — zero-copy (Option A leaves data in place, only the
+    /// shard boundaries move), so the app's TOTAL size is preserved and only the
+    /// per-sub-shard attribution changes. Deterministic across nodes: every node
+    /// runs it at the same frame the split's new prefixes become visible (the
+    /// per-frame `refresh_crdt_shard_prefixes` change-detection), over identical
+    /// committed state. Idempotent for an unchanged prefix set.
+    pub fn rebucket_app(&self, app: &[u8; 32]) -> Result<()> {
+        // Rebuild the app's buckets from committed state under a lock held across
+        // the swap so a concurrent commit can't interleave a stale partition.
+        let mut fresh: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
+        self.forest_app_buckets(app, &mut fresh)?;
+        // Validation shadow (`QUIL_REBUCKET_SHADOW=1`): recompute the buckets via
+        // the legacy full-leaf `scan_app_buckets` and log any divergence. The
+        // forest Merkle-sum MUST be byte-identical to the scan — the per-shard
+        // `(count, size)` is the consensus-relevant reward/join basis, so a
+        // mismatch would be a soft-fork. OFF in production: the scan is exactly
+        // the O(all-leaves) cost the forest aggregate replaces (the ~2h QUIL
+        // epoch-boundary stall). Used to validate value-preservation on localnet
+        // across real splits + vertex removes + hyperedges before relying on it.
+        if std::env::var("QUIL_REBUCKET_SHADOW").as_deref() == Ok("1") {
+            let mut scan: HashMap<Vec<u8>, (u64, i128)> = HashMap::new();
+            match self.scan_app_buckets(app, &mut scan) {
+                Err(e) => tracing::warn!(error = %e, "rebucket shadow: scan_app_buckets failed"),
+                Ok(()) if scan == fresh => tracing::info!(
+                    app = %hex::encode(&app[..4]),
+                    shards = fresh.len(),
+                    "rebucket shadow: forest == scan OK"
+                ),
+                Ok(()) => {
+                    let mut keys: std::collections::BTreeSet<&Vec<u8>> =
+                        scan.keys().collect();
+                    keys.extend(fresh.keys());
+                    for k in keys {
+                        let sv = scan.get(k).copied().unwrap_or((0, 0));
+                        let fv = fresh.get(k).copied().unwrap_or((0, 0));
+                        if sv != fv {
+                            tracing::error!(
+                                app = %hex::encode(&app[..4]),
+                                shard = %hex::encode(k),
+                                scan_count = sv.0, scan_size = sv.1,
+                                forest_count = fv.0, forest_size = fv.1,
+                                "REBUCKET SHADOW MISMATCH — forest aggregate != leaf scan"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut m = self.sub_meta.write().unwrap();
+        // Drop every bucket belonging to this app (keys are `app(32) ‖ prefix`),
+        // clearing the orphaned parent/ancestor buckets, then install the fresh set.
+        m.retain(|k, _| !k.starts_with(&app[..]));
+        for (k, v) in fresh {
+            m.insert(k, v);
+        }
         Ok(())
     }
 
@@ -1082,7 +1647,21 @@ impl HypergraphCrdt {
         }
         let mut app = [0u8; 32];
         app.copy_from_slice(&filter[..32]);
-        let prefix: Vec<u32> = filter[32..].iter().map(|&b| b as u32).collect();
+        // Decode the filter suffix into a prefix `sub_meta_for` can canonicalize.
+        // A SENTINEL filter (`app ‖ bit_len ‖ packed`, ≥2 suffix bytes) must be
+        // decoded to its bit-path — NOT read byte-for-byte, which yields garbage
+        // like `[0,6,0]` that matches no shard. A legacy 1-byte byte-suffix and
+        // the bare-app root are passed through (canonicalized downstream).
+        let suffix = &filter[32..];
+        let prefix: Vec<u32> = if suffix.is_empty() {
+            Vec::new()
+        } else if suffix.len() == 1 {
+            vec![suffix[0] as u32]
+        } else if let Some((_, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) {
+            quil_forest::bit_path_to_prefix(&bits)
+        } else {
+            suffix.iter().map(|&b| b as u32).collect()
+        };
         let (count, size) = self.sub_meta_for(&app, &prefix);
         if count == 0 && size == 0 {
             return None;
@@ -1109,6 +1688,122 @@ impl HypergraphCrdt {
         let forest = self.forest.read().unwrap();
         let prefixes = self.app_prefixes(&shard_key.l2);
         self.current_app_phase_root(&forest, &shard_key.l2, &prefixes, phase_idx)
+    }
+
+    /// A SPECIFIC sub-shard's phase commitment (vs [`compute_shard_root`], which
+    /// is the app aggregate). UNIFIED mode: the in-place subtree root via
+    /// [`Forest::app_subtree_root`] at the shard's canonical bit-path — a READ,
+    /// no separate tree. LEGACY: the shard's own per-prefix tree root. Both
+    /// compose to `compute_shard_root` (the app-phase root the header carries) —
+    /// natively via `subtree_hash` under unified, via `app_root_from_shard_paths`
+    /// under legacy. `prefix` is a `ShardInfo.prefix` (e.g. `[i]` for a QUIL
+    /// 64-way shard). Used by attestation / coverage / sync to read one shard's
+    /// commitment without materializing the whole app aggregate. Returns `vec![]`
+    /// for an unknown phase.
+    pub fn sub_shard_commitment(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        shard_key: &ShardKey,
+        prefix: &[u32],
+    ) -> Vec<u8> {
+        let phase_idx = match (set_type, phase_type) {
+            ("vertex", "adds") => 0,
+            ("vertex", "removes") => 1,
+            ("hyperedge", "adds") => 2,
+            ("hyperedge", "removes") => 3,
+            _ => return Vec::new(),
+        };
+        let forest = self.forest.read().unwrap();
+        let app = &shard_key.l2;
+        if self.unified_tree() {
+            // The shard's canonical bit-path within the app's COMPLETE prefix set
+            // (handles non-uniform splits; the isolated `prefix_to_bits` is only a
+            // fallback for a prefix not in the declared set).
+            let prefixes = self.app_prefixes(app);
+            let bit_paths = self.shard_bit_paths(app);
+            let bits = prefixes
+                .iter()
+                .position(|p| p == prefix)
+                .map(|i| bit_paths[i].clone())
+                .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6));
+            let ver = self
+                .resolve_phase_version_with(&forest, app, phase_idx)
+                .unwrap_or(0);
+            forest
+                .app_subtree_root(app, PHASES[phase_idx], ver, &bits)
+                .map(|r| r.to_vec())
+                .unwrap_or_default()
+        } else {
+            let sid = Forest::addr_path_shard_id(app, prefix);
+            self.read_shard_phase_root(&forest, &sid, phase_idx).to_vec()
+        }
+    }
+
+    /// The covered shard's subtree commitment addressed by its WIRE FILTER
+    /// (`app(32) ‖ encoded prefix`), i.e. the per-shard `state_root` under the
+    /// sharded unified model — computable from partial (subtree-only) storage,
+    /// unlike [`compute_shard_root`] (the whole-app aggregate a subtree-only
+    /// worker cannot reproduce). Resolves the filter to a registered
+    /// `ShardInfo.prefix` by matching against `app_prefixes` (handling BOTH
+    /// sentinel bit-path and byte-suffix encodings), then defers to
+    /// [`sub_shard_commitment`] (unified → `app_subtree_root` at the canonical
+    /// bit-path; legacy → the per-prefix tree root). A bare-app filter (unsplit)
+    /// resolves to the empty prefix, whose subtree root IS the app root — so an
+    /// unsplit app is a no-op vs `compute_shard_root`. `vec![]` on a malformed
+    /// filter / unknown phase.
+    pub fn sub_shard_commitment_for_filter(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        filter: &[u8],
+    ) -> Vec<u8> {
+        if filter.len() < 32 {
+            return Vec::new();
+        }
+        let mut app = [0u8; 32];
+        app.copy_from_slice(&filter[..32]);
+        let shard_key = ShardKey {
+            l1: crate::addressing::get_bloom_filter_indices(&app, 256, 3),
+            l2: app,
+        };
+        // The registered prefix for this filter's shard, matched by CANONICAL
+        // bit-path (NOT a byte-exact wire compare, which misses when the filter
+        // and the stored prefix are in different encodings — a byte-suffix
+        // filter vs a sentinel prefix post-reset — silently falling back to the
+        // whole-app root). Decode the filter suffix to its bit-path and find the
+        // registered shard with the same canonical bits. Empty ⇒ whole app.
+        let suffix = &filter[32..];
+        let lookup_prefix: Vec<u32> = if suffix.is_empty() {
+            Vec::new()
+        } else if suffix.len() == 1 {
+            vec![suffix[0] as u32]
+        } else if let Some((_, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) {
+            quil_forest::bit_path_to_prefix(&bits)
+        } else {
+            suffix.iter().map(|&b| b as u32).collect()
+        };
+        let prefixes = self.app_prefixes(&app);
+        let bit_paths = self.shard_bit_paths(&app);
+        let lookup_bits = prefixes
+            .iter()
+            .position(|p| p == &lookup_prefix)
+            .and_then(|i| bit_paths.get(i).cloned())
+            .unwrap_or_else(|| {
+                if lookup_prefix.is_empty() {
+                    Vec::new()
+                } else {
+                    quil_forest::shard_bit_path_from_prefix(&lookup_prefix)
+                        .unwrap_or_else(|| quil_forest::prefix_to_bits(&lookup_prefix, 6))
+                }
+            });
+        let prefix = prefixes
+            .iter()
+            .enumerate()
+            .find(|(i, _)| bit_paths.get(*i).map(|b| *b == lookup_bits).unwrap_or(false))
+            .map(|(_, p)| p.clone())
+            .unwrap_or_default();
+        self.sub_shard_commitment(set_type, phase_type, &shard_key, &prefix)
     }
 
     /// Build a forest membership proof for one or more vertices in a
@@ -1141,7 +1836,12 @@ impl HypergraphCrdt {
         };
         let forest = self.forest.read().unwrap();
         let prefixes = self.app_prefixes(&shard_key.l2);
-        let single_shard = prefixes.len() == 1 && prefixes[0].is_empty();
+        // Unified mode: one app tree, so a vertex leaf proves DIRECTLY against
+        // the app-phase root the header advertises — no per-sub-shard tree, no
+        // co-path aggregation (a shard-scoped verifier folds the co-path itself,
+        // spike #3). Same direct path as a genuinely single-shard app.
+        let single_shard =
+            self.unified_tree() || (prefixes.len() == 1 && prefixes[0].is_empty());
         let never_committed = || {
             QuilError::InvalidArgument(format!(
                 "build_membership_proof: shard/phase ({set_type}, {phase_type}) never committed"
@@ -1176,7 +1876,7 @@ impl HypergraphCrdt {
                 // top-6-bits to non-uniform splits). Prove the fields against that
                 // sub-shard tree, then attach the co-path binding the sub-shard
                 // root up to the app phase root the header advertises.
-                let bit_paths = canonical_shard_bit_paths(&prefixes);
+                let bit_paths = self.shard_bit_paths(&shard_key.l2);
                 let data = if vertex_address.len() > 32 { &vertex_address[32..] } else { &[][..] };
                 let pi = quil_forest::address_shard_index(data, &bit_paths);
                 let prefix = &prefixes[pi];
@@ -1253,10 +1953,15 @@ impl HypergraphCrdt {
     /// doesn't collide with live `commit_inner` versions). Returns the new root
     /// for the caller to verify against the trusted target.
     ///
-    /// The diff walk (remote reads) runs WITHOUT the commit lock — JMT reads are
-    /// version-exact, so it stays consistent even if a live commit advances the
-    /// tree; only the apply takes the lock. For a catch-up node a concurrent
-    /// local commit to the same shard is caught by the caller's root check.
+    /// The diff walk (remote reads) runs LOCK-FREE — it takes neither
+    /// `forest_write_lock` nor `commit_lock`. JMT reads are version-exact, so the
+    /// diff stays consistent even if the materializer advances the tree mid-walk;
+    /// only the apply takes the locks (forest_write_lock THEN commit_lock, the
+    /// same order the materializer uses). Because the diff is lock-free, the
+    /// version it read (`v_t`) is revalidated under the write lock before the
+    /// apply: if a commit advanced this phase in between, the diff's leaves are
+    /// stale and the apply is aborted for the caller to retry — so an expensive
+    /// full-tree diff can never block the global-frame materializer.
     pub fn sync_shard_phase_from<S: quil_forest::TreeReader>(
         &self,
         source: &S,
@@ -1267,12 +1972,17 @@ impl HypergraphCrdt {
         if phase_idx >= 4 {
             return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
         }
-        let leaves = {
+        // Lock-free diff (no forest_write_lock, no commit_lock). Capture the
+        // version it read (`v_t_opt`) so we can revalidate it under the write lock
+        // before applying.
+        let (v_t_opt, leaves) = {
             let forest = self.forest.read().unwrap();
-            let v_t = self.resolve_phase_version_with(&forest, shard_id, phase_idx).unwrap_or(0);
+            let v_t_opt = self.resolve_phase_version_with(&forest, shard_id, phase_idx);
             let target = forest.shard_phase_reader(shard_id, PHASES[phase_idx]);
-            quil_forest::diff_leaves(source, source_version, &target, v_t)
-                .map_err(|e| QuilError::Internal(format!("diff_leaves: {e}")))?
+            let leaves =
+                quil_forest::diff_leaves(source, source_version, &target, v_t_opt.unwrap_or(0))
+                    .map_err(|e| QuilError::Internal(format!("diff_leaves: {e}")))?;
+            (v_t_opt, leaves)
         };
         // The changed leaves as `(key_hash, leaf_value)` pairs. Under the
         // per-vertex-subtree model the raw-key `key_hash` IS the vertex's 32-byte
@@ -1282,14 +1992,29 @@ impl HypergraphCrdt {
         // `leaf_value` (a peer cannot serve data not matching the commitment).
         let changed: Vec<([u8; 32], Vec<u8>)> =
             leaves.iter().map(|(k, v)| (k.0, v.clone())).collect();
+        // Take the forest-write lock ONLY around the apply — the diff above ran
+        // lock-free, so an O(tree) diff no longer starves the global-frame
+        // materializer (which holds `forest_write_lock` across its whole
+        // verify+apply). Lock order matches the materializer: forest_write_lock
+        // BEFORE commit_lock.
+        let _forest_guard = self.forest_write_lock.lock().unwrap();
         let _guard = self.commit_lock.lock().unwrap();
         let forest = self.forest.read().unwrap();
+        // Revalidate the version the lock-free diff read against. If a commit
+        // advanced this phase between the diff and here, `leaves` is stale
+        // (computed against `v_t_opt`) and applying it would build a divergent
+        // version — abort so the caller re-diffs against the new head. (Under the
+        // old whole-sync forest lock this couldn't happen; the diff is now
+        // lock-free, so the guard moves here.)
+        let cur_opt = self.resolve_phase_version_with(&forest, shard_id, phase_idx);
+        if cur_opt != v_t_opt {
+            return Err(QuilError::Internal(format!(
+                "sync phase {phase_idx} advanced {v_t_opt:?}→{cur_opt:?} during diff — retry"
+            )));
+        }
         // Per-tree contiguous version (JMT builds on `version - 1`), same as
         // `commit_one_shard_phase`.
-        let ver = self
-            .resolve_phase_version_with(&forest, shard_id, phase_idx)
-            .map(|v| v + 1)
-            .unwrap_or(0);
+        let ver = cur_opt.map(|v| v + 1).unwrap_or(0);
         let (root, puts) = forest
             .apply_synced_shard_phase(shard_id, PHASES[phase_idx], ver, leaves)
             .map_err(|e| QuilError::Internal(format!("apply synced shard: {e}")))?;
@@ -1308,12 +2033,239 @@ impl HypergraphCrdt {
         Ok((root, ver, changed))
     }
 
+    /// UNIFIED shard-prover subtree-range sync: pull ONLY the leaves under
+    /// `bit_path` (this prover's shard prefix) from `source`'s app tree and apply
+    /// them to the LOCAL app tree (keyed by `app`), returning the local SUBTREE
+    /// root — the shard commitment. `pinned_app_root` is the trusted header app
+    /// root for the phase; the descent to the prefix is authenticated against it
+    /// (so a peer can't serve a fake subtree), and the applied local subtree root
+    /// is verified to equal the authenticated source subtree root. A shard prover
+    /// thus stores only its subtree yet holds a commitment that composes to the
+    /// global app root — never pulling the whole app. Empty `bit_path` ==
+    /// [`sync_shard_phase_from`] over the whole app tree.
+    pub fn sync_shard_subtree_phase_from<S: quil_forest::TreeReader>(
+        &self,
+        source: &S,
+        source_version: u64,
+        app: &[u8],
+        phase_idx: usize,
+        bit_path: &[bool],
+        pinned_app_root: Option<[u8; 32]>,
+    ) -> Result<([u8; 32], u64, Vec<([u8; 32], Vec<u8>)>)> {
+        if phase_idx >= 4 {
+            return Err(QuilError::InvalidArgument("phase_idx >= 4".into()));
+        }
+        // Lock-free subtree diff + authenticated source subtree root.
+        let (v_t_opt, leaves, src_subtree_root) = {
+            let forest = self.forest.read().unwrap();
+            let v_t_opt = self.resolve_phase_version_with(&forest, app, phase_idx);
+            let target = forest.shard_phase_reader(app, PHASES[phase_idx]);
+            let (leaves, src_root) = quil_forest::diff_leaves_under_prefix(
+                source,
+                source_version,
+                &target,
+                v_t_opt.unwrap_or(0),
+                bit_path,
+                pinned_app_root,
+            )
+            .map_err(|e| QuilError::Internal(format!("diff_leaves_under_prefix: {e}")))?;
+            (v_t_opt, leaves, src_root)
+        };
+        let changed: Vec<([u8; 32], Vec<u8>)> =
+            leaves.iter().map(|(k, v)| (k.0, v.clone())).collect();
+
+        // Nothing to pull — already synced. Return the current local subtree root
+        // without bumping the tree version.
+        if changed.is_empty() {
+            let forest = self.forest.read().unwrap();
+            let ver = v_t_opt.unwrap_or(0);
+            let local = forest
+                .app_subtree_root(app, PHASES[phase_idx], ver, bit_path)
+                .map_err(|e| QuilError::Internal(format!("app_subtree_root: {e}")))?;
+            if pinned_app_root.is_some() && local != src_subtree_root {
+                return Err(QuilError::Internal(
+                    "local subtree root != authenticated source subtree root (no-op path)".into(),
+                ));
+            }
+            return Ok((local, ver, changed));
+        }
+
+        let _forest_guard = self.forest_write_lock.lock().unwrap();
+        let _guard = self.commit_lock.lock().unwrap();
+        let forest = self.forest.read().unwrap();
+        let cur_opt = self.resolve_phase_version_with(&forest, app, phase_idx);
+        if cur_opt != v_t_opt {
+            return Err(QuilError::Internal(format!(
+                "sync subtree phase {phase_idx} advanced {v_t_opt:?}→{cur_opt:?} during diff — retry"
+            )));
+        }
+        let ver = cur_opt.map(|v| v + 1).unwrap_or(0);
+        let (_full_root, puts) = forest
+            .apply_synced_shard_phase(app, PHASES[phase_idx], ver, leaves)
+            .map_err(|e| QuilError::Internal(format!("apply synced subtree: {e}")))?;
+        let txn = self.store.new_transaction(false)?;
+        for (k, v) in puts {
+            txn.set(&k, &v)?;
+        }
+        if let Some((hk, hv)) = forest.head_version_put(app, PHASES[phase_idx], ver) {
+            txn.set(&hk, &hv)?;
+        }
+        txn.commit()?;
+        self.phase_versions.write().unwrap().insert((app.to_vec(), phase_idx), ver);
+
+        // The freshly-applied local subtree root MUST equal the authenticated
+        // source subtree root — this is what binds the pulled leaves to the
+        // trusted header (the pin authenticated the source subtree; this ties our
+        // reconstruction to it).
+        let local = forest
+            .app_subtree_root(app, PHASES[phase_idx], ver, bit_path)
+            .map_err(|e| QuilError::Internal(format!("app_subtree_root: {e}")))?;
+        if pinned_app_root.is_some() && local != src_subtree_root {
+            return Err(QuilError::Internal(
+                "post-sync local subtree root != authenticated source subtree root".into(),
+            ));
+        }
+        Ok((local, ver, changed))
+    }
+
+    /// The canonical bit-path of one shard `prefix` within an app's COMPLETE
+    /// prefix set — the input to unified subtree-range sync
+    /// ([`sync_shard_subtree_phase_from`](Self::sync_shard_subtree_phase_from))
+    /// and [`Forest::app_subtree_root`]. Falls back to an isolated
+    /// [`quil_forest::prefix_to_bits`] (6-bit levels) for a prefix not in the
+    /// declared set.
+    pub fn canonical_bits_for_prefix(&self, app: &[u8; 32], prefix: &[u32]) -> Vec<bool> {
+        let prefixes = self.app_prefixes(app);
+        let bit_paths = self.shard_bit_paths(app);
+        prefixes
+            .iter()
+            .position(|p| p == prefix)
+            .map(|i| bit_paths[i].clone())
+            .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6))
+    }
+
+    /// Leaf count under a `bit_path` in the unified app tree — the §6.1
+    /// empty-split guard's data-bearing test (see
+    /// [`quil_forest::Forest::app_subtree_leaf_count`]). Returns 0 when NOT in
+    /// unified mode (the app tree isn't the source of truth then), so callers
+    /// must treat "not unified" as "no opinion" and not block on it.
+    pub fn unified_subtree_leaf_count(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        app: &[u8],
+        bit_path: &[bool],
+    ) -> u64 {
+        if !self.unified_tree() {
+            return 0;
+        }
+        let phase_idx = match (set_type, phase_type) {
+            ("vertex", "adds") => 0,
+            ("vertex", "removes") => 1,
+            ("hyperedge", "adds") => 2,
+            ("hyperedge", "removes") => 3,
+            _ => return 0,
+        };
+        let forest = self.forest.read().unwrap();
+        let ver = self
+            .resolve_phase_version_with(&forest, app, phase_idx)
+            .unwrap_or(0);
+        forest
+            .app_subtree_leaf_count(app, PHASES[phase_idx], ver, bit_path)
+            .unwrap_or(0)
+    }
+
+    /// DEEP-BIFURCATION split PROPOSAL (Phase 3): compute a shard's MEANINGFUL
+    /// split children as bit-path shard filters. Runs
+    /// [`Forest::first_split_bifurcation`] on the app tree from the shard's
+    /// `shard_bits` — descending past any uniform run to the shallowest bit where
+    /// the data divides — and encodes each child bit-path via
+    /// [`quil_forest::encode_shard_bit_path`]. `None` when the shard is
+    /// unsplittable (<2 leaves, or no branch within `max_extra_bits`) — the
+    /// caller then proposes nothing (the §6.1 empty-split guard, done right: not
+    /// a one-sided cut but a real bifurcation). Only meaningful under unified (the
+    /// app tree is the data source); returns `None` otherwise.
+    pub fn propose_split_children(
+        &self,
+        set_type: &str,
+        phase_type: &str,
+        app: &[u8],
+        shard_bits: &[bool],
+        max_extra_bits: usize,
+    ) -> Option<Vec<Vec<u8>>> {
+        if !self.unified_tree() {
+            return None;
+        }
+        let phase_idx = match (set_type, phase_type) {
+            ("vertex", "adds") => 0,
+            ("vertex", "removes") => 1,
+            ("hyperedge", "adds") => 2,
+            ("hyperedge", "removes") => 3,
+            _ => return None,
+        };
+        let forest = self.forest.read().unwrap();
+        let resolved = self.resolve_phase_version_with(&forest, app, phase_idx);
+        // Fall back to the global forest version — NOT 0 — exactly like
+        // `read_shard_phase_root`. The unified app tree's version is often not
+        // tracked under the app-address key (no phase_versions entry / head
+        // marker), so `resolve` returns None; reading at version 0 sees an EMPTY
+        // tree (leaf_count 0 → empty-split guard → NO split ever proposed), while
+        // the forest version reads the real committed state.
+        let ver = resolved.unwrap_or_else(|| self.forest_version.load(Ordering::SeqCst));
+        let parent_leaves = forest
+            .app_subtree_leaf_count(app, PHASES[phase_idx], ver, shard_bits)
+            .unwrap_or(0);
+        // DIAGNOSTIC: whole-tree leaf count at `ver` (empty bit-path) distinguishes
+        // a VERSION problem (whole_tree==0 ⇒ the app tree is empty at `ver`, data
+        // lives at a different version) from a BIT-PATH problem (whole_tree>0 but
+        // parent_leaves==0 ⇒ data present but not under `shard_bits`). Plus the
+        // persisted head version for the app-address key and the raw forest_version.
+        let whole_tree_leaves = forest
+            .app_subtree_leaf_count(app, PHASES[phase_idx], ver, &[])
+            .unwrap_or(u64::MAX);
+        let head_ver_app = forest
+            .read_head_version(app, PHASES[phase_idx])
+            .ok()
+            .flatten();
+        let forest_ver = self.forest_version.load(Ordering::SeqCst);
+        let bifurcation = forest
+            .first_split_bifurcation(app, PHASES[phase_idx], ver, shard_bits, max_extra_bits)
+            .ok()
+            .flatten();
+        // Split-proposer diagnostic: pins WHY an over-crowded shard does / doesn't
+        // produce children. `resolved_version=None` ⇒ version fell back to 0 (an
+        // empty read → leaf_count 0 → no split; the read_shard_phase_root path
+        // instead falls back to forest_version); `parent_leaves<2` ⇒ empty-split
+        // guard fired; `children=0` with parent_leaves≥2 ⇒ data too clustered to
+        // bifurcate within the bit budget.
+        tracing::info!(
+            app = hex::encode(app),
+            shard_bits_len = shard_bits.len(),
+            phase_idx,
+            resolved_version = ?resolved,
+            used_version = ver,
+            forest_version = forest_ver,
+            head_ver_app = ?head_ver_app,
+            parent_leaves,
+            whole_tree_leaves,
+            children = bifurcation.as_ref().map(|c| c.len()).unwrap_or(0),
+            "split-proposer: bifurcation probe"
+        );
+        let children_bits = bifurcation?;
+        Some(
+            children_bits
+                .iter()
+                .map(|b| quil_forest::encode_shard_bit_path(app, b))
+                .collect(),
+        )
+    }
+
     /// The address-path sub-shards of an app: `(shard_id, prefix_bits)` for each
     /// (a single `(app, [])` for a single-shard app; 64 for QUIL). A sync client
     /// enumerates these to fetch each sub-shard's head and verify the set.
     pub fn app_sub_shards(&self, app: &[u8; 32]) -> Vec<(Vec<u8>, Vec<bool>)> {
         let prefixes = self.app_prefixes(app);
-        let bit_paths = canonical_shard_bit_paths(&prefixes);
+        let bit_paths = self.shard_bit_paths(app);
         prefixes
             .into_iter()
             .zip(bit_paths)
@@ -1419,6 +2371,31 @@ impl HypergraphCrdt {
         }
         let (set, phase) = PHASE_STR[phase_idx];
         self.store.get_app_manifest(set, phase, app, &app_root).ok().flatten()
+    }
+
+    /// Wipe ALL FOUR forest phase trees of a single shard back to empty and
+    /// forget its in-memory phase versions, so the NEXT commit rebuilds the
+    /// shard from version 0. The forest half of the shard-scoped prover-tree
+    /// reset (the engine clears the underlying blob keyspace via
+    /// `RocksHypergraphStore::clear_shard_underlying`, then re-seeds genesis and
+    /// commits). `shard_l2` is the shard's 32-byte l2 — the same id the CRDT
+    /// commits the shard under (`&shard.l2`); for the global prover shard it is
+    /// `[0xff; 32]`. Serialized against commits via the forest write + commit
+    /// locks. Idempotent.
+    pub fn reset_shard_forest_trees(&self, shard_l2: &[u8]) -> Result<()> {
+        let _forest_guard = self.forest_write_lock.lock().unwrap();
+        let _commit_guard = self.commit_lock.lock().unwrap();
+        {
+            let forest = self.forest.read().unwrap();
+            forest
+                .reset_shard_phase_trees(shard_l2)
+                .map_err(|e| QuilError::Internal(format!("reset_shard_forest_trees: {e}")))?;
+        }
+        self.phase_versions
+            .write()
+            .unwrap()
+            .retain(|(sid, _), _| sid.as_slice() != shard_l2);
+        Ok(())
     }
 
     /// Versioned-snapshot pruner: cull blob versions + forest nodes older than
@@ -1810,4 +2787,108 @@ fn id_matches_path(id: &[u8], path: &[i32]) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod size_index_tests {
+    use super::*;
+    use crate::testing::{MemStore, StubProver};
+    use std::sync::Arc;
+
+    fn crdt() -> HypergraphCrdt {
+        HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver))
+    }
+
+    /// A coin-shaped vertex whose data-address top bits route it to a shard: byte0
+    /// selects the top-of-tree bit-path (so `< 0x04` → shard `[0]`, `0x04` → `[1]`
+    /// in the binary grid the tests below use), the rest disambiguates the leaf.
+    fn at(app: [u8; 32], b0: u8, b1: u8, b2: u8) -> Location {
+        Location {
+            app_address: app,
+            data_address: {
+                let mut a = [0u8; 32];
+                a[0] = b0;
+                a[1] = b1;
+                a[2] = b2;
+                a
+            },
+        }
+    }
+
+    /// The forest Merkle-sum aggregate (`forest_app_buckets`) MUST produce
+    /// byte-identical per-shard `(count, size)` to the legacy full-leaf scan
+    /// (`scan_app_buckets`). The per-shard basis is consensus-relevant (reward +
+    /// join gate), so the O(depth) fast path can't change any value. This is the
+    /// pure-adds case across a 2-way split grid — the split/rebucket path the
+    /// localnet genesis shard is too small to exercise.
+    #[test]
+    fn forest_buckets_match_scan_adds_split() {
+        let app = [7u8; 32];
+        let c = crdt();
+        c.set_unified_tree(true);
+        // Binary split grid: shard `[0]` (top-6-bits 000000) and `[1]` (000001).
+        c.set_app_shard_prefixes(app, vec![vec![0u32], vec![1u32]]);
+        // Three leaves under `[0]` (byte0 == 0x00) + one under `[1]` (byte0 0x04).
+        c.add_vertex(&at(app, 0x00, 0xFF, 0x11), b"coin-a").unwrap();
+        c.add_vertex(&at(app, 0x00, 0xFE, 0x22), b"coin-bb").unwrap();
+        c.add_vertex(&at(app, 0x00, 0xF0, 0x33), b"coin-ccc").unwrap();
+        c.add_vertex(&at(app, 0x04, 0xAB, 0x44), b"coin-dddd").unwrap();
+        c.commit(1).unwrap();
+
+        let mut scan = HashMap::new();
+        c.scan_app_buckets(&app, &mut scan).unwrap();
+        let mut forest = HashMap::new();
+        c.forest_app_buckets(&app, &mut forest).unwrap();
+
+        assert!(
+            scan.values().any(|(cnt, _)| *cnt > 0),
+            "precondition: scan found leaves (grid/version wired)"
+        );
+        assert_eq!(
+            forest, scan,
+            "forest Merkle-sum buckets must equal the leaf-scan buckets\n\
+             forest={forest:?}\nscan={scan:?}"
+        );
+    }
+
+    /// Same equality invariant, now stressing the removes paths that most diverge
+    /// between the two code sides: `scan_app_buckets` excludes a removed leaf from
+    /// `live_size` (but still counts it in `raw_count`), while the forest retains
+    /// the add leaf and nets it out via the sized removes tombstone. Covers a spent
+    /// coin, a DOUBLE remove (tombstone must re-stamp the same size, not zero it), a
+    /// removed-but-never-added placeholder, and a removed hyperedge.
+    #[test]
+    fn forest_buckets_match_scan_with_removes() {
+        let app = [8u8; 32];
+        let c = crdt();
+        c.set_unified_tree(true);
+        c.set_app_shard_prefixes(app, vec![vec![0u32], vec![1u32]]);
+        c.add_vertex(&at(app, 0x00, 0xFF, 0x11), b"coin-a").unwrap();
+        c.add_vertex(&at(app, 0x04, 0xAB, 0x44), b"coin-dddd").unwrap();
+        // Add then remove a leaf under `[0]` — a spent coin, removed TWICE (the
+        // second remove must not zero the tombstone's recorded size).
+        let spent = at(app, 0x00, 0x12, 0x99);
+        c.add_vertex(&spent, b"spent-coin-xyz").unwrap();
+        c.remove_vertex(&spent).unwrap();
+        c.remove_vertex(&spent).unwrap();
+        // Remove an id that was never added — an empty add placeholder + tombstone.
+        c.remove_vertex(&at(app, 0x00, 0x77, 0x77)).unwrap();
+        // A live hyperedge and a removed one under `[1]`.
+        c.add_hyperedge(&at(app, 0x04, 0x01, 0x02), b"edge-live").unwrap();
+        let dead_edge = at(app, 0x04, 0x03, 0x04);
+        c.add_hyperedge(&dead_edge, b"edge-dead-longer").unwrap();
+        c.remove_hyperedge(&dead_edge).unwrap();
+        c.commit(1).unwrap();
+
+        let mut scan = HashMap::new();
+        c.scan_app_buckets(&app, &mut scan).unwrap();
+        let mut forest = HashMap::new();
+        c.forest_app_buckets(&app, &mut forest).unwrap();
+
+        assert_eq!(
+            forest, scan,
+            "forest vs scan must agree under removes (spent, double-remove, \
+             never-added, removed hyperedge)\nforest={forest:?}\nscan={scan:?}"
+        );
+    }
 }

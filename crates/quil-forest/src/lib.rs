@@ -39,8 +39,11 @@ mod store;
 // (crates/jmt: gen_child_node_key + NibblePath::new made pub).
 mod sync;
 
-pub use forest::{rollup_phase_roots, Forest, Phase, ShardRoots, PHASES};
-pub use sync::diff_leaves;
+pub use forest::{
+    node_size_sum, rollup_phase_roots, subtree_leaf_count, subtree_size, Forest, Phase,
+    ShardRoots, PHASES,
+};
+pub use sync::{diff_leaves, diff_leaves_under_prefix};
 // Re-export so sync callers can name the diff's key type + the reader bound
 // without depending on jmt directly.
 pub use jmt::storage::TreeReader;
@@ -48,7 +51,7 @@ pub use jmt::KeyHash;
 pub use membership_proof::{
     verify_vertex_membership, MembershipProof, ShardAggregation, VertexMembershipProof,
 };
-pub use store::{ForestStore, MemTreeStore, RocksTreeStore};
+pub use store::{ForestStore, MemTreeStore, RocksTreeStore, SizeIndex};
 
 /// Namespaces a single tree within the shared RocksDB. The `level` (1/2/3)
 /// plus an `id` (app address, shard id, …) uniquely identifies a tree; its
@@ -318,21 +321,38 @@ pub fn prefix_to_bits(prefix: &[u32], bits_per_level: u32) -> Vec<bool> {
     bits
 }
 
+// ---------------------------------------------------------------------------
+// Deep-bifurcation shard addressing codec (DEEP_BIFURCATION_ENCODING_SCOPE.md,
+// Phase 1). A shard's identity is its canonical address BIT-PATH (arbitrary
+// length) — not a `Vec<u32>` run through `canonical_shard_bit_paths` (which
+// collapses single-valued levels, so it can't skip the uniform bits a skewed
+// shard shares before it branches). These are the PURE codec + bit-prefix
+// helpers; the routing/proposal/migration that consume them are later phases.
+//
+// Wire form of a shard filter/address: `app ‖ bit_len(u16 BE) ‖ packed bits`,
+// where the packed bits are MSB-first, zero-padded to `ceil(bit_len/8)` bytes.
+// Fixed-width `bit_len` (not a varint) keeps the encoding trivially canonical:
+// exactly one byte string per `(app, bit_path)`, so every node routes identically.
+// (256-bit addresses ⇒ `bit_len ≤ 256`, well within `u16`.)
+
 /// The 2-byte big-endian bit-length header that follows the app address.
 const SHARD_BIT_LEN_BYTES: usize = 2;
 
 /// Pack a bit-path into `ceil(n/8)` bytes, MSB-first, zero-padded.
 fn pack_bits(bit_path: &[bool]) -> Vec<u8> {
     let mut out = vec![0u8; bit_path.len().div_ceil(8)];
-    for (i, &bit) in bit_path.iter().enumerate() {
-        if bit {
+    for (i, &b) in bit_path.iter().enumerate() {
+        if b {
             out[i / 8] |= 1 << (7 - (i % 8));
         }
     }
     out
 }
 
-/// Encode a shard as `app ‖ bit_len(u16 BE) ‖ packed bits`.
+/// Encode a shard as `app ‖ bit_len(u16 BE) ‖ packed bits` — the deep-bifurcation
+/// shard filter/address. `bit_path` is the shard's canonical address bit-path
+/// (empty ⇒ the whole app is one shard at the root). Inverse of
+/// [`decode_shard_bit_path`].
 pub fn encode_shard_bit_path(app: &[u8], bit_path: &[bool]) -> Vec<u8> {
     let mut out = Vec::with_capacity(app.len() + SHARD_BIT_LEN_BYTES + bit_path.len().div_ceil(8));
     out.extend_from_slice(app);
@@ -341,41 +361,188 @@ pub fn encode_shard_bit_path(app: &[u8], bit_path: &[bool]) -> Vec<u8> {
     out
 }
 
+/// Decode a shard filter `app(app_len) ‖ bit_len(u16 BE) ‖ packed bits` into
+/// `(app, bit_path)`. Returns `None` if malformed: too short, a length that
+/// doesn't match the packed-byte count, or a non-canonical form (any padding bit
+/// beyond `bit_len` set). Inverse of [`encode_shard_bit_path`].
+pub fn decode_shard_bit_path(filter: &[u8], app_len: usize) -> Option<(Vec<u8>, Vec<bool>)> {
+    if filter.len() < app_len + SHARD_BIT_LEN_BYTES {
+        return None;
+    }
+    let app = filter[..app_len].to_vec();
+    let n = u16::from_be_bytes(filter[app_len..app_len + SHARD_BIT_LEN_BYTES].try_into().ok()?) as usize;
+    let n_bytes = n.div_ceil(8);
+    if filter.len() != app_len + SHARD_BIT_LEN_BYTES + n_bytes {
+        return None;
+    }
+    let packed = &filter[app_len + SHARD_BIT_LEN_BYTES..];
+    let mut bits = Vec::with_capacity(n);
+    for i in 0..n {
+        bits.push((packed[i / 8] >> (7 - (i % 8))) & 1 == 1);
+    }
+    // Canonical form: every padding bit beyond `n` must be zero.
+    for i in n..n_bytes * 8 {
+        if (packed[i / 8] >> (7 - (i % 8))) & 1 == 1 {
+            return None;
+        }
+    }
+    Some((app, bits))
+}
+
+/// Whether `parent` is a bit-prefix of `child` — i.e. `child` extends `parent`.
+/// The bit-path counterpart of `slice::starts_with`, since a bit-path is NOT a
+/// byte prefix (`materialize_shard_split`'s `starts_with(parent)` check moves to
+/// this once shards carry bit-paths).
+pub fn bit_path_starts_with(child: &[bool], parent: &[bool]) -> bool {
+    child.len() >= parent.len() && child[..parent.len()] == *parent
+}
+
+/// Decode a shard filter to `(app, bit_path)`, treating a BARE app-address filter
+/// (exactly `app_len` bytes, no encoded suffix) as the ROOT shard (empty
+/// bit-path). The root/unsplit shard's on-chain filter is just its 32-byte app
+/// address (its `ConfirmationFilter` / `ShardInfo`), NOT an encoded
+/// `app ‖ bit_len ‖ packed` — so a root split's parent must be accepted as the
+/// empty-bit-path parent. Deeper shards always carry an encoded bit-path.
+///
+/// LEGACY BYTE-SUFFIX (`app ‖ level-byte`, `app_len + 1` bytes): the QUIL 64-way
+/// genesis grid registers each shard as a plain byte-suffix filter (`app ‖ [i]`,
+/// `i` in `0..64`), NOT a bit-path — too short to be `app ‖ u16 ‖ packed`. When a
+/// genesis shard takes its FIRST deep split, its parent filter arrives in this
+/// form, so decode it to the 6-bit binary of the byte (`bits_per_level = 6`,
+/// 64-way = 2^6). This is IDENTICAL to `canonical_shard_bit_paths` for the intact
+/// uniform 64-way set (prefix `[i]` → 6-bit `binary(i)`), which is exactly what
+/// the split proposer (`canonical_bits_for_prefix`) and `migrate_app_shards_to_sentinel`
+/// use — so the child-extends-parent check and the parent removal both line up.
+/// Only the intact uniform genesis grid produces a byte-suffix parent (the first
+/// deep split migrates the whole set to sentinel bit-paths), where this holds.
+pub fn decode_shard_filter_or_root(filter: &[u8], app_len: usize) -> Option<(Vec<u8>, Vec<bool>)> {
+    if filter.len() == app_len {
+        return Some((filter[..app_len].to_vec(), Vec::new()));
+    }
+    if filter.len() > app_len && filter.len() < app_len + SHARD_BIT_LEN_BYTES {
+        // `app ‖ level-byte(s)` legacy byte-suffix (single-byte for the QUIL
+        // 64-way genesis): 6 bits/level, MSB-first = binary of each level byte.
+        let app = filter[..app_len].to_vec();
+        let prefix: Vec<u32> = filter[app_len..].iter().map(|&b| b as u32).collect();
+        return Some((app, prefix_to_bits(&prefix, 6)));
+    }
+    decode_shard_bit_path(filter, app_len)
+}
+
+/// Whether `child_filter` is a valid child of `parent_filter`: same app, and the
+/// child's bit-path extends the parent's. The bit-path replacement for the
+/// materialize `proposed.starts_with(shard_address)` structural check. Both sides
+/// are decoded via [`decode_shard_filter_or_root`] so a bare 32-byte app address
+/// (the root shard being split) is treated as the empty-bit-path parent.
+pub fn shard_filter_extends(child_filter: &[u8], parent_filter: &[u8], app_len: usize) -> bool {
+    match (
+        decode_shard_filter_or_root(child_filter, app_len),
+        decode_shard_filter_or_root(parent_filter, app_len),
+    ) {
+        (Some((ca, cb)), Some((pa, pb))) => ca == pa && bit_path_starts_with(&cb, &pb),
+        _ => false,
+    }
+}
+
+/// THE canonical `ShardInfo.prefix` → wire shard FILTER conversion — the single
+/// source of truth every consumer MUST use instead of `l2 ‖ (prefix as u8)*`.
+///
+/// A legacy prefix is small level indices appended as low bytes (`l2 ‖ p₀ ‖ …`,
+/// the historical byte-suffix filter). A deep-bifurcation prefix is a SENTINEL
+/// bit-path (`[0xFFFF_FFFF, b0, …]`) and MUST become the encoded bit-path filter
+/// (`app ‖ bit_len ‖ packed`) — a raw `p as u8` on the sentinel (`0xFFFF_FFFF` →
+/// `0xFF`) garbles it, the bug class that recurred across ~11 independent call
+/// sites (inventory, world-size, worker-allocator, submit-check, archive-sync).
+/// Route ALL of them through here so the sentinel is handled in exactly one place.
+pub fn shard_prefix_to_filter(l2: &[u8], prefix: &[u32]) -> Vec<u8> {
+    if let Some(bits) = shard_bit_path_from_prefix(prefix) {
+        encode_shard_bit_path(l2, &bits)
+    } else {
+        let mut f = l2.to_vec();
+        for &p in prefix {
+            f.push(p as u8);
+        }
+        f
+    }
+}
+
+/// The co-path SPINE of a deep split: the off-path sibling bit-paths passed while
+/// descending from the parent shard `parent` down to the `branch` (the common
+/// prefix of the two data-bearing children, i.e. a child with its last bit
+/// dropped). For each bit stepped from `parent` to `branch`, the sibling is the
+/// path taken so far with the OPPOSITE next bit. Registering these siblings
+/// alongside the two leaf children makes the shard set COMPLETE and PREFIX-FREE:
+/// every address routes to exactly one shard, no fallback. The spine shards start
+/// EMPTY (they cover the regions the split descended past, which held no data) —
+/// latent placeholders excluded from halt-risk / proposal until data lands.
+///
+/// `parent` MUST be a bit-prefix of `branch`. Example: `parent=[]`,
+/// `branch=[0,0]` (children `[0,0,0]`/`[0,0,1]`) → spine `[[1], [0,1]]`.
+/// An immediate (1-bit) split has `branch == parent` → empty spine.
+pub fn split_spine_siblings(parent: &[bool], branch: &[bool]) -> Vec<Vec<bool>> {
+    let mut out = Vec::new();
+    for i in parent.len()..branch.len() {
+        let mut sib = branch[..i].to_vec();
+        sib.push(!branch[i]);
+        out.push(sib);
+    }
+    out
+}
+
 /// Sentinel first `Vec<u32>` level marking a deep-bifurcation bit-path prefix.
+/// Legacy `ShardInfo.prefix` levels are QUIL 6-bit indices (`0..64`) or split
+/// markers (`0..256`), never `0xFFFF_FFFF` — so the sentinel disambiguates a
+/// bit-path prefix from a legacy one WITHOUT changing the `ShardInfo` type or its
+/// serialization: a deep shard rides the existing `prefix: Vec<u32>` as
+/// `[SENTINEL, b0, b1, …]` (each bit a `0`/`1` level). The unified routing decodes
+/// it (via [`shard_bit_path_from_prefix`]); pre-unified paths never see it.
 pub const BIT_PATH_PREFIX_SENTINEL: u32 = 0xFFFF_FFFF;
 
-/// If `prefix` is sentinel-tagged, decode its remaining `0`/`1` levels.
+/// Encode a shard's bit-path into a `ShardInfo.prefix` `Vec<u32>` as
+/// `[SENTINEL, b0, b1, …]`. Inverse of [`shard_bit_path_from_prefix`].
+pub fn bit_path_to_prefix(bit_path: &[bool]) -> Vec<u32> {
+    let mut p = Vec::with_capacity(1 + bit_path.len());
+    p.push(BIT_PATH_PREFIX_SENTINEL);
+    p.extend(bit_path.iter().map(|&b| b as u32));
+    p
+}
+
+/// Canonical QUIL genesis shard-grid prefixes for `network`, in the ONE forward
+/// format: SENTINEL bit-path prefixes. Mainnet (network 0) is the fixed 64-way
+/// pre-split — the 6-bit paths `000000`..`111111`; every other network is a
+/// single root shard (empty prefix == the whole app). The legacy byte-suffix
+/// `[i]` form is deliberately NOT produced: every grid seeder (genesis, boot
+/// reset, split-reset config, dry-run) routes through here so a node's local
+/// grid — and the confirmation filters derived from it via
+/// [`shard_prefix_to_filter`] — are sentinel everywhere. A root shard's `[]`
+/// is not the byte-suffix genesis format; its filter is the bare app address.
+pub fn genesis_grid_prefixes(network: u8) -> Vec<Vec<u32>> {
+    if network == 0 {
+        (0..64u32)
+            .map(|i| bit_path_to_prefix(&prefix_to_bits(&[i], 6)))
+            .collect()
+    } else {
+        vec![vec![]]
+    }
+}
+
+/// If `prefix` is a sentinel-tagged bit-path prefix, decode it to the bit-path;
+/// otherwise `None` (a legacy prefix — resolve via [`canonical_shard_bit_paths`]).
+/// Rejects a malformed tagged prefix (any level after the sentinel not `0`/`1`).
 pub fn shard_bit_path_from_prefix(prefix: &[u32]) -> Option<Vec<bool>> {
     let (&head, rest) = prefix.split_first()?;
     if head != BIT_PATH_PREFIX_SENTINEL {
         return None;
     }
     let mut bits = Vec::with_capacity(rest.len());
-    for &level in rest {
-        match level {
+    for &lvl in rest {
+        match lvl {
             0 => bits.push(false),
             1 => bits.push(true),
-            _ => return None,
+            _ => return None, // malformed: a tagged prefix's levels are bits
         }
     }
     Some(bits)
-}
-
-/// Canonical `ShardInfo.prefix` to wire shard-filter conversion.
-///
-/// Legacy prefixes append their low bytes to `l2`. Sentinel-tagged deep
-/// prefixes use the bit-path encoding so the sentinel cannot be truncated to
-/// a bogus `0xFF` suffix.
-pub fn shard_prefix_to_filter(l2: &[u8], prefix: &[u32]) -> Vec<u8> {
-    if let Some(bits) = shard_bit_path_from_prefix(prefix) {
-        encode_shard_bit_path(l2, &bits)
-    } else {
-        let mut filter = l2.to_vec();
-        for &level in prefix {
-            filter.push(level as u8);
-        }
-        filter
-    }
 }
 
 /// Derive the canonical address **bit-path** of every shard in an app from the
@@ -674,10 +841,246 @@ mod tests {
         s.chars().map(|c| c == '1').collect()
     }
 
+    // ---- deep-bifurcation shard codec (Phase 1) ----
+
+    #[test]
+    fn shard_bit_path_codec_round_trips() {
+        let app = [0xABu8; 32];
+        // Cover: empty, 1 bit, sub-byte (6, the QUIL width), byte boundary (8),
+        // multi-byte (13), and a deep skewed-style path.
+        for p in [
+            "", "0", "1", "000000", "000001", "10101010", "1010101011010",
+            "0000000000001", // the "descend K uniform bits then branch" shape
+        ] {
+            let bp = bits(p);
+            let enc = encode_shard_bit_path(&app, &bp);
+            // Layout: 32 app + 2 len + ceil(n/8) packed.
+            assert_eq!(enc.len(), 32 + 2 + bp.len().div_ceil(8), "len for {p:?}");
+            assert_eq!(&enc[..32], &app, "app preserved for {p:?}");
+            let (a, b) = decode_shard_bit_path(&enc, 32).expect("decodes");
+            assert_eq!(a, app.to_vec());
+            assert_eq!(b, bp, "round-trip for {p:?}");
+        }
+    }
+
+    #[test]
+    fn shard_bit_path_codec_rejects_malformed_and_noncanonical() {
+        let app = [0x11u8; 32];
+        // Too short (no room for the length header).
+        assert!(decode_shard_bit_path(&app, 32).is_none());
+        // Length says 3 bits (1 packed byte) but no packed byte present.
+        let mut short = app.to_vec();
+        short.extend_from_slice(&3u16.to_be_bytes());
+        assert!(decode_shard_bit_path(&short, 32).is_none());
+        // Trailing bytes beyond the declared length.
+        let mut long = encode_shard_bit_path(&app, &bits("010"));
+        long.push(0x00);
+        assert!(decode_shard_bit_path(&long, 32).is_none());
+        // Non-canonical: a padding bit beyond bit_len is set (3 bits, but the
+        // packed byte has a low bit set).
+        let mut noncanon = app.to_vec();
+        noncanon.extend_from_slice(&3u16.to_be_bytes());
+        noncanon.push(0b010_00001); // bits[0..3]=010, bit at position 7 (padding) set
+        assert!(decode_shard_bit_path(&noncanon, 32).is_none(), "padding bit must be zero");
+    }
+
+    #[test]
+    fn sentinel_prefix_codec_round_trips_and_disambiguates() {
+        for p in ["", "0", "1", "000000", "0000001", "1010"] {
+            let bp = bits(p);
+            let prefix = bit_path_to_prefix(&bp);
+            assert_eq!(prefix[0], BIT_PATH_PREFIX_SENTINEL);
+            assert_eq!(shard_bit_path_from_prefix(&prefix), Some(bp.clone()), "round-trip {p:?}");
+        }
+        // Legacy prefixes are NOT sentinel-tagged → None (resolve via canonical).
+        assert_eq!(shard_bit_path_from_prefix(&[]), None);
+        assert_eq!(shard_bit_path_from_prefix(&[0]), None); // QUIL shard 0 / binary child 0
+        assert_eq!(shard_bit_path_from_prefix(&[63]), None); // QUIL shard 63
+        assert_eq!(shard_bit_path_from_prefix(&[128]), None); // binary split marker
+        // Malformed tagged prefix (a level after the sentinel isn't a bit).
+        assert_eq!(shard_bit_path_from_prefix(&[BIT_PATH_PREFIX_SENTINEL, 0, 2]), None);
+    }
+
+    #[test]
+    fn bit_path_prefix_and_extends() {
+        assert!(bit_path_starts_with(&bits("0001"), &bits("000")));
+        assert!(bit_path_starts_with(&bits("000"), &bits("000")));
+        assert!(bit_path_starts_with(&bits("0"), &bits(""))); // everything extends the root
+        assert!(!bit_path_starts_with(&bits("001"), &bits("000")));
+        assert!(!bit_path_starts_with(&bits("00"), &bits("000"))); // shorter can't extend
+
+        let app = [0x2Au8; 32];
+        let other = [0x2Bu8; 32];
+        let parent = encode_shard_bit_path(&app, &bits("000"));
+        let child = encode_shard_bit_path(&app, &bits("0001"));
+        let sibling = encode_shard_bit_path(&app, &bits("0000"));
+        let wrong_app = encode_shard_bit_path(&other, &bits("0001"));
+        let non_ext = encode_shard_bit_path(&app, &bits("001"));
+        assert!(shard_filter_extends(&child, &parent, 32));
+        assert!(shard_filter_extends(&sibling, &parent, 32));
+        assert!(!shard_filter_extends(&wrong_app, &parent, 32), "different app");
+        assert!(!shard_filter_extends(&non_ext, &parent, 32), "not a bit-prefix");
+        assert!(!shard_filter_extends(&parent, &child, 32), "parent does not extend child");
+
+        // ROOT split: the parent is the BARE 32-byte app address (empty bit-path),
+        // NOT an encoded filter — a bit-path child must still be accepted.
+        let root_parent = app.to_vec(); // bare app, len == app_len
+        let root_child0 = encode_shard_bit_path(&app, &bits("000000"));
+        let root_child1 = encode_shard_bit_path(&app, &bits("000001"));
+        assert_eq!(decode_shard_filter_or_root(&root_parent, 32), Some((app.to_vec(), vec![])));
+        assert!(shard_filter_extends(&root_child0, &root_parent, 32), "deep child extends bare-app root");
+        assert!(shard_filter_extends(&root_child1, &root_parent, 32));
+        // A child under a DIFFERENT bare-app root is rejected.
+        assert!(!shard_filter_extends(&root_child0, &other.to_vec(), 32), "wrong app root");
+    }
+
+    #[test]
+    fn shard_prefix_to_filter_handles_legacy_and_sentinel() {
+        let app = [0x2Au8; 32];
+        // Legacy: small level indices → l2 ‖ low bytes.
+        assert_eq!(shard_prefix_to_filter(&app, &[5]), {
+            let mut f = app.to_vec();
+            f.push(5);
+            f
+        });
+        assert_eq!(shard_prefix_to_filter(&app, &[]), app.to_vec()); // unsplit = bare app
+        // Sentinel bit-path → the ENCODED filter (NOT l2 ‖ 0xFF ‖ bits).
+        let sentinel = bit_path_to_prefix(&bits("000001"));
+        assert_eq!(shard_prefix_to_filter(&app, &sentinel), encode_shard_bit_path(&app, &bits("000001")));
+        // Round-trips: the produced filter decodes back to the same bit-path.
+        let (dec_app, dec_bits) =
+            decode_shard_bit_path(&shard_prefix_to_filter(&app, &sentinel), 32).unwrap();
+        assert_eq!(dec_app, app.to_vec());
+        assert_eq!(dec_bits, bits("000001"));
+    }
+
+    #[test]
+    fn split_spine_is_the_complete_prefix_free_cover() {
+        // Root split descending to branch [0,0] (children [0,0,0]/[0,0,1]):
+        // co-path siblings are [1] (bit 0) and [0,1] (bit 1).
+        let spine = split_spine_siblings(&[], &bits("00"));
+        assert_eq!(spine, vec![bits("1"), bits("01")]);
+
+        // Spine + the two leaves = a COMPLETE prefix-free partition: every 8-bit
+        // address matches exactly one shard.
+        let mut shards = spine.clone();
+        shards.push(bits("000"));
+        shards.push(bits("001"));
+        for a in 0u16..256 {
+            let byte = [a as u8];
+            let matches: Vec<&Vec<bool>> =
+                shards.iter().filter(|p| addr_has_bit_prefix(&byte, p)).collect();
+            assert_eq!(matches.len(), 1, "addr {a:08b} must match exactly one shard, got {matches:?}");
+        }
+
+        // Immediate (1-bit) split: branch == parent → no spine.
+        assert!(split_spine_siblings(&bits("0"), &bits("0")).is_empty());
+        // Deeper parent: descend from [0,1] to [0,1,0,0] → siblings [0,1,1], [0,1,0,1].
+        assert_eq!(
+            split_spine_siblings(&bits("01"), &bits("0100")),
+            vec![bits("011"), bits("0101")]
+        );
+    }
+
     #[test]
     fn canonical_unsplit_app_is_root() {
         // A single unsplit shard (empty prefix) = the whole app at the root.
         assert_eq!(canonical_shard_bit_paths(&[vec![]]), vec![Vec::<bool>::new()]);
+    }
+
+    #[test]
+    fn genesis_grid_prefixes_are_sentinel_and_never_byte_suffix() {
+        // Mainnet: 64 rows, every one a SENTINEL bit-path prefix (leading marker),
+        // never the legacy byte-suffix `[i]`. Each decodes to its 6-bit index, so
+        // routing is identical to the old form — only the stored bytes changed.
+        let mainnet = genesis_grid_prefixes(0);
+        assert_eq!(mainnet.len(), 64);
+        for (i, p) in mainnet.iter().enumerate() {
+            assert!(
+                shard_bit_path_from_prefix(p).is_some(),
+                "row {i} must be sentinel-encoded, got {p:?}"
+            );
+            assert_ne!(*p, vec![i as u32], "row {i} must NOT be legacy byte-suffix");
+            assert_eq!(
+                shard_bit_path_from_prefix(p).unwrap(),
+                prefix_to_bits(&[i as u32], 6),
+                "row {i} routes to its 6-bit index"
+            );
+        }
+        // Testnet/localnet: a single root shard (bare-app filter, not byte-suffix).
+        assert_eq!(genesis_grid_prefixes(1), vec![Vec::<u32>::new()]);
+    }
+
+    // Faithful model of the multi-node valid-shard flow that the single-shard
+    // localnet could NEVER exercise (network 1 = one root shard, always matches
+    // itself). Reproduces the mainnet 64-way fleet divergence using the REAL
+    // functions each side uses:
+    //   * archive valid-set  = { shard_prefix_to_filter(l2, row.prefix) }   (archive_sync.rs:2828)
+    //   * prover join/coverage address = shard_prefix_to_filter(l2, row.prefix) over the
+    //                                    joiner's OWN local grid              (lifecycle.rs:1083)
+    //   * collector reject    = !valid.contains(&address)                    (message_collector.rs:305)
+    // The grid is per-node and does NOT sync, so two nodes seeding genesis in
+    // different encodings produce non-matching filters → reject. This test would
+    // have FAILED before the seeder unification (byte-suffix boot/genesis seed vs
+    // sentinel v4 reset), which is exactly what shipped to prod uncaught.
+    #[test]
+    fn heterogeneous_fleet_grids_diverge_but_unified_seeders_agree() {
+        let l2 = [0x11u8; 32]; // stand-in QUIL app address (l2)
+        // Build a node's valid-shard address set the way the archive does.
+        let valid_set = |grid: &[Vec<u32>]| -> std::collections::HashSet<Vec<u8>> {
+            grid.iter().map(|p| shard_prefix_to_filter(&l2, p)).collect()
+        };
+        // The coverage/join address a prover on shard `k` submits, derived from
+        // ITS OWN local grid (same call the lifecycle join path makes).
+        let coverage_addr = |grid: &[Vec<u32>], k: usize| shard_prefix_to_filter(&l2, &grid[k]);
+
+        // Node grids: OLD binary seeds legacy byte-suffix `[i]`; FIXED binary
+        // seeds via the canonical helper (sentinel). Both are 64-way mainnet.
+        let grid_old: Vec<Vec<u32>> = (0..64u32).map(|i| vec![i]).collect();
+        let grid_fixed = genesis_grid_prefixes(0);
+
+        // Sanity: the two encodings are genuinely different bytes for the SAME
+        // shard, but route to the same bit-path (so it "looks" fine until the
+        // byte-exact valid-set check runs).
+        assert_ne!(grid_old[5], grid_fixed[5], "encodings differ byte-wise");
+        assert_eq!(
+            canonical_shard_bit_paths(&grid_old),
+            canonical_shard_bit_paths(&grid_fixed),
+            "…yet both route identically"
+        );
+
+        let archive_fixed = valid_set(&grid_fixed);
+
+        // REGRESSION (the prod bug): an OLD-binary prover's byte-suffix coverage
+        // address is NOT in a FIXED-binary archive's sentinel valid-set → the
+        // collector rejects it (`!valid.contains`) → 0 rewards.
+        let addr_old = coverage_addr(&grid_old, 5);
+        assert!(
+            !archive_fixed.contains(&addr_old),
+            "byte-suffix prover MUST be rejected by the sentinel archive — this is the bug"
+        );
+
+        // FIX (positive case): a FIXED-binary prover's address IS in the archive's
+        // valid-set for every shard → accepted.
+        for k in 0..64 {
+            assert!(
+                archive_fixed.contains(&coverage_addr(&grid_fixed, k)),
+                "fixed-binary prover accepted on shard {k}"
+            );
+        }
+
+        // INVARIANT the fix guarantees: any two nodes that seed via the helper
+        // produce BYTE-IDENTICAL valid-sets, so the fleet can never diverge as
+        // long as everyone runs the fixed seeder.
+        assert_eq!(
+            archive_fixed,
+            valid_set(&genesis_grid_prefixes(0)),
+            "two fixed-binary nodes agree byte-for-byte"
+        );
+
+        // And a HOMOGENEOUS old fleet is internally consistent (why it silently
+        // "worked" until one archive updated and flipped to sentinel).
+        assert!(valid_set(&grid_old).contains(&addr_old), "old fleet self-consistent");
     }
 
     #[test]
@@ -724,6 +1127,47 @@ mod tests {
             }
             assert_eq!(*p, expected, "octal shard {i}");
         }
+    }
+
+    /// A QUIL genesis shard's FIRST deep split: the parent arrives as a legacy
+    /// byte-suffix filter (`app ‖ [i]`, 33 bytes) while the children are bit-path
+    /// filters. `decode_shard_filter_or_root` must decode the byte-suffix parent to
+    /// the SAME 6-bit binary the proposer/migrate use, so `shard_filter_extends`
+    /// accepts the split (the mainnet bug: byte-suffix parent → decode None →
+    /// "bit-path child must extend parent bit-path" rejection).
+    #[test]
+    fn byte_suffix_genesis_parent_decodes_and_children_extend() {
+        let app = [0x11u8; 32];
+        // Parent = QUIL genesis shard 3, byte-suffix `app ‖ 0x03` (33 bytes).
+        let mut parent = app.to_vec();
+        parent.push(0x03);
+
+        // It decodes to the 6-bit binary of 3 — identical to canonical bits for
+        // the intact uniform 64-way set.
+        let (pa, pb) = decode_shard_filter_or_root(&parent, 32).expect("byte-suffix decodes");
+        assert_eq!(pa, app.to_vec());
+        assert_eq!(pb, bits("000011"), "byte 3 → 6-bit binary");
+        let quil64: Vec<Vec<u32>> = (0..64u32).map(|i| vec![i]).collect();
+        assert_eq!(
+            canonical_shard_bit_paths(&quil64)[3],
+            bits("000011"),
+            "decode matches canonical_shard_bit_paths[3]"
+        );
+
+        // Children = 7-bit paths 0000110 / 0000111 (proposer's deep bifurcation),
+        // encoded as bit-path filters. Both must extend the parent.
+        for child_bits in [bits("0000110"), bits("0000111")] {
+            let child = encode_shard_bit_path(&app, &child_bits);
+            assert!(
+                shard_filter_extends(&child, &parent, 32),
+                "bit-path child {child_bits:?} must extend byte-suffix parent [3]"
+            );
+        }
+
+        // A child under a DIFFERENT genesis shard (shard 4 = 000100) must NOT
+        // extend parent [3] — the fix stays a bit-prefix check, not a byte one.
+        let foreign = encode_shard_bit_path(&app, &bits("0001000"));
+        assert!(!shard_filter_extends(&foreign, &parent, 32), "shard-4 child ⊄ shard-3");
     }
 
     #[test]

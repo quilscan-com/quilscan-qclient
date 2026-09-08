@@ -76,6 +76,12 @@ pub struct FrameMaterializer {
     prover_root_mismatch: AtomicBool,
     /// Frame number at which prover root was last verified.
     prover_root_verified_frame: AtomicU64,
+    /// The DECLARED prover root from #1's most recent FORK nullify — the lineage
+    /// the proposers agree on. The archive reconcile pins its sync to THIS, not to
+    /// this node's own finalized-header root: a forked OUTLIER's finalized root is
+    /// a lineage no peer holds ("no reachable peer holds the finalized prover
+    /// root"), so it must instead converge to the proposers' root.
+    fork_target_root: std::sync::RwLock<Option<Vec<u8>>>,
     /// Whether a prover sync is currently in progress.
     prover_sync_in_progress: AtomicBool,
 
@@ -97,6 +103,14 @@ pub struct FrameMaterializer {
     /// and is only flipped on by tests that exercise the kick path.
     evictions_enabled: bool,
 
+    /// Epoch of the last inline eviction/registry-refresh pass. The expensive
+    /// `refresh_from_store` full-scan + `find_eviction_candidates` census now run
+    /// INLINE only once per epoch boundary (allocations are epoch-stable, so
+    /// per-frame freshness buys nothing — the recv-loop + archive poller keep the
+    /// shared registry epoch-fresh for consensus on the same cadence). `u64::MAX`
+    /// = "no pass yet", so the first frame after boot always refreshes.
+    last_eviction_pass_epoch: AtomicU64,
+
     /// MAINNET-ONLY 2.1.0.25 frozen-era recovery (see `FROZEN_ERA_RECOVERY_*`).
     /// When true, frames in `[FROZEN_ERA_RECOVERY_START..FROZEN_ERA_RECOVERY_CUTOFF)`
     /// are materialized as a deterministic no-op. Set only for `network == 0`;
@@ -107,6 +121,22 @@ pub struct FrameMaterializer {
     /// `commit_frame` to rebuild the prover-registry cache from the
     /// just-flushed RocksDB trees.
     rocks_hg_store: Option<Arc<quil_store::RocksHypergraphStore>>,
+    /// (B/#2) At-cutover consolidation hook `Fn(frame) -> ok`. Run on THIS
+    /// materializer's CRDT store at the cutover frame BEFORE flipping to unified,
+    /// to fold every split app's per-sub-shard trees into its app.l2 tree from
+    /// current committed vertices — so a split/commit in the `[boot, cutover)`
+    /// window is reflected (boot-only consolidation goes stale). Built by the node
+    /// (archive hg + shards store → `run_unified_consolidation_in_place`). `None`
+    /// (tests) flips without consolidating.
+    unified_cutover_consolidate: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
+    /// At-cutover PROVER-TREE reset hook `Fn(frame) -> ok`. Runs on the archive's
+    /// CRDT + store at the cutover frame alongside the unified flip: wipes the
+    /// global prover shard (vertex + hyperedge trees + blob keyspace) and rebuilds
+    /// it from the genesis committee (`reset_prover_tree_to_genesis`), so provers
+    /// stranded on alias sub-shards are cleared and re-join onto the reset grid.
+    /// Built by the node (archive hg + rocks store + network genesis committee).
+    /// `None` (tests / non-archives) leaves the prover tree untouched.
+    prover_tree_reset: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
     /// Concrete `SharedProverRegistry` reference for the mutating
     /// `evict_inactive_provers` path. When set, archive
     /// nodes apply Status=4 + KickFrameNumber to evicted prover and
@@ -216,13 +246,17 @@ impl FrameMaterializer {
             prover_root_synced: AtomicBool::new(false),
             prover_root_mismatch: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
+            fork_target_root: std::sync::RwLock::new(None),
             prover_sync_in_progress: AtomicBool::new(false),
             _prover_address: prover_address,
             archive_mode,
             eviction_grace_frames: 360,
             evictions_enabled: false,
+            last_eviction_pass_epoch: AtomicU64::new(u64::MAX),
             frozen_era_recovery_enabled: false,
             rocks_hg_store: None,
+            unified_cutover_consolidate: None,
+            prover_tree_reset: None,
             eviction_registry: None,
             current_frame: None,
             frame_prover: None,
@@ -304,6 +338,24 @@ impl FrameMaterializer {
         self
     }
 
+    /// Wire the at-cutover consolidation hook (see `unified_cutover_consolidate`).
+    pub fn with_unified_cutover_consolidate(
+        mut self,
+        hook: Arc<dyn Fn(u64) -> bool + Send + Sync>,
+    ) -> Self {
+        self.unified_cutover_consolidate = Some(hook);
+        self
+    }
+
+    /// Wire the at-cutover prover-tree reset hook (see `prover_tree_reset`).
+    pub fn with_prover_tree_reset(
+        mut self,
+        hook: Arc<dyn Fn(u64) -> bool + Send + Sync>,
+    ) -> Self {
+        self.prover_tree_reset = Some(hook);
+        self
+    }
+
     /// Materialize a finalized global frame — apply all its transactions
     /// to local state.
     pub fn materialize(
@@ -313,6 +365,112 @@ impl FrameMaterializer {
         let header = frame.header.as_ref()
             .ok_or_else(|| QuilError::InvalidArgument("frame has no header".into()))?;
         let frame_number = header.frame_number;
+
+        // UNIFIED_APP_TREE cutover: flip to the unified commitment at exactly the
+        // cutover frame, BEFORE this frame's state commits. Deterministic across
+        // nodes (pure fn of `frame_number`), so every node switches at the same
+        // height. (B/#2) Consolidate AT the cutover frame first — folding every
+        // split app's per-sub-shard trees into its app.l2 tree from current
+        // committed vertices — so a split/commit in the [boot, cutover) window is
+        // reflected (a boot-only app tree goes stale). If it fails, defer the flip.
+        if frame_number
+            >= quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame()
+            && !self.hypergraph.unified_tree()
+        {
+            let ok = self
+                .unified_cutover_consolidate
+                .as_ref()
+                .map(|h| h(frame_number))
+                .unwrap_or(true);
+            // Prover-tree reset rides the same flag day: wipe the global prover
+            // shard + rebuild from the genesis committee, so provers stranded on
+            // alias sub-shards are cleared and re-join. Committed here (before this
+            // frame materializes), so the reset lands in the cutover frame's
+            // recorded prover root and propagates to syncing nodes. `None` (tests /
+            // non-archives) is a no-op.
+            let reset_ok = self
+                .prover_tree_reset
+                .as_ref()
+                .map(|h| h(frame_number))
+                .unwrap_or(true);
+            if ok && reset_ok {
+                self.hypergraph.set_unified_tree(true);
+                info!(frame = frame_number, "unified app-tree commitment ACTIVATED at cutover");
+            } else {
+                error!(
+                    frame = frame_number,
+                    consolidate_ok = ok,
+                    reset_ok,
+                    "unified cutover step FAILED — deferring flip this frame"
+                );
+            }
+        }
+
+        // Grid-reset v2 (mainnet 740_000): a SECOND coordinated flag day clearing
+        // the corrupt overlapping-shard grid the pre-fix split machinery produced.
+        // It runs INDEPENDENTLY of the unified flip (already active above), so it
+        // needs its own block. The QUIL grid itself is reset by the execution engine
+        // (`maybe_apply_split_reset`, which also fires at this frame); the prover
+        // side (wipe + rebuild from the genesis committee) rides HERE because the
+        // put-only forest can't propagate a wipe through sync. The hook self-gates
+        // on the v2 marker (exactly-once); `None` (regulars use the recv path) no-ops.
+        if frame_number
+            == quil_execution::global_intrinsic::materialize::quil_grid_reset_v2_frame()
+        {
+            let reset_ok = self
+                .prover_tree_reset
+                .as_ref()
+                .map(|h| h(frame_number))
+                .unwrap_or(true);
+            if reset_ok {
+                info!(frame = frame_number, "grid-reset v2: prover-tree wiped + rebuilt (grid reset via execution engine)");
+            } else {
+                error!(frame = frame_number, "grid-reset v2: prover-tree reset FAILED");
+            }
+        }
+
+        // Prover-reset v3 (mainnet 747_000): re-run the complete tree wipe+reseed.
+        // Pairs with the delete-free reassignment (vacated slots retire to Historic)
+        // and the per-node worker-filter reset (worker allocator) so provers re-join
+        // onto the clean genesis grid and the overlap cascade cannot re-form. Same
+        // hook, self-gated on the v3 marker; the grid is reset by the execution
+        // engine's `maybe_apply_split_reset`, which also fires at this frame.
+        if frame_number
+            == quil_execution::global_intrinsic::materialize::quil_prover_reset_v3_frame()
+        {
+            let reset_ok = self
+                .prover_tree_reset
+                .as_ref()
+                .map(|h| h(frame_number))
+                .unwrap_or(true);
+            if reset_ok {
+                info!(frame = frame_number, "prover-reset v3: prover-tree wiped + rebuilt");
+            } else {
+                error!(frame = frame_number, "prover-reset v3: prover-tree reset FAILED");
+            }
+        }
+
+        // Prover-reset v4 (mainnet 755_000): re-baseline once more after removing
+        // the boot-time grid clobber (`normalize_quil_token_grid`) that was reverting
+        // each archive's local grid to 64-way while allocations stayed split. Same
+        // hook + self-gated on the v4/v5 markers. v5 (759_000) clears the
+        // byte-suffix allocations the old-binary fleet re-joined with post-v4.
+        if frame_number
+            == quil_execution::global_intrinsic::materialize::quil_prover_reset_v4_frame()
+            || frame_number
+                == quil_execution::global_intrinsic::materialize::quil_prover_reset_v5_frame()
+        {
+            let reset_ok = self
+                .prover_tree_reset
+                .as_ref()
+                .map(|h| h(frame_number))
+                .unwrap_or(true);
+            if reset_ok {
+                info!(frame = frame_number, "prover-reset v4/v5: prover-tree wiped + rebuilt");
+            } else {
+                error!(frame = frame_number, "prover-reset v4/v5: prover-tree reset FAILED");
+            }
+        }
 
         // 1. Idempotency check
         let last = self.last_materialized_frame.load(Ordering::SeqCst);
@@ -361,12 +519,22 @@ impl FrameMaterializer {
             }
         }
         let _materialize_timer = MatTimer(std::time::Instant::now());
+        // Opt-in per-stage materialize timing (set QUIL_MAT_STAGE_TIMING=1 on one
+        // archive to capture where the per-frame floor goes). `mat_start` brackets
+        // the whole function; each stage logs its CUMULATIVE elapsed so per-stage
+        // deltas are the differences between consecutive lines.
+        let mat_stage_timing = std::env::var("QUIL_MAT_STAGE_TIMING").is_ok();
+        let mat_start = std::time::Instant::now();
 
         // (B) Serialize this ENTIRE materialize (pre-apply verify + apply +
         // commit + root capture) against the prover-tree sync and any other
         // forest writer. Nothing may advance the forest mid-materialize, so the
         // verify below reads a stable N-1 forest and cannot fork the prover root.
         let _forest_guard = self.hypergraph.lock_forest_writes();
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: forest lock acquired (this delta = lock-wait)");
+        }
 
         // ── 2.1.0.25 frozen-era recovery (see FROZEN_ERA_RECOVERY_* doc) ──
         // Deterministic no-op for the frozen era: fail every request WITHOUT
@@ -874,6 +1042,28 @@ impl FrameMaterializer {
         // reflected in the CRDT — which is the sole safe window given
         // `apply_reward` is additive with no per-frame idempotency
         // (re-running a committed frame would double-mint).
+        // Apply any epoch-aligned shard topology changes (split/merge) due at this
+        // frame ONCE per global frame, BEFORE the commit — so a staged split flips
+        // at its E+2 boundary even on frames carrying no app-shard FrameHeader. The
+        // in-`invoke_frame_header` call only fires when a header is materialized,
+        // which stalls in the field (header flow to the global chain pauses), so
+        // the flip was never triggered at the due frame. Its reassignment writes
+        // ride the same `commit_frame_with_global_cursor` batch below.
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: process_message loop done (delta from lock = request execution only)");
+        }
+        if let Err(e) = self
+            .execution_manager
+            .apply_global_due_shard_changes(frame_number)
+        {
+            error!(frame = frame_number, error = %e, "apply_due_shard_changes failed — aborting materialize");
+            return Err(e);
+        }
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: apply_due_shard_changes done (delta = split/merge reassign + grid flip)");
+        }
         if let Err(e) = self
             .execution_manager
             .commit_frame_with_global_cursor(frame_number)
@@ -881,10 +1071,42 @@ impl FrameMaterializer {
             error!(frame = frame_number, error = %e, "CRDT commit_frame failed — aborting materialize");
             return Err(e);
         }
-        if let (Some(eviction_reg), Some(rocks_store)) =
-            (self.eviction_registry.as_ref(), self.rocks_hg_store.as_ref())
-        {
-            eviction_reg.refresh_from_store(rocks_store);
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: commit_frame_with_global_cursor done (delta = the main CRDT commit)");
+        }
+        // A split/merge that flipped the grid this frame (at the E+2 boundary) must
+        // re-attribute the CRDT's per-app prefixes + size buckets to the new leaves.
+        // Without this the serial materializer leaves the CRDT on the PRE-split
+        // partition (only boot / the inline-fallback poller refreshed), so
+        // `sub_meta_for` — GetAppShards size + the reward basis — can't resolve the
+        // new deep-split sub-shards and reports size 0 for them (the parent bucket
+        // lingers on a now-merged shallow prefix), starving joins + rewards.
+        // No-op (just a grid read + compare) when nothing changed.
+        let prefix_changes = self.execution_manager.refresh_shard_prefixes();
+        if prefix_changes > 0 {
+            info!(frame = frame_number, apps = prefix_changes,
+                "MAT stage: shard grid changed — re-partitioned CRDT prefixes + size buckets");
+        }
+        // Run the expensive registry refresh + eviction census INLINE only at
+        // epoch boundaries (and the first frame after boot). `refresh_from_store`
+        // clears + rebuilds the whole registry from a full RocksDB scan with a
+        // double blob-deserialize (~2s/frame); since allocations are epoch-stable
+        // (`effective_status` is epoch-quantized), per-frame freshness bought
+        // nothing on the hot path. Consensus reads of the shared registry stay
+        // epoch-fresh via the recv-loop (`message_loop`) and archive poller
+        // (`archive_sync`) refreshers, which already run on this same cadence.
+        let cur_eviction_epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let run_eviction_pass = self
+            .last_eviction_pass_epoch
+            .swap(cur_eviction_epoch, Ordering::SeqCst)
+            != cur_eviction_epoch;
+        if run_eviction_pass {
+            if let (Some(eviction_reg), Some(rocks_store)) =
+                (self.eviction_registry.as_ref(), self.rocks_hg_store.as_ref())
+            {
+                eviction_reg.refresh_from_store(rocks_store);
+            }
         }
 
         // 6. Prune orphan joins from prover registry
@@ -901,7 +1123,7 @@ impl FrameMaterializer {
         // causing split-brain shard summaries. Mirrors Go's
         // `EvictInactiveProvers(..., evictionState)` at
         // `frame_materializer.go:285`.
-        if self.archive_mode {
+        if self.archive_mode && run_eviction_pass {
             if let Some(eviction_reg) = self.eviction_registry.as_ref() {
                 // Build the size-aware effective halt map. The coverage
                 // monitor stamps `u64::MAX` on every shard with
@@ -1104,9 +1326,17 @@ impl FrameMaterializer {
         if let Err(e) = self.persist_alt_shard_updates(frame_number, frame) {
             warn!(frame = frame_number, error = %e, "persist alt shard updates failed");
         }
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: eviction + persist_alt done (delta = eviction scan + alt-shard)");
+        }
 
         // 8. Compute post-materialization prover root
         let post_root = self.compute_local_prover_root(frame_number + 1);
+        if mat_stage_timing {
+            info!(frame = frame_number, ms = mat_start.elapsed().as_millis() as u64,
+                "MAT stage: compute_local_prover_root done (delta = the SECOND full commit(N+1))");
+        }
 
         // 9. Update state
         self.last_materialized_frame.store(frame_number, Ordering::SeqCst);
@@ -1283,6 +1513,30 @@ impl FrameMaterializer {
             self.prover_root_mismatch.store(false, Ordering::Relaxed);
             self.prover_root_verified_frame.store(frame_number, Ordering::Relaxed);
         }
+    }
+
+    /// Force the prover-root mismatch flag ON from OUTSIDE the materialize path.
+    /// The global vote seam calls this when it nullifies a proposal on a
+    /// prover-tree FORK: during such a halt NO frame finalizes, so the
+    /// materializer never runs `verify_prover_root` to set the flag itself — and
+    /// the archive reconcile loop (which gates on `prover_root_mismatch_detected`)
+    /// would sit idle forever, never healing the fork. This routes the vote-time
+    /// fork detection to the same flag so the reconcile fires DURING the halt.
+    pub fn flag_prover_root_mismatch(&self, declared_target_root: Vec<u8>) {
+        self.prover_root_synced.store(false, Ordering::Relaxed);
+        self.prover_root_mismatch.store(true, Ordering::Relaxed);
+        self.prover_root_verified_frame.store(0, Ordering::Relaxed);
+        // The proposers' root — the lineage the reconcile should converge onto.
+        if !declared_target_root.is_empty() {
+            *self.fork_target_root.write().unwrap() = Some(declared_target_root);
+        }
+    }
+
+    /// The DECLARED root the archive reconcile should converge to (set by #1's
+    /// FORK nullify via [`Self::flag_prover_root_mismatch`]). `None` until a fork
+    /// is detected.
+    pub fn fork_target_root(&self) -> Option<Vec<u8>> {
+        self.fork_target_root.read().unwrap().clone()
     }
 
     /// Whether a prover-root mismatch has been positively detected and not yet

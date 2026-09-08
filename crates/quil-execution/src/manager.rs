@@ -21,6 +21,10 @@ pub struct ExecutionEngineManager {
     /// vertices visible to `prover_registry::refresh_from_store` and
     /// to peer HyperSync.
     crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    /// The shard grid store (`None` for app-shard-only managers). Held so
+    /// [`Self::refresh_shard_prefixes`] can re-read the grid after a split/merge
+    /// flip and re-attribute the CRDT's per-app prefix sets + size buckets.
+    shards_store: Option<Arc<dyn quil_types::store::ShardsStore>>,
 }
 
 impl ExecutionEngineManager {
@@ -41,6 +45,43 @@ impl ExecutionEngineManager {
         >,
         include_global: bool,
     ) -> Self {
+        Self::new_with_shards(
+            inclusion_prover,
+            key_manager,
+            crdt,
+            circuit_compiler,
+            clock_store,
+            hypergraph_config_resolver,
+            include_global,
+            None,
+            None,
+        )
+    }
+
+    /// Like [`Self::new`], but wires the global intrinsic's shard stores so
+    /// shard split/merge topology changes actually record (`PendingShardChange`)
+    /// and apply at the E+2 boundary. The GLOBAL materialization path
+    /// (master/archive, `include_global = true`) MUST use this — otherwise
+    /// proposed splits validate + "succeed" but never take effect. App-shard-only
+    /// managers (workers) can keep using [`Self::new`] (they never process the
+    /// global-intrinsic split/merge ops).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_shards(
+        inclusion_prover: Arc<dyn InclusionProver>,
+        key_manager: Arc<dyn quil_types::crypto::KeyManager>,
+        crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+        circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler>,
+        clock_store: Arc<dyn quil_types::store::ClockStore>,
+        hypergraph_config_resolver: Arc<
+            dyn crate::hypergraph_intrinsic::HypergraphConfigResolver,
+        >,
+        include_global: bool,
+        shards_store: Option<Arc<dyn quil_types::store::ShardsStore>>,
+        shards_db: Option<Arc<dyn quil_types::store::KvDb>>,
+    ) -> Self {
+        // Keep a handle for `refresh_shard_prefixes` before the store is moved into
+        // the global engine below.
+        let shards_store_for_manager = shards_store.clone();
         let mut engines: HashMap<String, Box<dyn ShardExecutionEngine>> = HashMap::new();
 
         if include_global {
@@ -51,6 +92,8 @@ impl ExecutionEngineManager {
                     key_manager.clone(),
                     crdt.clone(),
                     clock_store.clone(),
+                    shards_store,
+                    shards_db,
                 )),
             );
         }
@@ -95,7 +138,51 @@ impl ExecutionEngineManager {
         Self {
             engines: RwLock::new(engines),
             crdt,
+            shards_store: shards_store_for_manager,
         }
+    }
+
+    /// Re-attribute the CRDT's per-app shard prefixes + size buckets to the
+    /// CURRENT grid in the shards store. MUST be called after a split/merge flips
+    /// the grid (`apply_global_due_shard_changes`) — otherwise the CRDT keeps the
+    /// PRE-split partition, so `sub_meta_for` (GetAppShards size / the reward
+    /// basis) can't resolve the new deep-split sub-shards and reports size 0 for
+    /// them (the parent bucket lingers on a now-merged shallow prefix). Mirrors the
+    /// node's `refresh_crdt_shard_prefixes`: for each app whose registered shard
+    /// set TRANSITIONED, `rebucket_app` re-scans committed state and re-partitions
+    /// the buckets to the new leaves. Cheap when nothing changed
+    /// (`set_app_shard_prefixes` returns false → no rescan). Returns the number of
+    /// apps whose prefix set actually changed (0 in the steady state).
+    pub fn refresh_shard_prefixes(&self) -> usize {
+        let Some(store) = self.shards_store.as_ref() else {
+            return 0;
+        };
+        let rows = match store.range_app_shards() {
+            Ok(r) => r,
+            Err(_) => return 0,
+        };
+        let mut by_app: HashMap<[u8; 32], Vec<Vec<u32>>> = HashMap::new();
+        for row in rows {
+            if row.shard_key.len() >= 35 {
+                let mut l2 = [0u8; 32];
+                l2.copy_from_slice(&row.shard_key[3..35]);
+                by_app.entry(l2).or_default().push(row.prefix);
+            }
+        }
+        let mut changed = 0usize;
+        for (app, prefixes) in by_app {
+            if self.crdt.set_app_shard_prefixes(app, prefixes) {
+                changed += 1;
+                if let Err(e) = self.crdt.rebucket_app(&app) {
+                    tracing::warn!(
+                        app = %hex::encode(app),
+                        error = %e,
+                        "refresh_shard_prefixes: rebucket_app failed after shard-set change"
+                    );
+                }
+            }
+        }
+        changed
     }
 
     /// The hypergraph CRDT these engines commit to — used by the forest sync,
@@ -140,6 +227,39 @@ impl ExecutionEngineManager {
         crate::metrics::observe_execution_duration("crdt", "commit", start.elapsed().as_secs_f64());
         res?;
         Ok(())
+    }
+
+    /// Apply epoch-aligned shard topology changes (split/merge) due at this GLOBAL
+    /// frame, once per frame — decoupled from `invoke_frame_header` so a staged
+    /// `PendingShardChange` flips at its E+2 boundary regardless of whether an
+    /// app-shard `FrameHeader` is materialized in the frame. GLOBAL-ONLY; a no-op
+    /// on app-shard-only managers (no "global" engine). MUST be called after the
+    /// frame's messages are processed and BEFORE `commit_frame_with_global_cursor`,
+    /// so the reassignment writes ride the same commit batch.
+    pub fn apply_global_due_shard_changes(&self, frame_number: u64) -> Result<()> {
+        // Confirm whether the per-frame ~5s materialize cost is the WAIT to acquire
+        // this write lock (contention with another engines-lock holder — e.g. a
+        // concurrent materializer or a background task) vs actual apply work.
+        let engines_lock_start = std::time::Instant::now();
+        let mut engines = self.engines.write().unwrap();
+        let engines_lock_ms = engines_lock_start.elapsed().as_millis() as u64;
+        if engines_lock_ms > 500 {
+            tracing::warn!(
+                frame = frame_number,
+                ms = engines_lock_ms,
+                "apply_global_due_shard_changes: waited >500ms for the engines WRITE lock (contention, not apply work)"
+            );
+        }
+        let Some(engine) = engines.get_mut("global") else {
+            return Ok(());
+        };
+        let Some(any) = engine.as_any_mut() else {
+            return Ok(());
+        };
+        let Some(global) = any.downcast_mut::<GlobalExecutionEngine>() else {
+            return Ok(());
+        };
+        global.apply_due_shard_changes(frame_number)
     }
 
     /// Get an engine by name.
@@ -216,6 +336,28 @@ impl ExecutionEngineManager {
             )
         })?;
         global.install_frame_prover(frame_prover);
+        Ok(())
+    }
+
+    /// Install the split-reset config (archive KEEP-set + network QUIL genesis
+    /// prefix set) on the global engine's intrinsic, used by the unified-tree
+    /// split reset at the flag day. GLOBAL-ONLY; a no-op without a "global" engine.
+    pub fn install_global_split_reset_config(
+        &self,
+        archive_prover_addresses: Arc<std::collections::HashSet<Vec<u8>>>,
+        reset_genesis_prefixes: Arc<Vec<Vec<u32>>>,
+    ) -> Result<()> {
+        let mut engines = self.engines.write().unwrap();
+        let Some(engine) = engines.get_mut("global") else {
+            return Ok(());
+        };
+        let Some(any) = engine.as_any_mut() else {
+            return Ok(());
+        };
+        let Some(global) = any.downcast_mut::<GlobalExecutionEngine>() else {
+            return Ok(());
+        };
+        global.install_split_reset_config(archive_prover_addresses, reset_genesis_prefixes);
         Ok(())
     }
 
