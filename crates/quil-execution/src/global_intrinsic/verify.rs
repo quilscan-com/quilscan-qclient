@@ -212,7 +212,7 @@ pub fn verify_prover_leave(
         QuilError::InvalidArgument("verify prover leave: missing signature".into())
     })?;
 
-    let message = prover_verify::multi_filter_signing_message(&op.filters, op.frame_number);
+    let message = prover_verify::prover_leave_signing_message(&op.filters, op.frame_number);
     let domain = prover_verify::prover_leave_domain()?;
 
     key_manager.validate_signature(
@@ -531,6 +531,7 @@ where
 /// validators that did and did not run materialize.
 pub fn verify_prover_join_not_kicked(
     prover_tree: &quil_tries::VectorCommitmentTree,
+    current_frame: u64,
 ) -> Result<()> {
     let kf_bytes =
         read_field(prover_tree, "allocation:ProverAllocation", "KickFrameNumber")
@@ -542,7 +543,9 @@ pub fn verify_prover_join_not_kicked(
         return Ok(());
     }
     let kf = u64::from_be_bytes(kf_bytes.try_into().unwrap());
-    if kf != 0 {
+    // Spurious-kick amnesty: a kick recorded before the flag-day frame no longer
+    // bars re-join once the chain reaches it (see `materialize::KICK_AMNESTY_FRAME`).
+    if super::materialize::kick_bars_rejoin(kf, current_frame) {
         return Err(QuilError::InvalidArgument(format!(
             "ProverJoin verify: prover has been previously kicked \
              (KickFrameNumber={})",
@@ -579,7 +582,13 @@ where
         let status = read_field(&alloc_tree, "allocation:ProverAllocation", "Status")
             .and_then(|b| b.first().copied())
             .unwrap_or(4);
-        if status == 4 {
+        // Byte 4 (Rejected) and byte 6 (Historic) are re-joinable: Historic is a
+        // slot vacated by a reassignment and RETAINED so it can be reactivated, so
+        // a fresh Join must be allowed to reclaim it rather than being blocked by
+        // the 720-frame still-active window. MUST stay in lockstep with the
+        // materialize-side gate in `invoke_step` (a validate/materialize mismatch
+        // would let a Join pass one and fail the other).
+        if status == 4 || status == super::materialize::STATUS_HISTORIC {
             continue;
         }
         let jf_bytes = read_field(&alloc_tree, "allocation:ProverAllocation", "JoinFrameNumber")
@@ -924,19 +933,38 @@ pub fn verify_shard_split(
             op.proposed_shards.len()
         )));
     }
+    // Deep-bifurcation: post-cutover proposals encode children as bit-path
+    // FILTERS (`app ‖ bit_len ‖ packed`, variable length), validated as
+    // bit-prefix extensions of the parent — NOT the legacy byte-suffix children
+    // (exactly parent_len+1/+2, a byte prefix). The proposal frame decides the
+    // format, matching `materialize_shard_split`'s gate at the same frame.
+    let bit_path_mode = op.frame_number >= super::materialize::unified_tree_cutover_frame();
     let parent_len = op.shard_address.len();
     for shard in &op.proposed_shards {
-        if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
-            return Err(QuilError::InvalidArgument(format!(
-                "shard split: proposed shard length {} invalid for parent length {}",
-                shard.len(),
-                parent_len
-            )));
-        }
-        if !shard.starts_with(&op.shard_address) {
-            return Err(QuilError::InvalidArgument(
-                "shard split: proposed shard must share parent prefix".into(),
-            ));
+        if bit_path_mode {
+            if !quil_forest::shard_filter_extends(shard, &op.shard_address, 32) {
+                return Err(QuilError::InvalidArgument(
+                    "shard split: bit-path child must extend parent bit-path".into(),
+                ));
+            }
+            if quil_forest::decode_shard_bit_path(shard, 32).is_none() {
+                return Err(QuilError::InvalidArgument(
+                    "shard split: malformed bit-path child filter".into(),
+                ));
+            }
+        } else {
+            if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
+                return Err(QuilError::InvalidArgument(format!(
+                    "shard split: proposed shard length {} invalid for parent length {}",
+                    shard.len(),
+                    parent_len
+                )));
+            }
+            if !shard.starts_with(&op.shard_address) {
+                return Err(QuilError::InvalidArgument(
+                    "shard split: proposed shard must share parent prefix".into(),
+                ));
+            }
         }
     }
 
@@ -985,19 +1013,38 @@ pub fn verify_shard_merge(
             op.shard_addresses.len()
         )));
     }
+    // Deep-bifurcation (parity with `verify_shard_split`): post-cutover the
+    // merged children are variable-length bit-path FILTERS validated as bit-prefix
+    // extensions of the parent — NOT the legacy parent_len+1/+2 byte suffixes. The
+    // proposal frame decides the format. The parent may be the bare app root or a
+    // bit-path filter; `shard_filter_extends` handles both.
+    let bit_path_mode = op.frame_number >= super::materialize::unified_tree_cutover_frame();
     let parent_len = op.parent_address.len();
     for shard in &op.shard_addresses {
-        if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
-            return Err(QuilError::InvalidArgument(format!(
-                "shard merge: child shard length {} invalid for parent length {}",
-                shard.len(),
-                parent_len
-            )));
-        }
-        if !shard.starts_with(&op.parent_address) {
-            return Err(QuilError::InvalidArgument(
-                "shard merge: child shard must share parent prefix".into(),
-            ));
+        if bit_path_mode {
+            if !quil_forest::shard_filter_extends(shard, &op.parent_address, 32) {
+                return Err(QuilError::InvalidArgument(
+                    "shard merge: bit-path child must extend parent bit-path".into(),
+                ));
+            }
+            if quil_forest::decode_shard_bit_path(shard, 32).is_none() {
+                return Err(QuilError::InvalidArgument(
+                    "shard merge: malformed bit-path child filter".into(),
+                ));
+            }
+        } else {
+            if shard.len() != parent_len + 1 && shard.len() != parent_len + 2 {
+                return Err(QuilError::InvalidArgument(format!(
+                    "shard merge: child shard length {} invalid for parent length {}",
+                    shard.len(),
+                    parent_len
+                )));
+            }
+            if !shard.starts_with(&op.parent_address) {
+                return Err(QuilError::InvalidArgument(
+                    "shard merge: child shard must share parent prefix".into(),
+                ));
+            }
         }
     }
 
@@ -1812,6 +1859,38 @@ mod tests {
         assert!(!verify_shard_split(&sample_split(), &prover_tree, &RejectKeyManager).unwrap());
     }
 
+    /// Deep-bifurcation: post-cutover (`frame_number >= cutover`) the children are
+    /// variable-length bit-path FILTERS (`app ‖ bit_len ‖ packed`), NOT the legacy
+    /// parent_len+1/+2 byte suffixes — validated as bit-prefix extensions. The
+    /// parent here is the BARE 32-byte app address (the root shard). Both the
+    /// byte-length wall and the bare-app-root parent were bugs that silently
+    /// rejected real deep splits at this validation wall.
+    #[test]
+    fn shard_split_bit_path_mode_accepts_deep_children_under_bare_app_root() {
+        use quil_forest::encode_shard_bit_path;
+        let prover_tree = make_prover_tree();
+        let app = [0x01u8; 32]; // == sample_split shard_address (the signer/app)
+        // A 4-bit descent past the immediate bit: children branch at bit 3.
+        let c0 = encode_shard_bit_path(&app, &[false, false, false, false]);
+        let c1 = encode_shard_bit_path(&app, &[false, false, false, true]);
+        let mut op = sample_split();
+        op.frame_number = 700_000; // >= UNIFIED_TREE_CUTOVER_FRAME (698_000)
+        op.shard_address = app.to_vec(); // bare app root (empty bit-path parent)
+        op.proposed_shards = vec![c0, c1];
+        assert!(
+            verify_shard_split(&op, &prover_tree, &AcceptKeyManager).unwrap(),
+            "deep bit-path children under the bare-app root must pass validation"
+        );
+
+        // A child under a DIFFERENT app does not extend the parent → rejected.
+        let mut bad = op.clone();
+        bad.proposed_shards = vec![
+            encode_shard_bit_path(&app, &[true]),
+            encode_shard_bit_path(&[0x09u8; 32], &[false]),
+        ];
+        assert!(verify_shard_split(&bad, &prover_tree, &AcceptKeyManager).is_err());
+    }
+
     fn sample_merge() -> ShardMerge {
         ShardMerge {
             shard_addresses: vec![vec![0x01u8; 33], vec![0x01u8; 33]],
@@ -1845,6 +1924,36 @@ mod tests {
         op.public_key_signature_bls48581.as_mut().unwrap().address = vec![0x77u8; 32];
         // poseidon(pubkey) != sig.address → Ok(false).
         assert!(!verify_shard_merge(&op, &prover_tree, &AcceptKeyManager).unwrap());
+    }
+
+    /// Deep-bifurcation (parity with the split): post-cutover the merged children
+    /// are bit-path FILTERS validated as bit-prefix extensions of the parent —
+    /// NOT the legacy parent_len+1/+2 byte suffixes. The parent here is a deep
+    /// bit-path filter (merging [0,0,0,0]/[0,0,0,1] back into [0,0,0]).
+    #[test]
+    fn shard_merge_bit_path_mode_accepts_deep_children() {
+        use quil_forest::encode_shard_bit_path;
+        let prover_tree = make_prover_tree();
+        let app = [0x01u8; 32];
+        let mut op = sample_merge();
+        op.frame_number = 700_000; // >= cutover
+        op.parent_address = encode_shard_bit_path(&app, &[false, false, false]);
+        op.shard_addresses = vec![
+            encode_shard_bit_path(&app, &[false, false, false, false]),
+            encode_shard_bit_path(&app, &[false, false, false, true]),
+        ];
+        assert!(
+            verify_shard_merge(&op, &prover_tree, &AcceptKeyManager).unwrap(),
+            "deep bit-path children merging into their parent branch must validate"
+        );
+
+        // A child that does NOT extend the parent branch is rejected.
+        let mut bad = op.clone();
+        bad.shard_addresses = vec![
+            encode_shard_bit_path(&app, &[false, false, false, false]),
+            encode_shard_bit_path(&app, &[true, false, false, false]), // wrong branch
+        ];
+        assert!(verify_shard_merge(&bad, &prover_tree, &AcceptKeyManager).is_err());
     }
 
     fn sample_seniority_merge() -> ProverSeniorityMerge {
@@ -1936,7 +2045,7 @@ mod tests {
     #[test]
     fn join_not_kicked_passes_when_no_kick_field() {
         let prover_tree = make_prover_tree();
-        assert!(verify_prover_join_not_kicked(&prover_tree).is_ok());
+        assert!(verify_prover_join_not_kicked(&prover_tree, 1000).is_ok());
     }
 
     #[test]
@@ -1945,7 +2054,8 @@ mod tests {
         // KickFrameNumber on prover:Prover at its schema key.
         let kf_key = crate::global_schema::field_key("prover:Prover", "KickFrameNumber").unwrap();
         prover_tree.insert(&kf_key, &500u64.to_be_bytes(), &[], &BigInt::from(8)).unwrap();
-        assert!(verify_prover_join_not_kicked(&prover_tree).is_err());
+        // Before the amnesty frame, a kick still bars re-join.
+        assert!(verify_prover_join_not_kicked(&prover_tree, 1000).is_err());
     }
 
     #[test]
@@ -1953,7 +2063,28 @@ mod tests {
         let mut prover_tree = make_prover_tree();
         let kf_key = crate::global_schema::field_key("prover:Prover", "KickFrameNumber").unwrap();
         prover_tree.insert(&kf_key, &0u64.to_be_bytes(), &[], &BigInt::from(8)).unwrap();
-        assert!(verify_prover_join_not_kicked(&prover_tree).is_ok());
+        assert!(verify_prover_join_not_kicked(&prover_tree, 1000).is_ok());
+    }
+
+    #[test]
+    fn join_not_kicked_amnesty_forgives_pre_flag_day_kick() {
+        use crate::global_intrinsic::materialize::KICK_AMNESTY_FRAME;
+        let mut prover_tree = make_prover_tree();
+        let kf_key = crate::global_schema::field_key("prover:Prover", "KickFrameNumber").unwrap();
+        // A kick BEFORE the amnesty frame.
+        prover_tree
+            .insert(&kf_key, &(KICK_AMNESTY_FRAME - 100).to_be_bytes(), &[], &BigInt::from(8))
+            .unwrap();
+        // Still barred while the chain is before the amnesty frame …
+        assert!(verify_prover_join_not_kicked(&prover_tree, KICK_AMNESTY_FRAME - 1).is_err());
+        // … forgiven once the chain reaches it.
+        assert!(verify_prover_join_not_kicked(&prover_tree, KICK_AMNESTY_FRAME).is_ok());
+
+        // A kick AT/AFTER the amnesty frame is never forgiven.
+        prover_tree
+            .insert(&kf_key, &(KICK_AMNESTY_FRAME + 50).to_be_bytes(), &[], &BigInt::from(8))
+            .unwrap();
+        assert!(verify_prover_join_not_kicked(&prover_tree, KICK_AMNESTY_FRAME + 1000).is_err());
     }
 
     // -----------------------------------------------------------------

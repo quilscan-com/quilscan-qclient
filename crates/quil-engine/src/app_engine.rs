@@ -71,6 +71,14 @@ pub enum AppEngineMessage {
     /// so the gap would re-fire forever and later-arriving full frames
     /// could be re-applied on top of the already-synced tree.
     ShardSyncCompleted { synced_to_frame: u64 },
+    /// A worker with no local app-shard clock head fetched an archive anchor and
+    /// synced its tree to that anchor's pre-state. The engine validates the
+    /// certified frames, installs the predecessor as its local clock head, then
+    /// restarts simplex from that lineage.
+    ShardBootstrapCompleted {
+        anchor: quil_types::proto::global::AppShardFrame,
+        predecessor: Option<quil_types::proto::global::AppShardFrame>,
+    },
     /// (P3 / commonware-simplex) A frame this shard's simplex engine FINALIZED
     /// (prost-encoded `AppShardFrame`). Routed from `AppSeamFinalizer::on_finalized`
     /// (which runs on the simplex engine thread) into the engine run loop so it
@@ -80,7 +88,14 @@ pub enum AppEngineMessage {
     /// aggregate in the header). `cert` is the serialized simplex finalization
     /// certificate, attached to the reward-coverage bundle for global-level
     /// verification.
-    CwFinalizedFrame { frame: Vec<u8>, cert: Vec<u8> },
+    CwFinalizedFrame {
+        frame: Vec<u8>,
+        cert: Vec<u8>,
+        /// Whether this node's application validator sealed these exact bytes
+        /// before finalization (vs. a certificate-only replica). Gates the
+        /// finalize-time proposal re-validation — see `handle_cw_finalized_frame`.
+        locally_verified: bool,
+    },
     /// (P3) An inbound commonware-simplex message from a committee peer, demuxed
     /// from `shard_cw_bitmask` gossip. `channel` = CW channel id; `from` = the
     /// sender's committee Falcon public-key bytes (resolved by the master from
@@ -91,6 +106,10 @@ pub enum AppEngineMessage {
         from: Vec<u8>,
         data: Vec<u8>,
     },
+    /// The master installed the CW subscription and observed a connected peer.
+    /// Do not start simplex before this barrier: earlier messages failed with
+    /// `NoPeersSubscribedToTopic` and were historically discarded.
+    CwTransportReady,
 }
 
 // =====================================================================
@@ -151,6 +170,15 @@ pub enum AppEngineEvent {
     AncestorSyncRequested {
         filter: Vec<u8>,
         missing_frames: Vec<u64>,
+    },
+    /// Engine requests a PROACTIVE bootstrap of the covered shard's committed
+    /// DATA into its own CRDT — emitted on becoming bound (Joining) with no local
+    /// data, so the member is staged BEFORE it must produce/attest at Active
+    /// (rather than waiting for a consensus catch-up trigger that never fires
+    /// while it produces on empty state). Handled identically to the
+    /// [`Self::AncestorSyncRequested`] bootstrap by the worker's shard syncer.
+    ShardDataBootstrapRequested {
+        filter: Vec<u8>,
     },
     /// A certified parent was sealed (state committed via materializer).
     ParentSealed {
@@ -225,6 +253,11 @@ impl AppEngineHandle {
     /// attempts during the halt window are skipped.
     pub fn set_halted(&self, halted: bool) {
         let _ = self.msg_tx.try_send(AppEngineMessage::SetHalted(halted));
+    }
+
+    /// Release the CW startup barrier after the master observes a usable peer.
+    pub fn set_cw_transport_ready(&self) {
+        let _ = self.msg_tx.try_send(AppEngineMessage::CwTransportReady);
     }
 
     /// Read the engine's most-recently-published internal sizes.
@@ -550,13 +583,72 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                     .to_string(),
             ));
         }
-        // Get latest shard frame number
-        let prior_frame_number = self.clock_store
-            .get_latest_shard_clock_frame(&self.filter)
-            .ok()
-            .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
-            .unwrap_or(0);
+        // Effective-Active proposing gate (storage frames only). A prover that is
+        // NOT yet effective-`Active` for THIS shard at the frame's epoch (freshly
+        // joined + still inside its deferred-activation epoch, or admitted only by
+        // the empty-committee floor) has no storage leaf-root registration for the
+        // CURRENT epoch — its confirm registers "encode-ahead" for the NEXT epoch.
+        // Proposing a storage frame now produces an attestation whose leaf roots are
+        // for a future epoch, so no verifier matches it and the finalized frame is
+        // dropped ("app shard frame storage attestation rejected") — the shard
+        // stalls. Decline until this prover is Active for the epoch it would anchor
+        // to. Consensus stays live (the floor keeps the committee non-empty) but
+        // never mints an unverifiable storage frame.
+        if anchor_gfn > 0 {
+            let eff_active = self
+                .prover_registry
+                .get_prover_info(&self.local_prover_address)
+                .ok()
+                .flatten()
+                .map(|info| {
+                    info.allocations.iter().any(|a| {
+                        a.confirmation_filter == self.filter
+                            && a.effective_status(anchor_gfn)
+                                == quil_types::consensus::EffectiveStatus::Active
+                    })
+                })
+                .unwrap_or(false);
+            if !eff_active {
+                return Err(QuilError::NoVote(
+                    "local prover not effective-Active for this shard at the frame's \
+                     epoch — declining to propose (storage attestation would have no \
+                     current-epoch leaf roots)"
+                        .to_string(),
+                ));
+            }
+        }
+        // Get the latest shard frame (parent): both its local number and its GLOBAL
+        // anchor, for the cadence gate below.
+        let parent_frame = self.clock_store.get_latest_shard_clock_frame(&self.filter).ok();
+        let (prior_frame_number, parent_anchor_gfn) = parent_frame
+            .as_ref()
+            .and_then(|f| f.header.as_ref())
+            .map(|h| (h.frame_number, h.global_frame_number))
+            .unwrap_or((0, 0));
         let frame_number = prior_frame_number + 1;
+
+        // CADENCE GATE: pace app-shard production to the GLOBAL anchor. The
+        // global materializer folds EVERY app-shard frame produced between two
+        // global frames into the next global frame's `requests`; a shard finalizing
+        // many frames per global frame balloons that request set (N× attestation
+        // verifies + apply-due tombstone scans), slowing the global chain, which lets
+        // still more shard frames accumulate — a feedback loop. Bound it to ≤1 frame
+        // per global anchor: decline until the global head has advanced past the
+        // parent frame's anchor. The decision reads the PARENT's committed anchor
+        // (which every node agrees on), so rotating leaders cannot collectively
+        // out-run the global cadence — after a frame anchored at G, none propose the
+        // next until their global head passes G. Only in storage-frame mode
+        // (`anchor_gfn > 0`) and past genesis; rewards are per-global-frame, so at
+        // most one rewardable shard frame per global frame is the intended rate.
+        // NoVote → the view nullifies without killing the loop (mirrors the guards
+        // above); the leader resumes the instant the global head advances.
+        if anchor_gfn > 0 && prior_frame_number > 0 && anchor_gfn <= parent_anchor_gfn {
+            return Err(QuilError::NoVote(format!(
+                "app-shard cadence gate: global anchor {anchor_gfn} has not advanced \
+                 past parent frame {prior_frame_number}'s anchor {parent_anchor_gfn} — \
+                 pacing production to \u{2264}1 shard frame per global frame",
+            )));
+        }
 
         // STRICT GATE (mirrors the global `compute_prover_root`): never produce
         // frame N until this node has MATERIALIZED the parent N-1. `state_roots`
@@ -678,6 +770,11 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // hyperedge.removes]; `state_roots[0]` (vertex-adds) stays the sync
         // anchor. Empty (never-committed) phases normalize to the zero root so
         // the 4-root shape holds.
+        // (B) NOTE: the unified flip is driven from AppConsensusEngine's run loop
+        // (`maybe_flip_unified_at_cutover`) on the SHARED CRDT before produce, so
+        // by the time this producer computes `state_roots` the CRDT already
+        // reflects the cutover — no flip needed here (this is AppLeaderProvider,
+        // which shares the worker's CRDT Arc with the engine).
         let state_roots: Vec<Vec<u8>> = match self.hypergraph.as_ref() {
             Some(hg) => {
                 let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(
@@ -698,7 +795,18 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 ]
                 .iter()
                 .map(|(s, p)| {
-                    let r = hg.compute_shard_root(s, p, &shard_key);
+                    // (A) Sharded unified model: the per-shard `state_root` is the
+                    // covered SUBTREE root (computable from partial, subtree-only
+                    // storage), NOT `compute_shard_root(app)` (the whole-app
+                    // aggregate a subtree-only worker cannot reproduce). Gated on
+                    // the worker CRDT being unified (flipped at the cutover by (B));
+                    // legacy pre-cutover keeps the aggregate so in-flight frames
+                    // don't fork. Unsplit app is a no-op (subtree root == app root).
+                    let r = if hg.unified_tree() {
+                        hg.sub_shard_commitment_for_filter(s, p, &self.filter)
+                    } else {
+                        hg.compute_shard_root(s, p, &shard_key)
+                    };
                     if r.is_empty() { zero.clone() } else { r }
                 })
                 .collect();
@@ -890,7 +998,22 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                                     prost::Message::encode_to_vec(&att),
                                 );
                             }
+                            info!(
+                                frame = frame_number,
+                                openings = openings.len(),
+                                "app-shard proof: storage attestation generated + attached to frame header"
+                            );
+                        } else {
+                            warn!(
+                                frame = frame_number,
+                                "app-shard proof: vote-openings decoded EMPTY — frame carries NO storage attestation (the global storage gate will withhold this shard's reward)"
+                            );
                         }
+                    } else {
+                        warn!(
+                            frame = frame_number,
+                            "app-shard proof: build_vote_openings produced nothing (no readable replicas for this shard) — frame carries NO storage attestation (the global storage gate will withhold this shard's reward)"
+                        );
                     }
                 }
             }
@@ -1052,6 +1175,16 @@ pub struct AppEngineDeps {
     /// An empty resolved path ⇒ ephemeral journal (tests). Default is fine for
     /// callers that don't persist app-shard consensus.
     pub db_config: quil_config::DbConfig,
+    /// (B) Unified-cutover consolidation hook, `Fn(filter, global_frame) -> ok`.
+    /// Invoked once, on THIS worker's CRDT, at the moment its anchored global
+    /// frame reaches `UNIFIED_TREE_CUTOVER_FRAME` — BEFORE flipping the CRDT to
+    /// unified — to fold the covered app's pre-cutover per-sub-shard trees into
+    /// its single app.l2 tree (so the first unified subtree `state_root` reflects
+    /// pre-cutover data). Built by the node (`worker_state_builder`) capturing the
+    /// worker's hg store; `None` (tests / no-migrate) skips consolidation and just
+    /// flips. Returns `false` to abort the flip this cycle (retried next).
+    pub unified_cutover_hook:
+        Option<Arc<dyn Fn(&[u8], u64) -> bool + Send + Sync>>,
 }
 
 /// The persistent base directory for a core's app-shard simplex journals,
@@ -1191,6 +1324,9 @@ pub struct AppConsensusEngine {
     hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
     /// Storage-attestation SOURCE crdt (master's hypergraph). See `AppEngineDeps`.
     storage_source_hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// (B) Unified-cutover consolidation hook (see `AppEngineDeps`).
+    unified_cutover_hook:
+        Option<Arc<dyn Fn(&[u8], u64) -> bool + Send + Sync>>,
     execution_engine: Option<Arc<quil_execution::ExecutionEngineManager>>,
     inclusion_prover: Option<Arc<dyn quil_types::crypto::InclusionProver>>,
 
@@ -1226,6 +1362,13 @@ pub struct AppConsensusEngine {
     /// pre-state) rather than signing blind — closing the frame-number-jump
     /// bypass of audit #3. A lagging voter catches up via shard sync, then votes.
     shard_mat_frame: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Shared with the CW proposer/verifier: whether this member has staged the
+    /// covered sub-shard's committed data into its own CRDT. Gates propose/vote
+    /// (see [`crate::cw_app_seams::AppSeamProposer`]) so a joining member neither
+    /// produces attestation-less frames nor forks the shard on empty state. Set
+    /// true when the join-time data bootstrap converges, or immediately when the
+    /// data is already present (archive / restart / shared-state).
+    data_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Shared with the leader provider: requests this node collected for
     /// frames it proposed (proto `MessageBundle`s), keyed by frame
     /// number. Read at finalization to self-materialize + assemble the
@@ -1355,6 +1498,7 @@ impl AppConsensusEngine {
             min_active_provers_for_propose: deps.min_active_provers_for_propose,
             hypergraph: deps.hypergraph,
             storage_source_hypergraph: deps.storage_source_hypergraph,
+            unified_cutover_hook: deps.unified_cutover_hook,
             execution_engine: deps.execution_engine,
             inclusion_prover: deps.inclusion_prover,
             current_difficulty: Arc::new(std::sync::atomic::AtomicU32::new(50000)),
@@ -1368,6 +1512,7 @@ impl AppConsensusEngine {
             pending_seal_rank: None,
             last_materialized_frame: 0,
             shard_mat_frame: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            data_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             frame_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             frame_attestations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             finalized_requests_roots: HashMap::new(),
@@ -1521,9 +1666,71 @@ impl AppConsensusEngine {
     /// CW proposal check). Use this instead of assigning `last_materialized_frame`
     /// directly so `shard_mat_frame` stays consistent (audit #3).
     fn set_materialized_frame(&mut self, n: u64) {
+        let prev = self.last_materialized_frame;
         self.last_materialized_frame = n;
         self.shard_mat_frame
             .store(n, std::sync::atomic::Ordering::Relaxed);
+        // The CW verify gate nullifies any proposal where `mat + 1 != N`
+        // (app_engine.rs ~2326). If this line never logs a non-zero `now`, the
+        // shard is wedged at genesis: every proposal is nullified, nothing
+        // finalizes, and `mat` can never advance (self-sustaining deadlock).
+        info!(
+            filter = %hex::encode(&self.filter[..self.filter.len().min(8)]),
+            prev,
+            now = n,
+            "app-shard materialized height advanced"
+        );
+    }
+
+    /// Persist a certified shard frame as the shard clock head so the next
+    /// `prove_next_state` (which reads `get_latest_shard_clock_frame`) chains on
+    /// it. MUST be called by EVERY path that advances the materialized cursor —
+    /// not only the CW-finalize handler, but also the leader self-materialize and
+    /// the follower catch-up drain. Otherwise a node that materializes a frame
+    /// OUTSIDE its own finalize handler (e.g. draining `received_full_frames`
+    /// after a frame-sync) advances `mat` while the clock head stalls, and the
+    /// (co-located, in cluster mode separate-process) proposer then reads the
+    /// stale clock and RE-PROPOSES the already-materialized frame N — which every
+    /// voter nullifies (`mat+1 != N`), producing a view-churn storm that never
+    /// makes progress. Keeping clock-head == mat on every path removes that whole
+    /// divergence class. Idempotent + monotonic: `commit_shard_clock_frame` only
+    /// bumps the latest-index pointer when `frame_number` exceeds the current
+    /// head (clock.rs:1152), so re-committing or filling a gap below the head can
+    /// never regress it.
+    fn commit_shard_clock_head(
+        &self,
+        frame: &quil_types::proto::global::AppShardFrame,
+        frame_number: u64,
+    ) {
+        let Some(header) = frame.header.as_ref() else {
+            return;
+        };
+        let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
+            .map(|h| h.to_vec())
+            .unwrap_or_default();
+        if let Ok(txn) = self.clock_store.new_transaction(false) {
+            if let Err(e) =
+                self.clock_store
+                    .stage_shard_clock_frame(&selector, frame, txn.as_ref())
+            {
+                warn!(core_id = self.core_id, frame = frame_number, error = %e, "stage shard clock head failed");
+            } else {
+                let _ = txn.commit();
+            }
+        }
+        if let Ok(txn) = self.clock_store.new_transaction(false) {
+            if let Err(e) = self.clock_store.commit_shard_clock_frame(
+                &self.filter,
+                frame_number,
+                &selector,
+                txn.as_ref(),
+                false,
+            ) {
+                warn!(core_id = self.core_id, frame = frame_number, error = %e, "commit shard clock head failed");
+            } else {
+                let _ = txn.commit();
+            }
+        }
     }
 
     async fn reconcile_with_sync(&mut self, synced_to_frame: u64) {
@@ -1546,6 +1753,121 @@ impl AppConsensusEngine {
             .retain(|&f, _| f > synced_to_frame);
         // Continue materializing any contiguous frames we still hold.
         self.try_materialize_follower_frames().await;
+    }
+
+    /// Frame N advertises state after N-1, so install certified frame N-1 as
+    /// the clock head after the worker tree has synced to N's roots.
+    async fn install_archive_bootstrap(
+        &mut self,
+        anchor: quil_types::proto::global::AppShardFrame,
+        predecessor: Option<quil_types::proto::global::AppShardFrame>,
+    ) -> bool {
+        let synced_to = match archive_bootstrap_predecessor_height(
+            &self.app_address,
+            &anchor,
+            predecessor.as_ref(),
+        ) {
+            Ok(height) => height,
+            Err(error) => {
+                warn!(core_id = self.core_id, error, "app-shard bootstrap: invalid archive chain");
+                return false;
+            }
+        };
+        let anchor_n = anchor.header.as_ref().expect("checked above").frame_number;
+        let Some(validator) = self.app_frame_validator.as_ref() else {
+            warn!(core_id = self.core_id, "app-shard bootstrap: validator not ready");
+            return false;
+        };
+        match validate_app_frame_panic_safe(validator, &anchor, false) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    core_id = self.core_id,
+                    frame = anchor_n,
+                    global_frame = anchor.header.as_ref().map(|h| h.global_frame_number),
+                    signature_present = anchor.header.as_ref().and_then(|h| h.public_key_signature_bls48581.as_ref()).is_some(),
+                    "app-shard bootstrap: archive anchor validation returned false"
+                );
+                return false;
+            }
+            Err(error) => {
+                let header = anchor.header.as_ref().expect("checked above");
+                let signature = header.public_key_signature_bls48581.as_ref();
+                warn!(
+                    core_id = self.core_id,
+                    frame = anchor_n,
+                    global_frame = header.global_frame_number,
+                    state_root_lengths = ?header.state_roots.iter().map(Vec::len).collect::<Vec<_>>(),
+                    signature_present = signature.is_some(),
+                    signature_len = signature.map(|s| s.signature.len()),
+                    bitmask_len = signature.map(|s| s.bitmask.len()),
+                    storage_attestation_root_len = header.storage_attestation_root.len(),
+                    error = %error,
+                    "app-shard bootstrap: archive anchor validation failed"
+                );
+                return false;
+            }
+        }
+        if synced_to == 0 {
+            return true;
+        }
+        let predecessor = predecessor.expect("non-genesis chain checked above");
+        match validate_app_frame_panic_safe(validator, &predecessor, false) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(core_id = self.core_id, frame = synced_to, "app-shard bootstrap: predecessor validation returned false");
+                return false;
+            }
+            Err(error) => {
+                warn!(core_id = self.core_id, frame = synced_to, error = %error,
+                    "app-shard bootstrap: predecessor validation failed");
+                return false;
+            }
+        }
+        self.commit_shard_clock_head(&predecessor, synced_to);
+        self.reconcile_with_sync(synced_to).await;
+        info!(core_id = self.core_id, anchor_frame = anchor_n, synced_to,
+            "app-shard bootstrap installed archive predecessor and synced pre-state");
+        true
+    }
+
+    /// (B) At the moment this worker's anchored global frame reaches the unified
+    /// cutover, fold its covered app's pre-cutover per-sub-shard trees into the
+    /// single app.l2 tree (the consolidation hook) and flip its CRDT to unified —
+    /// so the per-shard `state_root` (A) becomes the covered SUBTREE root
+    /// (computable from partial storage). Idempotent: a no-op once unified or
+    /// before the cutover. Every worker on the shard runs it at the same anchored
+    /// frame over committed state, so producers and verifiers flip together and
+    /// agree on the post-cutover roots. Called before producing/validating a frame.
+    fn maybe_flip_unified_at_cutover(&self) {
+        let Some(hg) = self.hypergraph.as_ref() else {
+            return;
+        };
+        if hg.unified_tree() {
+            return;
+        }
+        let (anchor_gfn, _) = resolve_global_anchor(self.global_anchor_store.as_ref());
+        if anchor_gfn
+            < quil_execution::global_intrinsic::materialize::unified_tree_cutover_frame()
+        {
+            return;
+        }
+        if let Some(hook) = self.unified_cutover_hook.as_ref() {
+            if !hook(&self.filter, anchor_gfn) {
+                tracing::warn!(
+                    core_id = self.core_id,
+                    anchor_gfn,
+                    "unified cutover consolidation failed — deferring flip this cycle"
+                );
+                return;
+            }
+        }
+        hg.set_unified_tree(true);
+        tracing::info!(
+            core_id = self.core_id,
+            anchor_gfn,
+            "worker app-tree unified commitment ACTIVATED at cutover"
+        );
     }
 
     /// Start the app shard consensus loop. Runs on the worker thread's
@@ -1626,24 +1948,48 @@ impl AppConsensusEngine {
             }
         }
 
-        // Start the shard consensus driver: commonware-simplex (P3) + Falcon.
-        match self.start_consensus_cw((bls_signer_factory)()) {
-            Ok(handle) => {
-                self.cw_handle = Some(handle);
-                info!(
+        // ONE-TIME startup sync of the covered shard's committed data from the
+        // storage source (the master's genesis-seeded/forest-filled hypergraph)
+        // into this worker's OWN crdt, BEFORE consensus can propose or verify.
+        // Per-worker stores start empty; the seeded genesis coins live only in
+        // the master store. The storage-attestation path (`prove_next_state`)
+        // syncs them lazily, but that runs AFTER `state_roots` is computed, so the
+        // first proposal reads an un-synced (zero) pre-state root while later
+        // verifiers read the synced (non-zero) root → every proposal is nullified
+        // (state_roots mismatch) and the app-shard CW churns views + leaks journal
+        // buffers. Syncing here makes the own crdt's committed root deterministic
+        // from frame 1 (mat=0) on every node, so leader and verifier agree. No-op
+        // for archives/tests (no separate source) and for empty shards (copied=0).
+        if let (Some(source), Some(own_crdt)) =
+            (self.storage_source_hypergraph.as_ref(), self.hypergraph.as_ref())
+        {
+            let app_addr = self.filter[..self.filter.len().min(32)].to_vec();
+            match crate::app_shard_metadata::sync_app_shard_to_own_crdt(
+                source.as_ref(),
+                own_crdt.as_ref(),
+                &app_addr,
+                0,
+            ) {
+                Ok(n) if n > 0 => info!(
                     core_id = self.core_id,
-                    filter = hex::encode(&self.filter),
-                    "shard commonware-simplex consensus running (EQUAL VOTES)"
-                );
-            }
-            Err(e) => {
-                warn!(
+                    copied = n,
+                    "startup: synced app-shard seed data into own crdt (deterministic pre-state)"
+                ),
+                Err(e) => warn!(
                     core_id = self.core_id,
                     error = %e,
-                    "failed to start shard simplex consensus — will retry (passive until committee is present)"
-                );
+                    "startup app-shard sync into own crdt failed"
+                ),
+                _ => {}
             }
         }
+
+        // A CW engine must not emit its first simplex messages until its topic
+        // is subscribed locally and a remote subscriber is present. The master
+        // sends `CwTransportReady` after that condition becomes true.
+        let mut cw_transport_ready = false;
+        info!(core_id = self.core_id, filter = hex::encode(&self.filter),
+            "waiting for CW topic transport readiness before starting consensus");
 
         // Frame cleanup timer — remove stale cached frames every 60s
         let mut cleanup_timer = tokio::time::interval(Duration::from_secs(60));
@@ -1660,6 +2006,11 @@ impl AppConsensusEngine {
 
                 // Inbound network messages
                 msg = msg_rx.recv() => {
+                    // (B) Flip this worker's CRDT to unified (+ consolidate) once
+                    // its anchored global frame reaches the cutover, BEFORE any
+                    // produce/validate/materialize below computes a `state_root`.
+                    // Idempotent + cheap after the flip (a `bool` load).
+                    self.maybe_flip_unified_at_cutover();
                     match msg {
                         Some(AppEngineMessage::Consensus(_data)) => {
                             // Legacy HotStuff consensus wire messages are no
@@ -1697,9 +2048,27 @@ impl AppConsensusEngine {
                         }
                         Some(AppEngineMessage::ShardSyncCompleted { synced_to_frame }) => {
                             self.reconcile_with_sync(synced_to_frame).await;
+                            // Covered data is now staged — un-gate propose/vote.
+                            self.data_ready.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Some(AppEngineMessage::CwFinalizedFrame { frame, cert }) => {
-                            self.handle_cw_finalized_frame(&frame, &cert).await;
+                        Some(AppEngineMessage::ShardBootstrapCompleted { anchor, predecessor }) => {
+                            if !self.install_archive_bootstrap(anchor, predecessor).await {
+                                continue;
+                            }
+                            // Covered data is now staged — un-gate propose/vote. The
+                            // cw_handle is rebuilt below and reads this same flag.
+                            self.data_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                            if let Some(old) = self.cw_handle.take() {
+                                old.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        Some(AppEngineMessage::CwFinalizedFrame {
+                            frame,
+                            cert,
+                            locally_verified,
+                        }) => {
+                            self.handle_cw_finalized_frame(&frame, &cert, locally_verified)
+                                .await;
                         }
                         Some(AppEngineMessage::CwIn { channel, from, data }) => {
                             if let Some(h) = self.cw_handle.as_ref() {
@@ -1713,6 +2082,17 @@ impl AppConsensusEngine {
                                     // (the block is still verified at `verify`, so this
                                     // is authorization/DoS hardening, not a safety hole).
                                     if quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&from).is_some() {
+                                        if let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data.as_slice()) {
+                                            if let Some(header) = frame.header.as_ref() {
+                                                let cursor = self.shard_mat_frame.load(std::sync::atomic::Ordering::Relaxed);
+                                                if header.frame_number > cursor.saturating_add(1) {
+                                                    let _ = self.event_tx.send(AppEngineEvent::AncestorSyncRequested {
+                                                        filter: self.filter.clone(),
+                                                        missing_frames: vec![cursor.saturating_add(1)],
+                                                    });
+                                                }
+                                            }
+                                        }
                                         (h.ingest_block)(data);
                                     } else {
                                         tracing::debug!(
@@ -1735,6 +2115,20 @@ impl AppConsensusEngine {
                                 }
                             }
                         }
+                        Some(AppEngineMessage::CwTransportReady) => {
+                            if !cw_transport_ready {
+                                cw_transport_ready = true;
+                                match self.start_consensus_cw((bls_signer_factory)()) {
+                                    Ok(handle) => {
+                                        self.cw_handle = Some(handle);
+                                        info!(core_id = self.core_id, filter = hex::encode(&self.filter),
+                                            "shard commonware-simplex consensus running after transport readiness");
+                                    }
+                                    Err(e) => warn!(core_id = self.core_id, error = %e,
+                                        "failed to start shard simplex after transport readiness — will retry"),
+                                }
+                            }
+                        }
                         None => {
                             info!(core_id = self.core_id, "message channel closed");
                             break;
@@ -1751,7 +2145,12 @@ impl AppConsensusEngine {
                 // committee is buildable (the shard's active provers are present
                 // in this node's registry). No-op once running.
                 _ = cw_retry_timer.tick() => {
-                    if self.cw_handle.is_none() {
+                    // This timer also handles dynamic-committee rebuilds below.
+                    // Keep *both* paths behind the transport barrier: otherwise
+                    // a timer tick while CW is still waiting for a subscribed
+                    // peer can instantiate simplex and emit the very startup
+                    // messages that the barrier is meant to prevent.
+                    if cw_transport_ready && self.cw_handle.is_none() {
                         // Passive-mode retry: keep trying until the committee is
                         // buildable (active provers present in this registry).
                         match self.start_consensus_cw((bls_signer_factory)()) {
@@ -1771,7 +2170,7 @@ impl AppConsensusEngine {
                                 );
                             }
                         }
-                    } else {
+                    } else if cw_transport_ready {
                         // DYNAMIC COMMITTEE: if the shard's active-prover set
                         // changed since this instance was built (e.g. a prover's
                         // deferred activation reached its epoch, growing a 1-member
@@ -1881,6 +2280,25 @@ impl AppConsensusEngine {
             h.update(m);
         }
         h.finalize().into()
+    }
+
+    /// Whether this member's OWN CRDT holds the covered sub-shard's committed data,
+    /// read from the FOREST via the exact `partition_shard_leaves` path
+    /// `build_vote_openings` uses (NOT the write-time size bucket, which a synced
+    /// tree doesn't populate). A shared-state / test engine has no separate own CRDT
+    /// (`hypergraph` None) and is treated as staged. An empty covered subtree yields
+    /// no leaves → `false` here; the caller's stickiness + bootstrap-convergence path
+    /// handles the genuinely-empty shard.
+    fn covered_data_staged(&self) -> bool {
+        let Some(hg) = self.hypergraph.as_ref() else {
+            return true;
+        };
+        let (app, sub_prefix) = crate::app_shard_metadata::split_coverage_filter(&self.filter);
+        let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(app, 256, 3);
+        let mut shard_key = Vec::with_capacity(3 + app.len());
+        shard_key.extend_from_slice(&l1);
+        shard_key.extend_from_slice(app);
+        !crate::app_shard_metadata::partition_shard_leaves(hg, &shard_key, &sub_prefix).is_empty()
     }
 
     fn start_consensus_cw(
@@ -2001,10 +2419,14 @@ impl AppConsensusEngine {
         // `handle_cw_finalized_frame` materializes it on `&mut self`.
         let on_finalized: crate::cw_app_seams::AppFinalizedSink = {
             let msg_tx = self.self_msg_tx.clone();
-            Arc::new(move |frame, cert| {
+            Arc::new(move |frame, cert, locally_verified| {
                 let mut buf = Vec::new();
                 if prost::Message::encode(&frame, &mut buf).is_ok() {
-                    let _ = msg_tx.try_send(AppEngineMessage::CwFinalizedFrame { frame: buf, cert });
+                    let _ = msg_tx.try_send(AppEngineMessage::CwFinalizedFrame {
+                        frame: buf,
+                        cert,
+                        locally_verified,
+                    });
                 }
             })
         };
@@ -2063,6 +2485,9 @@ impl AppConsensusEngine {
                         l2[..copy_len].copy_from_slice(&self.filter[..copy_len]);
                         quil_types::store::ShardKey { l1, l2 }
                     };
+                    // Captured for the (A) sharded verifier recompute
+                    // (subtree root, mirrors the leader's `state_roots` build).
+                    let filter_for_verify = self.filter.clone();
                     Some(Arc::new(
                         move |frame: &quil_types::proto::global::AppShardFrame| -> bool {
                             let Some(header) = frame.header.as_ref() else {
@@ -2133,7 +2558,15 @@ impl AppConsensusEngine {
                                     ("hyperedge", "removes"),
                                 ];
                                 for (i, (s, p)) in phases.iter().enumerate() {
-                                    let mut local = hg.compute_shard_root(s, p, &shard_key);
+                                    // (A) Recompute the SAME per-shard root the leader
+                                    // committed: subtree root under unified, whole-app
+                                    // aggregate under legacy. Gated symmetrically with
+                                    // the producer on `unified_tree()`.
+                                    let mut local = if hg.unified_tree() {
+                                        hg.sub_shard_commitment_for_filter(s, p, &filter_for_verify)
+                                    } else {
+                                        hg.compute_shard_root(s, p, &shard_key)
+                                    };
                                     if local.is_empty() {
                                         local = zero.clone();
                                     }
@@ -2154,6 +2587,32 @@ impl AppConsensusEngine {
                 }
                 _ => None,
             };
+        // Stage-gate: the CW proposer/verifier are gated on `data_ready` until this
+        // member holds the covered sub-shard's committed DATA in its own CRDT.
+        // Without it, `build_vote_openings` yields no storage openings → the frame
+        // carries no attestation → the global proof-of-storage gate zeroes the shard
+        // reward (and producing on empty state forks the shard + churns the CW
+        // re-seed). Re-evaluated on each committee (re)build. The check reads the
+        // FOREST (`covered_data_staged` → the same `partition_shard_leaves` source
+        // `build_vote_openings` uses), NOT the write-time size bucket — a synced tree
+        // populates the forest but not that bucket. `data_ready` is STICKY: once set
+        // (forest has data, or a bootstrap converged — the latter covers a genuinely
+        // EMPTY shard, which has nothing to stage yet must still produce), a later
+        // rebuild never flips it back off. If not yet staged, kick off a PROACTIVE
+        // data bootstrap now (while Joining) so we're ready before Active.
+        if self.covered_data_staged() {
+            self.data_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if !self.data_ready.load(std::sync::atomic::Ordering::Relaxed) {
+            info!(
+                core_id = self.core_id,
+                filter = hex::encode(&self.filter),
+                "app-shard: covered data not staged — gating propose/vote and requesting proactive data bootstrap"
+            );
+            let _ = self.event_tx.send(AppEngineEvent::ShardDataBootstrapRequested {
+                filter: self.filter.clone(),
+            });
+        }
+
         let handle = crate::cw_app_seams::activate_app_consensus_cw(
             scheme,
             peers,
@@ -2171,6 +2630,7 @@ impl AppConsensusEngine {
             transport,
             cw_app_storage_dir,
             requests_root_check,
+            self.data_ready.clone(),
         );
         Ok(handle)
     }
@@ -2192,11 +2652,11 @@ impl AppConsensusEngine {
     /// Materialize a simplex-FINALIZED app frame (P3). The frame is already
     /// certified by the CW committee quorum, so — unlike [`handle_frame_message`]
     /// — this does NOT run the BLS-aggregate-signature gate (a CW frame carries a
-    /// Falcon certificate, not a BLS aggregate in its header). Mirrors the
-    /// self-materialize half of [`distribute_and_materialize_own_frame`]: apply
-    /// the requests, advance + persist the durable cursor, and publish the full
-    /// frame for followers/archives on `shard_frame_bitmask`.
-    async fn handle_cw_finalized_frame(&mut self, data: &[u8], cert: &[u8]) {
+    /// Falcon certificate, not a BLS aggregate in its header). Whether this node
+    /// proposed the frame or received it, the flow is the same: apply the
+    /// requests, seal the shard clock head, advance + persist the durable cursor,
+    /// and publish the full frame for followers/archives on `shard_frame_bitmask`.
+    async fn handle_cw_finalized_frame(&mut self, data: &[u8], cert: &[u8], locally_verified: bool) {
         let mut frame: quil_types::proto::global::AppShardFrame = match prost::Message::decode(data) {
             Ok(f) => f,
             Err(e) => {
@@ -2204,32 +2664,60 @@ impl AppConsensusEngine {
                 return;
             }
         };
-        // SECURITY — post-verification substitution defense (audit Finding #1).
-        // These finalized `data` bytes are a FRESH read of the mutable
-        // `BlockStore` (the reporter re-reads by digest at finalize), so they
-        // can differ from the bytes the committee actually verified at proposal
-        // time: the store is last-writer-wins and the block channel (3) has no
-        // committee admission. A substitution keeps the certified
-        // `Poseidon(output)` digest (so the finalization cert still verifies)
-        // while changing every other header field and the body. Re-run PROPOSAL
-        // validation here before anything touches the clock store or
-        // materializer: it RECOMPUTES the deterministic output from the declared
-        // fields (parent_selector, requests_root, state_roots, ρ_N, frame_number,
-        // rank, prover) and rejects any frame whose fields don't reproduce
-        // `header.output`. Honest frames (same bytes as verified) pass; a
-        // substituted/internally-inconsistent header is dropped. (Validate the
-        // PRISTINE frame, before the cert is attached below.)
-        if let Some(v) = self.app_frame_validator.as_ref() {
-            match validate_app_frame_panic_safe(v, &frame, /* proposal */ true) {
-                Ok(true) => {}
-                other => {
-                    warn!(
-                        core_id = self.core_id,
-                        result = ?other,
-                        "cw finalized frame: failed re-validation (post-verification \
-                         substitution or inconsistent header) — dropping",
-                    );
-                    return;
+        // DEV-ONLY fault injection: also drop the CW-finalization path for the
+        // range [df, df+8) so this node's `last_materialized_frame` genuinely
+        // STALLS (CW materialization is sequential) — it then falls onto the
+        // gossip follower path (whose same range is dropped in the receive
+        // handler), leaving frames buffered AHEAD of a hole → gap detection →
+        // step-4 catch-up sync. Unset in prod (QUIL_APP_SYNC_DROP_FRAME).
+        if let Some(fnum) = frame.header.as_ref().map(|h| h.frame_number) {
+            let fault_drop = std::env::var("QUIL_APP_SYNC_DROP_FRAME")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|df| fnum >= df && fnum < df + 8)
+                .unwrap_or(false);
+            if fault_drop {
+                tracing::warn!(
+                    core_id = self.core_id,
+                    frame = fnum,
+                    "FAULT-INJECT (QUIL_APP_SYNC_DROP_FRAME): dropping CW-finalized \
+                     frame to stall the materializer and force a step-4 sync"
+                );
+                return;
+            }
+        }
+        // SECURITY — post-verification substitution defense (audit Finding #1),
+        // gated on `locally_verified` (#594 "preserve finalized app shard frames").
+        //
+        // When `locally_verified`, these `data` bytes are the EXACT sequence this
+        // node's application validator accepted and the `BlockStore` SEALED at
+        // proposal time (peer ingress can no longer substitute them). Re-running
+        // PROPOSAL validation here would recompute the deterministic output from
+        // fields whose backing is MUTABLE local state (storage attestations,
+        // global-frame anchors, state_roots) — which can legitimately drift
+        // between our vote and finalization — and would DROP a frame we already
+        // voted for, losing a validly-finalized app-shard frame. So skip it for
+        // sealed bytes.
+        //
+        // A certificate-only replica (e.g. replay/catch-up) may learn the
+        // finalization cert WITHOUT locally verifying the block; those unsealed
+        // bytes still take the defensive re-validation path before anything
+        // touches the clock store or materializer. It RECOMPUTES `header.output`
+        // from the declared fields and drops any frame whose fields don't
+        // reproduce it — catching a substituted/internally-inconsistent header.
+        if !locally_verified {
+            if let Some(v) = self.app_frame_validator.as_ref() {
+                match validate_app_frame_panic_safe(v, &frame, /* proposal */ true) {
+                    Ok(true) => {}
+                    other => {
+                        warn!(
+                            core_id = self.core_id,
+                            result = ?other,
+                            "cw finalized frame: unverified bytes failed re-validation \
+                             (substitution or inconsistent header) — dropping",
+                        );
+                        return;
+                    }
                 }
             }
         }
@@ -2492,12 +2980,33 @@ impl AppConsensusEngine {
                 let frame_id = hex::encode(Sha256::digest(&h.output));
                 self.frame_store.insert(frame_id, data.to_vec());
 
-                // Buffer the full frame (header+requests) for follower
-                // materialization, but only if it's still ahead of what
-                // we've materialized (avoid unbounded re-buffering of old
-                // frames). The buffer is materialized in strict order
-                // against the finalized (trusted) requests_root.
-                if frame_number > self.last_materialized_frame {
+                // DEV-ONLY fault injection: drop a specific app-frame on receipt
+                // to force a PERSISTENT materialization gap (a locally-dropped
+                // frame can't be refilled by gossip — it's re-dropped on every
+                // receipt), exercising the step-4 catch-up sync. Unset in prod;
+                // set QUIL_APP_SYNC_DROP_FRAME=<app_frame_number> to reproduce a
+                // deeply-behind node. Re-read per receipt (rare, dev-only path).
+                // Drops a small RANGE [df, df+8) so a single node falls behind
+                // even across the frames it happens to lead (a leader
+                // self-materializes and doesn't hit this receive path).
+                let fault_drop = std::env::var("QUIL_APP_SYNC_DROP_FRAME")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(|df| frame_number >= df && frame_number < df + 8)
+                    .unwrap_or(false);
+                if fault_drop {
+                    tracing::warn!(
+                        core_id = self.core_id,
+                        frame = frame_number,
+                        "FAULT-INJECT (QUIL_APP_SYNC_DROP_FRAME): dropping received \
+                         app-frame to force a step-4 catch-up sync"
+                    );
+                } else if frame_number > self.last_materialized_frame {
+                    // Buffer the full frame (header+requests) for follower
+                    // materialization, but only if it's still ahead of what
+                    // we've materialized (avoid unbounded re-buffering of old
+                    // frames). The buffer is materialized in strict order
+                    // against the finalized (trusted) requests_root.
                     self.received_full_frames.insert(frame_number, frame);
                     self.try_materialize_follower_frames().await;
                 }
@@ -2655,184 +3164,6 @@ impl AppConsensusEngine {
         self.proposal_cache.retain(|&rank, _| rank >= cutoff);
     }
 
-    /// On finalizing a frame THIS node proposed: assemble the full
-    /// `AppShardFrame { header, requests }`, materialize its requests
-    /// into local shard state, and publish the full frame on
-    /// `shard_frame_bitmask`. No-op if this node didn't propose the frame
-    /// (no collected requests on hand — it materializes on receipt
-    /// instead). `header_canonical_bytes` is the certified header.
-    async fn distribute_and_materialize_own_frame(
-        &mut self,
-        frame_number: u64,
-        header_canonical_bytes: &[u8],
-    ) {
-        // Decode the certified canonical header into a proto FrameHeader.
-        // This is the header THIS node finalized through BLS-verified
-        // consensus, so its `requests_root` is the trust anchor for
-        // materializing the matching full frame (whether ours or a
-        // follower's received from the proposer).
-        let canon = match quil_execution::global_intrinsic::frame_header::FrameHeader::from_canonical_bytes(
-            header_canonical_bytes,
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(core_id = self.core_id, frame = frame_number, error = %e,
-                    "could not decode finalized header");
-                return;
-            }
-        };
-        // Record the trusted requests_root and bound the map.
-        self.finalized_requests_roots
-            .insert(frame_number, canon.requests_root.clone());
-        let root_cutoff = frame_number.saturating_sub(256);
-        self.finalized_requests_roots
-            .retain(|&f, _| f >= root_cutoff);
-
-        // Requests are present only if WE proposed this frame. A follower
-        // has none here and materializes from the received full frame
-        // (try_materialize_follower_frames below).
-        let requests = match self
-            .frame_requests
-            .lock()
-            .ok()
-            .and_then(|mut m| m.remove(&frame_number))
-        {
-            Some(r) => r,
-            None => {
-                // Follower path: maybe the full frame already arrived.
-                self.try_materialize_follower_frames().await;
-                return;
-            }
-        };
-
-        let proto_header = quil_types::proto::global::FrameHeader {
-            address: canon.address.clone(),
-            frame_number: canon.frame_number,
-            rank: canon.rank,
-            timestamp: canon.timestamp,
-            difficulty: canon.difficulty,
-            output: canon.output.clone(),
-            parent_selector: canon.parent_selector.clone(),
-            requests_root: canon.requests_root.clone(),
-            state_roots: canon.state_roots.clone(),
-            prover: canon.prover.clone(),
-            fee_multiplier_vote: canon.fee_multiplier_vote as u64,
-            // Carry the quorum aggregate BLS cert into the gossiped frame
-            // so any receiver (follower or archive) can verify it against
-            // the shard committee via BlsAppFrameValidator. The canonical
-            // header's sig blob is the same AggregateSignature the global
-            // engine quorum-verifies as the reward proof
-            // (intrinsic.rs:599-634).
-            public_key_signature_bls48581: if canon.public_key_signature_bls48581.is_empty() {
-                None
-            } else {
-                quil_execution::hypergraph_intrinsic::canonical::AggregateSignature::from_canonical_bytes(
-                    &canon.public_key_signature_bls48581,
-                )
-                .ok()
-                .map(|sig| quil_types::proto::keys::Bls48581AggregateSignature {
-                    public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
-                        key_value: sig
-                            .public_key
-                            .as_ref()
-                            .map(|k| k.key_value.clone())
-                            .unwrap_or_default(),
-                    }),
-                    signature: sig.signature.clone(),
-                    bitmask: sig.bitmask.clone(),
-                })
-            },
-            storage_attestation_root: canon.storage_attestation_root.clone(),
-            global_frame_number: canon.global_frame_number,
-            storage_attestation: canon.storage_attestation.clone(),
-        };
-
-        // PoRep: the committee `StorageAttestation` was assembled once, at
-        // finalization (`AppFollower::enrich_with_storage_attestation`), and
-        // bound onto the canonical header (root + serialized openings) that
-        // `canon` was decoded from. Surface it on the full proto frame for
-        // archives — `proto_header.storage_attestation_root` already carries
-        // `canon.storage_attestation_root` (set above). Empty = legacy frame.
-        let storage_attestation = if canon.storage_attestation.is_empty() {
-            None
-        } else {
-            <quil_types::proto::global::StorageAttestation as prost::Message>::decode(
-                canon.storage_attestation.as_slice(),
-            )
-            .ok()
-        };
-
-        let fee_multiplier_vote = proto_header.fee_multiplier_vote;
-        // Capture the certified difficulty before `proto_header` is moved into
-        // the frame — materialize must use the value bound into the frame output,
-        // which can differ from `current_difficulty` if a difficulty adjustment
-        // landed between producing this header and materializing it (hardening #2).
-        let header_difficulty = proto_header.difficulty;
-        let frame = quil_types::proto::global::AppShardFrame {
-            header: Some(proto_header),
-            requests: requests.clone(),
-            storage_attestation,
-        };
-
-        // Step 2: self-materialize into local shard state (idempotent).
-        // Offloaded to the blocking pool so it doesn't HOL-block the
-        // engine's runtime thread.
-        if self.execution_engine.is_some()
-            && frame_number > self.last_materialized_frame
-            && frame_number != self.last_materialized_frame + 1
-        {
-            // Leapfrog guard (Finding #4): don't materialize past a gap.
-            warn!(
-                core_id = self.core_id, frame = frame_number,
-                cursor = self.last_materialized_frame,
-                "own shard frame ahead of cursor; deferring to catch-up (not skipping)",
-            );
-        } else if frame_number == self.last_materialized_frame + 1 && self.execution_engine.is_some() {
-            let world_size = self
-                .hypergraph
-                .as_ref()
-                .map(|hg| {
-                    use num_traits::ToPrimitive;
-                    hg.total_size().to_u64().unwrap_or(0)
-                })
-                .unwrap_or(0);
-            let difficulty = header_difficulty;
-            match self
-                .materialize_offloaded(
-                    requests.clone(),
-                    frame_number,
-                    difficulty,
-                    world_size,
-                    fee_multiplier_vote,
-                )
-                .await
-            {
-                Ok((processed, skipped)) => {
-                    self.set_materialized_frame(frame_number);
-                    // Persist AFTER commit_frame succeeded (inside
-                    // materialize_app_shard_requests) so the durable
-                    // cursor never outruns the CRDT.
-                    self.persist_materialized_cursor(frame_number);
-                    debug!(core_id = self.core_id, frame = frame_number, processed, skipped,
-                        "self-materialized own shard frame");
-                }
-                // Cursor held on error → retried on next finalize/sync (Finding #4).
-                Err(e) => warn!(core_id = self.core_id, frame = frame_number, error = %e,
-                    "self-materialize of own shard frame failed (cursor held; will retry)"),
-            }
-        }
-
-        // Step 1: publish the full frame for followers/archives.
-        let mut buf = Vec::new();
-        if prost::Message::encode(&frame, &mut buf).is_ok() {
-            let _ = self.event_tx.send(AppEngineEvent::FullFrameProduced {
-                filter: self.filter.clone(),
-                frame_number,
-                frame_data: buf,
-            });
-        }
-    }
-
     /// Materialize buffered received full frames in strict order, as a
     /// follower. Each is gated by: it is exactly the next frame to
     /// materialize, we hold the finalized (trusted) `requests_root` for
@@ -2920,6 +3251,12 @@ impl AppConsensusEngine {
                 Ok((processed, skipped)) => {
                     self.set_materialized_frame(next);
                     self.persist_materialized_cursor(next);
+                    // Advance the clock head in lockstep with the cursor. This is
+                    // the critical case: a follower drains finalized frames it
+                    // received via frame-sync WITHOUT running its own finalize
+                    // handler for them, so nothing else writes the clock head —
+                    // leaving mat > clock and triggering a re-propose/nullify storm.
+                    self.commit_shard_clock_head(&frame, next);
                     self.received_full_frames.remove(&next);
                     self.materialize_failures.remove(&next);
                     debug!(core_id = self.core_id, frame = next, processed, skipped,
@@ -3260,6 +3597,39 @@ impl AppConsensusEngine {
         self.drain_proposal_cache();
         self.pending_certified_parents.retain(|&r, _| r >= cutoff);
     }
+}
+
+/// Verify the structural relation between an archive anchor N and its required
+/// predecessor N-1. Certificate validation remains in `install_archive_bootstrap`;
+/// keeping this portion pure makes the fail-closed bootstrap boundary testable.
+fn archive_bootstrap_predecessor_height(
+    app_address: &[u8],
+    anchor: &quil_types::proto::global::AppShardFrame,
+    predecessor: Option<&quil_types::proto::global::AppShardFrame>,
+) -> std::result::Result<u64, &'static str> {
+    let anchor_header = anchor.header.as_ref().ok_or("anchor has no header")?;
+    if anchor_header.frame_number == 0 {
+        return Err("anchor is genesis");
+    }
+    if anchor_header.address != app_address || anchor_header.state_roots.len() != 4 {
+        return Err("malformed or wrong-shard anchor");
+    }
+    let synced_to = anchor_header.frame_number - 1;
+    if synced_to == 0 {
+        return Ok(0);
+    }
+    let predecessor = predecessor.ok_or("archive omitted predecessor")?;
+    let previous_header = predecessor.header.as_ref().ok_or("predecessor has no header")?;
+    if previous_header.address != app_address || previous_header.frame_number != synced_to {
+        return Err("non-contiguous or wrong-shard predecessor");
+    }
+    let expected_parent = quil_crypto::poseidon::hash_bytes_to_32(&previous_header.output)
+        .map(|h| h.to_vec())
+        .map_err(|_| "invalid predecessor output")?;
+    if anchor_header.parent_selector != expected_parent {
+        return Err("anchor does not link to predecessor");
+    }
+    Ok(synced_to)
 }
 
 // =====================================================================
@@ -3754,6 +4124,67 @@ fn validate_app_frame_panic_safe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bootstrap_frame(
+        address: Vec<u8>,
+        frame_number: u64,
+        output: Vec<u8>,
+        parent_selector: Vec<u8>,
+    ) -> quil_types::proto::global::AppShardFrame {
+        quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                address,
+                frame_number,
+                output,
+                parent_selector,
+                state_roots: vec![vec![1], vec![2], vec![3], vec![4]],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn archive_bootstrap_accepts_contiguous_anchor_and_predecessor() {
+        let address = vec![0xaa; 32];
+        let predecessor = bootstrap_frame(address.clone(), 6, vec![0x42; 32], vec![]);
+        let parent_selector = quil_crypto::poseidon::hash_bytes_to_32(&[0x42; 32])
+            .unwrap()
+            .to_vec();
+        let anchor = bootstrap_frame(address.clone(), 7, vec![0x43; 32], parent_selector);
+
+        assert_eq!(
+            archive_bootstrap_predecessor_height(&address, &anchor, Some(&predecessor)),
+            Ok(6)
+        );
+    }
+
+    #[test]
+    fn archive_bootstrap_rejects_missing_or_unlinked_predecessor() {
+        let address = vec![0xbb; 32];
+        let predecessor = bootstrap_frame(address.clone(), 6, vec![0x42; 32], vec![]);
+        let anchor = bootstrap_frame(address.clone(), 7, vec![0x43; 32], vec![0; 32]);
+
+        assert_eq!(
+            archive_bootstrap_predecessor_height(&address, &anchor, None),
+            Err("archive omitted predecessor")
+        );
+        assert_eq!(
+            archive_bootstrap_predecessor_height(&address, &anchor, Some(&predecessor)),
+            Err("anchor does not link to predecessor")
+        );
+    }
+
+    #[test]
+    fn archive_bootstrap_allows_first_frame_without_predecessor() {
+        let address = vec![0xcc; 32];
+        let anchor = bootstrap_frame(address.clone(), 1, vec![0x42; 32], vec![]);
+
+        assert_eq!(
+            archive_bootstrap_predecessor_height(&address, &anchor, None),
+            Ok(0)
+        );
+    }
 
     /// Go parity (`app_consensus_engine.go:718`): core 0 → `db.path`; worker
     /// core N → `worker_paths[N-1]` else `worker_path_prefix` (`%d`→N); empty

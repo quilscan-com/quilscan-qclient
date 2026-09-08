@@ -209,6 +209,19 @@ pub struct WorkerOwnedDeps {
     /// expose a KV handle leave this `None` and the engine falls
     /// back to the in-memory consensus stub.
     pub kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
+    /// Archive-direct shard-tree syncer bound to THIS worker's CRDT/store.
+    /// Handles the step-4 app-shard catch-up (`AncestorSyncRequested`) when the
+    /// worker falls far enough behind that gossip can't fill the gap — it pulls
+    /// the shard subtree from an archive and the engine fast-forwards its cursor.
+    /// `None` in shared-state mode (or when no archive/key is wired), where the
+    /// event is simply skipped. Mirrors the `worker_node.rs` (multi-process) path.
+    pub shard_syncer:
+        Option<Arc<dyn crate::prover_tree_syncer::ProverTreeSyncer>>,
+    /// (B) Unified-cutover consolidation hook bound to THIS worker's CRDT/store
+    /// (see `AppEngineDeps::unified_cutover_hook`). Built by the node
+    /// (`worker_state_builder`); `None` skips consolidation (still flips).
+    pub unified_cutover_hook:
+        Option<Arc<dyn Fn(&[u8], u64) -> bool + Send + Sync>>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -547,6 +560,11 @@ impl ThreadWorkerManager {
                                                         kv_db,
                                                         app_consensus_cw: deps.app_consensus_cw,
                                                         db_config: deps.db_config.clone(),
+                                                        // (B) per-worker consolidation hook (bound to this
+                                                        // worker's CRDT/store by worker_state_builder).
+                                                        unified_cutover_hook: owned
+                                                            .as_ref()
+                                                            .and_then(|o| o.unified_cutover_hook.clone()),
                                                     };
                                                     let (engine, app_handle) = crate::app_engine::AppConsensusEngine::new(
                                                         core_id,
@@ -578,7 +596,16 @@ impl ThreadWorkerManager {
                                                     let master_tx_events = master_tx_clone.clone();
                                                     let loopback_handle = app_handle.clone();
                                                     let _filter_for_events = filter_clone.clone();
-                                                    // TODO
+                                                    // Step-4 app-shard catch-up (AncestorSyncRequested): the
+                                                    // per-worker archive-direct syncer + this shard's clock store
+                                                    // (for the finalized-header pin), and a single-in-flight guard.
+                                                    let sync_syncer =
+                                                        owned.as_ref().and_then(|o| o.shard_syncer.clone());
+                                                    let sync_clock =
+                                                        owned.as_ref().map(|o| o.clock_store.clone());
+                                                    let sync_in_progress = std::sync::Arc::new(
+                                                        std::sync::atomic::AtomicBool::new(false),
+                                                    );
                                                     tokio::spawn(async move {
                                                         while let Some(event) = event_rx.recv().await {
                                                             match event {
@@ -664,11 +691,115 @@ impl ThreadWorkerManager {
                                                                         }
                                                                     ).await;
                                                                 }
+                                                                crate::app_engine::AppEngineEvent::AncestorSyncRequested { filter, .. }
+                                                                | crate::app_engine::AppEngineEvent::ShardDataBootstrapRequested { filter } => {
+                                                                    // Step-4 app-shard catch-up OR a proactive join-time
+                                                                    // data bootstrap (ShardDataBootstrapRequested): both
+                                                                    // stage the covered shard's data via the same syncer —
+                                                                    // catch-up path pins to the shard clock head; a fresh
+                                                                    // joiner (no clock frame) takes the archive-anchor
+                                                                    // bootstrap branch below. Convergence loops back
+                                                                    // ShardSyncCompleted / ShardBootstrapCompleted, which
+                                                                    // un-gates the engine's propose/vote.
+                                                                    // The engine hit a
+                                                                    // frame gap gossip can't fill (deeply behind).
+                                                                    // Pull the shard's forest subtree from an archive
+                                                                    // (pinned to the latest finalized header's
+                                                                    // state_roots), then loopback ShardSyncCompleted
+                                                                    // so the engine fast-forwards its materialized
+                                                                    // cursor. Mirrors worker_node.rs; before this,
+                                                                    // thread-mode workers dropped the event and a
+                                                                    // deeply-behind node wedged permanently.
+                                                                    let (Some(syncer), Some(clock)) =
+                                                                        (sync_syncer.clone(), sync_clock.clone())
+                                                                    else {
+                                                                        // Shared-state mode / no syncer wired.
+                                                                        debug!(core_id, "AncestorSyncRequested: no shard syncer wired — skipping");
+                                                                        continue;
+                                                                    };
+                                                                    // One in-flight sync per worker.
+                                                                    if sync_in_progress.swap(
+                                                                        true,
+                                                                        std::sync::atomic::Ordering::SeqCst,
+                                                                    ) {
+                                                                        continue;
+                                                                    }
+                                                                    // Pin ALL FOUR phases to the latest finalized
+                                                                    // header's state_roots (audit #5). Those roots
+                                                                    // are the PRE-materialization state of frame L =
+                                                                    // POST of L-1, so a converged sync brings the
+                                                                    // tree to L-1.
+                                                                    let latest = clock
+                                                                        .get_latest_shard_clock_frame(&filter)
+                                                                        .ok()
+                                                                        .and_then(|f| f.header)
+                                                                        .map(|h| (h.frame_number, h.state_roots));
+                                                                    let lb = loopback_handle.clone();
+                                                                    let flag = sync_in_progress.clone();
+                                                                    let f = filter.clone();
+                                                                    tokio::spawn(async move {
+                                                                        match latest {
+                                                                            Some((pinned_frame, expected_roots)) => {
+                                                                                let synced_to_frame = pinned_frame.saturating_sub(1);
+                                                                                match syncer.sync_shard_tree(&f, &expected_roots).await {
+                                                                                    Ok(true) => {
+                                                                                        tracing::info!(filter = %hex::encode(&f), synced_to_frame, "app-shard catch-up sync converged");
+                                                                                        lb.send(crate::app_engine::AppEngineMessage::ShardSyncCompleted { synced_to_frame });
+                                                                                    }
+                                                                                    Ok(false) => tracing::warn!(filter = %hex::encode(&f), "app-shard catch-up sync did not converge"),
+                                                                                    Err(e) => tracing::warn!(filter = %hex::encode(&f), error = %e, "app-shard catch-up sync failed"),
+                                                                                }
+                                                                            }
+                                                                            None => {
+                                                                                let anchor = match syncer.get_app_shard_frame(&f, 0).await {
+                                                                                    Ok(Some(frame)) => frame,
+                                                                                    Ok(None) => {
+                                                                                        tracing::warn!(filter = %hex::encode(&f), "app-shard bootstrap: archive has no frame");
+                                                                                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                                        return;
+                                                                                    }
+                                                                                    Err(e) => {
+                                                                                        tracing::warn!(filter = %hex::encode(&f), error = %e, "app-shard bootstrap: anchor fetch failed");
+                                                                                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                                        return;
+                                                                                    }
+                                                                                };
+                                                                                let Some(header) = anchor.header.as_ref() else {
+                                                                                    tracing::warn!(filter = %hex::encode(&f), "app-shard bootstrap: archive anchor has no header");
+                                                                                    flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                                    return;
+                                                                                };
+                                                                                let anchor_frame = header.frame_number;
+                                                                                let expected_roots = header.state_roots.clone();
+                                                                                let predecessor = if anchor_frame > 1 {
+                                                                                    match syncer.get_app_shard_frame(&f, anchor_frame - 1).await {
+                                                                                        Ok(frame) => frame,
+                                                                                        Err(e) => {
+                                                                                            tracing::warn!(filter = %hex::encode(&f), frame = anchor_frame, error = %e, "app-shard bootstrap: predecessor fetch failed");
+                                                                                            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                                            return;
+                                                                                        }
+                                                                                    }
+                                                                                } else {
+                                                                                    None
+                                                                                };
+                                                                                match syncer.sync_shard_tree(&f, &expected_roots).await {
+                                                                                    Ok(true) => {
+                                                                                        tracing::info!(filter = %hex::encode(&f), anchor_frame, "app-shard bootstrap tree sync converged");
+                                                                                        lb.send(crate::app_engine::AppEngineMessage::ShardBootstrapCompleted { anchor, predecessor });
+                                                                                    }
+                                                                                    Ok(false) => tracing::warn!(filter = %hex::encode(&f), "app-shard bootstrap tree sync did not converge"),
+                                                                                    Err(e) => tracing::warn!(filter = %hex::encode(&f), error = %e, "app-shard bootstrap tree sync failed"),
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                                    });
+                                                                }
                                                                 _ => {
-                                                                    // Equivocation/Halted/AncestorSyncRequested/
-                                                                    // ParentSealed — informational; engine handles
-                                                                    // them internally or they require no master
-                                                                    // mediation in local mode.
+                                                                    // Equivocation/Halted/ParentSealed —
+                                                                    // informational; engine handles them internally
+                                                                    // or they require no master mediation in local mode.
                                                                     debug!(core_id, "engine event: {:?}", event);
                                                                 }
                                                             }

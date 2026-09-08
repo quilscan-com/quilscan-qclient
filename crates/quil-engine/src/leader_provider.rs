@@ -117,68 +117,83 @@ impl GlobalLeaderProvider {
     /// Returns empty only when no CRDT is wired (unit tests) or the shard
     /// truly has no root — tolerated by the empty-root branch in
     /// `verify_prover_root`.
-    fn compute_prover_root(&self, frame_number: u64) -> Vec<u8> {
-        let Some(hg) = self.hypergraph.as_ref() else {
-            return Vec::new();
-        };
-        // Bind the PARENT (frame_number-1) prover-shard root: the deterministic
-        // post-materialize-(N-1) value recorded by the frame materializer, which
-        // every node reproduces identically. Do NOT read the LIVE forest here —
-        // it is RACY: the async materializer lags the (faster) produce path, so a
-        // live read lands on N-2/N-1 unpredictably and forks the commitment (the
-        // prover-root-mismatch storm).
-        //
-        // SERIAL/MONOTONIC GATE: the leader must not produce frame N until its
-        // materializer has recorded the parent (N-1) root. Produce outruns the
-        // async materializer by ~1-2 frames, so briefly BLOCK for the in-flight
-        // materialize(N-1) to record rather than reading the lagging forest.
-        // Bounded so a genuinely-behind materializer (deep catch-up) can't wedge
-        // proposing — past the deadline we fall back to a best-effort live read
-        // (tolerated by the empty/degenerate branch and `verify_prover_root`'s
-        // empty-root skip). Once produce paces to materialize, the wait is a
-        // single poll.
+    /// Non-blocking single read of the local prover root for `frame_number`: the
+    /// deterministic post-materialize-(N-1) value recorded by the frame
+    /// materializer, with the genesis (frame ≤ 1) live-forest fallback. `None` when
+    /// the parent (N-1) is not yet recorded (frame > 1). Do NOT read the LIVE
+    /// forest for a post-genesis frame — it is RACY (the async materializer lags
+    /// the faster produce path, so a live read lands on N-2/N-1 unpredictably and
+    /// forks the commitment). Shared by the blocking produce path
+    /// (`compute_prover_root`) and the non-blocking vote-verify path
+    /// (`LeaderProvider::local_prover_root`) so both bind the identical root.
+    fn prover_root_read(&self, frame_number: u64) -> Option<Vec<u8>> {
+        let hg = self.hypergraph.as_ref()?;
         let parent = frame_number.saturating_sub(1);
-        let mut recorded = hg.prover_root_at(parent);
+        let root = match hg.prover_root_at(parent) {
+            Some(r) => r,
+            // Genesis has no parent to materialize — read the live genesis forest
+            // (deterministic; every node's genesis is identical).
+            None if frame_number <= 1 => {
+                let global_shard = quil_types::store::ShardKey {
+                    l1: [0u8; 3],
+                    l2: [0xffu8; 32],
+                };
+                hg.compute_shard_root("vertex", "adds", &global_shard)
+            }
+            // Post-genesis parent not recorded yet — the caller decides (produce
+            // blocks then declines; vote-verify nullifies). NEVER a live read.
+            None => return None,
+        };
+        // A real forest root is 32 bytes; reject the empty/degenerate case.
+        if root.len() == 32 || root.len() >= 64 {
+            Some(root)
+        } else {
+            None
+        }
+    }
+
+    fn compute_prover_root(&self, frame_number: u64) -> Vec<u8> {
+        if self.hypergraph.is_none() {
+            return Vec::new();
+        }
+        // SERIAL/MONOTONIC GATE: the leader must not produce frame N until its
+        // materializer has recorded the parent (N-1) root (see `prover_root_read`
+        // for why a live read is racy). Produce outruns the async materializer by
+        // ~1-2 frames, so briefly BLOCK for the in-flight materialize(N-1) to
+        // record rather than reading the lagging forest. Bounded so a genuinely-
+        // behind materializer (deep catch-up) can't wedge proposing — past the
+        // deadline we DECLINE (empty → the view nullifies) rather than producing on
+        // a stale/frozen root (which is exactly what let a fleet-wide materializer
+        // wedge keep advancing the chain on FROZEN state).
+        let mut recorded = self.prover_root_read(frame_number);
         if recorded.is_none() && frame_number > 1 {
-            const MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(5000);
+            // How long the leader blocks for the in-flight materialize(N-1) to
+            // record before declining (view nullifies). Env-tunable so nodes on
+            // slower hardware can absorb residual jitter within their view budget.
+            // Keep it below the CW leader timeout so a genuinely-wedged materializer
+            // still yields the view rather than holding it to the end.
+            let max_wait_ms: u64 = std::env::var("QUIL_MATERIALIZE_WAIT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5000);
+            let max_wait = std::time::Duration::from_millis(max_wait_ms);
             const POLL: std::time::Duration = std::time::Duration::from_millis(25);
-            let deadline = std::time::Instant::now() + MAX_WAIT;
+            let deadline = std::time::Instant::now() + max_wait;
             while recorded.is_none() && std::time::Instant::now() < deadline {
                 std::thread::sleep(POLL);
-                recorded = hg.prover_root_at(parent);
+                recorded = self.prover_root_read(frame_number);
             }
             if recorded.is_none() {
-                // STRICT GATE: never produce frame N on a stale root. We do NOT
-                // fall back to a live forest read — that stale read is exactly what
-                // let a fleet-wide materializer wedge keep producing frames on a
-                // FROZEN root (the whole chain advanced on unmaterialized state).
-                // Return empty so the caller DECLINES to propose (the view
-                // nullifies); this node resumes producing only once its materializer
-                // records the parent (N-1) root.
                 tracing::warn!(
                     frame = frame_number,
-                    parent,
+                    parent = frame_number.saturating_sub(1),
                     "parent (N-1) prover root not materialized before deadline — \
                      declining to produce (never build N on an unmaterialized N-1)"
                 );
                 return Vec::new();
             }
         }
-        // Genesis (frame ≤ 1) has no parent to materialize — read the live genesis
-        // forest. Every other frame is `recorded` by the strict gate above.
-        let root = recorded.unwrap_or_else(|| {
-            let global_shard = quil_types::store::ShardKey {
-                l1: [0u8; 3],
-                l2: [0xffu8; 32],
-            };
-            hg.compute_shard_root("vertex", "adds", &global_shard)
-        });
-        // A real forest root is 32 bytes; reject the empty/degenerate case.
-        if root.len() == 32 || root.len() >= 64 {
-            root
-        } else {
-            Vec::new()
-        }
+        recorded.unwrap_or_default()
     }
 
     /// Compute the prover shard's phase 1/2/3 roots (vertex-removes,
@@ -321,7 +336,62 @@ pub fn compute_global_requests_root(
     tree.commit(prover)
 }
 
+/// Coalesce a set of shard-frame proof messages to the TIP per shard
+/// address — the highest LOCAL frame number (`FrameHeader.frame_number`) each
+/// shard carries. Returns `(kept, superseded)`: `kept` holds one proof per shard
+/// (its tip) plus any bundle that isn't a single-shard frame (0 or >1 shard frame
+/// — e.g. a multi-shard bundle — passes through untouched); `superseded` holds the
+/// lower-frame proofs the tip replaced (the caller drops them from the mempool).
+///
+/// The global proposer's lockstep filter admits a shard proof by its ANCHOR
+/// (`global_frame_number`), NOT its count, so a shard that produced several local
+/// frames all anchored to the prior global frame passes them ALL. Rewards are
+/// per-global-frame and the tip's state roots subsume its ancestors, so only the
+/// tip needs to ride the global frame — this bounds the request set to O(#shards).
+/// Equal frame numbers (duplicate serializations of the same proof) collapse to
+/// the first seen. Order-independent: the tip for an address is the max regardless
+/// of arrival order.
+pub(crate) fn coalesce_shard_frames_to_tip(
+    shard_frame_msgs: Vec<Vec<u8>>,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut tip: std::collections::HashMap<Vec<u8>, (u64, Vec<u8>)> =
+        std::collections::HashMap::new();
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+    let mut superseded: Vec<Vec<u8>> = Vec::new();
+    for raw in shard_frame_msgs {
+        let keys = crate::message_collector::extract_shard_frame_keys(&raw);
+        if keys.len() == 1 {
+            let (addr, local_frame) = keys.into_iter().next().unwrap();
+            match tip.get(&addr) {
+                // A higher-or-equal tip is already held → this is superseded
+                // (equal ⇒ a duplicate serialization of the same-height proof).
+                Some((best, _)) if *best >= local_frame => superseded.push(raw),
+                _ => {
+                    if let Some((_, old_raw)) = tip.insert(addr, (local_frame, raw)) {
+                        superseded.push(old_raw);
+                    }
+                }
+            }
+        } else {
+            // 0 keys (not a decodable single shard frame) or a multi-shard bundle:
+            // don't coalesce — pass through.
+            kept.push(raw);
+        }
+    }
+    kept.extend(tip.into_values().map(|(_, raw)| raw));
+    (kept, superseded)
+}
+
 impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
+    /// Non-blocking local prover root for `frame_number` (the vote-verify side of
+    /// `compute_prover_root`): reads the recorded post-materialize-(N-1) value
+    /// without the produce-path blocking wait. `None` if this node hasn't
+    /// materialized N-1 yet — the vote seam nullifies in that case, which paces
+    /// production to materialization instead of signing a root it can't reproduce.
+    fn local_prover_root(&self, frame_number: u64) -> Option<Vec<u8>> {
+        self.prover_root_read(frame_number)
+    }
+
     /// Return leaders for the next rank, ordered by the prover
     /// registry's VDF-distance walk seeded by the parent frame's
     /// Poseidon-hashed output.
@@ -523,20 +593,38 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 let global_addr = [0xFFu8; 32];
                 let mut valid: Vec<Vec<u8>> = Vec::with_capacity(collected.len());
                 let mut invalid: Vec<Vec<u8>> = Vec::new();
+                // Categorized drop breakdown: `"<msg_type> :: <reason>" -> count`,
+                // logged with the summary below. The per-message reason is otherwise
+                // debug-only, hiding WHICH message types + reasons dominate the drops
+                // (e.g. below-quorum shard-frame certs vs benign duplicate re-confirms).
+                let mut drop_reasons: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                let msg_type = |raw: &[u8]| -> String {
+                    if raw.len() >= 4 {
+                        format!("0x{:08x}", u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+                    } else {
+                        "short".to_string()
+                    }
+                };
+                // First pass: hold in-lockstep shard proofs for tip coalescing
+                // (below); validate non-shard messages inline.
+                let mut in_lockstep_shard: Vec<Vec<u8>> = Vec::new();
                 for raw in collected {
                     if crate::message_collector::bundle_has_shard_frame(&raw) {
-                        // Strict lockstep: include a shard-frame proof ONLY if it
-                        // anchors to `frame_number - 1` (or genesis anchor 0). The
-                        // materializer hard-rejects any frame carrying an
-                        // out-of-lockstep shard op, so packing a stale proof would
-                        // halt the chain — drop it here instead. A lagging shard
-                        // must re-attest against the new tip to be included.
+                        // Strict lockstep: a shard proof rides ONLY if its ANCHOR
+                        // (`global_frame_number`) is `frame_number - 1` (or genesis
+                        // anchor 0) — NOT its local frame number. The materializer
+                        // hard-rejects any frame carrying an out-of-lockstep shard op,
+                        // so packing a stale proof would halt the chain — drop it here.
                         if crate::message_collector::bundle_shard_frames_in_lockstep(
                             &raw,
                             frame_number,
                         ) {
-                            valid.push(raw);
+                            in_lockstep_shard.push(raw);
                         } else {
+                            *drop_reasons
+                                .entry(format!("{} :: out-of-lockstep-shard-frame", msg_type(&raw)))
+                                .or_insert(0) += 1;
                             tracing::debug!(
                                 frame = frame_number,
                                 "dropping out-of-lockstep shard frame proof from global mempool",
@@ -548,6 +636,17 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     match validator.validate_message(frame_number, &global_addr, &raw) {
                         Ok(()) => valid.push(raw),
                         Err(e) => {
+                            // Normalize the reason (digit runs → '#') so per-epoch /
+                            // per-frame variants group into one bucket.
+                            let reason: String = e
+                                .to_string()
+                                .chars()
+                                .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                                .take(90)
+                                .collect();
+                            *drop_reasons
+                                .entry(format!("{} :: {}", msg_type(&raw), reason))
+                                .or_insert(0) += 1;
                             tracing::debug!(
                                 frame = frame_number,
                                 error = %e,
@@ -557,10 +656,46 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         }
                     }
                 }
+                // Tip-per-shard coalescing. The lockstep gate admits a shard
+                // proof by its ANCHOR, NOT its count — a shard that produced several
+                // local frames all anchored to the same prior global frame passes them
+                // ALL, ballooning the request set (N× attestation verify + apply-due
+                // scan in materialize). Rewards are per-global-frame and the tip's
+                // state roots subsume its ancestors, so only the HIGHEST LOCAL frame
+                // per shard address needs to ride the global frame. Coalesce to the
+                // tip → request set O(#shards).
+                let (tips, superseded) = coalesce_shard_frames_to_tip(in_lockstep_shard);
+                let coalesced = superseded.len();
+                valid.extend(tips);
+                for s in &superseded {
+                    *drop_reasons
+                        .entry(format!("{} :: coalesced-superseded-shard-tip", msg_type(s)))
+                        .or_insert(0) += 1;
+                }
+                invalid.extend(superseded);
+                if coalesced > 0 {
+                    tracing::info!(
+                        frame = frame_number,
+                        coalesced,
+                        "coalesced superseded shard-frame proofs to the per-shard tip",
+                    );
+                }
                 if !invalid.is_empty() {
+                    // Sorted, human-readable breakdown of WHY messages were dropped —
+                    // turns the opaque `removed=N` count into per-type/reason buckets
+                    // so a persistent stall (e.g. legitimate confirms being dropped)
+                    // is visible without debug logging.
+                    let mut breakdown: Vec<(String, usize)> = drop_reasons.into_iter().collect();
+                    breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+                    let by_reason = breakdown
+                        .iter()
+                        .map(|(k, n)| format!("{n}× {k}"))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
                     tracing::info!(
                         frame = frame_number,
                         removed = invalid.len(),
+                        by_reason = %by_reason,
                         "dropped protocol-invalid messages from global mempool",
                     );
                     self.message_collector.remove(&invalid);
@@ -1116,5 +1251,89 @@ mod tests {
     fn compute_prover_root_empty_without_crdt() {
         let provider = provider_with_crdt(None);
         assert!(provider.compute_prover_root(0).is_empty());
+    }
+
+    /// Build a canonical shard-frame proof bundle carrying one
+    /// `FrameHeader` for `addr` at LOCAL frame `local_frame`.
+    fn make_shard_frame(addr: u8, local_frame: u64) -> Vec<u8> {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let fh = FrameHeader {
+            address: vec![addr; 32],
+            frame_number: local_frame,
+            global_frame_number: 99,
+            ..Default::default()
+        };
+        let req = CanonicalMessageRequest {
+            inner_type_prefix: TYPE_FRAME_HEADER,
+            inner_bytes: fh.to_canonical_bytes().unwrap(),
+        };
+        CanonicalMessageBundle { requests: vec![Some(req)], timestamp: 0 }
+            .to_canonical_bytes()
+            .unwrap()
+    }
+
+    #[test]
+    fn coalesce_keeps_only_the_tip_per_shard() {
+        // Shard A (0x11): local frames 876, 878, 877 (out of order) + a duplicate
+        // 877. Shard B (0x22): a single frame 500. All share one anchor, so the
+        // lockstep filter would admit them ALL — coalescing must keep only the tip
+        // (highest LOCAL frame) per shard.
+        let msgs = vec![
+            make_shard_frame(0x11, 876),
+            make_shard_frame(0x11, 878),
+            make_shard_frame(0x11, 877),
+            make_shard_frame(0x11, 877), // duplicate serialization of the same height
+            make_shard_frame(0x22, 500),
+        ];
+
+        let (kept, superseded) = coalesce_shard_frames_to_tip(msgs);
+
+        // One tip per shard → 2 kept; the other 3 (876, 877, dup 877) superseded.
+        assert_eq!(kept.len(), 2, "one tip per shard address (A + B)");
+        assert_eq!(superseded.len(), 3, "876, 877 and the duplicate 877 dropped");
+
+        // The kept tips are exactly A@878 and B@500 (order-independent).
+        let mut kept_keys: Vec<(Vec<u8>, u64)> = kept
+            .iter()
+            .flat_map(|m| crate::message_collector::extract_shard_frame_keys(m))
+            .collect();
+        kept_keys.sort();
+        assert_eq!(
+            kept_keys,
+            vec![(vec![0x11u8; 32], 878), (vec![0x22u8; 32], 500)],
+            "kept exactly the highest LOCAL frame per shard",
+        );
+
+        // Every superseded proof is shard A below its tip — nothing from B lost.
+        for m in &superseded {
+            let keys = crate::message_collector::extract_shard_frame_keys(m);
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0].0, vec![0x11u8; 32], "only shard A frames superseded");
+            assert!(keys[0].1 < 878, "superseded frame is below the tip");
+        }
+    }
+
+    #[test]
+    fn coalesce_bounds_a_deep_backlog_to_one_per_shard() {
+        // A 1000-frame backlog for one shard (the mainnet balloon) collapses to 1.
+        let msgs: Vec<Vec<u8>> = (1..=1000u64).map(|n| make_shard_frame(0x11, n)).collect();
+        let (kept, superseded) = coalesce_shard_frames_to_tip(msgs);
+        assert_eq!(kept.len(), 1, "backlog bounded to the single tip");
+        assert_eq!(superseded.len(), 999);
+        let keys = crate::message_collector::extract_shard_frame_keys(&kept[0]);
+        assert_eq!(keys, vec![(vec![0x11u8; 32], 1000)], "tip is the highest frame");
+    }
+
+    #[test]
+    fn coalesce_passes_through_undecodable_and_leaves_empty_empty() {
+        // A non-bundle message has 0 shard-frame keys → passes through untouched.
+        let junk = b"not a bundle".to_vec();
+        let (kept, superseded) = coalesce_shard_frames_to_tip(vec![junk.clone()]);
+        assert_eq!(kept, vec![junk]);
+        assert!(superseded.is_empty());
+        // Empty in → empty out.
+        let (k, s) = coalesce_shard_frames_to_tip(Vec::new());
+        assert!(k.is_empty() && s.is_empty());
     }
 }
