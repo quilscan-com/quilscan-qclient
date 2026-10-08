@@ -45,6 +45,8 @@ The official Token command set also includes `escrows`, `shield`, `shield-all`, 
 
 The current Agent `ParseTokenBalances` expects the old `Total balance` line and old claimable wording, so it must be updated before deploying this qclient to managed nodes.
 
+For monitoring that must report rewards independently of wallet availability, use `qclient token claimable-rewards`. It performs only the authenticated GLOBAL reward-witness query and prints the same `Claimable prover rewards:` line without starting a wallet coin scan. An unavailable witness remains unknown and must not be converted to zero. `token balance` remains the wallet command and may fail after its reward line when no application-serving node answers; consumers must not parse that failed command's partial output.
+
 ## Official Prover read outputs
 
 `node prover status` retains the basic `Peer ID`, `Version`, worker-count, `Last Received`, and `Reachable` lines consumed by the current Agent. Allocation hints now use `Next Action:` and `Default Action:`. Worker rows add `Local execution:` with state, height, advance age, and observation age when available.

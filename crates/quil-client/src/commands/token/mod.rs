@@ -63,6 +63,9 @@ pub enum TokenCommand {
     Account,
     /// Lists the total balance of tokens in the managing account.
     Balance,
+    /// Reads only the authenticated prover reward witness without scanning wallet coins.
+    #[cfg(feature = "confidential-tokens")]
+    ClaimableRewards,
     /// Lists all coins under control of the managing account.
     Coins,
     /// Lists this identity's legacy (pre-2.1) coins and their unshielded total.
@@ -410,6 +413,10 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
     anyhow::ensure!(decoded.len() == 32, "application must be exactly 32 bytes");
     #[cfg(feature = "confidential-tokens")]
     match &args.command {
+        TokenCommand::ClaimableRewards => {
+            println!("{}", balance::claimable_rewards(&tc).await);
+            return Ok(());
+        }
         TokenCommand::Balance => return wallet::run_balance(&tc, &application, args.max_pages, args.max_coins).await,
         TokenCommand::Coins => return wallet::run_coins(&tc, &application, args.max_pages, args.max_coins).await,
         TokenCommand::ConfidentialAddress => {
@@ -552,6 +559,8 @@ mod tests {
     fn token_cli_has_no_retired_suite_switch() {
         let parsed = TokenCli::try_parse_from(["token", "balance"]).unwrap();
         assert!(matches!(parsed.token.command, TokenCommand::Balance));
+        let rewards = TokenCli::try_parse_from(["token", "claimable-rewards"]).unwrap();
+        assert!(matches!(rewards.token.command, TokenCommand::ClaimableRewards));
         assert!(TokenCli::try_parse_from(["token", "--legacy", "balance"]).is_err());
         assert!(TokenCli::try_parse_from(["token", "balance", "--legacy"]).is_err());
     }
