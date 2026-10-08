@@ -1,7 +1,7 @@
 //! Rendering for the `prover manage` TUI. Port of the bubbletea `View`
 //! and its panel/help/join-picker renderers, expressed with ratatui.
 
-use super::super::local_execution::{local_execution_state, age};
+use super::super::local_execution::{execution_detail, local_execution_state, running_without_materialized_frames};
 
 use num_bigint::BigInt;
 use super::super::epoch::EffectiveStatus;
@@ -757,8 +757,7 @@ fn filter_width(content_width: usize, widths: &[usize], n: usize, cap: usize) ->
 }
 
 fn local_warning(a: &AllocationRow) -> bool {
-    local_execution_state(a.execution.as_ref()) == "running"
-        && a.execution.as_ref().and_then(|s| s.materialized_frame) == Some(0)
+    running_without_materialized_frames(a.execution.as_ref())
 }
 
 fn local_color(a: &AllocationRow) -> Color {
@@ -782,16 +781,8 @@ fn global_snapshot_label<'a>(heads: impl Iterator<Item = Option<&'a quil_types::
 }
 
 fn allocation_detail(a: &AllocationRow) -> Line<'static> {
-    let Some(execution) = a.execution.as_ref() else {
-        return Line::from(Span::styled("Local execution details unavailable", Style::new().fg(HELP)));
-    };
-    let mut text = format!("Last advance: {}", if execution.last_advance_unix_ms == 0 {
-        "not observed since start".into()
-    } else { format!("{} ago", age(execution.last_advance_unix_ms)) });
-    if !execution.blocker.is_empty() { text += &format!(" | Blocker: {}", execution.blocker); }
-    if local_warning(a) { text += " | Warning: no materialized frames"; }
-    let warning = !execution.blocker.is_empty() || local_warning(a) || matches!(local_execution_state(Some(execution)), "blocked" | "stopped");
-    Line::from(Span::styled(text, Style::new().fg(if warning { Color::Yellow } else { HELP })))
+    let detail = execution_detail(a.execution.as_ref());
+    Line::from(Span::styled(detail.text, Style::new().fg(if detail.severity == "warning" { Color::Yellow } else { HELP })))
 }
 
 fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, aligned: Option<&[usize]>) -> Vec<Line<'static>> {

@@ -97,6 +97,54 @@ fn once_snapshot_uses_official_allocation_fields_and_exact_units() {
 }
 
 #[test]
+fn once_snapshot_includes_the_tui_execution_detail_for_each_allocation() {
+    let filter = vec![0xef; 32];
+    let mut node = NodeInfoResponse::default();
+    node.current_epoch = 1;
+    node.epoch_length_frames = 720;
+    node.last_received_frame = 1000;
+    node.shard_allocations.push(ShardAllocationInfo {
+        filter: filter.clone(),
+        status: 2,
+        epoch: 1,
+        ..Default::default()
+    });
+
+    let mut shards = GetShardInfoResponse::default();
+    shards.shards.push(ShardRewardInfo {
+        filter: filter.clone(),
+        is_allocated: true,
+        ring_known: Some(true),
+        ..Default::default()
+    });
+
+    let mut workers = WorkerInfoResponse::default();
+    workers.worker_info.push(WorkerInfo {
+        core_id: 3,
+        filter,
+        execution: Some(WorkerExecution {
+            state: "running".into(),
+            materialized_frame: Some(0),
+            last_advance_unix_ms: 0,
+            observed_unix_ms: u64::MAX,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    let mut model = Model::new();
+    model.process_refresh_data(Some(node), Some(shards), Some(workers));
+    let json: serde_json::Value = serde_json::from_str(&format_snapshot(&model).unwrap()).unwrap();
+    let row = &json["allocations"][0];
+
+    assert_eq!(
+        row["execution_detail"],
+        "Last advance: not observed since start | Warning: no materialized frames"
+    );
+    assert_eq!(row["execution_severity"], "warning");
+}
+
+#[test]
 fn once_snapshot_distinguishes_unknown_heads_and_rewards_from_zero_size() {
     let filter = vec![0xcd; 32];
     let mut node = NodeInfoResponse::default();

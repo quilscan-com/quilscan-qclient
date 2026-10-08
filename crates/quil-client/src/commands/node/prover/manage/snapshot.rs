@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use super::super::epoch::ThresholdUnit;
 use super::super::format_quil_daily_round;
-use super::super::local_execution::local_execution_state;
+use super::super::local_execution::{execution_detail, local_execution_state};
 use super::model::{materialization_state, AllocationRow, Model, ShardRow, UNKNOWN_REWARD_RING};
 use super::msg::Msg;
 
@@ -41,6 +41,7 @@ fn allocation_json(row: &AllocationRow, epoch_length: u64) -> Value {
             "automatic"
         }
     });
+    let execution_detail = execution_detail(row.execution.as_ref());
 
     json!({
         "filter": row.filter_hex,
@@ -57,6 +58,8 @@ fn allocation_json(row: &AllocationRow, epoch_length: u64) -> Value {
         "global_head": global_head_json(&row.global_head),
         "execution": execution_json(&row.execution),
         "local_execution_state": local_execution_state(row.execution.as_ref()),
+        "execution_detail": execution_detail.text,
+        "execution_severity": execution_detail.severity,
         "reward_units_per_frame": reward_known.then(|| row.estimated_reward.to_string()),
         "reward_quil_per_day": reward_known.then(|| format_quil_daily_round(&row.estimated_reward)),
         "next_action": row.next_action.render(ThresholdUnit::Frames, epoch_length),
