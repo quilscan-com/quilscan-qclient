@@ -13,7 +13,7 @@ quil-types = { path = "../quil-types" }
 quil-config = { path = "../quil-config" }
 quil-lifecycle = { path = "../quil-lifecycle" }
 quil-crypto = { path = "../quil-crypto" }
-# Phase 1: the pubsub layer is now stock `libp2p::gossipsub` (the `blossomsub`
+# The pubsub layer is stock `libp2p::gossipsub` (the `blossomsub`
 # fork crate stays in the workspace but is no longer a dependency here). Must
 # stay version-compatible with gossipsub's prometheus-client — the two share one
 # Registry, so the `Registry` type must unify.
@@ -31,6 +31,7 @@ libp2p = { version = "0.56", features = [
     "autonat",
     "gossipsub",
     "macros",
+    "request-response",
 ] }
 # Enable gossipsub's own `metrics` feature (not enabled by the libp2p umbrella)
 # so `Behaviour::with_metrics` / `MetricsConfig` are available. Same version

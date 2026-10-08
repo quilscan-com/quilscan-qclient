@@ -10,6 +10,10 @@ use quil_types::crypto::{BlsConstructor, FrameProver};
 use quil_types::error::{QuilError, Result};
 use quil_types::proto::global::{AppShardFrame, GlobalFrame, GlobalFrameHeader};
 
+#[cfg(test)]
+#[path = "frame_validator_history_tests.rs"]
+mod history_tests;
+
 /// Validates received global frames by verifying VDF proof and BLS signature.
 pub struct GlobalFrameVerifier {
     frame_prover: Arc<dyn FrameProver>,
@@ -20,6 +24,23 @@ pub struct GlobalFrameVerifier {
     /// over the VDF, which is publicly computable. Empty ⇒ cert check skipped
     /// (legacy / callers that don't know the committee).
     global_committee: Vec<Vec<u8>>,
+}
+
+/// Whether `child` extends `parent` on one app shard: the same shard, the
+/// next frame, a later rank, and `child.parent_selector` naming `parent`'s
+/// output identity. The child's output binds its `parent_selector`, and the
+/// parent's output binds its own fields, so a certified child authenticates a
+/// parent that has no certificate of its own (Simplex finalizes a view's
+/// ancestors with it).
+pub fn app_frame_links_to_child(
+    parent: &quil_types::proto::global::FrameHeader,
+    child: &quil_types::proto::global::FrameHeader,
+) -> bool {
+    parent.address == child.address
+        && parent.frame_number.checked_add(1) == Some(child.frame_number)
+        && child.rank > parent.rank
+        && quil_crypto::poseidon::hash_bytes_to_32(&parent.output)
+            .is_ok_and(|identity| child.parent_selector == identity.as_slice())
 }
 
 /// True iff the request BODY hashes to the header's `requests_root`.
@@ -66,6 +87,11 @@ impl GlobalFrameVerifier {
         self
     }
 
+    /// Whether finalization certificates can be checked at all.
+    pub fn knows_global_committee(&self) -> bool {
+        !self.global_committee.is_empty()
+    }
+
     /// Strict authentication for global frames arriving over the UNTRUSTED
     /// gossip mesh. The frame MUST carry a simplex FINALIZATION cert (CWCT magic
     /// in the header sig field) that verifies against the fixed global committee.
@@ -100,6 +126,24 @@ impl GlobalFrameVerifier {
             output_digest,
         )
         .is_some()
+    }
+
+    /// Authentication of the durable execution base for a running GLOBAL epoch.
+    /// A certificate from another epoch/view cannot authorize the local cursor.
+    pub(crate) fn verify_global_execution_base(&self, header: &GlobalFrameHeader, epoch: u64) -> bool {
+        self.global_finalization_parent(header, epoch).is_some()
+    }
+
+    /// Authenticated parent view from a finalization in the requested epoch and
+    /// the header's view. Callers also bind its digest, height and state roots.
+    pub(crate) fn global_finalization_parent(&self, header: &GlobalFrameHeader, epoch: u64) -> Option<u64> {
+        let Some(cert) = header.public_key_signature_bls48581.as_ref()
+            .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature)) else { return None };
+        let Ok(digest) = quil_crypto::poseidon::hash_bytes_to_32(&header.output) else { return None };
+        quil_cw_consensus::app_cert::verify_finalization_details(cert, &self.global_committee, b"global", digest)
+            .filter(|verified| verified.finalization.proposal.round.epoch().get() == epoch
+                && verified.finalization.proposal.round.view().get() == header.rank)
+            .map(|verified| verified.finalization.proposal.parent.get())
     }
 
     /// Bind a global frame's request BODY to its authenticated header.
@@ -274,9 +318,8 @@ impl FramePipeline {
         // 3. VDF verification.
         // Genesis (frame 0) has no VDF proof to verify. For all other
         // frames, VDF correctness is enforced by the frame_prover's
-        // verify_frame_header() call in the BLS validation path
-        // (see BlsGlobalFrameValidator / BlsAppShardFrameValidator
-        // below). During initial bulk-sync the BLS validators are the
+        // verify_global_frame_header() call in BlsGlobalFrameValidator.
+        // During initial bulk-sync the global validators are the
         // primary entry point, so standalone VDF re-verification here
         // is unnecessary — the proof has already been checked before
         // the frame reaches process_raw_frame().
@@ -308,19 +351,17 @@ impl FramePipeline {
 //   - `node/consensus/validator/bls_global_frame_validator.go`
 //   - `node/consensus/validator/bls_app_shard_frame_validator.go`
 //
-// Both validators perform the same three-step check:
-//   1. Structural sanity (non-nil header, expected field widths).
-//   2. VDF proof verification via `FrameProver::verify_*_frame_header`,
-//      which returns the aggregated-signer bitmask.
-//   3. BLS aggregate-public-key check: compute
-//      `aggregate(active_provers_matching_bitmask)` and compare to the
-//      frame's declared `PublicKeySignatureBls48581.public_key`.
-//
-// The Go code takes a `crypto.BlsConstructor` as the aggregation
-// helper; we do the same in Rust via the `BlsConstructor` trait.
+// Global validation checks the VDF and committee authentication. App validation
+// checks the deterministic beacon-bound digest, storage attestation and committee
+// authentication. Both also enforce structural field widths. Legacy signature
+// carriers use `BlsConstructor` for their aggregate-public-key checks.
 
 /// The exact declared width of the VDF `output` field on a global frame header.
 pub const GLOBAL_FRAME_OUTPUT_LEN: usize = 516;
+
+/// How a missing historical storage registration reads: the one validation
+/// failure a notarized parent is excused (`validate_notarized_parent`).
+const HISTORY_UNAVAILABLE: &str = "historical storage registration unavailable";
 
 /// Validates a `GlobalFrame` by:
 /// 1. Checking structural fields on the header.
@@ -497,14 +538,17 @@ impl GlobalFrameValidator for BlsGlobalFrameValidator {
     }
 }
 
-/// Mirror of
-/// `node/consensus/validator/bls_app_shard_frame_validator.go`.
+/// The latest GLOBAL frame number `clock` holds.
+fn latest_global_frame_number(clock: &dyn quil_types::store::ClockStore) -> Option<u64> {
+    clock.get_latest_global_clock_frame().ok()?.header.map(|header| header.frame_number)
+}
+
 /// Validates an `AppShardFrame` by:
 /// 1. Checking structural fields (non-empty address, exactly 4 state
-/// roots of length 64 or 74).
-/// 2. Running the VDF proof through `FrameProver::verify_frame_header`.
-/// 3. Aggregating public keys of active provers under the app shard's
-/// address filter whose indices are in the VDF bitmask.
+/// roots of length 32, 64 or 74).
+/// 2. Recomputing its deterministic output against the selected global beacon.
+/// 3. Verifying committee authentication and the required storage attestation.
+/// App frames, including genesis, have no VDF.
 pub struct BlsAppFrameValidator {
     prover_registry: Arc<dyn ProverRegistryTrait>,
     bls_constructor: Arc<dyn BlsConstructor>,
@@ -514,6 +558,16 @@ pub struct BlsAppFrameValidator {
     /// storage-attestation check is skipped (e.g. pre-storage-attestation
     /// frames, where `storage_attestation_root` is empty anyway).
     clock_store: Option<Arc<dyn quil_types::store::ClockStore>>,
+    /// Authenticated GLOBAL state, distinct from a worker's local app trees.
+    /// Each finalized-frame check captures one committed authorization view.
+    handoff_authority: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    storage_history: crate::storage_history::StorageHistory,
+    storage_history_source: Option<crate::storage_history::GlobalVertexProofSource>,
+    global_anchor_source: Option<crate::global_anchor::GlobalAnchorSource>,
+    /// Committees a legacy frame's certificate may have been signed by, when
+    /// today's registry cannot reproduce it (see `historical_committee`).
+    historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
+    historical_committees: crate::historical_committee::HistoricalCommittees,
 }
 
 impl BlsAppFrameValidator {
@@ -527,7 +581,107 @@ impl BlsAppFrameValidator {
             bls_constructor,
             frame_prover,
             clock_store: None,
+            handoff_authority: None,
+            storage_history: Default::default(),
+            storage_history_source: None,
+            global_anchor_source: None,
+            historical_committee_source: None,
+            historical_committees: Default::default(),
         }
+    }
+
+    pub fn with_historical_committee_source(
+        mut self,
+        source: crate::historical_committee::HistoricalCommitteeSource,
+    ) -> Self {
+        self.historical_committee_source = Some(source);
+        self
+    }
+
+    /// Before validating a certified legacy frame from an archive (recovery,
+    /// a restart head): when today's registry does not reproduce the committee
+    /// that signed it, fetch the committees the GLOBAL prover tree gave around
+    /// its anchor, so `validate` can try them. Session certificates, frames
+    /// the live committee verifies, and nodes without a source are untouched.
+    pub async fn prepare_historical_committee(&self, frame: &AppShardFrame) -> Result<()> {
+        let Some(source) = self.historical_committee_source.as_ref() else { return Ok(()) };
+        let Some(header) = frame.header.as_ref() else { return Ok(()) };
+        let Some(cert) = header
+            .public_key_signature_bls48581
+            .as_ref()
+            .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature))
+        else {
+            return Ok(());
+        };
+        if header.frame_number == 0 || quil_cw_consensus::app_cert::unverified_finalization_epoch(cert) != Some(0) {
+            return Ok(());
+        }
+        let anchor = legacy_committee_frame(header);
+        if self.historical_committees.get(&header.address, anchor).is_some() {
+            return Ok(());
+        }
+        let digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?;
+        let live = self.live_legacy_committee(header)?;
+        if quil_cw_consensus::app_cert::verify_finalization_details(cert, &live, &legacy_namespace(header), digest).is_some() {
+            return Ok(());
+        }
+        let candidates = tokio::time::timeout(
+            crate::historical_committee::HISTORICAL_COMMITTEE_TIMEOUT,
+            source(header.address.clone(), anchor),
+        )
+        .await
+        .map_err(|_| QuilError::ExecutionUnavailable("historical committee reconstruction timed out".into()))??;
+        tracing::info!(
+            filter = %hex::encode(&header.address),
+            frame = header.frame_number,
+            anchor,
+            candidates = candidates.len(),
+            "reconstructed historical committees for a legacy certificate",
+        );
+        self.historical_committees.put(header.address.clone(), anchor, candidates);
+        Ok(())
+    }
+
+    /// No legacy certificate is accepted from the committee-handoff flag day
+    /// on (`frames::refuse_legacy_after_flag_day`): neither a frame anchored
+    /// at or after activation nor any legacy frame once this node's GLOBAL
+    /// chain has reached activation, when it discards its legacy history.
+    fn refuse_legacy_after_flag_day(&self, header: &quil_types::proto::global::FrameHeader) -> Result<()> {
+        let local = self.clock_store.as_ref().and_then(|clock| latest_global_frame_number(clock.as_ref())).unwrap_or(0);
+        quil_execution::global_intrinsic::handoff::frames::refuse_legacy_after_flag_day(
+            header.global_frame_number.max(local),
+        )
+    }
+
+    fn live_legacy_committee(&self, header: &quil_types::proto::global::FrameHeader) -> Result<Vec<Vec<u8>>> {
+        let active = self.prover_registry.get_active_provers(&header.address, legacy_committee_frame(header))?;
+        Ok(active.iter().map(|p| p.public_key.clone()).collect())
+    }
+
+    /// Verify a legacy certificate under the live registry's committee at its
+    /// anchor, then under any prepared historical committee for that anchor.
+    fn verify_legacy_certificate(
+        &self,
+        header: &quil_types::proto::global::FrameHeader,
+        cert_bytes: &[u8],
+        output_digest: [u8; 32],
+    ) -> Result<quil_cw_consensus::app_cert::VerifiedFinalization> {
+        let namespace = legacy_namespace(header);
+        let live = self.live_legacy_committee(header)?;
+        if let Some(verified) = quil_cw_consensus::app_cert::verify_finalization_details(
+            cert_bytes, &live, &namespace, output_digest,
+        ) {
+            return Ok(verified);
+        }
+        let historical = self.historical_committees.get(&header.address, legacy_committee_frame(header));
+        for committee in historical.iter().flat_map(|c| c.iter()) {
+            if let Some(verified) = quil_cw_consensus::app_cert::verify_finalization_details(
+                cert_bytes, committee, &namespace, output_digest,
+            ) {
+                return Ok(verified);
+            }
+        }
+        Err(QuilError::InvalidSignature("app shard frame CW finalization cert verification failed".into()))
     }
 
     /// Attach a clock store so storage attestations can be verified (supplies
@@ -539,6 +693,126 @@ impl BlsAppFrameValidator {
         self.clock_store = Some(clock_store);
         self
     }
+
+    pub fn with_handoff_authority(mut self, crdt: Arc<quil_hypergraph::HypergraphCrdt>) -> Self {
+        self.handoff_authority = Some(crdt);
+        self
+    }
+
+    pub fn with_storage_history_source(mut self, source: crate::storage_history::GlobalVertexProofSource) -> Self {
+        self.storage_history_source = Some(source);
+        self
+    }
+
+    pub fn with_global_anchor_source(mut self, source: crate::global_anchor::GlobalAnchorSource) -> Self {
+        self.global_anchor_source = Some(source);
+        self
+    }
+
+    /// The GLOBAL frame `frame` is anchored to, when this node's clock does
+    /// not hold it, with the latest GLOBAL frame it does hold (`None`: none
+    /// or no clock). `None` when the anchor is held or the frame has none.
+    pub fn missing_global_anchor(&self, frame: &AppShardFrame) -> Option<(u64, Option<u64>)> {
+        let wanted = frame.header.as_ref()?.global_frame_number;
+        if wanted == 0 {
+            return None;
+        }
+        let Some(clock) = self.clock_store.as_ref() else {
+            return Some((wanted, None));
+        };
+        if clock.get_global_clock_frame(wanted).is_ok() {
+            return None;
+        }
+        Some((wanted, latest_global_frame_number(clock.as_ref())))
+    }
+
+    fn storage_registration(
+        &self, root: Option<[u8; 32]>, member: &[u8], leaf: &[u8], epoch: u64,
+    ) -> Result<Option<crate::storage_history::Registration>> {
+        if let Some(root) = root {
+            let address = quil_execution::global_intrinsic::materialize::leaf_root_address(member, leaf)?;
+            if let Some(value) = self.storage_history.get(root, address, epoch) { return Ok(value); }
+            if let Some(global) = self.handoff_authority.as_ref() {
+                if global.global_root_available(&root)? {
+                    let Some(proof) = global.global_vertex_membership_at_root(&root, &address)? else { return Ok(None); };
+                    let bytes = quil_forest::MembershipProof { inputs: vec![proof] }.to_bytes();
+                    return self.storage_history.insert(root, member, leaf, epoch, &bytes);
+                }
+            }
+        }
+        // Preserve the live registry path when this node did not sync the
+        // exact anchor. Old registrations can instead be recovered by prepare.
+        let current = self.prover_registry.get_leaf_root(member, leaf, epoch)?;
+        if current.is_none() && (self.handoff_authority.is_some() || self.storage_history_source.is_some()) {
+            return Err(QuilError::ExecutionUnavailable(format!(
+                "{HISTORY_UNAVAILABLE} at epoch {epoch}"
+            )));
+        }
+        Ok(current)
+    }
+
+    /// Fetch only missing historical registrations before synchronous frame
+    /// validation. The callback supplies untrusted bytes; every proof is bound
+    /// to this frame's canonical GLOBAL anchor and decoded identity here.
+    pub async fn prepare_storage_history(&self, frame: &AppShardFrame) -> Result<()> {
+        self.prepare_storage_history_with(frame, true).await
+    }
+
+    /// [`Self::prepare_storage_history`] for a frame final only through its
+    /// certified child, which has no certificate of its own. The caller has
+    /// authenticated it: the child's certificate, and the child naming this
+    /// frame as its parent (`app_frame_links_to_child`). Its structure and
+    /// output are still checked before any read.
+    pub async fn prepare_storage_history_of_linked(&self, frame: &AppShardFrame) -> Result<()> {
+        self.prepare_storage_history_with(frame, false).await
+    }
+
+    async fn prepare_storage_history_with(&self, frame: &AppShardFrame, certified: bool) -> Result<()> {
+        if let (Some(source), Some(header)) = (self.global_anchor_source.as_ref(), frame.header.as_ref()) {
+            let store = self.clock_store.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable("GLOBAL anchor has no clock store".into()))?;
+            crate::global_anchor::ensure_global_anchor(store.as_ref(), source, header.global_frame_number).await?;
+        }
+        let Some(source) = self.storage_history_source.as_ref() else { return Ok(()); };
+        let (Some(header), Some(attestation)) = (frame.header.as_ref(), frame.storage_attestation.as_ref()) else { return Ok(()); };
+        if attestation.openings.is_empty() { return Ok(()); }
+        let global = self.clock_store.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable("storage history has no clock source".into()))?
+            .get_global_clock_frame(header.global_frame_number)?;
+        let global_header = global.header.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable("storage history anchor lacks header".into()))?;
+        let Ok(root) = <[u8;32]>::try_from(global_header.prover_tree_commitment.as_slice()) else {
+            // Historical proofs apply to forest roots. Legacy commitments
+            // retain their existing live-registry validation path.
+            return Ok(());
+        };
+        // Authenticate before local proof reads as well as before peer fetches.
+        // Full possession verification follows after preparation.
+        self.validate_with_mode(frame, certified, false)?;
+        let epoch = quil_types::consensus::epoch_for_frame(header.global_frame_number);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut attempted = std::collections::BTreeSet::new();
+            for opening in &attestation.openings {
+                // The ordinary validator reports malformed epoch bindings.
+                if opening.epoch != epoch { continue; }
+                let existing = self.storage_registration(Some(root), &opening.member_id, &opening.shard_id, epoch);
+                match existing {
+                    Ok(Some((registered, blocks, registered_epoch)))
+                        if registered == opening.leaf_root && blocks == opening.num_blocks && registered_epoch == epoch => continue,
+                    Ok(None) => continue, // authenticated absence: reject in validate
+                    _ => {}
+                }
+                let address = quil_execution::global_intrinsic::materialize::leaf_root_address(&opening.member_id, &opening.shard_id)?;
+                if !attempted.insert(address) { continue; }
+                if attempted.len() > 128 {
+                    return Err(QuilError::ExecutionUnavailable("storage history fetch budget exceeded".into()));
+                }
+                let bytes = source(root, address).await?.ok_or_else(|| QuilError::ExecutionUnavailable("peer lacks historical storage registration".into()))?;
+                self.storage_history.insert(root, &opening.member_id, &opening.shard_id, epoch, &bytes)?;
+                info!(frame = header.frame_number, global_anchor = header.global_frame_number,
+                    epoch, record = %hex::encode(address), proof_bytes = bytes.len(),
+                    "recovered authenticated historical storage registration");
+            }
+            Ok(())
+        }).await.map_err(|_| QuilError::ExecutionUnavailable("storage history fetch timed out".into()))?
+    }
 }
 
 impl BlsAppFrameValidator {
@@ -547,9 +821,13 @@ impl BlsAppFrameValidator {
     /// gating**: a proposed frame is not yet certified — it has no aggregate
     /// signature (votes haven't formed the QC), and the proposer's authenticity
     /// is verified separately by `gate_proposal`/`validate_vote`. In proposal
-    /// mode we still verify the VDF and structural shape (and any signature that
-    /// IS present), but don't *require* one.
+    /// mode we still verify the deterministic output, storage attestation and
+    /// structural shape (and any signature present), but don't require a signature.
     fn validate_with(&self, frame: &AppShardFrame, require_signature: bool) -> Result<bool> {
+        self.validate_with_mode(frame, require_signature, true)
+    }
+
+    fn validate_with_mode(&self, frame: &AppShardFrame, require_signature: bool, verify_storage: bool) -> Result<bool> {
         let header = frame
             .header
             .as_ref()
@@ -565,7 +843,7 @@ impl BlsAppFrameValidator {
             )));
         }
         for (i, root) in header.state_roots.iter().enumerate() {
-            // 32 = Phase-3 forest (JMT) root; 64 = empty/placeholder phase;
+            // 32 = forest (JMT) root; 64 = empty/placeholder phase;
             // 74 = legacy KZG commitment (tests / pre-migration).
             if root.len() != 32 && root.len() != 64 && root.len() != 74 {
                 return Err(QuilError::InvalidArgument(format!(
@@ -576,21 +854,12 @@ impl BlsAppFrameValidator {
             }
         }
 
-        // 1. VDF proof verification. The trait's return value is
-        // the VDF output, not a participant bitmask — discard it.
-        // The actual participant indices come from the BLS aggregate
-        // signature carrier (mirroring Go's
-        // `WesolowskiFrameProver.VerifyFrameHeader` which returns
-        // `GetSetBitIndices(sig.Bitmask)`). See the matching comment
-        // on `BlsGlobalFrameValidator::validate` above for why the
-        // previous behavior (treating the VDF output as a bitmask)
-        // was a soundness bug.
+        // 1. Verify the deterministic app output. The global chain supplies
+        // the storage beacon; app frames perform no VDF verification.
         if header.global_frame_number > 0 {
             // Storage attestation is always-on: any frame anchored to a real
             // global frame (`global_frame_number > 0`) is a storage frame and
-            // omits the app-shard VDF. Only genesis/no-chain frames (== 0) keep
-            // the legacy VDF. (keyed on the GLOBAL frame the header anchors to.)
-            // Recompute the deterministic ρ_N-bound output (the producer's
+            // requires a storage attestation.
             // Recompute the deterministic ρ_N-bound output (the producer's
             // identity basis) and require it to match the header. ρ_N is derived
             // from the anchored global frame's VDF output, resolved from our own
@@ -603,9 +872,17 @@ impl BlsAppFrameValidator {
             let (global_output, global_timestamp) = match global_anchor {
                 Some(o) => o,
                 None => {
-                    return Err(QuilError::Crypto(
-                        "storage frame: anchored global frame unavailable for ρ_N".into(),
-                    ));
+                    // Which frame, and how far this node is from it, tells a
+                    // GLOBAL view moments behind from a hole or a stalled one.
+                    let latest = self
+                        .clock_store
+                        .as_ref()
+                        .and_then(|cs| latest_global_frame_number(cs.as_ref()));
+                    return Err(QuilError::Crypto(format!(
+                        "storage frame: anchored global frame {} unavailable for ρ_N (latest local global frame: {})",
+                        header.global_frame_number,
+                        latest.map_or_else(|| "none".to_string(), |n| n.to_string()),
+                    )));
                 }
             };
             let rho_n = quil_crypto::porep::derive_storage_beacon(
@@ -624,6 +901,10 @@ impl BlsAppFrameValidator {
                 header.fee_multiplier_vote,
                 header.timestamp,
                 &header.storage_attestation_root,
+                quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&header.fee_total),
+                &header.settlements,
+                &header.accumulator,
+                &header.spends,
             );
             if expected != header.output {
                 return Err(QuilError::Crypto(
@@ -631,8 +912,8 @@ impl BlsAppFrameValidator {
                 ));
             }
 
-            // Timestamp sanity (hardening #3). Now that `timestamp` is bound into
-            // the deterministic output (fix C), a malicious leader can still stamp
+            // Timestamp sanity. Although `timestamp` is bound into
+            // the deterministic output, a malicious leader can still stamp
             // an arbitrary value and have the committee certify it unless voters
             // reject out-of-range timestamps before signing.
             //
@@ -692,6 +973,10 @@ impl BlsAppFrameValidator {
                 header.fee_multiplier_vote,
                 header.timestamp,
                 &header.storage_attestation_root,
+                quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&header.fee_total),
+                &header.settlements,
+                &header.accumulator,
+                &header.spends,
             );
             if expected != header.output {
                 return Err(QuilError::Crypto(
@@ -700,15 +985,9 @@ impl BlsAppFrameValidator {
             }
         }
 
-        // 2. Aggregate-key check. Required for every post-genesis
-        // frame. The previous behavior wrapped this entire block in
-        // `if let Some(sig) = ...`, so a frame with the signature
-        // field omitted entirely would pass the validator after only
-        // the VDF check (and VDF alone is publicly computable —
-        // anyone can solve a Wesolowski problem given the inputs).
-        // Genesis frames carry no signature by design (mirroring
-        // `BlsGlobalFrameValidator` above which exempts
-        // `frame_number == 0`).
+        // 2. Committee authentication is required for every finalized
+        // post-genesis frame. Recomputing the public deterministic digest alone
+        // does not authenticate a frame. Genesis has no signature.
         if require_signature
             && header.frame_number != 0
             && header.public_key_signature_bls48581.is_none()
@@ -719,8 +998,8 @@ impl BlsAppFrameValidator {
         }
         // A commonware-simplex-finalized shard frame carries the simplex
         // FINALIZATION certificate (magic-prefixed) in the sig field's
-        // `signature` bytes — NOT a header aggregate. Verify it against the shard
-        // committee over `poseidon(output)` (namespace `b"appshard" ++ address`),
+        // `signature` bytes. Verify it against the authorized historical session
+        // over `poseidon(output)`; unmanaged apps retain the legacy namespace,
         // mirroring the global reward path (`prover_shard_update.rs`) and the
         // finalize-side attach in `app_engine::handle_cw_finalized_frame`. This
         // is how a follower / archive (non-committee member) accepts a CW frame.
@@ -728,32 +1007,50 @@ impl BlsAppFrameValidator {
             .public_key_signature_bls48581
             .as_ref()
             .and_then(|s| quil_cw_consensus::app_cert::unwrap_cert_from_header(&s.signature));
+        // Without a handoff policy a node may hold no GLOBAL cursor; nothing
+        // is managed then, so frames verify as legacy ones.
+        let handoff_view = || match &self.handoff_authority {
+            Some(crdt) => crate::app_handoff::committed_view(crdt),
+            None => Ok(None),
+        };
+        if cw_cert.is_none() && (require_signature || header.public_key_signature_bls48581.is_some()) {
+            self.refuse_legacy_after_flag_day(header)?;
+            if let Some(view) = handoff_view()? {
+                quil_execution::global_intrinsic::handoff::frames::require_legacy_allowed(
+                    &view, &header.address, header.frame_number)?;
+            }
+        }
         if let Some(cert_bytes) = cw_cert {
-            let committee_frame = if header.global_frame_number > 0 {
-                header.global_frame_number
+            let output_digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?;
+            let authorized = if let Some(view) = handoff_view()? {
+                use quil_execution::global_intrinsic::handoff::frames;
+                frames::verify(
+                    &view,
+                    &frames::FrameClaim {
+                        filter: &header.address,
+                        frame: header.frame_number,
+                        view: header.rank,
+                        parent: &header.parent_selector,
+                        digest: output_digest,
+                    },
+                    cert_bytes,
+                )?.is_some()
             } else {
-                header.frame_number
+                false
             };
-            let active = self
-                .prover_registry
-                .get_active_provers(&header.address, committee_frame)?;
-            let committee_pubkeys: Vec<Vec<u8>> =
-                active.iter().map(|p| p.public_key.clone()).collect();
-            let mut namespace = b"appshard".to_vec();
-            namespace.extend_from_slice(&header.address);
-            let output_digest = quil_crypto::poseidon::hash_bytes_to_32(&header.output)
-                .map_err(|e| QuilError::Crypto(format!("cw cert: poseidon(output): {e}")))?;
-            if quil_cw_consensus::app_cert::verify_finalization(
-                cert_bytes,
-                &committee_pubkeys,
-                &namespace,
-                output_digest,
-            )
-            .is_none()
-            {
-                return Err(QuilError::InvalidSignature(
-                    "app shard frame CW finalization cert verification failed".into(),
-                ));
+            if !authorized {
+                if quil_cw_consensus::app_cert::unverified_finalization_epoch(cert_bytes) != Some(0) {
+                    return Err(QuilError::ExecutionUnavailable(
+                        "app session certificate requires authenticated global authorization".into(),
+                    ));
+                }
+                self.refuse_legacy_after_flag_day(header)?;
+                let verified = self.verify_legacy_certificate(header, cert_bytes, output_digest)?;
+                if verified.finalization.proposal.round.view().get() != header.rank {
+                    return Err(QuilError::InvalidSignature(
+                        "app header rank differs from certified view".into(),
+                    ));
+                }
             }
         } else if let Some(sig) = header.public_key_signature_bls48581.as_ref() {
             let Some(pk) = sig.public_key.as_ref() else {
@@ -856,7 +1153,7 @@ impl BlsAppFrameValidator {
         // member's registered leaf root for the active epoch. Skipped when the
         // header carries no storage attestation (pre-fork frames) or no clock
         // store is attached (the beacon source).
-        if !header.storage_attestation_root.is_empty() {
+        if verify_storage && !header.storage_attestation_root.is_empty() {
             if let Some(clock_store) = self.clock_store.as_ref() {
             let global = clock_store
                 .get_global_clock_frame(header.global_frame_number)
@@ -881,8 +1178,9 @@ impl BlsAppFrameValidator {
                 .as_ref()
                 .map(|s| s.bitmask.clone())
                 .unwrap_or_default();
-            let registry = self.prover_registry.clone();
-            let ok = quil_crypto::porep::verify_frame_storage_attestation_registered(
+            let registration_root = global.header.as_ref().and_then(|h| h.prover_tree_commitment.as_slice().try_into().ok());
+            let lookup_error = std::cell::RefCell::new(None);
+            let verdict = quil_crypto::porep::explain_frame_storage_attestation_registered(
                 &header.storage_attestation_root,
                 &attestation,
                 header.frame_number,
@@ -899,13 +1197,17 @@ impl BlsAppFrameValidator {
                 quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
                 active_epoch,
                 |member: &[u8], leaf_id: &[u8], epoch: u64| {
-                    registry.get_leaf_root(member, leaf_id, epoch).ok().flatten()
+                    match self.storage_registration(registration_root, member, leaf_id, epoch) {
+                        Ok(value) => value,
+                        Err(error) => { *lookup_error.borrow_mut() = Some(error); None }
+                    }
                 },
             );
-            if !ok {
-                return Err(QuilError::Crypto(
-                    "app shard frame storage attestation rejected".into(),
-                ));
+            if let Some(error) = lookup_error.into_inner() { return Err(error); }
+            if let Err(reason) = verdict {
+                return Err(QuilError::Crypto(format!(
+                    "app shard frame storage attestation rejected: {reason}"
+                )));
             }
             } else {
                 // No beacon source (e.g. the archive-ingest validator): skip —
@@ -928,12 +1230,47 @@ impl BlsAppFrameValidator {
         Ok(true)
     }
 
-    /// Gate an inbound **proposal**: structural + VDF validation (and any
+    /// Gate an inbound **proposal**: structure, deterministic output and storage
+    /// attestation validation (and any
     /// signature that is present), but the committee quorum signature is NOT
     /// required — a proposed frame is not yet certified. The proposer's
     /// authenticity is verified separately by `gate_proposal`/`validate_vote`.
     pub fn validate_proposal(&self, frame: &AppShardFrame) -> Result<bool> {
         self.validate_with(frame, false)
+    }
+
+    /// Validate a **certified** frame whose storage registrations no archive
+    /// retains any longer: its quorum certificate, structure and output are
+    /// checked, its possession proof is not. The quorum verified possession
+    /// when it certified the frame, and GLOBAL credited it then. A shard halted
+    /// past the archives' retention could otherwise never be recovered: its
+    /// members re-check the head's registrations at the historical GLOBAL root
+    /// before starting consensus, and every sync anchor is that same head.
+    pub fn validate_certified_without_storage(&self, frame: &AppShardFrame) -> Result<bool> {
+        self.validate_with_mode(frame, true, false)
+    }
+
+    /// The same for a frame final only through its certified child, which the
+    /// caller has authenticated (see [`Self::prepare_storage_history_of_linked`]):
+    /// structure and output, no certificate of its own, no possession proof.
+    pub fn validate_linked_without_storage(&self, frame: &AppShardFrame) -> Result<bool> {
+        self.validate_with_mode(frame, false, false)
+    }
+
+    /// A notarized frame used as the parent of the next proposal (a private
+    /// parent and its unfinalized ancestors): validated as a proposal, and
+    /// without possession when the only failure is a registration this node
+    /// no longer holds. The notarizing quorum verified possession. After a
+    /// restart a shard's unfinalized frames can be hours old; without this,
+    /// every member refuses them ("historical storage registration
+    /// unavailable") and abstains.
+    pub fn validate_notarized_parent(&self, frame: &AppShardFrame) -> Result<bool> {
+        match self.validate_with(frame, false) {
+            Err(QuilError::ExecutionUnavailable(message)) if message.starts_with(HISTORY_UNAVAILABLE) => {
+                self.validate_with_mode(frame, false, false)
+            }
+            other => other,
+        }
     }
 }
 
@@ -947,6 +1284,23 @@ impl AppFrameValidator for BlsAppFrameValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_app_frame_links_only_to_the_parent_its_selector_names() {
+        use quil_types::proto::global::FrameHeader;
+        let parent = FrameHeader { address: vec![1; 32], frame_number: 66, rank: 66, output: vec![6; 32], ..Default::default() };
+        let selector = quil_crypto::poseidon::hash_bytes_to_32(&parent.output).unwrap().to_vec();
+        let child = FrameHeader { address: vec![1; 32], frame_number: 67, rank: 68, parent_selector: selector, ..Default::default() };
+        assert!(app_frame_links_to_child(&parent, &child));
+        for bad in [
+            FrameHeader { address: vec![2; 32], ..child.clone() },
+            FrameHeader { frame_number: 68, ..child.clone() },
+            FrameHeader { rank: 66, ..child.clone() },
+            FrameHeader { parent_selector: vec![0; 32], ..child.clone() },
+        ] {
+            assert!(!app_frame_links_to_child(&parent, &bad));
+        }
+    }
 
     #[test]
     fn global_frame_nil_header_rejected() {
@@ -1195,6 +1549,10 @@ mod tests {
             header.fee_multiplier_vote,
             header.timestamp,
             &header.storage_attestation_root,
+            quil_execution::global_intrinsic::frame_header::fee_total_from_bytes(&header.fee_total),
+            &header.settlements,
+            &header.accumulator,
+            &header.spends,
         );
         let frame = AppShardFrame {
             header: Some(header),
@@ -1265,7 +1623,7 @@ mod tests {
         assert!(res.is_err());
     }
 
-    // ---- gossip untrusted-source cert gate (Finding 1) ----
+    // ---- gossip untrusted-source cert gate ----
 
     #[test]
     fn gossip_cert_gate_rejects_when_committee_empty() {
@@ -1431,12 +1789,6 @@ mod tests {
         ) -> Result<quil_types::proto::global::FrameHeader> {
             Err(QuilError::Internal("stub".into()))
         }
-        fn verify_frame_header(
-            &self,
-            _: &quil_types::proto::global::FrameHeader,
-        ) -> Result<Vec<u8>> {
-            Ok(Vec::new())
-        }
         fn prove_global_frame_header(
             &self,
             _: &quil_types::proto::global::GlobalFrameHeader,
@@ -1444,6 +1796,7 @@ mod tests {
             _: &[u8],
             _: &[Vec<u8>],
             _: &[u8],
+            _: u64,
             _: &dyn quil_types::crypto::Signer,
             _: i64,
             _: u32,
@@ -1476,4 +1829,17 @@ mod tests {
             Ok(true)
         }
     }
+}
+
+/// The GLOBAL frame a legacy app frame's committee is read at: its anchor,
+/// or its own number for a frame without one.
+fn legacy_committee_frame(header: &quil_types::proto::global::FrameHeader) -> u64 {
+    if header.global_frame_number > 0 { header.global_frame_number } else { header.frame_number }
+}
+
+/// The signing namespace of a legacy app shard's certificates.
+fn legacy_namespace(header: &quil_types::proto::global::FrameHeader) -> Vec<u8> {
+    let mut namespace = b"appshard".to_vec();
+    namespace.extend_from_slice(&header.address);
+    namespace
 }

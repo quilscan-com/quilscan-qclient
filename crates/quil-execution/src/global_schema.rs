@@ -60,7 +60,7 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             FieldTag { name: "Seniority",        order: 3, size: 8,   rdf_type: RdfType::Uint },
             // order 4 — 8-byte big-endian u64.
             FieldTag { name: "KickFrameNumber",  order: 4, size: 8,   rdf_type: RdfType::Uint },
-            // order 5 — NEW (Rust-ahead seniority-accrual fork): the last frame
+            // order 5 — not in the Go schema: the last frame
             // this prover accrued active-seniority for. Idempotency key so a
             // multi-shard prover (one call per allocation) or a re-materialized
             // frame accrues `SENIORITY_PER_ACTIVE_FRAME` at most once per frame.
@@ -85,11 +85,11 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             FieldTag { name: "LeaveConfirmFrameNumber", order: 11, size: 8,  rdf_type: RdfType::Uint },
             FieldTag { name: "LeaveRejectFrameNumber",  order: 12, size: 8,  rdf_type: RdfType::Uint },
             FieldTag { name: "LastActiveFrameNumber",   order: 13, size: 8,  rdf_type: RdfType::Uint },
-            // order 14 — NEW (Rust-ahead storage-attestation fork): the storage
+            // order 14 — not in the Go schema: the storage
             // epoch this allocation was last confirmed for. Data-shard
             // allocations are epoch-bound (see `EffectiveStatus::ExpiredEpoch`).
             FieldTag { name: "Epoch",                   order: 14, size: 8,  rdf_type: RdfType::Uint },
-            // order 15 — NEW (Rust-ahead ring-lock fork): the reward-ring index
+            // order 15 — not in the Go schema: the reward-ring index
             // this allocation sits in (`2^(ring+1)` = the shard's reward divisor).
             // Assigned by `prover_shard_update::recompute_shard_rings` from a
             // STABLE ordering — `JoinFrameNumber` then address, both immutable —
@@ -101,6 +101,16 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // shift up). Deliberately NOT sorted by live seniority, whose per-frame
             // drift is what forked the prover-tree root before the ring was stored.
             FieldTag { name: "Ring",                    order: 15, size: 1,  rdf_type: RdfType::Uint },
+            // order 16 — not in the Go schema: the cohort this allocation ranks
+            // in for its ring: the epoch its join confirm activated it, or the
+            // epoch a split, merge or the committee-handoff flag day moved it to
+            // its shard. Earlier cohorts rank first. Absent on allocations made
+            // before the seniority ring rule (`prover_rings`).
+            FieldTag { name: "RingEpoch",               order: 16, size: 8,  rdf_type: RdfType::Uint },
+            // order 17 — the prover's seniority when its join confirm
+            // materialized (or at the flag day, for allocations already
+            // confirmed). Ranks a cohort, most senior first; never updated.
+            FieldTag { name: "RingSeniority",           order: 17, size: 8,  rdf_type: RdfType::Uint },
         ],
     },
     ClassDef {
@@ -141,7 +151,7 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             FieldTag { name: "ProverAddress", order: 0, size: 32, rdf_type: RdfType::ByteArray },
         ],
     },
-    // NEW (Rust-ahead storage-attestation fork; not in the Go GLOBAL_RDF_SCHEMA).
+    // Not in the Go GLOBAL_RDF_SCHEMA.
     // A member's per-leaf, per-epoch storage registration. Keyed by address
     // poseidon("LEAF_ROOT_REGISTRATION" || member || leaf_id || epoch). The
     // stored fields are enough to reconstruct the (member, leaf_id, epoch) key
@@ -168,7 +178,7 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // epoch (it confirms one epoch ahead while still answering audits for
             // the current one). Orders 3..5 are the "current" (lower-epoch) slot;
             // 7..9 are the "next" (higher-epoch) slot. Two fixed slots — no
-            // per-epoch address growth. See [[epoch-aligned-lifecycle-design]].
+            // per-epoch address growth.
             // order 7 — next-epoch slot: replication epoch.
             FieldTag { name: "NextEpoch",     order: 7, size: 8,   rdf_type: RdfType::Uint },
             // order 8 — next-epoch slot: registered KZG leaf root.
@@ -195,12 +205,12 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
     },
 ];
 
-/// The schema's max `order` across all classes — now 14 (allocation's new
-/// `Epoch` field). Still within the single-byte band (`≤ 63`), so `order_to_key`
-/// returns `order << 2` exactly as before: every existing field key is
-/// unchanged, no allocation vertex is re-keyed. Used to decide the
-/// `order_to_key` encoding width.
-pub const GLOBAL_MAX_ORDER: u16 = 14;
+/// The schema's max `order` across all classes — now 17 (allocation's
+/// `RingEpoch`/`RingSeniority`). Still within the single-byte band (`≤ 63`),
+/// so `order_to_key` returns `order << 2` exactly as before: every existing
+/// field key is unchanged, no allocation vertex is re-keyed. Used to decide
+/// the `order_to_key` encoding width.
+pub const GLOBAL_MAX_ORDER: u16 = 17;
 
 /// Encoding boundaries from `types/schema/order_encoding.go`.
 pub const MAX_ORDER_SINGLE_BYTE: u16 = 63;
@@ -328,7 +338,7 @@ pub fn class_for_type_hash(hash: &[u8]) -> Option<&'static str> {
     if hash == spent_merge_hash.as_slice() {
         return Some("merge:SpentMerge");
     }
-    // Fallback: leafroot:LeafRootRegistration (Rust-ahead, computed at runtime).
+    // Fallback: leafroot:LeafRootRegistration (not in the Go schema, computed at runtime).
     if hash == type_hash_leaf_root_registration().as_slice() {
         return Some("leafroot:LeafRootRegistration");
     }
@@ -336,7 +346,7 @@ pub fn class_for_type_hash(hash: &[u8]) -> Option<&'static str> {
 }
 
 /// `poseidon(GLOBAL_INTRINSIC_ADDRESS || "leafroot:LeafRootRegistration")`,
-/// computed at runtime (this class is Rust-ahead, not on the Go mainnet).
+/// computed at runtime (this class is not in the Go schema).
 pub fn type_hash_leaf_root_registration() -> [u8; 32] {
     compute_type_hash("leafroot:LeafRootRegistration")
 }

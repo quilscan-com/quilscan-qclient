@@ -1,5 +1,6 @@
 pub mod archive_client;
 pub mod dispatch_service;
+pub mod forest_read_cache;
 pub mod forest_sync_reader;
 pub mod frame_sync;
 pub mod mixnet_service;
@@ -24,7 +25,7 @@ pub use archive_client::{
 pub use frame_sync::{
     run_archive_poller, ArchiveEndpointPool, ArchivePollerConfig, GossipFreshness,
 };
-pub use shard_info_refresh::{fetch_shard_sizes_from_archive, ShardInfoRefreshError};
+pub use shard_info_refresh::{fetch_shard_sizes_from_archive, ArchiveShardInfo, ShardInfoRefreshError};
 pub use forest_sync_reader::RemoteTreeReader;
 pub use global_service::{FrameLookup, GlobalRpcServer, SubmitHandler};
 pub use prover_counts::{

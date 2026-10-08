@@ -16,7 +16,7 @@ quil-execution = { path = "../quil-execution" }
 quil-hypergraph = { path = "../quil-hypergraph" }
 quil-tries = { path = "../quil-tries" }
 quil-crypto = { path = "../quil-crypto" }
-# Phase-3 forest: sync-side verification (fresh-JMT root of pulled leaves).
+# JMT forest: sync-side verification (fresh-JMT root of pulled leaves).
 quil-forest-migrate = { path = "../quil-forest-migrate" }
 quil-forest = { path = "../quil-forest" }
 # RemoteTreeReader implements jmt's TreeReader over gRPC for the Merkle-diff sync.
@@ -32,6 +32,8 @@ tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1"
 thiserror = "2"
 parking_lot = "0.12"
+lru = "0.12"
+futures = "0.3"
 prost = "0.13"
 tokio-stream = { version = "0.1", features = ["sync"] }
 async-stream = "0.3"
@@ -49,6 +51,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio"] }
 tower = "0.5"
 http = "1"
 hyper = "1"
+h2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

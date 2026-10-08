@@ -156,15 +156,21 @@ impl ProverRegistry for TestProverRegistry {
             .collect())
     }
 
-    fn get_active_provers(&self, _filter: &[u8], _frame_number: u64) -> Result<Vec<ProverInfo>> {
-        Ok(self
-            .provers
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|p| p.status == ProverStatus::Active)
-            .cloned()
-            .collect())
+    fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Result<Vec<ProverInfo>> {
+        let provers = self.provers.lock().unwrap();
+        // Match the trait's committee contract: serving Leaving allocations
+        // remain members, while Joining/Paused are not active proof producers.
+        // Allocation-free Active fixtures retain the harness shorthand for
+        // an all-shard committee; an empty filter queries global membership.
+        let members = |floor: bool| provers.iter().filter(|p|
+            (p.status == ProverStatus::Active && (filter.is_empty() || p.allocations.is_empty()))
+            || p.allocations.iter().any(|a|
+            a.confirmation_filter == filter && (matches!(a.effective_status(frame_number),
+                quil_types::consensus::EffectiveStatus::Active | quil_types::consensus::EffectiveStatus::Leaving)
+                || (floor && a.status == ProverStatus::Active))))
+            .cloned().collect::<Vec<_>>();
+        let strict = members(false);
+        Ok(if strict.is_empty() && !filter.is_empty() { members(true) } else { strict })
     }
 
     fn get_prover_count(&self, _filter: &[u8]) -> Result<usize> {
@@ -632,4 +638,43 @@ impl quil_types::crypto::KeyManager for AcceptAllKeyManager {
     ) -> quil_types::error::Result<bool> {
         Ok(true)
     }
+}
+
+/// A real Simplex finalization of `seal` by every member of `session`, for
+/// tests that drive a committee handoff without running a consensus host.
+pub fn certify_seal(
+    session: &quil_cw_consensus::handoff::Session,
+    signers: &[quil_crypto::FalconSigner],
+    seal: &quil_cw_consensus::handoff::Seal,
+) -> Vec<u8> {
+    use quil_cw_consensus::{
+        _consensus::{
+            simplex::{scheme::Namespace, types::{Finalization, Proposal, Subject}},
+            types::{Epoch, Round, View},
+        },
+        _crypto::{sha256::Digest, Signer as _},
+        _utils::{ordered::Set, N3f1},
+        app_cert::encode_finalization,
+        falcon_base::FalconPrivateKey,
+        falcon_scheme::Generic,
+        falcon_simplex::SimplexFalconScheme,
+    };
+    use quil_types::crypto::Signer as _;
+    let keys: Vec<FalconPrivateKey> = signers.iter()
+        .map(|s| FalconPrivateKey::from_bytes(s.private_key(), s.public_key()).unwrap())
+        .collect();
+    let proposal = Proposal::new(
+        Round::new(Epoch::new(session.generation), View::new(seal.view)),
+        View::new(seal.checkpoint.view),
+        Digest(seal.digest()),
+    );
+    let participants: Set<_> = keys.iter().map(|key| key.public_key()).collect::<Vec<_>>().try_into().unwrap();
+    let schemes: Vec<Generic<Namespace>> = keys.iter().cloned()
+        .map(|key| Generic::signer(&session.namespace().unwrap(), participants.clone(), key).unwrap())
+        .collect();
+    let votes: Vec<_> = schemes.iter()
+        .map(|scheme| scheme.sign::<SimplexFalconScheme, Digest>(Subject::Finalize { proposal: &proposal }).unwrap())
+        .collect();
+    let certificate = schemes[0].assemble::<SimplexFalconScheme, _, N3f1>(votes).unwrap();
+    encode_finalization(&Finalization { proposal, certificate })
 }

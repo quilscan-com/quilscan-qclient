@@ -8,7 +8,7 @@ use quil_types::proto::node::{GetNodeInfoRequest, GetWorkerInfoRequest, ShardAll
 
 use super::epoch::{
     action_hints, compute_effective_status, epoch_for_frame, epoch_len, AllocationTiming,
-    EffectiveStatus, ThresholdUnit,
+    ThresholdUnit,
 };
 use super::{format_storage, worker_by_filter, ProverCtx};
 
@@ -22,25 +22,6 @@ fn timing(a: &ShardAllocationInfo) -> AllocationTiming<'_> {
         leave_confirm_frame: a.leave_confirm_frame_number,
         epoch: a.epoch,
     }
-}
-
-fn allocation_action_line(
-    timing: &AllocationTiming<'_>,
-    status: EffectiveStatus,
-    epoch_length: u64,
-    current_frame: u64,
-    next_boundary: u64,
-) -> Option<String> {
-    let (next, default) = action_hints(timing, status, epoch_length, current_frame, next_boundary);
-    if next.is_empty() && default.is_empty() {
-        return None;
-    }
-    let unit = ThresholdUnit::Frames;
-    Some(format!(
-        "      Next Action: {}  Default Action: {}",
-        next.render(unit, epoch_length),
-        default.render(unit, epoch_length)
-    ))
 }
 
 pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
@@ -110,10 +91,15 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
             eff.label()
         );
 
-        if let Some(line) =
-            allocation_action_line(&t, eff, epoch_length, current_frame, next_boundary)
-        {
-            println!("{line}");
+        // Same vocabulary as the `manage` TUI's Next/Default Action columns.
+        let (next, default) = action_hints(&t, eff, epoch_length, current_frame, next_boundary);
+        if !next.is_empty() || !default.is_empty() {
+            let unit = ThresholdUnit::Frames;
+            println!(
+                "      Next Action: {}  Default Action: {}",
+                next.render(unit, epoch_length),
+                default.render(unit, epoch_length)
+            );
         }
 
         if alloc.join_frame_number > 0 {
@@ -159,32 +145,10 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
                     format_storage(w.available_storage),
                     format_storage(w.total_storage)
                 );
+                println!("    {}", super::local_execution::detail(w.execution.as_ref()));
             }
         }
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::epoch::raw_status;
-    use super::*;
-
-    #[test]
-    fn allocation_action_line_uses_official_join_window_wording() {
-        let timing = AllocationTiming {
-            raw_status: raw_status::JOINING,
-            filter: &[0x42],
-            join_frame: 720,
-            join_confirm_frame: 0,
-            leave_frame: 0,
-            leave_confirm_frame: 0,
-            epoch: 1,
-        };
-        assert_eq!(
-            allocation_action_line(&timing, EffectiveStatus::Joining, 720, 1500, 2160),
-            Some("      Next Action: (reject|confirm)  Default Action: expire@f2160".into())
-        );
-    }
 }

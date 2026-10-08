@@ -13,29 +13,33 @@ mod actions;
 mod filter;
 mod model;
 mod msg;
+mod snapshot;
 mod update;
 mod util;
 mod view;
+
+#[cfg(test)]
+mod snapshot_tests;
 
 use std::io::Stdout;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use crossterm::execute;
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::{mpsc::{self, UnboundedSender}, Semaphore};
 use tonic::transport::Channel;
 
 use quil_keys::FileKeyManager;
 use quil_types::proto::node::node_service_client::NodeServiceClient;
 
-use self::model::{materialization_lag, materialization_state, Model};
+use self::model::Model;
 use self::msg::Msg;
 use self::update::{apply_msg, handle_key, Cmd};
 use super::ProverCtx;
@@ -69,114 +73,28 @@ pub async fn run(pc: &ProverCtx, once: bool) -> anyhow::Result<()> {
 }
 
 async fn run_once(pc: &ProverCtx) -> anyhow::Result<()> {
-    let refresh = actions::fetch_data(pc.connect().await?).await;
-    let Msg::DataRefresh {
-        node_info,
-        shard_info,
-        worker_info,
-        err,
-    } = refresh
-    else {
-        unreachable!("fetch_data always returns DataRefresh")
-    };
+    let client = pc.connect().await?;
+    let (node_refresh, shard_refresh) = tokio::join!(
+        actions::fetch_data(client.clone()),
+        actions::fetch_shards(client),
+    );
 
-    if let Some(err) = err {
-        anyhow::bail!("fetch prover data: {err}");
-    }
-    let node_info = node_info.ok_or_else(|| anyhow::anyhow!("missing node info"))?;
-
-    let mut model = Model::new();
-    model.process_refresh_data(Some(node_info), shard_info, worker_info);
-    print!("{}", format_once(&model));
+    println!("{}", snapshot::from_refresh(node_refresh, shard_refresh)?);
     Ok(())
 }
 
-fn format_once(model: &Model) -> String {
-    let allocations = model.sorted_allocations();
-    let available = model.sorted_available();
-    let mut lines = vec![
-        format!("Peer ID: {}", model.peer_id),
-        format!("Frame: {}", model.frame_number),
-        format!("Running Workers: {}", model.running_workers),
-        format!("Allocated Workers: {}", model.allocated_workers),
-        String::new(),
-        format!("Allocations ({}):", allocations.len()),
-        "Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]  Worker  Status  Mode  Next Action  Default Action".to_string(),
-    ];
-
-    for row in allocations {
-        let worker = if row.worker_id >= 0 {
-            row.worker_id.to_string()
-        } else {
-            "-".to_string()
-        };
-        let mode = if row.manually_managed { "M" } else { "A" };
-        let next_action = empty_placeholder(&row.next_action);
-        let default_action = empty_placeholder(&row.default_action);
-        let lag = materialization_lag(row.materialized_frame, row.latest_frame)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        lines.push(format!(
-            "[ ] {} {} {} {} {} {} {} {} ~{} {} {} {} {} {}",
-            row.filter_hex,
-            row.active_provers,
-            row.ring,
-            super::format_mb(&row.shard_size),
-            row.data_shards,
-            row.materialized_frame,
-            lag,
-            materialization_state(row.materialized_frame, row.latest_frame),
-            super::format_quil_reward(&row.estimated_reward),
-            worker,
-            row.status_name,
-            mode,
-            next_action,
-            default_action,
-        ));
-    }
-
-    lines.push(String::new());
-    lines.push(format!("Available Shards ({}):", available.len()));
-    lines.push(
-        "Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]"
-            .to_string(),
-    );
-    for row in available {
-        let lag = materialization_lag(row.materialized_frame, row.latest_frame)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        lines.push(format!(
-            "[ ] {} {} {} {} {} {} {} {} ~{}",
-            row.filter_hex,
-            row.active_provers,
-            row.ring,
-            super::format_mb(&row.shard_size),
-            row.data_shards,
-            row.materialized_frame,
-            lag,
-            materialization_state(row.materialized_frame, row.latest_frame),
-            super::format_quil_reward(&row.estimated_reward),
-        ));
-    }
-
-    lines.push(String::new());
-    lines.join("\n")
-}
-
-fn empty_placeholder(value: &str) -> &str {
-    if value.is_empty() {
-        "-"
-    } else {
-        value
-    }
-}
-
-async fn event_loop(terminal: &mut Term, client: Client, km: Arc<FileKeyManager>) -> anyhow::Result<()> {
+async fn event_loop(
+    terminal: &mut Term,
+    client: Client,
+    km: Arc<FileKeyManager>,
+) -> anyhow::Result<()> {
     let mut model = Model::new();
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 
+    let refresh_state = RefreshState::default();
+
     // Kick off the initial fetch + auto-refresh + spinner tickers.
-    spawn_action(&client, &km, &tx, Cmd::Fetch);
+    spawn_action(&client, &km, &tx, &refresh_state, Cmd::Fetch);
     let mut refresh = tokio::time::interval(Duration::from_secs(8));
     refresh.tick().await; // consume the immediate first tick
     let mut spin = tokio::time::interval(Duration::from_millis(120));
@@ -201,7 +119,7 @@ async fn event_loop(terminal: &mut Term, client: Client, km: Arc<FileKeyManager>
                 apply_msg(&mut model, msg)
             }
             _ = refresh.tick() => {
-                spawn_action(&client, &km, &tx, Cmd::Fetch);
+                spawn_action(&client, &km, &tx, &refresh_state, Cmd::Fetch);
                 Vec::new()
             }
             _ = spin.tick() => {
@@ -214,7 +132,7 @@ async fn event_loop(terminal: &mut Term, client: Client, km: Arc<FileKeyManager>
             if matches!(cmd, Cmd::Quit) {
                 return Ok(());
             }
-            spawn_action(&client, &km, &tx, cmd);
+            spawn_action(&client, &km, &tx, &refresh_state, cmd);
         }
 
         terminal.draw(|f| view::draw(f, &mut model))?;
@@ -222,18 +140,52 @@ async fn event_loop(terminal: &mut Term, client: Client, km: Arc<FileKeyManager>
     Ok(())
 }
 
-/// Execute a [`Cmd`] by spawning the matching async task (or timer); each
-/// posts its resulting [`Msg`] back onto the channel.
-fn spawn_action(client: &Client, km: &Arc<FileKeyManager>, tx: &UnboundedSender<Msg>, cmd: Cmd) {
+struct RefreshState {
+    node: Arc<Semaphore>,
+    shards: Arc<Semaphore>,
+    rewards: Arc<Semaphore>,
+}
+
+impl Default for RefreshState {
+    fn default() -> Self {
+        Self { node: Arc::new(Semaphore::new(1)), shards: Arc::new(Semaphore::new(1)), rewards: Arc::new(Semaphore::new(1)) }
+    }
+}
+
+/// Each refresh stream has one in-flight request, including manual refreshes.
+/// The owned permit also releases on cancellation or task failure.
+fn spawn_refresh(
+    gate: &Arc<Semaphore>,
+    tx: &UnboundedSender<Msg>,
+    loading: Option<Msg>,
+    fetch: impl std::future::Future<Output = Msg> + Send + 'static,
+) {
+    let Ok(permit) = gate.clone().try_acquire_owned() else { return; };
+    let tx = tx.clone();
+    if let Some(loading) = loading { let _ = tx.send(loading); }
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _ = tx.send(fetch.await);
+    });
+}
+
+/// Execute a command by spawning its asynchronous action.
+fn spawn_action(
+    client: &Client,
+    km: &Arc<FileKeyManager>,
+    tx: &UnboundedSender<Msg>,
+    refresh: &RefreshState,
+    cmd: Cmd,
+) {
     let client = client.clone();
     let km = km.clone();
     let tx = tx.clone();
     match cmd {
         Cmd::Quit => {}
         Cmd::Fetch => {
-            tokio::spawn(async move {
-                let _ = tx.send(actions::fetch_data(client).await);
-            });
+            spawn_refresh(&refresh.node, &tx, None, actions::fetch_data(client.clone()));
+            spawn_refresh(&refresh.rewards, &tx, None, actions::fetch_rewards(client.clone(), km));
+            spawn_refresh(&refresh.shards, &tx, Some(Msg::ShardLoading), actions::fetch_shards(client));
         }
         Cmd::Join(filters) => {
             tokio::spawn(async move {
@@ -276,98 +228,30 @@ fn spawn_action(client: &Client, km: &Arc<FileKeyManager>, tx: &UnboundedSender<
 }
 
 #[cfg(test)]
-mod tests {
-    use num_bigint::BigInt;
+mod refresh_tests {
+    use super::*;
 
-    use super::format_once;
-    use super::model::{AllocationRow, Model, ShardRow};
-
-    const ALLOCATION_HEADER: &str = "Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]  Worker  Status  Mode  Next Action  Default Action";
-    const AVAILABLE_HEADER: &str =
-        "Select  Filter  Provers  Ring  Size [MB]  Shards  Mat  Lag  State  Reward [Q/f]";
-
-    #[test]
-    fn format_once_uses_official_default_sorting_and_agent_table_contract() {
-        let mut model = Model::new();
-        assert_eq!((model.alloc_sort_col, model.alloc_sort_asc), (10, true));
-        assert_eq!((model.avail_sort_col, model.avail_sort_asc), (9, false));
-        model
-            .allocations
-            .push(allocation_row("aaaa", 2, 100_000_000));
-        model
-            .allocations
-            .push(allocation_row("bbbb", 1, 200_000_000));
-        model.available.push(available_row("cccc", 50_000_000));
-        model.available.push(available_row("dddd", 200_000_000));
-
-        let output = format_once(&model);
-        let lines: Vec<_> = output.lines().collect();
-        let allocation_section = lines
-            .iter()
-            .position(|line| *line == "Allocations (2):")
-            .expect("allocation section");
-        let available_section = lines
-            .iter()
-            .position(|line| *line == "Available Shards (2):")
-            .expect("available section");
-
-        assert_eq!(lines[allocation_section + 1], ALLOCATION_HEADER);
-        assert_eq!(lines[available_section + 1], AVAILABLE_HEADER);
-        assert_eq!(
-            &lines[allocation_section + 2..allocation_section + 4],
-            &[
-                "[ ] bbbb 3 0 10.0 7 41 2 Lag ~2.00000000 1 Active A Confirm Reject",
-                "[ ] aaaa 3 0 10.0 7 41 2 Lag ~1.00000000 2 Active A Confirm Reject",
-            ]
-        );
-        assert_eq!(
-            &lines[available_section + 2..available_section + 4],
-            &[
-                "[ ] dddd 4 1 <0.1 3 0 43 Unmat ~2.00000000",
-                "[ ] cccc 4 1 <0.1 3 0 43 Unmat ~0.50000000",
-            ]
-        );
-    }
-
-    fn allocation_row(filter_hex: &str, worker_id: i64, estimated_reward: u64) -> AllocationRow {
-        AllocationRow {
-            filter: Vec::new(),
-            filter_key: filter_hex.to_string(),
-            filter_hex: filter_hex.to_string(),
-            status: 2,
-            status_name: "Active".to_string(),
-            ring: 0,
-            active_provers: 3,
-            shard_size: BigInt::from(10 * 1024 * 1024),
-            data_shards: 7,
-            materialized_frame: 41,
-            latest_frame: 43,
-            estimated_reward: BigInt::from(estimated_reward),
-            join_frame: 0,
-            leave_frame: 0,
-            worker_id,
-            next_action: "Confirm".to_string(),
-            default_action: "Reject".to_string(),
-            manually_managed: false,
-            confirm_frame: 0,
-            leave_confirm_frame: 0,
-            epoch: 0,
-            last_active_frame: 0,
-        }
-    }
-
-    fn available_row(filter_hex: &str, estimated_reward: u64) -> ShardRow {
-        ShardRow {
-            filter: Vec::new(),
-            filter_key: filter_hex.to_string(),
-            filter_hex: filter_hex.to_string(),
-            active_provers: 4,
-            ring: 1,
-            shard_size: BigInt::from(2048),
-            data_shards: 3,
-            materialized_frame: 0,
-            latest_frame: 43,
-            estimated_reward: BigInt::from(estimated_reward),
-        }
+    #[tokio::test]
+    async fn slow_shards_do_not_block_status_or_spawn_duplicate_queries() {
+        let state = RefreshState::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        spawn_refresh(&state.shards, &tx, Some(Msg::ShardLoading), async move {
+            wait.await.unwrap();
+            Msg::ShardRefresh(Err("test failure".into()))
+        });
+        spawn_refresh(&state.shards, &tx, None, async { panic!("duplicate shard query") });
+        spawn_refresh(&state.node, &tx, None, async {
+            Msg::DataRefresh { node_info: None, shard_info: None, worker_info: None, err: None }
+        });
+        assert!(matches!(rx.recv().await, Some(Msg::ShardLoading)));
+        assert!(matches!(rx.recv().await, Some(Msg::DataRefresh { .. })));
+        assert!(rx.try_recv().is_err());
+        release.send(()).unwrap();
+        assert!(matches!(rx.recv().await, Some(Msg::ShardRefresh(Err(_)))));
+        spawn_refresh(&state.shards, &tx, None, async {
+            Msg::ShardRefresh(Ok(Default::default()))
+        });
+        assert!(matches!(rx.recv().await, Some(Msg::ShardRefresh(Ok(_)))));
     }
 }

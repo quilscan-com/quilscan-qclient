@@ -42,9 +42,15 @@ pub fn detect_store_format(path: &Path) -> StoreFormat {
     let mut had_any_file = false;
     let mut had_options = false;
     for entry in entries.flatten() {
-        had_any_file = true;
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        // Hidden files such as the proof-worker admission lock files
+        // (`.proof-worker-admission.lock`, `.1`, ...) are created in the base
+        // directory before the store is opened; they are not store content.
+        if name.starts_with('.') {
+            continue;
+        }
+        had_any_file = true;
         if !name.starts_with("OPTIONS-") {
             continue;
         }
@@ -76,7 +82,19 @@ pub fn detect_store_format(path: &Path) -> StoreFormat {
 
 /// RocksDB-backed key-value store.
 pub struct RocksDb {
-    db: Arc<rocksdb::DB>,
+    db: quil_forest::CoordinatedDb,
+}
+
+/// Per-instance RocksDB read health. See [`RocksDb::health`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RocksDbHealth {
+    pub level0_files: u64,
+    pub pending_compaction_bytes: u64,
+    pub running_compactions: u64,
+    pub write_stopped: bool,
+    pub delayed_write_rate: u64,
+    pub block_cache: u64,
+    pub block_cache_capacity: u64,
 }
 
 /// Per-instance RocksDB memory accounting (bytes). See [`RocksDb::memory_usage`].
@@ -167,7 +185,32 @@ impl RocksDb {
         let migrations = crate::migration::rust_node_migrations();
         crate::migration::run_migrations(&db, &migrations)?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self { db: Self::coordinated(db) })
+    }
+
+    /// Inspect an existing, stopped database without writes or migrations.
+    /// Unlike secondary mode this supports snapshots; it does not follow a
+    /// running primary. Existing WAL records are included in the read view.
+    pub fn open_for_read_only(path: &Path) -> Result<Self> {
+        let mut opts = rocksdb::Options::default();
+        opts.set_max_open_files(64);
+        let db = rocksdb::DB::open_for_read_only(&opts, path, false)
+            .map_err(|e| QuilError::Store(format!("failed to open rocksdb read-only: {e}")))?;
+        Ok(Self { db: quil_forest::CoordinatedDb::new(db) })
+    }
+
+    /// Open a database another process is running, read-only, as the
+    /// point-in-time view of its files and WAL at open. It takes no lock and
+    /// writes nothing. Every table file is opened up front, so a compaction
+    /// by the running process cannot delete a file this view still needs
+    /// (the open handles keep it readable); snapshots work, unlike on a
+    /// secondary instance.
+    pub fn open_for_read_only_live(path: &Path) -> Result<Self> {
+        let mut opts = rocksdb::Options::default();
+        opts.set_max_open_files(-1);
+        let db = rocksdb::DB::open_for_read_only(&opts, path, false)
+            .map_err(|e| QuilError::Store(format!("failed to open rocksdb read-only (live): {e}")))?;
+        Ok(Self { db: quil_forest::CoordinatedDb::new(db) })
     }
 
     /// Open the database at `primary_path` as a read-only secondary
@@ -186,7 +229,7 @@ impl RocksDb {
         let db = rocksdb::DB::open_as_secondary(&opts, primary_path, secondary_path)
             .map_err(|e| QuilError::Store(format!("failed to open rocksdb as secondary: {}", e)))?;
         // Skip migrations on secondary — only the primary may write.
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self { db: quil_forest::CoordinatedDb::new(db) })
     }
 
     /// Open an in-memory RocksDB instance (for testing).
@@ -200,11 +243,20 @@ impl RocksDb {
         // Leak the TempDir so it's not cleaned up while DB is open.
         // This is intentional for in-memory test stores.
         std::mem::forget(tmp);
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self { db: Self::coordinated(db) })
     }
 
-    /// Get the inner Arc for sharing across store implementations.
-    pub fn inner(&self) -> Arc<rocksdb::DB> {
+    /// A writable store watches the prover registry's keys, so execution
+    /// branches can reuse a registry scan no write has changed.
+    fn coordinated(db: rocksdb::DB) -> quil_forest::CoordinatedDb {
+        quil_forest::CoordinatedDb::with_watched_prefixes(
+            db,
+            crate::encoding::prover_registry_key_prefixes(),
+        )
+    }
+
+    /// Share the database and its write barrier across store implementations.
+    pub fn inner(&self) -> quil_forest::CoordinatedDb {
         self.db.clone()
     }
 
@@ -224,9 +276,51 @@ impl RocksDb {
         }
     }
 
+    /// Compaction and cache state that slows every read when it backs up:
+    /// each level-0 file is searched on every point read, and a block cache
+    /// smaller than the index blocks turns reads into disk seeks.
+    pub fn health(&self) -> RocksDbHealth {
+        let prop = |name: &str| self.db.property_int_value(name).ok().flatten().unwrap_or(0);
+        RocksDbHealth {
+            level0_files: prop("rocksdb.num-files-at-level0"),
+            pending_compaction_bytes: prop("rocksdb.estimate-pending-compaction-bytes"),
+            running_compactions: prop("rocksdb.num-running-compactions"),
+            write_stopped: prop("rocksdb.is-write-stopped") != 0,
+            delayed_write_rate: prop("rocksdb.actual-delayed-write-rate"),
+            block_cache: prop("rocksdb.block-cache-usage"),
+            block_cache_capacity: prop("rocksdb.block-cache-capacity"),
+        }
+    }
+
     /// Create an owned iterator over a key range.
     fn make_iter(&self, lower: &[u8], upper: &[u8]) -> Result<Box<dyn store::Iterator>> {
         Ok(Box::new(RocksIterator::new(self.db.clone(), lower, upper)))
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+
+    #[test]
+    fn read_only_inspection_supports_snapshots_and_cannot_write_or_migrate() {
+        let directory = tempfile::tempdir().unwrap();
+        // Bypass our migrating open path so a surprise migration is observable.
+        {
+            let primary = rocksdb::DB::open_default(directory.path()).unwrap();
+            primary.put(b"saved", b"checkpoint").unwrap();
+        }
+        {
+            let read_only = RocksDb::open_for_read_only(directory.path()).unwrap();
+            let db = read_only.inner();
+            let snapshot = db.snapshot();
+            assert_eq!(snapshot.get(b"saved").unwrap(), Some(b"checkpoint".to_vec()));
+            assert_eq!(snapshot.iterator(rocksdb::IteratorMode::Start).count(), 1);
+            assert!(db.put(b"saved", b"changed").is_err());
+        }
+        let reopened = rocksdb::DB::open_default(directory.path()).unwrap();
+        assert_eq!(reopened.get(b"saved").unwrap(), Some(b"checkpoint".to_vec()));
+        assert_eq!(reopened.iterator(rocksdb::IteratorMode::Start).count(), 1);
     }
 }
 
@@ -289,7 +383,7 @@ impl store::KvDb for RocksDb {
 
 /// A write batch acting as a transaction.
 pub struct RocksTransaction {
-    pub(crate) db: Arc<rocksdb::DB>,
+    pub(crate) db: quil_forest::CoordinatedDb,
     pub(crate) batch: std::sync::Mutex<rocksdb::WriteBatch>,
 }
 
@@ -336,7 +430,7 @@ impl store::Transaction for RocksTransaction {
 /// An owned iterator that holds an Arc to the DB and materializes
 /// key/value pairs so it can be Send + 'static.
 pub struct RocksIterator {
-    db: Arc<rocksdb::DB>,
+    db: quil_forest::CoordinatedDb,
     lower: Vec<u8>,
     upper: Vec<u8>,
     /// Materialized entries: (key, value) pairs.
@@ -347,7 +441,7 @@ pub struct RocksIterator {
 }
 
 impl RocksIterator {
-    fn new(db: Arc<rocksdb::DB>, lower: &[u8], upper: &[u8]) -> Self {
+    fn new(db: quil_forest::CoordinatedDb, lower: &[u8], upper: &[u8]) -> Self {
         Self {
             db,
             lower: lower.to_vec(),

@@ -19,6 +19,7 @@ use jmt::{KeyHash, OwnedValue, Sha256Jmt, Version};
 use sha2::{Digest, Sha256};
 
 use crate::store::SizeIndex;
+use crate::overlay::KvStore;
 use crate::{commit_pruning, ForestStore, MemTreeStore, RocksTreeStore, TreeId};
 
 /// A per-tree store the forest opens on demand, over either RocksDB or an
@@ -29,11 +30,22 @@ pub enum TreeStore {
     Mem(Arc<MemTreeStore>),
 }
 
+/// Bumped whenever a tree is wiped or its head dropped. A rebuilt tree
+/// reuses versions, so the same node key can then name different content;
+/// caches of served nodes key their entries by this.
+static TREE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current tree generation (see [`TREE_GENERATION`]).
+pub fn tree_generation() -> u64 {
+    TREE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 impl TreeStore {
     /// Wipe this tree back to empty (all nodes/values/stale/preimages/head).
     /// Used by the shard-scoped prover-tree reset; the next commit rebuilds
     /// from version 0.
     pub fn clear(&self) -> Result<()> {
+        TREE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         match self {
             TreeStore::Rocks(s) => s.clear(),
             TreeStore::Mem(s) => {
@@ -42,7 +54,25 @@ impl TreeStore {
             }
         }
     }
+
+    /// See [`RocksTreeStore::leaves_between`].
+    pub fn leaves_between(
+        &self,
+        version: Version,
+        first: &[u8; 32],
+        last: &[u8; 32],
+        after: Option<&[u8; 32]>,
+        max_leaves: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<(KeyHash, OwnedValue)>, bool)> {
+        match self {
+            TreeStore::Rocks(s) => s.leaves_between(version, first, last, after, max_leaves, max_bytes),
+            TreeStore::Mem(s) => s.leaves_between(version, first, last, after, max_leaves, max_bytes),
+        }
+    }
 }
+
+impl crate::BatchTreeReader for TreeStore {}
 
 impl TreeReader for TreeStore {
     fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
@@ -66,6 +96,46 @@ impl TreeReader for TreeStore {
             TreeStore::Rocks(s) => s.get_rightmost_leaf(),
             TreeStore::Mem(s) => s.get_rightmost_leaf(),
         }
+    }
+}
+
+/// Read a proposed tree update without publishing it to either storage backend.
+struct UpdatedTree<'a> {
+    base: &'a TreeStore,
+    batch: &'a NodeBatch,
+}
+
+/// A sync update that has not changed either backend. Persist `puts()` with
+/// its readable blobs, then publish the memory backend after that commit.
+pub struct StagedForestSync {
+    root: [u8; 32],
+    puts: Vec<(Vec<u8>, Vec<u8>)>,
+    memory: Option<(Arc<MemTreeStore>, TreeUpdateBatch)>,
+}
+
+impl StagedForestSync {
+    pub fn root(&self) -> [u8; 32] { self.root }
+    pub fn puts(&self) -> &[(Vec<u8>, Vec<u8>)] { &self.puts }
+    pub fn publish_memory(self) -> Result<()> {
+        if let Some((store, batch)) = self.memory { store.apply_update(&batch)?; }
+        Ok(())
+    }
+}
+
+impl crate::BatchTreeReader for UpdatedTree<'_> {}
+
+impl TreeReader for UpdatedTree<'_> {
+    fn get_node_option(&self, key: &NodeKey) -> Result<Option<Node>> {
+        match self.batch.nodes().get(key) {
+            Some(node) => Ok(Some(node.clone())),
+            None => self.base.get_node_option(key),
+        }
+    }
+    fn get_value_option(&self, _: Version, _: KeyHash) -> Result<Option<OwnedValue>> {
+        anyhow::bail!("tree commitment preview does not read values")
+    }
+    fn get_rightmost_leaf(&self) -> Result<Option<(NodeKey, LeafNode)>> {
+        anyhow::bail!("tree commitment preview does not enumerate leaves")
     }
 }
 
@@ -111,7 +181,7 @@ impl ForestStore for TreeStore {
 /// The forest's storage backend.
 #[derive(Clone)]
 enum Backend {
-    Rocks { db: Arc<rocksdb::DB>, namespace: Vec<u8> },
+    Rocks { db: KvStore, namespace: Vec<u8> },
     /// In-memory: one [`MemTreeStore`] per tree-id prefix (tests/benches).
     Mem(Arc<Mutex<HashMap<Vec<u8>, Arc<MemTreeStore>>>>),
 }
@@ -402,14 +472,47 @@ pub struct Forest {
 impl Forest {
     /// A standalone forest DB (no namespace) — e.g. the converter's fresh
     /// destination DB.
-    pub fn new(db: Arc<rocksdb::DB>) -> Self {
-        Forest { backend: Backend::Rocks { db, namespace: Vec::new() } }
+    pub fn new(db: crate::CoordinatedDb) -> Self {
+        Forest { backend: Backend::Rocks { db: KvStore::Rocks(db), namespace: Vec::new() } }
     }
 
     /// A forest embedded in a shared DB under `namespace` (a reserved prefix
     /// the surrounding schema never emits).
-    pub fn with_namespace(db: Arc<rocksdb::DB>, namespace: impl Into<Vec<u8>>) -> Self {
-        Forest { backend: Backend::Rocks { db, namespace: namespace.into() } }
+    pub fn with_namespace(db: crate::CoordinatedDb, namespace: impl Into<Vec<u8>>) -> Self {
+        Forest { backend: Backend::Rocks { db: KvStore::Rocks(db), namespace: namespace.into() } }
+    }
+
+    /// Use an already captured execution branch. Forest nodes, head versions,
+    /// preimages, size memos and pruning all stay inside this overlay. Other
+    /// stores in the same tentative execution must share this exact overlay.
+    /// This does not by itself fork a CRDT or an execution engine.
+    pub fn on_overlay(overlay: Arc<crate::ExecutionOverlay>, namespace: impl Into<Vec<u8>>) -> Self {
+        Forest { backend: Backend::Rocks { db: KvStore::Overlay(overlay), namespace: namespace.into() } }
+    }
+
+    /// Identify the record store this forest can atomically commit alongside.
+    /// This does not expose the primary database from an overlay.
+    pub fn backing_store_identity(&self) -> Option<quil_types::store::BackingStoreIdentity> {
+        use quil_types::store::BackingStoreIdentity;
+        match &self.backend {
+            Backend::Rocks { db: KvStore::Rocks(db), .. } => Some(db.backing_store_identity()),
+            Backend::Rocks { db: KvStore::Overlay(overlay), .. } => Some(BackingStoreIdentity::of(overlay)),
+            Backend::Mem(_) => None,
+        }
+    }
+
+    /// Capture this backend's current generation, retaining its namespace.
+    /// The caller must exclude CRDT writes/metadata changes during capture.
+    pub fn fork_execution_overlay(&self, limits: crate::OverlayLimits) -> Result<(Self, Arc<crate::ExecutionOverlay>)> {
+        let Backend::Rocks { db, namespace } = &self.backend else {
+            anyhow::bail!("execution capture requires a versioned database backend");
+        };
+        anyhow::ensure!(namespace.len() <= limits.max_record_bytes, "forest namespace byte limit");
+        let overlay = Arc::new(match db {
+            KvStore::Rocks(db) => crate::ExecutionOverlay::capture(db.clone(), limits)?,
+            KvStore::Overlay(parent) => parent.fork(limits)?,
+        });
+        Ok((Self::on_overlay(overlay.clone(), namespace.clone()), overlay))
     }
 
     /// An in-memory forest — for unit tests / benches that construct a
@@ -420,18 +523,26 @@ impl Forest {
     }
 
     /// The RocksDB handle, if this forest is RocksDB-backed (`None` for
-    /// [`in_memory`](Self::in_memory)).
-    pub fn db(&self) -> Option<&Arc<rocksdb::DB>> {
+    /// [`in_memory`](Self::in_memory) and [`on_overlay`](Self::on_overlay)).
+    /// An overlay never exposes its base DB as a writable forest handle.
+    pub fn db(&self) -> Option<&crate::CoordinatedDb> {
         match &self.backend {
-            Backend::Rocks { db, .. } => Some(db),
+            Backend::Rocks { db, .. } => db.db(),
             Backend::Mem(_) => None,
         }
+    }
+
+    /// The backend separates committed tree versions from pending CRDT writes
+    /// and can participate in a consistent checkpoint. An execution overlay
+    /// qualifies without exposing its base DB as writable storage.
+    pub fn supports_checkpoint_reads(&self) -> bool {
+        matches!(self.backend, Backend::Rocks { .. })
     }
 
     fn store(&self, tree: &TreeId) -> TreeStore {
         match &self.backend {
             Backend::Rocks { db, namespace } => {
-                TreeStore::Rocks(RocksTreeStore::with_namespace(db.clone(), namespace, tree))
+                TreeStore::Rocks(RocksTreeStore::with_backend(db.clone(), namespace, tree))
             }
             Backend::Mem(stores) => {
                 let prefix = tree.prefix();
@@ -458,9 +569,53 @@ impl Forest {
     /// clears that separately). Idempotent.
     pub fn reset_shard_phase_trees(&self, shard_id: &[u8]) -> Result<()> {
         for phase in PHASES {
-            self.store(&TreeId::shard_phase(shard_id, phase)).clear()?;
+            self.reset_shard_phase_tree(shard_id, phase)?;
         }
         Ok(())
+    }
+
+    /// [`Self::reset_shard_phase_trees`] for one phase: a shard rewound to a
+    /// state that predates this phase's first commit.
+    pub fn reset_shard_phase_tree(&self, shard_id: &[u8], phase: Phase) -> Result<()> {
+        self.store(&TreeId::shard_phase(shard_id, phase)).clear()?;
+        // Drop the persisted head-version marker with the tree. A marker that
+        // outlives its nodes names a version with no root, which the checked
+        // root read treats as unreadable state rather than an empty tree (boot
+        // prover-tree reset failed with "persisted phase head has no root").
+        if let Backend::Rocks { db, namespace } = &self.backend {
+            db.delete(Self::head_version_key(namespace, shard_id, phase))?;
+        }
+        Ok(())
+    }
+
+    /// A head marker a reset left behind: it names a version with no root,
+    /// and the tree holds no key at all. Resets before
+    /// [`Self::reset_shard_phase_tree`] dropped the marker cleared the tree
+    /// but kept it, because the marker lives outside the tree's prefix (the
+    /// mainnet build's reset of the GLOBAL prover tree, and its prover-tree
+    /// sync). Such a tree is empty; the checked root read, which cannot tell
+    /// it from lost state, refuses it. Returns the orphaned version.
+    pub fn orphaned_phase_head(&self, shard_id: &[u8], phase: Phase) -> Result<Option<u64>> {
+        let Some(head) = self.read_head_version(shard_id, phase)? else { return Ok(None) };
+        if self.shard_phase_root(shard_id, phase, head)?.is_some() {
+            return Ok(None);
+        }
+        match self.store(&TreeId::shard_phase(shard_id, phase)) {
+            TreeStore::Rocks(store) => Ok((!store.has_any_key()?).then_some(head)),
+            TreeStore::Mem(_) => Ok(None),
+        }
+    }
+
+    /// Drop an [orphaned head marker](Self::orphaned_phase_head), leaving the
+    /// tree as the reset now leaves it: never committed, read as empty, and
+    /// rebuilt from version 0 by its next commit. Returns the dropped version.
+    pub fn drop_orphaned_phase_head(&self, shard_id: &[u8], phase: Phase) -> Result<Option<u64>> {
+        let Some(head) = self.orphaned_phase_head(shard_id, phase)? else { return Ok(None) };
+        TREE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Backend::Rocks { db, namespace } = &self.backend {
+            db.delete(Self::head_version_key(namespace, shard_id, phase))?;
+        }
+        Ok(Some(head))
     }
 
     pub fn commit_shard_phase(
@@ -688,6 +843,78 @@ impl Forest {
         }
     }
 
+    /// Verify the complete sorted sync plan without staging database writes.
+    /// Auxiliary memory is bounded by the key depth, independently of the
+    /// plan's leaf count. Installation still uses bounded staged transactions.
+    pub fn preview_synced_phase(
+        &self,
+        shard_id: &[u8],
+        phase: Phase,
+        version: u64,
+        leaves: &[([u8; 32], Option<Vec<u8>>)],
+        bits: &[bool],
+        expected: [u8; 32],
+    ) -> Result<()> {
+        let store = self.store(&TreeId::shard_phase(shard_id, phase));
+        let root = crate::sync::preview_subtree_root(&store, version, leaves, bits)?;
+        anyhow::ensure!(root == expected, "reconstructed subtree differs from the authenticated source");
+        Ok(())
+    }
+
+    /// Prepare a whole-tree or subtree sync update without publishing it.
+    /// `expected` is required on the last chunk; earlier chunks contain only
+    /// authenticated changes and are resumable intermediate state. `None`
+    /// removes a local leaf absent from the authenticated source. The caller
+    /// must preview the complete reconstruction before publishing any chunk.
+    pub fn stage_synced_phase(
+        &self,
+        shard_id: &[u8],
+        phase: Phase,
+        version: u64,
+        leaves: impl IntoIterator<Item = (crate::KeyHash, Option<Vec<u8>>)>,
+        bits: &[bool],
+        expected: Option<[u8; 32]>,
+    ) -> Result<StagedForestSync> {
+        let store = self.store(&TreeId::shard_phase(shard_id, phase));
+        let (_, batch) = Sha256Jmt::new(&store).put_value_set(leaves, version)?;
+        let preview = UpdatedTree { base: &store, batch: &batch.node_batch };
+        let root = crate::sync::subtree_root(&preview, version, bits)?;
+        if let Some(expected) = expected {
+            anyhow::ensure!(root == expected, "reconstructed subtree differs from the authenticated source");
+        }
+        let (puts, memory) = match store {
+            TreeStore::Rocks(store) => (store.update_puts(&batch)?, None),
+            TreeStore::Mem(store) => (Vec::new(), Some((store, batch))),
+        };
+        Ok(StagedForestSync { root, puts, memory })
+    }
+
+    /// Apply only if the reconstructed subtree matches the authenticated source.
+    /// In particular, a target with extra local leaves must not publish a failed
+    /// merge before the caller discovers that its root differs from the header.
+    pub fn apply_synced_subtree_phase(
+        &self,
+        app: &[u8],
+        phase: Phase,
+        version: u64,
+        leaves: impl IntoIterator<Item = (crate::KeyHash, Vec<u8>)>,
+        bits: &[bool],
+        expected: [u8; 32],
+    ) -> Result<([u8; 32], Vec<(Vec<u8>, Vec<u8>)>)> {
+        let store = self.store(&TreeId::shard_phase(app, phase));
+        let (_, batch) = crate::commit_update_keyhash(&store, version, leaves)?;
+        let preview = UpdatedTree { base: &store, batch: &batch.node_batch };
+        let root = crate::sync::subtree_root(&preview, version, bits)?;
+        anyhow::ensure!(root == expected, "reconstructed subtree differs from the authenticated source");
+        match &store {
+            TreeStore::Rocks(s) => Ok((root, s.update_puts(&batch)?)),
+            TreeStore::Mem(_) => {
+                store.apply_update(&batch)?;
+                Ok((root, Vec::new()))
+            }
+        }
+    }
+
     /// A [`TreeReader`] view of one shard/phase tree — the target side of a sync
     /// diff (the peer/source is a remote reader). Lets [`crate::diff_leaves`] walk
     /// this forest's tree without exposing the store internals.
@@ -710,6 +937,26 @@ impl Forest {
             )),
             None => Ok(None),
         }
+    }
+
+    /// SERVER side of forest sync: the leaves of a shard/phase tree with keys in
+    /// `[first, last]` after `after`, each at its newest value at or below
+    /// `version`, in key order (see [`RocksTreeStore::leaves_between`]). A
+    /// bootstrap lists its whole subtree this way instead of walking it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn serve_leaves(
+        &self,
+        shard_id: &[u8],
+        phase: Phase,
+        version: u64,
+        first: &[u8; 32],
+        last: &[u8; 32],
+        after: Option<&[u8; 32]>,
+        max_leaves: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<(KeyHash, OwnedValue)>, bool)> {
+        self.store(&TreeId::shard_phase(shard_id, phase))
+            .leaves_between(version, first, last, after, max_leaves, max_bytes)
     }
 
     /// SERVER side of forest sync: serve a leaf value of a shard/phase tree by its
@@ -857,8 +1104,7 @@ impl Forest {
     /// This REPLACES the separate-per-shard-tree + [`crate::app_root_from_shard_paths`]
     /// rollup: a shard is the in-place subtree at its prefix, so its commitment is
     /// a READ, and the app root (`bit_path == []`) is the JMT root over ALL shards
-    /// natively — no `hash_pair` aggregation (see
-    /// `crates/quil-execution/UNIFIED_APP_TREE_DESIGN.md` §3/§4).
+    /// natively — no `hash_pair` aggregation.
     ///
     /// Handles the real cases: nibble-aligned prefix (the subtree root is the node
     /// hash at that path); non-nibble-aligned (the 64-way / top-6-bit boundary — a
@@ -892,7 +1138,7 @@ impl Forest {
         let mut cur_key = NodeKey::new(version, NibblePath::new(vec![]));
         let mut cur_node = match store.get_node_option(&cur_key)? {
             Some(n) => n,
-            None => return Ok([0u8; 32]),
+            None => return Err(anyhow::anyhow!("committed subtree root node is missing")),
         };
 
         // Descend `full` whole nibbles.
@@ -918,7 +1164,7 @@ impl Forest {
             cur_key = cur_key.gen_child_node_key(cver, nibble);
             cur_node = match store.get_node_option(&cur_key)? {
                 Some(n) => n,
-                None => return Ok([0u8; 32]),
+                None => return Err(anyhow::anyhow!("committed subtree child node is missing")),
             };
         }
 
@@ -944,8 +1190,7 @@ impl Forest {
     /// counterpart of [`Self::app_subtree_root`], via jmt's per-`Child`
     /// `leaf_count` metadata ([`jmt::node_type::InternalNode::subtree_leaf_count`]).
     /// `bit_path == []` is the whole-tree leaf count. Used by the split decision
-    /// (`UNIFIED_APP_TREE_DESIGN` §6.1) to test whether a candidate child is
-    /// data-bearing.
+    /// to test whether a candidate child is data-bearing.
     pub fn app_subtree_leaf_count(
         &self,
         app_address: &[u8],
@@ -1016,8 +1261,8 @@ impl Forest {
     /// Find the MEANINGFUL split point for a shard: descend its subtree bit-by-bit
     /// from `shard_bits` to the SHALLOWEST bit where the data divides into TWO
     /// non-empty halves, and return the two child bit-paths (`shard_bits ++ …0`,
-    /// `shard_bits ++ …1`). This is `UNIFIED_APP_TREE_DESIGN` §6.1's descend-to-
-    /// bifurcation + empty-split guard in one: the split cuts where the data
+    /// `shard_bits ++ …1`). This is the descend-to-bifurcation + empty-split
+    /// guard in one: the split cuts where the data
     /// actually branches (not the immediate bit, which may leave a child empty),
     /// and returns `None` when the shard is unsplittable — fewer than 2 leaves, or
     /// data so clustered no bifurcation appears within `max_extra_bits`.
@@ -1149,7 +1394,8 @@ impl Forest {
                     Some(v) if v.len() == 8 => {
                         Ok(Some(u64::from_be_bytes(v[..8].try_into().unwrap())))
                     }
-                    _ => Ok(None),
+                    Some(_) => Err(anyhow::anyhow!("invalid persisted forest head-version length")),
+                    None => Ok(None),
                 }
             }
             Backend::Mem(_) => Ok(None),
@@ -1278,16 +1524,63 @@ impl Forest {
         self.store(&TreeId::shard_phase(shard_id, phase))
             .prune(min_readable_version)
     }
+
+    /// Superseded leaf values of one shard/phase tree below its retention
+    /// watermark (see [`crate::RocksTreeStore::prune_values`]). An in-memory
+    /// forest keeps them.
+    pub fn prune_shard_phase_values(
+        &self,
+        shard_id: &[u8],
+        phase: Phase,
+        min_readable_version: u64,
+        budget: &mut usize,
+    ) -> Result<usize> {
+        match self.store(&TreeId::shard_phase(shard_id, phase)) {
+            TreeStore::Rocks(store) => store.prune_values(min_readable_version, budget),
+            TreeStore::Mem(_) => Ok(0),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Phase-2 unified tree: `app_subtree_root` reads per-shard commitments as
+    #[test]
+    fn missing_referenced_subtree_node_is_not_an_empty_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::CoordinatedDb::new(rocksdb::DB::open_default(dir.path()).unwrap());
+        let namespace = b"checkpoint-test/";
+        let forest = Forest::with_namespace(db.clone(), namespace);
+        let app = [7; 32];
+        let phase = Phase::VertexAdds;
+        let mut left = vec![0; 32];
+        left[31] = 1;
+        let mut right = left.clone();
+        right[0] = 0x80;
+        forest.commit_shard_phase_raw(&app, phase, 0,
+            vec![(left, vec![1]), (right, vec![2])]).unwrap();
+        assert_ne!(forest.app_subtree_root(&app, phase, 0, &[false; 4]).unwrap(), [0; 32]);
+        let root_key = NodeKey::new(0, NibblePath::new(vec![]));
+        let Node::Internal(root) = forest.shard_phase_reader(&app, phase)
+            .get_node_option(&root_key).unwrap().unwrap() else { panic!("expected branch"); };
+        let (nibble, child) = root.children_sorted().next().unwrap();
+        let key = root_key.gen_child_node_key(child.version, nibble);
+        let mut encoded = namespace.to_vec();
+        encoded.extend_from_slice(&TreeId::shard_phase(&app, phase).prefix());
+        encoded.push(b'n');
+        encoded.extend_from_slice(&borsh::to_vec(&key).unwrap());
+        assert!(db.get(&encoded).unwrap().is_some());
+        db.delete(encoded).unwrap();
+        assert!(forest.app_subtree_root(&app, phase, 0, &[false; 4]).is_err());
+        // A path with no referenced child is still an honestly empty subtree.
+        assert_eq!(forest.app_subtree_root(&app, phase, 0, &[false, true, false, false]).unwrap(), [0; 32]);
+    }
+
+    /// Unified tree: `app_subtree_root` reads per-shard commitments as
     /// in-place subtrees of the ONE app tree — nibble-aligned, non-nibble-aligned
     /// (6-bit), and empty — and the empty path is the JMT root over ALL shards.
-    /// §6.1 descend-to-bifurcation + empty-split guard: the split cuts where the
+    /// Descend-to-bifurcation + empty-split guard: the split cuts where the
     /// data actually branches (both children non-empty), skips uniform prefix
     /// bits, and refuses to split an un-splittable shard.
     #[test]
@@ -1359,7 +1652,7 @@ mod tests {
         let app = b"quil-app-address-0123456789abcd!".to_vec(); // 32B
         let phase = Phase::VertexAdds;
 
-        // Spike #2's layout, but committed THROUGH the Forest into ONE app tree:
+        // The 6-bit spike's layout, but committed THROUGH the Forest into ONE app tree:
         // 8 leaves under 1st-nibble 0 (byte0 0x00..0x07) + one under nibble 8
         // (0x80) so the app-tree root is a real internal node.
         let key = |b0: u8| -> Vec<u8> {
@@ -1388,7 +1681,7 @@ mod tests {
         assert_ne!(sx, [0u8; 32]);
         assert_ne!(sy, [0u8; 32]);
 
-        // (2b) Cross-check against the manual spike-#2 descent: they MUST equal
+        // (2b) Cross-check against the manual 6-bit-spike descent: they MUST equal
         //      the width-4 sub-ranges of the 2nd-nibble internal node.
         let store = forest.shard_phase_reader(&app, phase);
         let root_key = NodeKey::new(0, NibblePath::new(vec![]));
@@ -1564,10 +1857,10 @@ mod tests {
     }
     use crate::{AppEntry, ShardEntry};
 
-    fn open_db(path: &std::path::Path) -> Arc<rocksdb::DB> {
+    fn open_db(path: &std::path::Path) -> crate::CoordinatedDb {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        Arc::new(rocksdb::DB::open(&opts, path).unwrap())
+        crate::CoordinatedDb::new(rocksdb::DB::open(&opts, path).unwrap())
     }
 
     fn leaves(n: u32, tag: u8) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -1701,6 +1994,63 @@ mod tests {
         assert_eq!(tgt_root, src_root, "synced target reaches the source root");
     }
 
+    /// Resetting a shard's phase trees also drops their persisted head
+    /// markers, so the reset reads as a never-committed tree (no head) instead
+    /// of a head version whose root is gone.
+    #[test]
+    fn reset_shard_phase_trees_clears_head_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let forest = Forest::new(open_db(dir.path()));
+        let shard = [0xffu8; 32];
+        let leaves = vec![(crate::l3_leaf_key(&[0x11u8; 64], &[0x04u8]), b"v1".to_vec())];
+        forest.commit_shard_phase(&shard, Phase::VertexAdds, 3, leaves).unwrap();
+        forest.write_head_version(&shard, Phase::VertexAdds, 3).unwrap();
+        assert_eq!(forest.read_head_version(&shard, Phase::VertexAdds).unwrap(), Some(3));
+        assert!(forest.shard_phase_root(&shard, Phase::VertexAdds, 3).unwrap().is_some());
+
+        forest.reset_shard_phase_trees(&shard).unwrap();
+        for phase in PHASES {
+            assert_eq!(forest.read_head_version(&shard, phase).unwrap(), None);
+        }
+        assert!(forest.shard_phase_root(&shard, Phase::VertexAdds, 3).unwrap().is_none());
+    }
+
+    /// An older reset could clear a phase tree but keep its head marker,
+    /// leaving a GLOBAL prover tree with a head marker for an empty phase. The
+    /// checked root read refuses it ("persisted phase head has no root").
+    /// Only a marker with no root AND no
+    /// key left in the tree is orphaned; dropping it leaves a never-committed
+    /// tree that the next commit rebuilds.
+    #[test]
+    fn a_marker_an_old_reset_left_on_an_empty_tree_is_orphaned_and_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let forest = Forest::new(open_db(dir.path()));
+        let shard = [0xffu8; 32];
+        let leaves = || vec![(crate::l3_leaf_key(&[0x11u8; 64], &[0x04u8]), b"v1".to_vec())];
+        forest.commit_shard_phase(&shard, Phase::VertexRemoves, 3, leaves()).unwrap();
+        forest.write_head_version(&shard, Phase::VertexRemoves, 3).unwrap();
+        assert_eq!(forest.orphaned_phase_head(&shard, Phase::VertexRemoves).unwrap(), None, "a live tree");
+
+        // The old reset: clear the tree's keys, keep the marker.
+        forest.store(&TreeId::shard_phase(&shard, Phase::VertexRemoves)).clear().unwrap();
+        assert_eq!(forest.read_head_version(&shard, Phase::VertexRemoves).unwrap(), Some(3));
+        assert_eq!(forest.orphaned_phase_head(&shard, Phase::VertexRemoves).unwrap(), Some(3));
+        assert_eq!(forest.orphaned_phase_head(&shard, Phase::VertexAdds).unwrap(), None, "no marker");
+
+        assert_eq!(forest.drop_orphaned_phase_head(&shard, Phase::VertexRemoves).unwrap(), Some(3));
+        assert_eq!(forest.read_head_version(&shard, Phase::VertexRemoves).unwrap(), None);
+        assert_eq!(forest.drop_orphaned_phase_head(&shard, Phase::VertexRemoves).unwrap(), None, "idempotent");
+        let root = forest.commit_shard_phase(&shard, Phase::VertexRemoves, 0, leaves()).unwrap();
+        assert_eq!(forest.shard_phase_root(&shard, Phase::VertexRemoves, 0).unwrap(), Some(root));
+
+        // A marker whose root was pruned while other versions' keys remain is
+        // lost state, not an empty tree: never dropped.
+        forest.commit_shard_phase(&shard, Phase::HyperedgeAdds, 1, leaves()).unwrap();
+        forest.write_head_version(&shard, Phase::HyperedgeAdds, 2).unwrap();
+        assert_eq!(forest.orphaned_phase_head(&shard, Phase::HyperedgeAdds).unwrap(), None);
+        assert_eq!(forest.drop_orphaned_phase_head(&shard, Phase::HyperedgeAdds).unwrap(), None);
+    }
+
     #[test]
     fn preimages_recover_raw_keys_after_commit() {
         let dir = tempfile::tempdir().unwrap();
@@ -1817,6 +2167,107 @@ mod tests {
                 val.as_ref().unwrap(),
             )
             .expect("phase inclusion proof verifies against its state root");
+    }
+
+    #[test]
+    fn execution_overlay_isolates_roots_memos_preimages_heads_pruning_and_reset() {
+        use crate::{ExecutionOverlay, OverlayLimits, OverlayMutation};
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        let canonical = Forest::with_namespace(db.clone(), vec![0xf7]);
+        let other = Forest::with_namespace(db.clone(), vec![0xf8]);
+        let shard = b"tentative";
+        let phase = Phase::VertexAdds;
+        let base_root = canonical.commit_shard_phase(shard, phase, 0, leaves(24, 7)).unwrap();
+        canonical.write_head_version(shard, phase, 0).unwrap();
+        let other_root = other.commit_shard_phase(shard, phase, 0, leaves(8, 3)).unwrap();
+        canonical.clear_size_index(shard, phase).unwrap();
+        let rows = || db.iterator(rocksdb::IteratorMode::Start)
+            .collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        let original_rows = rows();
+        let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), OverlayLimits {
+            max_delta_bytes: 4 << 20, max_delta_entries: 100_000,
+            max_record_bytes: 1 << 20, max_read_bytes: 64 << 20,
+            max_read_operations: 1_000_000, max_cursors: 8,
+        }).unwrap());
+        let branch = Forest::on_overlay(overlay.clone(), vec![0xf7]);
+        assert!(branch.db().is_none());
+        // Whole-tree bootstrap cannot allocate its large maps in a branch.
+        assert!(branch.seed_size_index(shard, phase, 0, &|_| {}).is_err());
+        assert!(branch.app_subtree_size(shard, phase, 0, &[]).unwrap() > 0);
+        assert!(overlay.stats().delta_entries > 0, "lazy memos stay in the overlay");
+        assert_eq!(rows(), original_rows);
+
+        let changed_key = 3u32.to_be_bytes().to_vec();
+        let changed_value = vec![0x55; 40];
+        let (root, puts) = branch.commit_shard_phase_staged(shard, phase, 1,
+            vec![(changed_key.clone(), changed_value.clone())]).unwrap();
+        assert_eq!(branch.shard_phase_root(shard, phase, 1).unwrap(), None);
+        let mut batch: Vec<_> = puts.into_iter().map(|(k, v)| OverlayMutation::Put(k, v)).collect();
+        let (head_key, head_value) = branch.head_version_put(shard, phase, 1).unwrap();
+        batch.push(OverlayMutation::Put(head_key, head_value));
+        batch.push(OverlayMutation::Put(b"execution/cursor".to_vec(), 1u64.to_be_bytes().to_vec()));
+        overlay.apply(&batch).unwrap();
+        assert_eq!(branch.read_head_version(shard, phase).unwrap(), Some(1));
+        assert_eq!(overlay.get(b"execution/cursor").unwrap(), Some(1u64.to_be_bytes().to_vec()));
+        let (value, proof) = branch.shard_phase_get_with_proof(shard, phase, 1, &changed_key).unwrap();
+        assert_eq!(value, Some(changed_value.clone()));
+        proof.verify_existence(jmt::RootHash(root), KeyHash::with::<Sha256>(&changed_key), &changed_value).unwrap();
+        assert_eq!(branch.get_preimage(shard, phase, KeyHash::with::<Sha256>(&changed_key).0).unwrap(), Some(changed_key.clone()));
+        let store = branch.store(&TreeId::shard_phase(shard, phase));
+        let (deleted_root, deletion) = Sha256Jmt::new(&store).put_value_set(
+            vec![(KeyHash::with::<Sha256>(&changed_key), None)], 2).unwrap();
+        store.apply_update(&deletion).unwrap();
+        branch.write_head_version(shard, phase, 2).unwrap();
+        let (value, proof) = branch.shard_phase_get_with_proof(shard, phase, 2, &changed_key).unwrap();
+        assert!(value.is_none());
+        proof.verify_nonexistence(deleted_root, KeyHash::with::<Sha256>(&changed_key)).unwrap();
+        assert!(branch.prune_shard_phase(shard, phase, 2).unwrap() > 0);
+        assert_eq!(rows(), original_rows, "all forest writes, including prune, remain tentative");
+        assert_eq!(canonical.shard_phase_root(shard, phase, 0).unwrap(), Some(base_root));
+        assert_eq!(canonical.read_head_version(shard, phase).unwrap(), Some(0));
+
+        // Canonical writes after capture are invisible even at an untouched key.
+        canonical.commit_shard_phase(shard, phase, 1, leaves(2, 0x99)).unwrap();
+        canonical.write_head_version(shard, phase, 1).unwrap();
+        assert_eq!(branch.read_head_version(shard, phase).unwrap(), Some(2));
+        branch.reset_shard_phase_trees(shard).unwrap();
+        assert_eq!(branch.read_head_version(shard, phase).unwrap(), None);
+        assert_eq!(branch.shard_phase_root(shard, phase, 0).unwrap(), None);
+        assert_eq!(branch.get_preimage(shard, phase, KeyHash::with::<Sha256>(&changed_key).0).unwrap(), None);
+        let scoped = Forest::on_overlay(overlay.clone(), vec![0xf8]);
+        assert_eq!(scoped.shard_phase_root(shard, phase, 0).unwrap(), Some(other_root));
+        assert_eq!(canonical.read_head_version(shard, phase).unwrap(), Some(1));
+        // Reset followed by version zero is a fresh tree in this branch only.
+        let rebuilt = branch.commit_shard_phase(shard, phase, 0, leaves(2, 1)).unwrap();
+        assert_eq!(branch.shard_phase_root(shard, phase, 0).unwrap(), Some(rebuilt));
+        let mut external_batch = rocksdb::WriteBatch::default();
+        assert!(branch.stage_shard_phase(&mut external_batch, shard, phase, 1, leaves(1, 2)).is_err());
+        assert!(external_batch.is_empty(), "overlay cannot leak writes through a canonical batch");
+        overlay.close();
+        assert!(branch.read_head_version(shard, phase).is_err());
+        assert!(db.get(b"execution/cursor").unwrap().is_none());
+    }
+
+    #[test]
+    fn execution_overlay_rejects_oversized_forest_and_cursor_batch_atomically() {
+        use crate::{ExecutionOverlay, OverlayLimits, OverlayMutation};
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        let overlay = Arc::new(ExecutionOverlay::capture(db.clone(), OverlayLimits {
+            max_delta_bytes: 1 << 20, max_delta_entries: 2,
+            max_record_bytes: 1 << 20, max_read_bytes: 1 << 20,
+            max_read_operations: 10_000, max_cursors: 4,
+        }).unwrap());
+        let branch = Forest::on_overlay(overlay.clone(), vec![0xf7]);
+        let (_, puts) = branch.commit_shard_phase_staged(b"S", Phase::VertexAdds, 0, leaves(8, 2)).unwrap();
+        let mut batch = vec![OverlayMutation::Put(b"cursor".to_vec(), b"1".to_vec())];
+        batch.extend(puts.into_iter().map(|(k, v)| OverlayMutation::Put(k, v)));
+        assert!(overlay.apply(&batch).is_err());
+        assert_eq!(overlay.get(b"cursor").unwrap(), None);
+        assert_eq!(branch.shard_phase_root(b"S", Phase::VertexAdds, 0).unwrap(), None);
+        assert_eq!(overlay.stats().delta_entries, 0);
+        assert!(db.iterator(rocksdb::IteratorMode::Start).next().is_none());
     }
 
     #[test]
@@ -1995,5 +2446,65 @@ mod tests {
         // A read pinned at version 1 still resolves (its nodes were retained).
         let got = jmt_tree.get(KeyHash::with::<Sha256>(3u32.to_be_bytes()), 1).unwrap();
         assert_eq!(got, Some(vec![1u8 ^ 3u8; 40]));
+    }
+
+    /// A bootstrap's leaf listing reads each key's newest value at or below
+    /// the requested version, skips removed keys and keys outside the range,
+    /// and pages without losing or repeating a leaf.
+    #[test]
+    fn leaf_listing_reads_one_version_in_key_order_across_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let forest = Forest::new(open_db(dir.path()));
+        let shard = b"L".to_vec();
+        let tree = TreeId::shard_phase(&shard, Phase::VertexAdds);
+        let store = RocksTreeStore::new(forest.db().unwrap().clone(), &tree);
+        let key = |i: u8| { let mut k = [0u8; 32]; k[0] = i; k[31] = i; KeyHash(k) };
+        let write = |version: u64, writes: Vec<(KeyHash, Option<Vec<u8>>)>| {
+            let (_, batch) = Sha256Jmt::new(&store).put_value_set(writes, version).unwrap();
+            store.apply_update(&batch).unwrap();
+        };
+        write(0, (0..40u8).map(|i| (key(i), Some(vec![i; 40]))).collect());
+        // Version 1 rewrites the even keys, removes key 7 and adds key 200.
+        let mut changes: Vec<_> = (0..40u8).step_by(2).map(|i| (key(i), Some(vec![i ^ 0xff; 40]))).collect();
+        changes.push((key(7), None));
+        changes.push((key(200), Some(vec![9; 40])));
+        write(1, changes);
+        // Version 2 (above every read below) rewrites key 3.
+        write(2, vec![(key(3), Some(vec![3; 8]))]);
+
+        let all = |version: u64, first: &[u8; 32], last: &[u8; 32], page: usize| {
+            let mut out = Vec::new();
+            let mut after = None;
+            loop {
+                let (leaves, more) = forest
+                    .serve_leaves(&shard, Phase::VertexAdds, version, first, last, after.as_ref(), page, usize::MAX)
+                    .unwrap();
+                assert!(leaves.len() <= page);
+                after = leaves.last().map(|(k, _): &(KeyHash, OwnedValue)| k.0).or(after);
+                out.extend(leaves);
+                if !more { return out; }
+            }
+        };
+        let everything = ([0u8; 32], [0xffu8; 32]);
+        let at0 = all(0, &everything.0, &everything.1, 7);
+        assert_eq!(at0, (0..40u8).map(|i| (key(i), vec![i; 40])).collect::<Vec<_>>());
+        let at1 = all(1, &everything.0, &everything.1, 3);
+        let mut expected: Vec<_> = (0..40u8).filter(|i| *i != 7)
+            .map(|i| (key(i), if i % 2 == 0 { vec![i ^ 0xff; 40] } else { vec![i; 40] }))
+            .collect();
+        expected.push((key(200), vec![9; 40]));
+        assert_eq!(at1, expected, "newest value at or below the version; removed keys omitted");
+        // Every leaf read at version 1 is the tree's own value there.
+        for (k, v) in &at1 {
+            assert_eq!(store.get_value_option(1, *k).unwrap().as_ref(), Some(v));
+        }
+        // A key range bounds the listing at both ends.
+        let (first, last) = (key(10).0, key(12).0);
+        assert_eq!(all(1, &first, &last, 100).iter().map(|(k, _)| k.0[0]).collect::<Vec<_>>(), vec![10, 11, 12]);
+        // A byte budget stops a page early, but never before its first leaf.
+        let (leaves, more) = forest.serve_leaves(&shard, Phase::VertexAdds, 1, &everything.0, &everything.1, None, 100, 100).unwrap();
+        assert_eq!((leaves.len(), more), (2, true));
+        let (leaves, _) = forest.serve_leaves(&shard, Phase::VertexAdds, 1, &everything.0, &everything.1, None, 100, 1).unwrap();
+        assert_eq!(leaves.len(), 1);
     }
 }

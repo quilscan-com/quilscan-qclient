@@ -131,7 +131,7 @@ async fn tier2_joiner_lifecycle_emits_self_confirm_after_join() {
         .expect("materialize join");
     archive
         .prover_registry
-        .refresh_from_store(&archive.hg_store);
+        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
 
     // Sanity: joiner is now in the registry.
     assert!(
@@ -359,7 +359,7 @@ async fn tier2_confirm_materializes_to_active_and_allocator_starts_worker() {
         .expect("materialize join");
     archive
         .prover_registry
-        .refresh_from_store(&archive.hg_store);
+        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
 
     // Verify Joining status.
     let joining = archive.prover_registry.read(|r| {
@@ -430,7 +430,7 @@ async fn tier2_confirm_materializes_to_active_and_allocator_starts_worker() {
                     confirm_result_skipped += r.skipped;
                 }
             }
-            archive.prover_registry.refresh_from_store(&archive.hg_store);
+            archive.prover_registry.refresh_from_store(archive.hg_store.as_ref()).unwrap();
             status_after_confirm = archive.prover_registry.read(|r| {
                 r.get_prover_info(&joiner.address).and_then(|info| {
                     info.allocations
@@ -585,7 +585,7 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
         .expect("materialize join");
     archive
         .prover_registry
-        .refresh_from_store(&archive.hg_store);
+        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
 
     // 2. Joiner self-confirms after the window.
     joiner_pipeline.lifecycle.set_sync_complete();
@@ -639,7 +639,7 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
     }
     archive
         .prover_registry
-        .refresh_from_store(&archive.hg_store);
+        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
 
     // Verify allocation is now Active.
     let status_after_confirm = archive.prover_registry.read(|r| {
@@ -696,6 +696,10 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
         storage_attestation_root: Vec::new(),
         global_frame_number: 0,
         storage_attestation: Vec::new(),
+        fee_total: Vec::new(),
+        settlements: Vec::new(),
+        accumulator: Vec::new(),
+        spends: Vec::new(),
     };
     // No-global-anchor header ⇒ the attestation verifier recomputes the
     // zero-anchor deterministic output, so stamp it like the producer does.
@@ -766,7 +770,7 @@ async fn tier2_coverage_ingest_advances_archive_allocation_state() {
     // 4. Refresh and assert: joiner's allocation last_active advanced.
     archive
         .prover_registry
-        .refresh_from_store(&archive.hg_store);
+        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
     let alloc_after = archive.prover_registry.read(|r| {
         let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
         info.allocations
@@ -897,7 +901,7 @@ async fn tier2_composite_end_to_end() {
         .expect("materialize join");
     archive
         .prover_registry
-        .refresh_from_store(&archive.hg_store);
+        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
 
     // -----------------------------------------------------------------
     // Phase B — lifecycle emits ProverConfirm; archive flips to Active
@@ -954,7 +958,7 @@ async fn tier2_composite_end_to_end() {
     }
     archive
         .prover_registry
-        .refresh_from_store(&archive.hg_store);
+        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
 
     let status_after = archive.prover_registry.read(|r| {
         let info = r.get_prover_info(&joiner.address).expect("joiner").clone();
@@ -996,9 +1000,11 @@ async fn tier2_composite_end_to_end() {
             }));
 
         let deps = quil_engine::app_engine::AppEngineDeps {
+            delivery_frame_source: None,
             clock_store: clock_store as Arc<dyn ClockStore>,
             global_anchor_store: None,
-            storage_source_hypergraph: None,
+            global_hypergraph: None,
+            storage_source_hypergraph: None, topology: None,
             prover_registry: registry_for_engine.clone()
                 as Arc<dyn quil_types::consensus::ProverRegistry>,
             frame_prover: Arc::new(StubFrameProver) as Arc<dyn FrameProver>,
@@ -1011,7 +1017,14 @@ async fn tier2_composite_end_to_end() {
             reward_greedy: true,
             min_active_provers_for_propose: 1,
             coverage_publish,
-            hypergraph: None,
+            // The CW proposer and voter need the request-root validator, which
+            // is only built when the engine has a hypergraph.
+            hypergraph: Some(Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(quil_hypergraph::testing::MemStore::new())
+                    as Arc<dyn quil_types::store::HypergraphStore>,
+                Arc::new(quil_hypergraph::testing::StubProver)
+                    as Arc<dyn quil_types::crypto::InclusionProver>,
+            ))),
             execution_engine: Some(Arc::new(build_test_exec_manager(
                 Arc::new(NoopInclusionProver) as Arc<dyn InclusionProver>,
                 false,
@@ -1039,9 +1052,16 @@ async fn tier2_composite_end_to_end() {
             engine.run(bls_factory).await;
         });
         let event_drain = event_for_cb.clone();
+        let bootstrap_handle = handle.clone();
         tokio::spawn(async move {
             while let Some(ev) = event_rx.recv().await {
                 use quil_engine::app_engine::AppEngineEvent::*;
+                if matches!(ev, ShardDataBootstrapRequested { .. }) {
+                    // Empty harness shard: the bootstrap converges at once.
+                    bootstrap_handle.send(quil_engine::app_engine::AppEngineMessage::ShardSyncCompleted {
+                        synced_to_frame: 0,
+                    });
+                }
                 let name = match ev {
                     FrameProduced { .. } => "FrameProduced",
                     FullFrameProduced { .. } => "FullFrameProduced",
@@ -1052,6 +1072,7 @@ async fn tier2_composite_end_to_end() {
                     Halted { .. } => "Halted",
                     AncestorSyncRequested { .. } => "AncestorSyncRequested",
                     ParentSealed { .. } => "ParentSealed",
+                    ShardDataBootstrapRequested { .. } => "ShardDataBootstrapRequested",
                     CwOut { .. } => "CwOut",
                 };
                 event_drain.lock().push(name.to_string());
@@ -1212,7 +1233,7 @@ async fn tier2_composite_end_to_end() {
     // -----------------------------------------------------------------
     archive
         .prover_registry
-        .refresh_from_store(&archive.hg_store);
+        .refresh_from_store(archive.hg_store.as_ref()).unwrap();
     let post_last_active = archive.prover_registry.read(|r| {
         r.get_prover_info(&joiner.address)
             .expect("joiner")
@@ -1235,4 +1256,66 @@ async fn tier2_composite_end_to_end() {
         pre_last_active,
         post_last_active
     );
+}
+
+/// Exercise the real dispatch API with signed canonical messages. Different
+/// action kinds on one filter share ownership; unrelated filters still publish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_dispatch_reserves_before_spawning_across_action_kinds() {
+    use quil_engine::prover_message_transport::ProverMessageTransport;
+    use quil_engine::provers::lifecycle::LifecycleAction;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct BlockedTransport {
+        started: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        count: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ProverMessageTransport for BlockedTransport {
+        async fn latest_global_frame_header(&self) -> QResult<gpb::GlobalFrameHeader> {
+            Ok(gpb::GlobalFrameHeader { frame_number: 10, ..Default::default() })
+        }
+        async fn publish_prover_bundle(&self, bytes: Vec<u8>) -> QResult<()> {
+            // The test must reach actual canonical encoding and transport.
+            quil_engine::consensus_wire::decode_message_bundle(&bytes)?;
+            self.count.fetch_add(1, Ordering::SeqCst);
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(())
+        }
+    }
+    let prover = TestProver::generate();
+    let transport = Arc::new(BlockedTransport {
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        count: AtomicUsize::new(0),
+    });
+    let test_transport = Arc::new(quil_engine::test_support::TestProverMessageTransport::new());
+    let mut rig = build_test_pipeline_with_registry(&prover, test_transport,
+        Arc::new(TestProverRegistry::new()));
+    Arc::get_mut(&mut rig.pipeline).unwrap().transport = transport.clone();
+    let first = vec![0xA1; 35];
+    rig.pipeline.dispatch(LifecycleAction::RejectLeaves {
+        filters: vec![first.clone()], frame_number: 10,
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), transport.started.acquire())
+        .await.unwrap().unwrap().forget();
+    rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves {
+        filters: vec![first.clone()], frame_number: 11,
+    });
+    rig.pipeline.dispatch(LifecycleAction::ProposeLeave {
+        filters: vec![vec![0xB2; 35]], frame_number: 11,
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), transport.started.acquire())
+        .await.unwrap().unwrap().forget();
+    assert_eq!(transport.count.load(Ordering::SeqCst), 2,
+        "only the rejection and the independent filter may publish");
+    transport.release.add_permits(2);
+    // Repeating the conflicting operation immediately remains fenced whether
+    // the first task is still finishing or has recorded successful publication.
+    rig.pipeline.dispatch(LifecycleAction::ConfirmLeaves {
+        filters: vec![first], frame_number: 12,
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(transport.count.load(Ordering::SeqCst), 2);
 }
