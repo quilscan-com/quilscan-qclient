@@ -5993,7 +5993,6 @@ dependencies = [
  "parking_lot",
  "prost 0.13.5",
  "quil-execution",
- "quil-forest",
  "quil-hypergraph",
  "quil-p2p",
  "quil-tries",

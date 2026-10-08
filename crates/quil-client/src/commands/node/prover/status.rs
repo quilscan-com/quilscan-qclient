@@ -7,8 +7,8 @@ use num_bigint::{BigInt, Sign};
 use quil_types::proto::node::{GetNodeInfoRequest, GetWorkerInfoRequest, ShardAllocationInfo};
 
 use super::epoch::{
-    alloc_confirm_window, compute_effective_status, epoch_for_frame, epoch_len, AllocationTiming,
-    EffectiveStatus,
+    action_hints, compute_effective_status, epoch_for_frame, epoch_len, AllocationTiming,
+    EffectiveStatus, ThresholdUnit,
 };
 use super::{format_storage, worker_by_filter, ProverCtx};
 
@@ -22,6 +22,25 @@ fn timing(a: &ShardAllocationInfo) -> AllocationTiming<'_> {
         leave_confirm_frame: a.leave_confirm_frame_number,
         epoch: a.epoch,
     }
+}
+
+fn allocation_action_line(
+    timing: &AllocationTiming<'_>,
+    status: EffectiveStatus,
+    epoch_length: u64,
+    current_frame: u64,
+    next_boundary: u64,
+) -> Option<String> {
+    let (next, default) = action_hints(timing, status, epoch_length, current_frame, next_boundary);
+    if next.is_empty() && default.is_empty() {
+        return None;
+    }
+    let unit = ThresholdUnit::Frames;
+    Some(format!(
+        "      Next Action: {}  Default Action: {}",
+        next.render(unit, epoch_length),
+        default.render(unit, epoch_length)
+    ))
 }
 
 pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
@@ -91,22 +110,10 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
             eff.label()
         );
 
-        if let Some(w) = alloc_confirm_window(&t, epoch_length) {
-            println!(
-                "      Action: {} | {}",
-                w.label("Confirm", current_frame, epoch_length),
-                w.label("Reject", current_frame, epoch_length)
-            );
-        } else if eff == EffectiveStatus::Active && !alloc.filter.is_empty() {
-            println!(
-                "      Re-confirm through epoch {} (renew before frame {})",
-                alloc.epoch, next_boundary
-            );
-        } else if eff == EffectiveStatus::ExpiredEpoch {
-            println!(
-                "      MISSED re-confirm (registered epoch {} < current {}) — confirm now to restore",
-                alloc.epoch, cur_epoch
-            );
+        if let Some(line) =
+            allocation_action_line(&t, eff, epoch_length, current_frame, next_boundary)
+        {
+            println!("{line}");
         }
 
         if alloc.join_frame_number > 0 {
@@ -157,4 +164,27 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::epoch::raw_status;
+    use super::*;
+
+    #[test]
+    fn allocation_action_line_uses_official_join_window_wording() {
+        let timing = AllocationTiming {
+            raw_status: raw_status::JOINING,
+            filter: &[0x42],
+            join_frame: 720,
+            join_confirm_frame: 0,
+            leave_frame: 0,
+            leave_confirm_frame: 0,
+            epoch: 1,
+        };
+        assert_eq!(
+            allocation_action_line(&timing, EffectiveStatus::Joining, 720, 1500, 2160),
+            Some("      Next Action: (reject|confirm)  Default Action: expire@f2160".into())
+        );
+    }
 }

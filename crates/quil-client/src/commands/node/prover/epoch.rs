@@ -98,7 +98,11 @@ pub struct AllocationTiming<'a> {
 
 /// `computeEffectiveStatus` — map raw status + timing + current frame to
 /// the effective lifecycle state.
-pub fn compute_effective_status(a: &AllocationTiming, current_frame: u64, epoch_length: u64) -> EffectiveStatus {
+pub fn compute_effective_status(
+    a: &AllocationTiming,
+    current_frame: u64,
+    epoch_length: u64,
+) -> EffectiveStatus {
     let el = epoch_len(epoch_length);
     let current_epoch = current_frame / el;
 
@@ -216,6 +220,154 @@ pub fn alloc_confirm_window(a: &AllocationTiming, epoch_length: u64) -> Option<C
     }
 }
 
+/// The first frame of the epoch after the one `frame` falls in — the
+/// boundary at which an epoch-aligned lifecycle transition takes effect.
+pub fn next_epoch_boundary(frame: u64, epoch_length: u64) -> u64 {
+    epoch_start_frame(epoch_for_frame(frame, epoch_length) + 1, epoch_length)
+}
+
+/// Unit the Next/Default Action thresholds are displayed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThresholdUnit {
+    #[default]
+    Frames,
+    Epochs,
+}
+
+impl ThresholdUnit {
+    pub fn toggled(self) -> Self {
+        match self {
+            ThresholdUnit::Frames => ThresholdUnit::Epochs,
+            ThresholdUnit::Epochs => ThresholdUnit::Frames,
+        }
+    }
+}
+
+/// One lifecycle hint: a verb, and — when it is bounded — the frame it falls
+/// due at. Every threshold shown is an epoch boundary, so a single stored
+/// frame renders in either unit. An empty label means "nothing to show".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActionHint {
+    pub label: String,
+    pub at_frame: Option<u64>,
+}
+
+impl ActionHint {
+    pub fn none() -> Self {
+        ActionHint::default()
+    }
+
+    pub fn text(label: impl Into<String>) -> Self {
+        ActionHint {
+            label: label.into(),
+            at_frame: None,
+        }
+    }
+
+    pub fn at(label: impl Into<String>, frame: u64) -> Self {
+        ActionHint {
+            label: label.into(),
+            at_frame: Some(frame),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.label.is_empty()
+    }
+
+    /// `verb@f<frame>` or `verb@e<epoch>`; the bare verb when unbounded, which
+    /// for a Next Action reads as "available now".
+    pub fn render(&self, unit: ThresholdUnit, epoch_length: u64) -> String {
+        match self.at_frame {
+            None => self.label.clone(),
+            Some(f) => match unit {
+                ThresholdUnit::Frames => format!("{}@f{}", self.label, f),
+                ThresholdUnit::Epochs => {
+                    format!("{}@e{}", self.label, epoch_for_frame(f, epoch_length))
+                }
+            },
+        }
+    }
+}
+
+/// The Next Action / Default Action hint pair for an allocation.
+///
+/// Next Action lists the key-bound verbs the operator may use (`reject`,
+/// `confirm`, `pause`, `resume`, `leave`), with a threshold when they are not
+/// yet available. Default Action is the single verb the network applies on
+/// its own if the operator does nothing, at the boundary it takes effect.
+/// `qclient node prover status` uses these hints. Quilscan's `manage --once`
+/// keeps its existing Agent-facing wording until that output and parser are
+/// migrated together.
+pub fn action_hints(
+    t: &AllocationTiming,
+    eff: EffectiveStatus,
+    epoch_length: u64,
+    current_frame: u64,
+    next_boundary: u64,
+) -> (ActionHint, ActionHint) {
+    match eff {
+        // A proposed join, or a leave nobody has answered yet: confirm or
+        // reject it inside its one-epoch window.
+        EffectiveStatus::Joining if t.raw_status == raw_status::JOINING => {
+            confirm_hints(t, epoch_length, current_frame)
+        }
+        EffectiveStatus::Leaving if t.leave_confirm_frame == 0 => {
+            confirm_hints(t, epoch_length, current_frame)
+        }
+        // A confirmed leave is out of the operator's hands; it departs at the
+        // boundary after the confirmation.
+        EffectiveStatus::Leaving => (
+            ActionHint::none(),
+            ActionHint::at(
+                "depart",
+                next_epoch_boundary(t.leave_confirm_frame, epoch_length),
+            ),
+        ),
+        // A confirmed join short of its activation boundary is already an
+        // ordinary allocation to pause or leave.
+        EffectiveStatus::Joining => (
+            ActionHint::text("(pause|leave)"),
+            ActionHint::at(
+                "activate",
+                next_epoch_boundary(t.join_confirm_frame, epoch_length),
+            ),
+        ),
+        // A stale epoch is recoverable, so its default is the same renewal an
+        // Active allocation gets; the Status column carries the alarm.
+        EffectiveStatus::Active | EffectiveStatus::ExpiredEpoch => {
+            let default = if t.filter.is_empty() {
+                ActionHint::none() // the global filter is exempt from epoch checks
+            } else {
+                ActionHint::at("renew", next_boundary)
+            };
+            (ActionHint::text("(pause|leave)"), default)
+        }
+        EffectiveStatus::Paused => (ActionHint::text("(resume|leave)"), ActionHint::none()),
+        _ => (ActionHint::none(), ActionHint::none()),
+    }
+}
+
+/// Hints for a pending join/leave: both verbs share one window, so they are
+/// grouped under a single threshold, and letting the window close is what
+/// happens by default.
+fn confirm_hints(
+    t: &AllocationTiming,
+    epoch_length: u64,
+    current_frame: u64,
+) -> (ActionHint, ActionHint) {
+    let Some(w) = alloc_confirm_window(t, epoch_length) else {
+        // No proposal frame recorded: nothing gates the answer.
+        return (ActionHint::text("(reject|confirm)"), ActionHint::none());
+    };
+    let expire = ActionHint::at("expire", w.end_frame);
+    match w.state(current_frame, epoch_length) {
+        WindowState::Open => (ActionHint::text("(reject|confirm)"), expire),
+        WindowState::Pending => (ActionHint::at("(reject|confirm)", w.start_frame), expire),
+        WindowState::Missed => (ActionHint::none(), expire),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,7 +398,7 @@ mod tests {
     fn active_data_shard_expires_when_epoch_stale() {
         let mut t = timing(raw_status::ACTIVE);
         t.epoch = 1; // registered for epoch 1
-        // current frame in epoch 3 -> stale
+                     // current frame in epoch 3 -> stale
         assert_eq!(
             compute_effective_status(&t, 3 * 720, 720),
             EffectiveStatus::ExpiredEpoch
@@ -257,7 +409,7 @@ mod tests {
     fn joining_expires_past_confirm_epoch() {
         let mut t = timing(raw_status::JOINING);
         t.join_frame = 720; // epoch 1 -> must confirm epoch 2
-        // current epoch 3 -> expired
+                            // current epoch 3 -> expired
         assert_eq!(
             compute_effective_status(&t, 3 * 720, 720),
             EffectiveStatus::ExpiredJoining
@@ -276,5 +428,53 @@ mod tests {
         assert_eq!(w.state(1500, 720), WindowState::Open);
         assert_eq!(w.state(700, 720), WindowState::Pending);
         assert_eq!(w.state(3000, 720), WindowState::Missed);
+    }
+
+    #[test]
+    fn action_hints_show_join_confirmation_window_and_expiry() {
+        let mut t = timing(raw_status::JOINING);
+        t.join_frame = 720;
+
+        let (next, default) = action_hints(&t, EffectiveStatus::Joining, 720, 1500, 2160);
+        assert_eq!(next.render(ThresholdUnit::Frames, 720), "(reject|confirm)");
+        assert_eq!(default.render(ThresholdUnit::Frames, 720), "expire@f2160");
+
+        let (next, default) = action_hints(&t, EffectiveStatus::Joining, 720, 700, 720);
+        assert_eq!(
+            next.render(ThresholdUnit::Frames, 720),
+            "(reject|confirm)@f1440"
+        );
+        assert_eq!(default.render(ThresholdUnit::Frames, 720), "expire@f2160");
+
+        let (next, default) = action_hints(&t, EffectiveStatus::Joining, 720, 3000, 3600);
+        assert!(next.is_empty());
+        assert_eq!(default.render(ThresholdUnit::Frames, 720), "expire@f2160");
+    }
+
+    #[test]
+    fn action_hints_show_confirmed_leave_boundary() {
+        let mut t = timing(raw_status::LEAVING);
+        t.leave_frame = 720;
+        t.leave_confirm_frame = 1500;
+
+        let (next, default) = action_hints(&t, EffectiveStatus::Leaving, 720, 1600, 2160);
+        assert!(next.is_empty());
+        assert_eq!(default.render(ThresholdUnit::Frames, 720), "depart@f2160");
+        assert_eq!(default.render(ThresholdUnit::Epochs, 720), "depart@e3");
+    }
+
+    #[test]
+    fn action_hints_keep_stale_allocations_renewable() {
+        let mut t = timing(raw_status::ACTIVE);
+        t.epoch = 1;
+
+        let (next, default) = action_hints(&t, EffectiveStatus::ExpiredEpoch, 720, 2160, 2880);
+        assert_eq!(next.render(ThresholdUnit::Frames, 720), "(pause|leave)");
+        assert_eq!(default.render(ThresholdUnit::Frames, 720), "renew@f2880");
+        assert_eq!(default.render(ThresholdUnit::Epochs, 720), "renew@e4");
+
+        t.filter = &[];
+        let (_, default) = action_hints(&t, EffectiveStatus::Active, 720, 2160, 2880);
+        assert!(default.is_empty());
     }
 }
