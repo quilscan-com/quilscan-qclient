@@ -43,7 +43,7 @@ impl From<&GlobalFlags> for GlobalArgs {
     about = "Quilibrium client",
     long_about = "Quilibrium client is a command-line tool for managing Quilibrium nodes.\n\
                   It provides commands for installing, updating, and managing Quilibrium nodes.",
-    version
+    version = quil_config::display_version()
 )]
 struct Cli {
     #[command(flatten)]
@@ -158,4 +158,14 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_version_flag_reports_the_release_and_subpatch() {
+        assert_eq!(super::Cli::command().get_version(), Some(quil_config::display_version()));
+    }
 }

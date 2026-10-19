@@ -124,7 +124,7 @@ COPY --from=rust-base /root/.rustup /root/.rustup
 ENV PATH="${PATH}:/root/.cargo/bin/"
 WORKDIR /opt/quilscan-qclient
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock subpatch ./
 COPY crates crates
 COPY node/execution/intrinsics/global/compat node/execution/intrinsics/global/compat
 COPY protobufs protobufs

@@ -2,6 +2,8 @@
 
 Source baseline: official `QuilibriumNetwork/monorepo` branch `v2.1.0.25` at `b77ddfbe5785b6e56a46339e9cdeeef20b7f5dfc` (fetched 2026-10-19). The Rust qclient implementation and its Cargo dependency closure are synchronized to that source. `node prover manage --once` is the local Quilscan addition described below.
 
+Version display follows official `quil-config::display_version()` (currently `2.1.0.25.89`). Both `qclient --version` and the retained `qclient version` alias print `qclient 2.1.0.25.89`; `version --checksum` additionally prints checksums. These commands describe the source build. Quilscan Agent's update/reporting authority remains `qclient-version.json` plus installation state, including user-selected release suffixes such as `.88` or `.99`.
+
 ## `node prover manage --once`
 
 The old space-delimited `Allocations (...)` and `Available Shards (...)` tables are replaced by one JSON document on stdout. Errors go to stderr and return a nonzero exit code. The command requests the official `GetNodeInfo`, `GetWorkerInfo`, and `GetShardInfo(include_all=true)` data and builds the same `Model` used by the interactive Manage screen. A failed shard request fails the command; it does not emit a partial snapshot. The shard request has a 60-second RPC deadline, so the Agent command deadline must allow connection and JSON processing time beyond that.
