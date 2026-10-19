@@ -24,12 +24,12 @@ use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage, Supervi
 use commonware_utils::{NZUsize, NZU16};
 
 use crate::adapters::{
-    BlockStore, Digest, FalconAutomaton, FalconRelay, FalconReporter, FrameFinalizer, FrameSink,
-    GlobalProposer,
+    BlockStore, CountingBlocker, Digest, FalconAutomaton, FalconRelay, FalconReporter, FrameFinalizer,
+    FrameSink, GlobalProposer,
 };
 use crate::falcon_base::FalconPublicKey;
 use crate::falcon_simplex::SimplexFalconScheme;
-use crate::p2p_bridge::{build_channel, build_vote_channel, NoopBlocker, Outbound};
+use crate::p2p_bridge::{build_channel, build_vote_channel, Outbound};
 use commonware_p2p::Message;
 use commonware_runtime::{tokio as cw_tokio, Runner as _};
 
@@ -146,7 +146,8 @@ where
     Sk: FrameSink,
     Fin: FrameFinalizer,
 {
-    let automaton = FalconAutomaton::new(context.child("automaton"), proposer, store.clone());
+    let automaton = FalconAutomaton::new(context.child("automaton"), proposer, store.clone())
+        .with_liveness(params.liveness.clone());
     let relay = FalconRelay::new(sink, store.clone());
     let reporter = FalconReporter::new(finalizer, store).with_liveness(params.liveness.clone());
 
@@ -253,7 +254,8 @@ where
         ch1.inbound_tx.clone(),
         ch2.inbound_tx.clone(),
     ];
-    let (s0, r0) = (ch0.sender, ch0.receiver);
+    let (s0, r0) = (ch0.sender, crate::nullify_receiver::NullifyReceiver::new(
+        ch0.receiver, scheme.clone(), params.epoch));
     let (s1, r1) = (ch1.sender, ch1.receiver);
     let (s2, r2) = (ch2.sender, ch2.receiver);
 
@@ -278,7 +280,7 @@ where
             let engine = build_global_engine(
                 context.child("consensus"),
                 scheme,
-                NoopBlocker::<FalconPublicKey>::default(),
+                CountingBlocker::new(params.liveness.clone()),
                 proposer,
                 sink,
                 finalizer,
@@ -308,7 +310,13 @@ where
                 }
             }
             if let Some(outcome) = stopped {
-                tracing::error!(?outcome, "consensus engine stopped on its own; host exiting");
+                // The owner may ask for a stop while the engine is already
+                // returning: closing its inputs also ends the engine.
+                if shutdown.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                    tracing::info!(?outcome, "consensus engine stopped on request; host exiting");
+                } else {
+                    tracing::error!(?outcome, "consensus engine stopped on its own; host exiting");
+                }
             }
             // An actor may still be returning from a blocking proposer or
             // filesystem operation after its parent stopped. Dropping the

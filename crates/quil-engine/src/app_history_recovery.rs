@@ -103,20 +103,37 @@ impl Progress {
     }
 
     fn validate(&self, session: &Session, cursor: u64) -> Result<()> {
-        if self.version != 1
-            || self.session != session.id()?
-            || self.done < session.base_frame
-            || self.done > self.next
-            || self.next > self.target
-            || self.target > cursor
-            || self.carry > CARRY_WINDOW_FRAMES
-            || self.reports.len() > MAX_REPORT_STATES
-            || self.last_report.len() > shard_accumulator::MAX_REPORT_BYTES
-            || self.implied.as_ref().is_some_and(|(low, report)| {
-                *low < self.done || *low >= self.next || report.len() > shard_accumulator::MAX_REPORT_BYTES
-            })
-        {
-            return Err(unavailable("invalid recovery progress"));
+        let reason = if self.version != 1 {
+            Some("unsupported version")
+        } else if self.session != session.id()? {
+            Some("session mismatch")
+        } else if self.done < session.base_frame {
+            Some("audited prefix precedes session base")
+        } else if self.done > self.next {
+            Some("audited prefix exceeds next frame")
+        } else if self.next > self.target {
+            Some("next frame exceeds target")
+        } else if self.target > cursor {
+            Some("target exceeds cursor")
+        } else if self.carry > CARRY_WINDOW_FRAMES {
+            Some("carry exceeds window")
+        } else if self.reports.len() > MAX_REPORT_STATES {
+            Some("too many report states")
+        } else if self.last_report.len() > shard_accumulator::MAX_REPORT_BYTES {
+            Some("last report exceeds byte limit")
+        } else if self.implied.as_ref().is_some_and(|(low, _)| *low < self.done || *low >= self.next) {
+            Some("implied report range is outside the remaining audit")
+        } else if self.implied.as_ref().is_some_and(|(_, report)| report.len() > shard_accumulator::MAX_REPORT_BYTES) {
+            Some("implied report exceeds byte limit")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(unavailable(format!(
+                "invalid recovery progress: {reason} (version={}, base={}, done={}, next={}, target={}, cursor={}, carry={}, report_states={}, last_report_bytes={})",
+                self.version, session.base_frame, self.done, self.next, self.target, cursor,
+                self.carry, self.reports.len(), self.last_report.len(),
+            )));
         }
         if let Some((_, report)) = self.implied.as_ref().filter(|(_, report)| !report.is_empty()) {
             shard_accumulator::ShardReport::decode(report)?;
@@ -170,42 +187,53 @@ trait VerifiedHeaders: Sync {
     async fn get(&self, number: u64) -> Result<FrameHeader>;
 }
 
+/// How long fetching one historical frame from a peer may take.
+const FRAME_FETCH_BUDGET: Duration = Duration::from_secs(8);
+/// How long preparing one frame's history may take: its GLOBAL anchor and
+/// storage registrations can come from peers, the registrations under their
+/// own 15 s budget, whose errors this leaves visible. One 3 s budget for
+/// fetch, preparation and validation together cut every frame that needed a
+/// peer short, so recovery never progressed. Recovery runs on the engine's
+/// retry tick; the batch still stops after 3 s between frames.
+const FRAME_HISTORY_BUDGET: Duration = Duration::from_secs(17);
+
 #[async_trait::async_trait]
 impl VerifiedHeaders for Headers<'_> {
     async fn get(&self, number: u64) -> Result<FrameHeader> {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            let frame = match self.clock.get_shard_clock_frame(self.filter, number, false) {
-                Ok(frame) => frame,
-                Err(QuilError::NotFound(_)) => {
-                    let source = self
-                        .source
-                        .ok_or_else(|| unavailable("no historical frame source"))?;
-                    source(self.filter.to_vec(), number).await.ok_or_else(|| {
-                        unavailable(format!("historical frame {number} unavailable"))
-                    })?
-                }
-                Err(error) => return Err(error),
-            };
-            if frame.encoded_len() > MAX_FRAME_BYTES
-                || frame
-                    .header
-                    .as_ref()
-                    .is_none_or(|h| h.address != self.filter || h.frame_number != number)
-            {
-                return Err(unavailable("wrong or oversized historical frame"));
+        let frame = match self.clock.get_shard_clock_frame(self.filter, number, false) {
+            Ok(frame) => frame,
+            Err(QuilError::NotFound(_)) => {
+                let source = self
+                    .source
+                    .ok_or_else(|| unavailable(format!("no source for historical frame {number}")))?;
+                tokio::time::timeout(FRAME_FETCH_BUDGET, source(self.filter.to_vec(), number))
+                    .await
+                    .map_err(|_| unavailable(format!("fetching historical frame {number} timed out")))?
+                    .ok_or_else(|| unavailable(format!("no peer served historical frame {number}")))?
             }
-            self.validator.prepare_storage_history(&frame).await?;
-            if !crate::app_engine::validate_app_frame_panic_safe(self.validator, &frame, false)? {
-                return Err(QuilError::InvalidSignature(
-                    "historical frame rejected".into(),
-                ));
-            }
-            // Recovery consumes authenticated headers only. Unchecked request
-            // bodies are never installed into the canonical frame store.
-            Ok(frame.header.expect("checked above"))
-        })
-        .await
-        .map_err(|_| unavailable("historical frame validation timed out"))?
+            Err(error) => return Err(error),
+        };
+        if frame.encoded_len() > MAX_FRAME_BYTES
+            || frame
+                .header
+                .as_ref()
+                .is_none_or(|h| h.address != self.filter || h.frame_number != number)
+        {
+            return Err(unavailable(format!("historical frame {number} is the wrong frame or oversized")));
+        }
+        tokio::time::timeout(FRAME_HISTORY_BUDGET, self.validator.prepare_storage_history(&frame))
+            .await
+            .map_err(|_| unavailable(format!("preparing historical frame {number}'s anchor and storage history timed out")))?
+            .map_err(|error| match error {
+                QuilError::ExecutionUnavailable(message) => unavailable(format!("historical frame {number}: {message}")),
+                other => other,
+            })?;
+        if !crate::app_engine::validate_app_frame_panic_safe(self.validator, &frame, false)? {
+            return Err(QuilError::InvalidSignature(format!("historical frame {number} rejected")));
+        }
+        // Recovery consumes authenticated headers only. Unchecked request
+        // bodies are never installed into the canonical frame store.
+        Ok(frame.header.expect("checked above"))
     }
 }
 
@@ -1178,6 +1206,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_rejects_a_saved_audit_past_the_cursor_without_writes() {
+        let directory = Directory::new();
+        let session = session();
+        let (_, _, manager) = open(&directory.0);
+        let cursor_key = encoding::consensus_materialized_cursor_key(&session.filter);
+        let progress_key = encoding::app_history_recovery_key(&session.filter, &session.id().unwrap());
+        let mut saved = progress(&session);
+        saved.done = 95;
+        saved.next = 95;
+        let encoded = serde_json::to_vec(&saved).unwrap();
+        let mut records = tip(&session, 94);
+        records.push((progress_key.clone(), encoded.clone()));
+        manager.crdt().commit_with_frame_cursor_and_records(94, &cursor_key, &records).unwrap();
+        let headers = VerifiedFixture {
+            frames: BTreeMap::new(), fail_at: Mutex::new(None), reads: Mutex::new(vec![]),
+        };
+        let error = recover_with_headers(&session, manager.clone(), &headers, 94).await.unwrap_err();
+        assert!(error.to_string().contains("target exceeds cursor"), "{error}");
+        assert!(error.to_string().contains("target=95, cursor=94"), "{error}");
+        let snapshot = manager.crdt().capture_committed_shard(&session.filter).unwrap();
+        assert_eq!(snapshot.records.read_record(&progress_key).unwrap(), Some(encoded));
+        assert_eq!(snapshot.records.read_record(&cursor_key).unwrap(), Some(94u64.to_be_bytes().to_vec()));
+        assert!(headers.reads.lock().unwrap().is_empty());
+        // The same audited prefix is valid when the committed cursor reaches it.
+        manager.crdt().commit_with_frame_cursor_and_records(95, &cursor_key, &tip(&session, 95)).unwrap();
+        assert!(recover_with_headers(&session, manager.clone(), &headers, 95).await.unwrap());
+        assert!(headers.reads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn executed_frames_extend_the_audited_prefix_but_a_jump_does_not() {
         let directory = Directory::new();
         let session = session();
@@ -1347,7 +1405,8 @@ mod tests {
             .unwrap_err();
             if variant == 0 {
                 assert!(
-                    error.to_string().contains("missing BLS signature"),
+                    error.to_string().contains("app shard frame 95 ")
+                        && error.to_string().contains("missing BLS signature"),
                     "{error}"
                 );
             }

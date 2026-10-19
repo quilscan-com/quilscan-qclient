@@ -1352,6 +1352,159 @@ fn a_seal_below_or_beside_the_executed_tip_is_refused() {
     assert!(super::apply_submission(&state, 3, &seal).unwrap());
 }
 
+/// A seal notarized without a finalization is extended by a re-seal (the app
+/// automaton's `with_seal_parents`): the same checkpoint frame, digest, roots
+/// and history, at a later view, with `checkpoint.view` naming the notarized
+/// seal's view. GLOBAL accepts its finalization as it does any seal's, and
+/// authorizes the successor from the same frame.
+#[test]
+fn a_re_seal_of_a_notarized_seal_closes_the_source_at_the_same_frame() {
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    let keys = keys();
+    let filter = vec![0x5d; 32];
+    initialize(&state, 1, &initial(filter.clone(), &keys)).unwrap();
+    let request = schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+    let notarized = submission(&request, 0, &keys, 6).seal;
+    let source = &request.sources[0];
+    let reseal = Seal {
+        view: 14,
+        checkpoint: Checkpoint { view: notarized.view, ..notarized.checkpoint.clone() },
+        ..notarized.clone()
+    };
+    // Certified as a child of the data frame instead of the seal: refused.
+    let misbound = CertificateSubmission {
+        seal: reseal.clone(),
+        certificate: sign_certificate(source, &keys, reseal.view, notarized.checkpoint.view, reseal.digest()),
+    };
+    record_session_tip(&state, 3, &reseal.session, &notarized.checkpoint).unwrap();
+    assert!(super::verify_submission(&state, 3, &misbound).is_err());
+    let finalized = CertificateSubmission {
+        seal: reseal.clone(),
+        certificate: sign_certificate(source, &keys, reseal.view, notarized.view, reseal.digest()),
+    };
+    assert!(super::apply_submission(&state, 3, &finalized).unwrap());
+    let successor = head(&state, &filter).unwrap().unwrap();
+    assert_eq!((successor.generation, successor.base_frame), (2, 6));
+    assert_eq!(closed_checkpoint(&state, &reseal.session).unwrap().unwrap(), reseal.checkpoint);
+}
+
+/// A re-seal's checkpoint names the notarized seal's view, not its data
+/// frame's. That frame, the session tip GLOBAL executed, stays verifiable as
+/// history (archives ingest its body after the seal); GLOBAL header execution
+/// still refuses it, and nothing else at or past the checkpoint passes.
+#[test]
+fn a_re_sealed_checkpoint_keeps_its_data_frame_verifiable_as_history() {
+    use super::frames::{verify, verify_history, FrameClaim};
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    let keys = keys();
+    let filter = vec![0x5f; 32];
+    initialize(&state, 1, &initial(filter.clone(), &keys)).unwrap();
+    let request = schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+    let source = &request.sources[0];
+    let notarized = submission(&request, 0, &keys, 6).seal;
+    let reseal = Seal {
+        view: 14,
+        checkpoint: Checkpoint { view: notarized.view, ..notarized.checkpoint.clone() },
+        ..notarized.clone()
+    };
+    let data = notarized.checkpoint.clone();
+    let tip = FrameClaim { filter: &filter, frame: data.frame, view: data.view, parent: &[0x21; 32], digest: data.digest };
+    let tip_cert = sign_certificate(source, &keys, tip.view, 4, tip.digest);
+    let earlier = FrameClaim { frame: 5, view: 4, digest: [0x32; 32], ..tip };
+    let earlier_cert = sign_certificate(source, &keys, 4, 3, earlier.digest);
+    record_session_tip(&state, 3, &reseal.session, &data).unwrap();
+    let finalized = CertificateSubmission {
+        certificate: sign_certificate(source, &keys, reseal.view, notarized.view, reseal.digest()),
+        seal: reseal,
+    };
+    assert!(super::apply_submission(&state, 3, &finalized).unwrap());
+    commit(&state, 3);
+    let committed = CommittedView::capture(state.crdt()).unwrap();
+
+    assert!(verify_history(&committed, &tip, &tip_cert).unwrap().is_some());
+    assert!(verify_history(&committed, &earlier, &earlier_cert).unwrap().is_some());
+    let refused = verify(&committed, &tip, &tip_cert).err().unwrap();
+    assert!(refused.to_string().contains("outside the terminal checkpoint"), "{refused}");
+    assert!(verify(&committed, &earlier, &earlier_cert).unwrap().is_some());
+
+    // Another frame at the checkpoint, the tip's digest at another view
+    // below the seal's, and a frame past it.
+    let forked = FrameClaim { digest: [0x34; 32], ..tip };
+    let other_view = FrameClaim { view: 7, ..tip };
+    let beyond = FrameClaim { frame: 7, view: 15, digest: [0x35; 32], ..tip };
+    for claim in [forked, other_view, beyond] {
+        let certificate = sign_certificate(source, &keys, claim.view, 4, claim.digest);
+        let error = verify_history(&committed, &claim, &certificate).err().unwrap();
+        assert!(error.to_string().contains("outside the terminal checkpoint"), "{error}");
+    }
+}
+
+/// A session asked to close before its first frame seals at its base; when
+/// that seal is notarized but never finalized, its re-seal names the genesis
+/// at the notarized seal's view. GLOBAL refuses it before the seal recovery
+/// frame, as an older build does, and accepts it from that frame.
+#[test]
+fn a_re_seal_at_the_base_is_accepted_from_the_seal_recovery_frame() {
+    let db = quil_store::RocksDb::open_in_memory().unwrap();
+    let (_, state) = make_state(&db);
+    let keys = keys();
+    let filter = vec![0x5e; 32];
+    initialize(&state, 1, &initial(filter.clone(), &keys)).unwrap();
+    let request = schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
+    let source = &request.sources[0];
+    let reseal = Seal {
+        request: request.id().unwrap(),
+        session: source.id().unwrap(),
+        view: 7,
+        checkpoint: Checkpoint {
+            frame: source.base_frame,
+            view: 3,
+            digest: source.genesis,
+            state_roots: [[0x40; 32]; 4],
+            history_root: [0x44; 32],
+        },
+    };
+    let submission = CertificateSubmission {
+        certificate: sign_certificate(source, &keys, 7, 3, reseal.digest()),
+        seal: reseal,
+    };
+    set_seal_recovery_frame_for_thread(Some(5));
+    let before = super::verify_submission(&state, 4, &submission).unwrap_err();
+    assert!(before.to_string().contains("invalid source finalization certificate"), "{before}");
+    assert!(super::apply_submission(&state, 5, &submission).unwrap());
+    set_seal_recovery_frame_for_thread(None);
+    let successor = head(&state, &filter).unwrap().unwrap();
+    assert_eq!((successor.generation, successor.base_frame), (2, 0));
+}
+
+/// Partial drains and base re-seals are GLOBAL consensus: mainnet starts at
+/// a fixed epoch boundary whatever the environment says; other networks only
+/// when set.
+#[test]
+fn seal_recovery_activates_at_the_mainnet_frame_or_the_testnet_setting() {
+    assert_eq!(seal_recovery_frame_for(0, None), 875_520);
+    assert_eq!(seal_recovery_frame_for(0, Some("7")), 875_520);
+    assert_eq!(875_520 % quil_types::consensus::epoch_length_frames(), 0);
+    assert_eq!(seal_recovery_frame_for(1, Some("7")), 7);
+    assert_eq!(seal_recovery_frame_for(1, Some("soon")), u64::MAX);
+    assert_eq!(seal_recovery_frame_for(1, None), u64::MAX);
+}
+
+/// Drains of frames certified only by their seal are GLOBAL consensus:
+/// mainnet starts at a fixed epoch boundary whatever the environment says;
+/// other networks only when set.
+#[test]
+fn seal_checkpoint_drains_activate_only_at_a_scheduled_frame() {
+    assert_eq!(seal_checkpoint_drain_frame_for(0, None), 887_040);
+    assert_eq!(seal_checkpoint_drain_frame_for(0, Some("7")), 887_040);
+    assert_eq!(887_040 % quil_types::consensus::epoch_length_frames(), 0);
+    assert_eq!(seal_checkpoint_drain_frame_for(1, Some("7")), 7);
+    assert_eq!(seal_checkpoint_drain_frame_for(1, Some("soon")), u64::MAX);
+    assert_eq!(seal_checkpoint_drain_frame_for(1, None), u64::MAX);
+}
+
 fn fence_timeout() -> u64 {
     schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames()
 }
@@ -1404,9 +1557,9 @@ fn a_session_that_never_seals_is_fenced_at_its_tip_and_succeeded() {
     assert!(verify(&state, &beyond, &beyond_cert).unwrap().is_some(), "still closing: not yet bounded");
 
     let due = 2 + fence_timeout();
-    assert_eq!(schedule::fence_stalled_sources(&state, due - 1, &[filter.clone()]).unwrap(), 0, "not before the timeout");
+    assert_eq!(schedule::fence_stalled_sources(&state, due - 1, &[filter.clone()], None).unwrap(), 0, "not before the timeout");
     assert!(!is_fenced(&state, &id).unwrap());
-    assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()]).unwrap(), 1);
+    assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
     commit(&state, due);
     assert!(is_fenced(&state, &id).unwrap());
     assert!(matches!(status(&state, &id).unwrap(), Status::Closed(_)));
@@ -1424,7 +1577,7 @@ fn a_session_that_never_seals_is_fenced_at_its_tip_and_succeeded() {
     let late = submission(&request, 0, &keys, 6);
     record_session_tip(&state, due, &id, &late.seal.checkpoint).unwrap();
     assert!(super::apply_submission(&state, due + 1, &late).is_err());
-    assert_eq!(schedule::fence_stalled_sources(&state, due + 8, &[filter.clone()]).unwrap(), 0);
+    assert_eq!(schedule::fence_stalled_sources(&state, due + 8, &[filter.clone()], None).unwrap(), 0);
 
     // The authorization commits to the fence, not to any seal of that checkpoint.
     let db2 = quil_store::RocksDb::open_in_memory().unwrap();
@@ -1441,6 +1594,59 @@ fn a_session_that_never_seals_is_fenced_at_its_tip_and_succeeded() {
     assert_ne!(head(&sealed_state, &filter).unwrap().unwrap().authorization, successor.authorization);
 }
 
+/// A fence's membership successor takes its shard's eligible provers at the
+/// fence, not the committee its request fixed four epochs earlier, so the
+/// same pass's reconciliation leaves it running instead of asking it to close
+/// at once (2026-10-16: one node's sixteen sessions, fenced again and again,
+/// sat at view 1 below quorum). Before the activation frame, with nobody
+/// eligible, or with the request's committee still eligible, the request's
+/// committee stands.
+#[test]
+fn a_fenced_membership_successor_takes_the_eligible_committee() {
+    let filter = vec![0x6d; 32];
+    let filters = vec![filter.clone()];
+    let (old, requested, eligible_now) = (keys(), keys(), keys());
+    let due = 4 + fence_timeout();
+    let fence = |activation: u64, eligible_at_fence: &[FalconPrivateKey]| {
+        set_fenced_successor_eligibility_frame_for_thread(Some(activation));
+        let directory = tempfile::tempdir().unwrap();
+        let db = quil_store::RocksDb::open(directory.path()).unwrap();
+        let (_store, state) = make_state(&db);
+        commit(&state, 1);
+        assert_eq!(schedule::reconcile_membership(&state, 2, &policy(), &filters, &scan_of(&[(&filter, &old)])).unwrap(), 1);
+        commit(&state, 2);
+        assert_eq!(schedule::reconcile_membership(&state, 4, &policy(), &filters, &scan_of(&[(&filter, &requested)])).unwrap(), 1);
+        commit(&state, 4);
+        let scan = scan_of(&[(&filter, eligible_at_fence)]);
+        let mut eligible = |filter: &[u8]| -> Result<Vec<Vec<u8>>> { Ok(schedule::desired_members(&scan, filter, due)) };
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &filters, Some(&mut eligible)).unwrap(), 1);
+        let rescheduled = schedule::reconcile_membership(&state, due, &policy(), &filters, &scan).unwrap();
+        commit(&state, due);
+        let successor = head(&state, &filter).unwrap().unwrap();
+        assert_eq!(successor.generation, 2);
+        let closing = matches!(status(&state, &successor.id().unwrap()).unwrap(), Status::Sealing(_));
+        (successor.members, closing, rescheduled)
+    };
+    assert_eq!(fence(u64::MAX, &eligible_now), (members(&requested), true, 1),
+        "before activation: the request's committee, asked at once to close");
+    assert_eq!(fence(due, &eligible_now), (members(&eligible_now), false, 0));
+    assert_eq!(fence(due, &[]), (members(&requested), false, 0), "nobody eligible");
+    assert_eq!(fence(due, &requested), (members(&requested), false, 0), "still eligible");
+}
+
+/// Fenced membership successors from current eligibility are GLOBAL
+/// consensus: mainnet starts at a fixed epoch boundary whatever the
+/// environment says; other networks only when set.
+#[test]
+fn fenced_successor_eligibility_activates_only_at_a_scheduled_frame() {
+    assert_eq!(fenced_successor_eligibility_frame_for(0, None), 891_360);
+    assert_eq!(fenced_successor_eligibility_frame_for(0, Some("7")), 891_360);
+    assert_eq!(891_360 % quil_types::consensus::epoch_length_frames(), 0);
+    assert_eq!(fenced_successor_eligibility_frame_for(1, Some("7")), 7);
+    assert_eq!(fenced_successor_eligibility_frame_for(1, Some("soon")), u64::MAX);
+    assert_eq!(fenced_successor_eligibility_frame_for(1, None), u64::MAX);
+}
+
 /// A stalled session GLOBAL never executed a frame of is fenced at its base
 /// and succeeded. With a same-filter predecessor the fence carries that
 /// predecessor's certified roots; a first session (like a split or merge
@@ -1455,8 +1661,8 @@ fn a_stalled_session_without_a_tip_is_fenced_at_its_base() {
     initialize(&state, 1, &first).unwrap();
     let request = schedule(&state, 2, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
     let due = 2 + fence_timeout();
-    assert_eq!(schedule::fence_stalled_sources(&state, due - 1, &[filter.clone()]).unwrap(), 0, "not before the timeout");
-    assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()]).unwrap(), 1, "a first session without a tip");
+    assert_eq!(schedule::fence_stalled_sources(&state, due - 1, &[filter.clone()], None).unwrap(), 0, "not before the timeout");
+    assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1, "a first session without a tip");
     assert!(is_fenced(&state, &first.id().unwrap()).unwrap());
     let fence = closed_checkpoint(&state, &first.id().unwrap()).unwrap().unwrap();
     assert_eq!((fence.frame, fence.view, fence.digest), (first.base_frame, 0, first.genesis));
@@ -1476,7 +1682,7 @@ fn a_stalled_session_without_a_tip_is_fenced_at_its_base() {
     let second = head(&state, &filter).unwrap().unwrap();
     let second_request = schedule(&state, 4, vec![filter.clone()], vec![desired(&filter, &keys)]).unwrap();
     let later = 4 + fence_timeout();
-    assert_eq!(schedule::fence_stalled_sources(&state, later, &[filter.clone()]).unwrap(), 1);
+    assert_eq!(schedule::fence_stalled_sources(&state, later, &[filter.clone()], None).unwrap(), 1);
     let fence = closed_checkpoint(&state, &second.id().unwrap()).unwrap().unwrap();
     assert_eq!((fence.frame, fence.digest), (second.base_frame, second.genesis));
     assert_eq!(fence.state_roots, [[0x40; 32], [0x41; 32], [0x42; 32], [0x43; 32]], "the predecessor's sealed roots");
@@ -1502,7 +1708,11 @@ fn a_merge_activates_from_one_sealed_and_one_fenced_source() {
     assert!(!apply_submission(&state, 3, &submission(&request, sealed_index, &keys, 5)).unwrap());
     record_session_tip(&state, 3, &right.id().unwrap(), &tip(8, 11, [0x88; 32])).unwrap();
     let filters = vec![left_filter.clone(), right_filter.clone()];
-    assert_eq!(schedule::fence_stalled_sources(&state, 2 + fence_timeout(), &filters).unwrap(), 1, "only the unsealed source");
+    // A merge's successor keeps the committee its request authorized.
+    set_fenced_successor_eligibility_frame_for_thread(Some(0));
+    let mut eligible = |_: &[u8]| -> Result<Vec<Vec<u8>>> { panic!("a merge's fence read eligibility") };
+    assert_eq!(schedule::fence_stalled_sources(&state, 2 + fence_timeout(), &filters, Some(&mut eligible)).unwrap(), 1,
+        "only the unsealed source");
     assert!(!is_fenced(&state, &left.id().unwrap()).unwrap());
     assert!(is_fenced(&state, &right.id().unwrap()).unwrap());
     assert!(schedule::activated(&state, &request.id().unwrap()).unwrap());

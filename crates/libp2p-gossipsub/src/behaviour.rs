@@ -515,6 +515,15 @@ where
         }
     }
 
+    /// Replace peers exempt from IP-colocation scoring. All other score
+    /// terms and validation remain unchanged. Callers must authorize peers
+    /// independently of their self-reported addresses or subscriptions.
+    pub fn set_ip_colocation_peer_whitelist(&mut self, peers: HashSet<PeerId>) {
+        if let PeerScoreState::Active(score) = &mut self.peer_score {
+            score.set_ip_colocation_peer_whitelist(peers);
+        }
+    }
+
     /// Subscribe to a topic.
     ///
     /// Returns [`Ok(true)`] if the subscription worked. Returns [`Ok(false)`] if we were already
@@ -1824,7 +1833,11 @@ where
         let msg_id = self.config.message_id(&message);
 
         // Broadcast IDONTWANT messages
-        if raw_protobuf_len > self.config.idontwant_message_size_threshold() {
+        // QUILIBRIUM: only for the first copy. A duplicate's IDONTWANT would
+        // repeat, to every mesh peer, the one the first copy already sent.
+        if raw_protobuf_len > self.config.idontwant_message_size_threshold()
+            && !self.duplicate_cache.contains(&msg_id)
+        {
             let recipient_peers = self
                 .mesh
                 .get(&message.topic)

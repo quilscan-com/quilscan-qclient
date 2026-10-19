@@ -33,16 +33,18 @@ pub struct ConnectOpts {
     pub public_rpc: bool,
     /// `ClientConfig.customRpc` (may be empty).
     pub custom_rpc: String,
-    /// `config.listen_grpc_multiaddr` from the node config (may be empty).
+    /// `config.listen_grpc_multiaddr` from the node config (may be empty:
+    /// the node then listens on `DEFAULT_LISTEN_GRPC_MULTIADDR`).
     pub listen_grpc_multiaddr: String,
 }
 
 impl ConnectOpts {
     /// Light node ⇔ talk to a hosted/public RPC rather than the local
-    /// node. Port of `token.go:69-83`: true if `--public-rpc`, or the
-    /// client config's `publicRpc`, or the node has no gRPC listener.
+    /// node: `--public-rpc`, the client config's `publicRpc`, or a
+    /// `customRpc` with no node listener configured. An empty listener alone
+    /// is not one: unlike Go's, the node then listens on its local default.
     pub fn is_light_node(&self) -> bool {
-        self.public_rpc || self.listen_grpc_multiaddr.is_empty()
+        self.public_rpc || (self.listen_grpc_multiaddr.is_empty() && !self.custom_rpc.is_empty())
     }
 
     /// The `host:port` to dial and whether TLS is required.
@@ -55,8 +57,12 @@ impl ConnectOpts {
             };
             Ok((addr, true))
         } else {
-            let addr = grpc_multiaddr_to_host_port(&self.listen_grpc_multiaddr)?;
-            Ok((addr, false))
+            let listen = if self.listen_grpc_multiaddr.is_empty() {
+                quil_config::DEFAULT_LISTEN_GRPC_MULTIADDR
+            } else {
+                &self.listen_grpc_multiaddr
+            };
+            Ok((grpc_multiaddr_to_host_port(listen)?, false))
         }
     }
 }
@@ -67,18 +73,25 @@ pub async fn connect_channel(opts: &ConnectOpts) -> anyhow::Result<Channel> {
     build_channel(&addr, tls).await
 }
 
-async fn build_channel(addr: &str, tls: bool) -> anyhow::Result<Channel> {
+fn endpoint(addr: &str, tls: bool) -> anyhow::Result<Endpoint> {
     let scheme = if tls { "https" } else { "http" };
     let mut endpoint = Endpoint::from_shared(format!("{scheme}://{addr}"))
         .map_err(|e| anyhow::anyhow!("invalid endpoint {addr}: {e}"))?
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(120));
     if tls {
+        // rustls cannot pick a process-level provider from its features in
+        // qclient's build and would panic here without one (#696).
+        quil_rpc::quil_tls::install_crypto_provider();
         // System trust roots, verifying the server cert (Go's
         // InsecureSkipVerify:false). SNI is taken from the URI authority.
         endpoint = endpoint.tls_config(ClientTlsConfig::new().with_native_roots())?;
     }
-    let channel = endpoint
+    Ok(endpoint)
+}
+
+async fn build_channel(addr: &str, tls: bool) -> anyhow::Result<Channel> {
+    let channel = endpoint(addr, tls)?
         .connect()
         .await
         .map_err(|e| anyhow::anyhow!("connect {addr}: {e}"))?;
@@ -172,6 +185,11 @@ mod tests {
     }
 
     #[test]
+    fn a_tls_endpoint_builds_without_a_preinstalled_crypto_provider() {
+        assert!(endpoint(PUBLIC_RPC_ADDR, true).is_ok());
+    }
+
+    #[test]
     fn parses_dns_multiaddr() {
         assert_eq!(
             grpc_multiaddr_to_host_port("/dns4/rpc.quilibrium.com/tcp/8337").unwrap(),
@@ -188,14 +206,36 @@ mod tests {
     }
 
     #[test]
-    fn light_node_when_no_listener() {
+    fn an_empty_listener_dials_the_local_default() {
         let opts = ConnectOpts {
             public_rpc: false,
             custom_rpc: String::new(),
             listen_grpc_multiaddr: String::new(),
         };
+        assert!(!opts.is_light_node());
+        assert_eq!(opts.target().unwrap(), ("127.0.0.1:8337".to_string(), false));
+    }
+
+    #[test]
+    fn public_rpc_flag_selects_the_hosted_endpoint() {
+        let opts = ConnectOpts {
+            public_rpc: true,
+            custom_rpc: String::new(),
+            listen_grpc_multiaddr: String::new(),
+        };
         assert!(opts.is_light_node());
         assert_eq!(opts.target().unwrap(), (PUBLIC_RPC_ADDR.to_string(), true));
+    }
+
+    #[test]
+    fn custom_rpc_without_a_listener_stays_a_light_node() {
+        let opts = ConnectOpts {
+            public_rpc: false,
+            custom_rpc: "example.com:9000".into(),
+            listen_grpc_multiaddr: String::new(),
+        };
+        assert!(opts.is_light_node());
+        assert_eq!(opts.target().unwrap(), ("example.com:9000".to_string(), true));
     }
 
     #[test]

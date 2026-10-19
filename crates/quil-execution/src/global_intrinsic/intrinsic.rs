@@ -83,6 +83,15 @@ pub struct GlobalIntrinsic {
 
 }
 
+/// What a seal submission's drain headers do ([`GlobalIntrinsic::seal_drain`]).
+struct SealDrain {
+    /// The sealed source's executed tip after them.
+    executed: Option<quil_cw_consensus::handoff::Checkpoint>,
+    /// They reach the sealed checkpoint, or there are none: the seal applies.
+    /// Otherwise a partial drain, which leaves the seal for later.
+    complete: bool,
+}
+
 /// Where a committee session pass spent its time, logged when it is slow.
 struct SessionPassTiming {
     frame: u64,
@@ -1246,11 +1255,18 @@ impl GlobalIntrinsic {
                 self.invoke_frame_header(frame_number, &op, state, &va_disc)
             }
             super::handoff::TYPE_COMMITTEE_HANDOFF => {
-                // The drain and the seal it enables apply together or not at all.
+                // The drain and the seal it enables apply together or not at
+                // all. A partial drain applies with a valid closing
+                // certificate, and leaves the seal for a later submission.
                 let sealed = super::handoff::SealSubmission::from_canonical_bytes(input)?;
                 let savepoint = state.changeset_len();
-                let applied = self.seal_drain(frame_number, &sealed, state, true)
-                    .and_then(|_| super::handoff::apply_submission(state, frame_number, &sealed.submission));
+                let applied = self.seal_drain(frame_number, &sealed, state, true).and_then(|drain| {
+                    if drain.complete {
+                        super::handoff::apply_submission(state, frame_number, &sealed.submission).map(|_| ())
+                    } else {
+                        super::handoff::verify_closing_certificate(state, frame_number, &sealed.submission).map(|_| ())
+                    }
+                });
                 if let Err(error) = applied {
                     state.rollback_to(savepoint);
                     return Err(error);
@@ -2070,9 +2086,9 @@ impl GlobalIntrinsic {
             QuilError::Internal("FrameHeader: clock_store not installed — cannot recompute output".into())
         })?;
         let anchor_output = clock_store
-            .get_global_clock_frame(op.global_frame_number)
+            .get_global_clock_frame_header(op.global_frame_number)
             .ok()
-            .and_then(|f| f.header.map(|h| h.output))
+            .map(|header| header.output)
             .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
                 "FrameHeader: anchored global frame {} unavailable — cannot recompute output",
                 op.global_frame_number
@@ -2149,9 +2165,9 @@ impl GlobalIntrinsic {
             )
         })?;
         let global_output = clock_store
-            .get_global_clock_frame(op.global_frame_number)
+            .get_global_clock_frame_header(op.global_frame_number)
             .ok()
-            .and_then(|f| f.header.map(|h| h.output))
+            .map(|header| header.output)
             .unwrap_or_default();
         let rho_n =
             quil_crypto::porep::derive_storage_beacon(op.global_frame_number, &global_output);
@@ -2230,41 +2246,109 @@ impl GlobalIntrinsic {
         Ok(())
     }
 
-    /// The sealed source's executed tip once a seal submission's drain
-    /// headers are executed (`execute`) or would be (validation, which writes
-    /// nothing), after checking each one (#699; `handoff::SealSubmission`).
-    /// The recorded tip when it carries none.
+    /// [`Self::check_drain_header`] for a header the seal certifies
+    /// ([`Self::drain_certified_by_seal`]): everything but its own certificate.
+    #[cfg_attr(not(feature = "confidential-tokens"), allow(unused_variables))]
+    fn check_seal_certified_header(&self, frame_number: u64, op: &super::frame_header::FrameHeader) -> Result<()> {
+        self.verify_shard_frame_output(op)?;
+        super::prover_shard_update::verify_settlement_relay(op)?;
+        #[cfg(feature = "confidential-tokens")]
+        crate::token_intrinsic::global_accumulator::verify_report(&op.address, &op.accumulator)?;
+        #[cfg(feature = "confidential-tokens")]
+        crate::token_intrinsic::global_commit::verify_relay(frame_number, op.frame_number, &op.spends)?;
+        Ok(())
+    }
+
+    /// Which drain headers, carrying no certificate of their own, the seal's
+    /// certificate authenticates (from `handoff::seal_checkpoint_drain_frame`):
+    /// the last when it is the sealed checkpoint frame itself, and each one
+    /// whose child, so authenticated or certified, names it as its parent. A
+    /// header's output digest commits to every field but its address, which
+    /// must be the session's shard. A seal built on a notarized checkpoint
+    /// finalizes that frame, and any notarized frame under it, with no
+    /// certificate of its own, so no proof or certified drain could bring it
+    /// to GLOBAL. Every other header must be certified by the session.
+    fn drain_certified_by_seal(
+        &self,
+        frame_number: u64,
+        sealed: &super::handoff::SealSubmission,
+        state: &HypergraphState,
+        headers: &[super::frame_header::FrameHeader],
+    ) -> Result<Vec<bool>> {
+        let uncertified: Vec<bool> = headers
+            .iter()
+            .map(|op| quil_cw_consensus::app_cert::unwrap_cert_from_header(&op.public_key_signature_bls48581).is_none())
+            .collect();
+        let mut by_seal = vec![false; headers.len()];
+        if !uncertified.contains(&true) || frame_number < super::handoff::seal_checkpoint_drain_frame() {
+            return Ok(by_seal);
+        }
+        // Only a valid seal certifies its checkpoint.
+        super::handoff::verify_closing_certificate(state, frame_number, &sealed.submission)?;
+        let checkpoint = &sealed.submission.seal.checkpoint;
+        let identity = |op: &super::frame_header::FrameHeader| quil_crypto::poseidon::hash_bytes_to_32(&op.output);
+        for index in (0..headers.len()).rev() {
+            if !uncertified[index] {
+                continue;
+            }
+            let op = &headers[index];
+            by_seal[index] = match headers.get(index + 1) {
+                // A re-seal names its parent seal's view, above the frame's own.
+                None => op.frame_number == checkpoint.frame
+                    && op.rank <= checkpoint.view
+                    && identity(op)? == checkpoint.digest,
+                Some(child) => (by_seal[index + 1] || !uncertified[index + 1])
+                    && child.address == op.address
+                    && op.frame_number.checked_add(1) == Some(child.frame_number)
+                    && child.rank > op.rank
+                    && child.parent_selector == identity(op)?.as_slice(),
+            };
+        }
+        Ok(by_seal)
+    }
+
+    /// What a seal submission's drain headers do once executed (`execute`)
+    /// or would do (validation, which writes nothing), after checking each one
+    /// (#699; `handoff::SealSubmission`): the sealed source's executed tip
+    /// after them, and whether they reach the sealed checkpoint. The recorded
+    /// tip, complete, when it carries none.
     ///
     /// Drain headers are the source's frames from the one after GLOBAL's
-    /// executed tip through the sealed checkpoint, consecutive; ones GLOBAL
-    /// already executed are passed over. Executing one records the tip and
-    /// its outflows (settlements, accumulator report, relayed spends) as
-    /// `invoke_frame_header` does, with no reward: the frames GLOBAL rewards
-    /// are the ones it packed in their window.
+    /// executed tip, consecutive, through the sealed checkpoint, or, as a
+    /// partial drain, exactly `MAX_DRAIN_HEADERS` of them ending below it;
+    /// ones GLOBAL already executed are passed over. Executing one records the
+    /// tip and its outflows (settlements, accumulator report, relayed spends)
+    /// as `invoke_frame_header` does, with no reward: the frames GLOBAL
+    /// rewards are the ones it packed in their window.
     fn seal_drain(
         &self,
         frame_number: u64,
         sealed: &super::handoff::SealSubmission,
         state: &HypergraphState,
         execute: bool,
-    ) -> Result<Option<quil_cw_consensus::handoff::Checkpoint>> {
+    ) -> Result<SealDrain> {
         use super::handoff;
         let invalid = |message: &str| QuilError::InvalidArgument(format!("seal drain: {message}"));
         let id = sealed.submission.seal.session;
         let recorded = handoff::session_tip(state, &id)?;
         if sealed.drain.is_empty() {
-            return Ok(recorded);
+            return Ok(SealDrain { executed: recorded, complete: true });
         }
         if frame_number < handoff::seal_drain_frame() {
             return Err(invalid("drain headers are not active"));
         }
         let session = handoff::session(state, &id)?.ok_or_else(|| invalid("no such session"))?;
+        let headers = sealed
+            .drain
+            .iter()
+            .map(|bytes| super::frame_header::FrameHeader::from_canonical_bytes(bytes))
+            .collect::<Result<Vec<_>>>()?;
+        let by_seal = self.drain_certified_by_seal(frame_number, sealed, state, &headers)?;
         let mut executed = recorded;
         let mut next = executed.as_ref().map_or(session.base_frame, |tip| tip.frame).saturating_add(1);
         let mut last: Option<u64> = None;
         let mut drained = 0usize;
-        for bytes in &sealed.drain {
-            let op = super::frame_header::FrameHeader::from_canonical_bytes(bytes)?;
+        for (op, by_seal) in headers.into_iter().zip(by_seal) {
             if op.address != session.filter {
                 return Err(invalid("header from another shard"));
             }
@@ -2278,7 +2362,11 @@ impl GlobalIntrinsic {
             if op.frame_number > next {
                 return Err(invalid("headers leave a gap after the executed tip"));
             }
-            self.check_drain_header(frame_number, &op, state, &id)?;
+            if by_seal {
+                self.check_seal_certified_header(frame_number, &op)?;
+            } else {
+                self.check_drain_header(frame_number, &op, state, &id)?;
+            }
             let roots: Option<Vec<[u8; 32]>> =
                 op.state_roots.iter().map(|root| <[u8; 32]>::try_from(root.as_slice()).ok()).collect();
             let state_roots = roots.and_then(|roots| <[[u8; 32]; 4]>::try_from(roots).ok())
@@ -2306,20 +2394,32 @@ impl GlobalIntrinsic {
             next = next.saturating_add(1);
             drained += 1;
         }
-        if last != Some(sealed.submission.seal.checkpoint.frame) {
-            return Err(invalid("headers do not end at the sealed checkpoint"));
-        }
+        let checkpoint = sealed.submission.seal.checkpoint.frame;
+        let complete = match last {
+            Some(last) if last == checkpoint => true,
+            Some(last) if last > checkpoint => return Err(invalid("headers run past the sealed checkpoint")),
+            _ if frame_number < handoff::seal_recovery_frame() => {
+                return Err(invalid("headers do not end at the sealed checkpoint"));
+            }
+            _ if sealed.drain.len() != handoff::MAX_DRAIN_HEADERS => {
+                return Err(invalid("a partial drain carries exactly the most headers a submission may"));
+            }
+            _ if drained == 0 => return Err(invalid("a partial drain's headers are already executed")),
+            _ => false,
+        };
         if execute && drained > 0 {
             tracing::info!(
                 frame = frame_number,
                 filter = %hex::encode(&session.filter),
                 session = %hex::encode(id),
                 drained,
-                through = sealed.submission.seal.checkpoint.frame,
+                through = last,
+                checkpoint,
+                complete,
                 "committee handoff: executed a seal's drain headers",
             );
         }
-        Ok(executed)
+        Ok(SealDrain { executed, complete })
     }
 
     /// Check a committee-handoff seal submission, its drain headers included,
@@ -2330,8 +2430,12 @@ impl GlobalIntrinsic {
         sealed: &super::handoff::SealSubmission,
         state: &HypergraphState,
     ) -> Result<()> {
-        let executed = self.seal_drain(frame_number, sealed, state, false)?;
-        super::handoff::verify_submission_at(state, frame_number, &sealed.submission, executed)?;
+        let drain = self.seal_drain(frame_number, sealed, state, false)?;
+        if drain.complete {
+            super::handoff::verify_submission_at(state, frame_number, &sealed.submission, drain.executed)?;
+        } else {
+            super::handoff::verify_closing_certificate(state, frame_number, &sealed.submission)?;
+        }
         Ok(())
     }
 
@@ -2352,6 +2456,7 @@ impl GlobalIntrinsic {
         // Materialize-only deps (reward_issuance, hypergraph) are
         // archive-mode extras: when absent, we skip the state
         // mutations but only AFTER the attestation has verified.
+        let mut timing = HeaderTiming::start();
         let fp = self.frame_prover.as_ref().ok_or_else(|| QuilError::Internal(
             "invoke_frame_header: frame_prover not installed — cannot verify attestation".into(),
         ))?;
@@ -2374,10 +2479,12 @@ impl GlobalIntrinsic {
         ).map_err(|e| QuilError::InvalidArgument(format!(
             "invoke_frame_header: frame header attestation invalid: {e}"
         )))?;
+        timing.mark("session");
 
         self.verify_shard_frame_output(op).map_err(|e| QuilError::InvalidArgument(format!(
             "invoke_frame_header: {e}"
         )))?;
+        timing.mark("output");
         super::prover_shard_update::verify_settlement_relay(op)?;
         // A certified header's accumulator report must be canonical and name
         // subtrees its own shard can own; checked by every node, like the relay.
@@ -2385,6 +2492,7 @@ impl GlobalIntrinsic {
         crate::token_intrinsic::global_accumulator::verify_report(&op.address, &op.accumulator)?;
         #[cfg(feature = "confidential-tokens")]
         crate::token_intrinsic::global_commit::verify_relay(frame_number, op.frame_number, &op.spends)?;
+        timing.mark("verify relay/report");
 
         // The authorized session's executed tip: a seal is accepted only once
         // it reaches the sealed checkpoint.
@@ -2428,7 +2536,9 @@ impl GlobalIntrinsic {
         // AND deterministically reassigns each affected prover's allocation onto
         // the new shard(s) in committed hypergraph state. Runs regardless of the
         // archive-mode reward/hypergraph deps below.
+        timing.mark("session tip");
         self.apply_due_shard_changes(frame_number, state)?;
+        timing.mark("due shard changes");
 
         // Now that verification has passed, gate further state writes
         // on the archive-mode deps.
@@ -2442,10 +2552,12 @@ impl GlobalIntrinsic {
         // Cross-domain settlements the QUIL shard relays become GLOBAL
         // records here, independent of the reward gates below.
         super::prover_shard_update::materialize_settlement_records(op, frame_number, state)?;
+        timing.mark("settlements");
         // The shard's accumulator report joins the application's canonical
         // root, in the same deterministic order.
         #[cfg(feature = "confidential-tokens")]
         crate::token_intrinsic::global_accumulator::materialize_report(state, frame_number, &op.address, &op.accumulator)?;
+        timing.mark("report");
         // Then the confidential operations the shard relayed, decided once in
         // this frame's order. The report is processed first so a spend can
         // cite the root it carries.
@@ -2453,6 +2565,7 @@ impl GlobalIntrinsic {
         let committed_fees = crate::token_intrinsic::global_commit::materialize_relay(
             state, frame_number, &op.address, op.frame_number, &op.spends,
         )?;
+        timing.mark("relay");
         #[cfg(not(feature = "confidential-tokens"))]
         let committed_fees = 0u128;
 
@@ -2575,6 +2688,8 @@ impl GlobalIntrinsic {
             Arc::new(StubFrameProver)
         });
 
+        timing.mark("sizes");
+        let participants = participant_indices.len();
         super::prover_shard_update::materialize_prover_shard_update_with_fees(
             op,
             frame_number,
@@ -2589,6 +2704,7 @@ impl GlobalIntrinsic {
             committed_fees,
             session,
         )?;
+        timing.mark("rewards/activity");
 
         // PoRep: the ρ_N-sampled possession audit runs LAST — AFTER the
         // coverage credit above — so a cheating member's eviction (Status=4,
@@ -2601,6 +2717,8 @@ impl GlobalIntrinsic {
         // registry), so every archive evicts identically and non-archive nodes
         // inherit it via sync.
         self.audit_storage_attestation(frame_number, op, &bitmask_bytes, state, va_disc)?;
+        timing.mark("storage audit");
+        timing.finish(frame_number, op, participants);
         Ok(())
     }
 
@@ -3321,9 +3439,22 @@ impl GlobalIntrinsic {
         timing.filters = filters.len();
         timing.lap("grid filters");
         // Closing sessions that never sealed are fenced first, so a successor
-        // they authorize is visible to the reconciliation below.
+        // they authorize is visible to the reconciliation below. A fenced
+        // membership successor takes the eligibility that reconciliation
+        // compares against: the same scan, read only once a fence needs it.
+        let mut scanned: Option<crate::prover_registry::CommittedProverScan> = None;
+        let mut eligible = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
+            if scanned.is_none() {
+                scanned = Some(crate::prover_registry::CommittedProverScan::try_scan(hg)?);
+            }
+            Ok(scanned.as_ref().map_or_else(Vec::new, |scan| {
+                super::handoff::schedule::desired_members(scan, filter, frame_number)
+            }))
+        };
         let checkpoint = state.changeset_len();
-        if let Err(error) = super::handoff::schedule::fence_stalled_sources(state, frame_number, &filters) {
+        if let Err(error) = super::handoff::schedule::fence_stalled_sources(
+            state, frame_number, &filters, Some(&mut eligible))
+        {
             if !matches!(error, QuilError::InvalidArgument(_)) {
                 return Err(error);
             }
@@ -3361,7 +3492,10 @@ impl GlobalIntrinsic {
         {
             return Ok(());
         }
-        let mut scan = crate::prover_registry::CommittedProverScan::try_scan(hg)?;
+        let mut scan = match scanned {
+            Some(scan) => scan,
+            None => crate::prover_registry::CommittedProverScan::try_scan(hg)?,
+        };
         timing.allocations = Some(scan.allocations.len());
         timing.lap("prover scan");
         // A flag day that discards legacy history prepares the prover tree
@@ -3755,8 +3889,8 @@ impl GlobalIntrinsic {
         Ok(())
     }
 
-    /// The committee-handoff flag day ([`LegacyHistory::Discard`], owner
-    /// decision 2026-10-05), in the first session pass from activation:
+    /// The committee-handoff flag day ([`LegacyHistory::Discard`], decided
+    /// 2026-10-05), in the first session pass from activation:
     ///
     /// 1. Every live allocation without a ring key records one
     ///    (`prover_rings::preexisting`: its join-confirm cohort and its
@@ -4113,6 +4247,39 @@ fn ed448_pubkey_to_peer_id_string(pubkey: &[u8]) -> String {
 ///
 /// Degrades CLOSED (returns `true`, "still registered") on a store
 /// error so a read failure never spuriously bypasses the halt-risk gate.
+/// Step durations of one shard header's GLOBAL execution, logged when it is
+/// slow: a frame executes some 20–30 headers, two or three times (proposal
+/// check, publication), and their sum is most of a GLOBAL frame's time.
+struct HeaderTiming {
+    started: std::time::Instant,
+    last: std::time::Instant,
+    steps: Vec<(&'static str, u128)>,
+}
+
+impl HeaderTiming {
+    const SLOW: std::time::Duration = std::time::Duration::from_millis(150);
+
+    fn start() -> Self {
+        let now = std::time::Instant::now();
+        Self { started: now, last: now, steps: Vec::new() }
+    }
+
+    fn mark(&mut self, step: &'static str) {
+        let now = std::time::Instant::now();
+        self.steps.push((step, now.duration_since(self.last).as_micros()));
+        self.last = now;
+    }
+
+    fn finish(self, frame: u64, op: &super::frame_header::FrameHeader, participants: usize) {
+        let total = self.started.elapsed();
+        if total >= Self::SLOW {
+            tracing::info!(frame, shard = %hex::encode(&op.address), shard_frame = op.frame_number,
+                participants, total_ms = total.as_millis() as u64,
+                steps_us = ?self.steps, "slow GLOBAL shard header execution");
+        }
+    }
+}
+
 /// `cell`'s committed prover scan of `hg`, read on first use.
 fn committed_prover_scan<'c>(
     cell: &'c std::cell::OnceCell<crate::prover_registry::CommittedProverScan>,

@@ -32,8 +32,18 @@ qclient node prover status
 qclient node prover manage --once
 ```
 
-`manage --once` prints the current allocation table without starting the
-interactive interface.
+`manage --once` prints one schema-version-1 JSON snapshot without starting the
+interactive interface. `manage --render` prints one read-only TUI frame;
+`manage --help-text` prints its controls without a node connection. The JSON
+mode cannot be combined with either text mode.
+
+Official source baseline: `QuilibriumNetwork/monorepo` branch `v2.1.0.25` at
+`b77ddfbe5785b6e56a46339e9cdeeef20b7f5dfc` (fetched 2026-10-19). The Rust
+client dependency closure and protobufs follow that pinned tree, with the
+Quilscan machine interface, independent reward query and version CLI retained.
+See [`QCLIENT_OUTPUT_MIGRATION.md`](QCLIENT_OUTPUT_MIGRATION.md) for output
+contracts and [`docs/qclient-upstream-sync.md`](docs/qclient-upstream-sync.md)
+for source scope and verification.
 
 ## License
 

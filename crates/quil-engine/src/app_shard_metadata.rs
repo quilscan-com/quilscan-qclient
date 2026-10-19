@@ -232,33 +232,50 @@ pub fn leaf_data_for(
     Ok(out)
 }
 
-/// Worker-side shard-data sync (per-prover PoRep possession). Copies a covered
-/// app's committed vertex-adds from a SOURCE crdt (the master's, which the frame
-/// poller forest-fills) into the prover's OWN crdt, so a thread-worker holds and
-/// proves its own copy of the shard data rather than reading a shared store. This
-/// is the in-process analogue of the network forest-sync a cluster/process worker
-/// would run. Idempotent (re-adding a vertex overwrites); commits only when it
-/// copied something so it's cheap once the worker is caught up.
+/// Seed a worker's own committed data for its full coverage filter. Unified
+/// workers reject unrelated addresses before retaining blobs and do not write
+/// unchanged vertices again. Legacy trees retain whole-app seed semantics.
 pub fn sync_app_shard_to_own_crdt(
     source: &HypergraphCrdt,
     own: &HypergraphCrdt,
-    app_address: &[u8],
+    filter: &[u8],
     frame_number: u64,
 ) -> quil_types::error::Result<usize> {
+    use quil_types::error::QuilError;
+    let app: [u8; 32] = filter.get(..32).and_then(|a| a.try_into().ok())
+        .ok_or_else(|| QuilError::InvalidArgument("seed filter lacks an application address".into()))?;
+    let bits = if own.unified_tree() {
+        let bits = own.canonical_bits_for_filter(filter)
+            .filter(|bits| bits.len() <= 256 && (filter.len() != 33 || filter[32] < 64))
+            .ok_or_else(|| QuilError::InvalidArgument("invalid unified seed filter".into()))?;
+        Some(bits)
+    } else { None };
+    let matches = |key: &[u8]| key.len() == 64 && bits.as_ref().is_none_or(|bits| {
+        key[..32] == app && bits.iter().enumerate().all(|(i, bit)| {
+            (key[32 + i / 8] >> (7 - i % 8) & 1 != 0) == *bit
+        })
+    });
     let mut copied = 0usize;
-    source.for_each_vertex_adds_blob(app_address, &mut |key, blob| {
-        if key.len() == 64 && !blob.is_empty() {
-            let mut id = [0u8; 64];
-            id.copy_from_slice(&key);
-            let loc = quil_hypergraph::addressing::Location::from_id(&id);
-            if own.add_vertex(&loc, &blob).is_ok() {
-                copied += 1;
+    let mut failure = None;
+    source.for_each_vertex_adds_blob_matching(&app, &matches, &mut |key, blob| {
+        if blob.is_empty() || failure.is_some() { return; }
+        let mut id = [0u8; 64];
+        id.copy_from_slice(&key);
+        let loc = quil_hypergraph::addressing::Location::from_id(&id);
+        if bits.is_some() {
+            match own.get_vertex_data_checked(&loc) {
+                Ok(Some(existing)) if existing == blob => return,
+                Ok(_) => {},
+                Err(error) => { failure = Some(error); return; }
             }
         }
+        match own.add_vertex(&loc, &blob) {
+            Ok(()) => copied += 1,
+            Err(error) => failure = Some(error),
+        }
     })?;
-    if copied > 0 {
-        own.commit(frame_number)?;
-    }
+    if let Some(error) = failure { return Err(error); }
+    if copied > 0 { own.commit(frame_number)?; }
     Ok(copied)
 }
 
@@ -290,12 +307,17 @@ pub(crate) fn split_coverage_filter(filter: &[u8]) -> (&[u8], Vec<u32>) {
 
 /// Whether committed data is present in this worker's covered subtree. This
 /// is a presence check, not proof that the state matches a certified frame;
-/// the proposal/verifier pre-state checks enforce that separately.
+/// the proposal/verifier pre-state checks enforce that separately. A subtree
+/// an interrupted download left partly installed holds leaves but not its
+/// state, and does not count until a download of it completes.
 pub(crate) fn has_committed_shard_data(crdt: &HypergraphCrdt, filter: &[u8]) -> bool {
     if crdt.unified_tree() {
         let Some(bits) = crdt.canonical_bits_for_filter(filter) else {
             return false;
         };
+        if crdt.sync_incomplete(&filter[..32], &bits).unwrap_or(true) {
+            return false;
+        }
         // A sync can install a complete subtree without populating write-time
         // size buckets. Decode the wire bit length and packed path before
         // reading the committed forest.
@@ -556,6 +578,80 @@ mod tests {
         Arc::new(HypergraphCrdt::new(store, prover))
     }
 
+    fn seed_test_crdt(unified: bool) -> (Arc<quil_store::RocksDb>, Arc<HypergraphCrdt>) {
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
+        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE.to_vec()));
+        crdt.set_unified_tree(unified);
+        (db, crdt)
+    }
+
+    #[test]
+    fn worker_seed_keeps_only_covered_data_and_unchanged_retries_do_not_write() {
+        let (_, source) = seed_test_crdt(true);
+        let (db, own) = seed_test_crdt(true);
+        let app = [0x71; 32];
+        let bits = vec![true, false, true, true, false, true, false, true, true];
+        let filter = quil_forest::encode_shard_bit_path(&app, &bits);
+        let mut address = [0; 32]; address[0] = 0xb5; address[1] = 0x80;
+        let covered = Location { app_address: app, data_address: address };
+        address[1] = 0;
+        let sibling = Location { app_address: app, data_address: address };
+        let distant = Location { app_address: app, data_address: [0; 32] };
+        for (location, value) in [(&covered, b"covered".as_slice()), (&sibling, b"sibling"), (&distant, b"distant")] {
+            source.add_vertex(location, value).unwrap();
+        }
+        source.commit(1).unwrap();
+        assert_eq!(sync_app_shard_to_own_crdt(&source, &own, &filter, 2).unwrap(), 1,
+            "worker must not copy unrelated sub-shards of its application");
+        assert_eq!(own.get_vertex_data_checked(&covered).unwrap(), Some(b"covered".to_vec()));
+        assert_eq!(own.get_vertex_data_checked(&sibling).unwrap(), None);
+        assert_eq!(own.get_vertex_data_checked(&distant).unwrap(), None);
+        let shard = quil_hypergraph::shard_key_for_location(&covered);
+        let path = build_app_shard_full_prefix(&app, &quil_forest::bit_path_to_prefix(&bits));
+        let roots = |crdt: &HypergraphCrdt| crdt.phase_set_metadata_at_path(&shard, &path).unwrap()
+            .map(|m| m.map(|m| m.commitment));
+        assert_eq!(roots(&source), roots(&own), "covered commitments are unchanged by omitted siblings");
+        let sequence = db.inner().latest_sequence_number();
+        assert_eq!(sync_app_shard_to_own_crdt(&source, &own, &filter, 3).unwrap(), 0);
+        assert_eq!(db.inner().latest_sequence_number(), sequence,
+            "an unchanged retry must not create blob/tree history");
+        source.add_vertex(&covered, b"updated").unwrap();
+        source.commit(4).unwrap();
+        assert_eq!(sync_app_shard_to_own_crdt(&source, &own, &filter, 5).unwrap(), 1);
+        assert_eq!(own.get_vertex_data_checked(&covered).unwrap(), Some(b"updated".to_vec()));
+        assert_eq!(roots(&source), roots(&own));
+    }
+
+    #[test]
+    fn worker_seed_preserves_root_and_legacy_scope_and_rejects_invalid_unified_filters() {
+        let (_, source) = seed_test_crdt(true);
+        let app = [0x71; 32];
+        let a = Location { app_address: app, data_address: [0; 32] };
+        let b = Location { app_address: app, data_address: [0xff; 32] };
+        source.add_vertex(&a, b"a").unwrap(); source.add_vertex(&b, b"b").unwrap();
+        source.commit(1).unwrap();
+        let (_, root) = seed_test_crdt(true);
+        assert_eq!(sync_app_shard_to_own_crdt(&source, &root, &app, 2).unwrap(), 2);
+        let (_, legacy) = seed_test_crdt(false);
+        let child = quil_forest::encode_shard_bit_path(&app, &[true]);
+        assert_eq!(sync_app_shard_to_own_crdt(&source, &legacy, &child, 2).unwrap(), 2,
+            "legacy whole-app roots retain their existing seed semantics");
+        let (_, byte_suffix) = seed_test_crdt(true);
+        let filter = [app.to_vec(), vec![63]].concat();
+        assert_eq!(sync_app_shard_to_own_crdt(&source, &byte_suffix, &filter, 2).unwrap(), 1);
+        assert!(byte_suffix.get_vertex_data_checked(&a).unwrap().is_none());
+        assert_eq!(byte_suffix.get_vertex_data_checked(&b).unwrap(), Some(b"b".to_vec()));
+        let (db, invalid) = seed_test_crdt(true);
+        let before = db.inner().latest_sequence_number();
+        for filter in [vec![1; 31], [app.to_vec(), vec![0, 1, 0x81]].concat(),
+            [app.to_vec(), vec![64]].concat(), quil_forest::encode_shard_bit_path(&app, &vec![false; 257])] {
+            assert!(sync_app_shard_to_own_crdt(&source, &invalid, &filter, 2).is_err());
+        }
+        assert_eq!(db.inner().latest_sequence_number(), before);
+    }
+
     /// A bit-path filter names its subtree in sentinel prefix form; a legacy
     /// byte-suffix filter keeps its bytes. (Read raw, a child shard's filter
     /// tail measured 0 after every split.)
@@ -608,6 +704,48 @@ mod tests {
         assert!(has_committed_shard_data(&reopened, &app));
         assert!(!has_committed_shard_data(&reopened, &sibling_filter));
         assert!(!has_committed_shard_data(&reopened, &filter[..34]), "malformed filter stays gated");
+    }
+
+    #[test]
+    fn a_partly_downloaded_subtree_is_not_staged_until_its_download_completes() {
+        use quil_forest::{SubtreeSyncAnchor, PHASES};
+        let open = || {
+            let db = quil_store::RocksDb::open_in_memory().unwrap();
+            let store: Arc<dyn HypergraphStore> = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+            let crdt = HypergraphCrdt::new(store, Arc::new(StubProver));
+            crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE.to_vec()));
+            crdt.set_unified_tree(true);
+            (db, crdt)
+        };
+        let app = [0x72; 32];
+        let bits = vec![true, false, true];
+        let filter = quil_forest::encode_shard_bit_path(&app, &bits);
+        let (source_db, source) = open();
+        for i in 1..=3u8 {
+            let mut address = [i; 32];
+            address[0] = 0xa0 | i;
+            source.add_vertex(&Location { app_address: app, data_address: address }, &[i; 40]).unwrap();
+        }
+        source.commit(1).unwrap();
+        let (version, _) = source.serve_forest_head(&app, 0).unwrap();
+        let source_forest = quil_forest::Forest::with_namespace(source_db.inner(), quil_store::FOREST_NAMESPACE.to_vec());
+        let reader = source_forest.shard_phase_reader(&app, PHASES[0]);
+        let subtree = source.sub_shard_commitment_for_filter("vertex", "adds", &filter);
+        let pinned = SubtreeSyncAnchor::SubtreeRoot(subtree.as_slice().try_into().unwrap());
+
+        let (_db, target) = open();
+        let mut plan = target.prepare_phase_sync(&reader, version, &app, 0, &bits, Some(pinned)).unwrap();
+        assert_eq!(plan.remaining().len(), 3);
+        let blob = |plan: &quil_hypergraph::crdt::ForestSyncPlan, n: usize| plan.remaining()[..n].iter()
+            .map(|(key, _)| vec![key[0] & 0x0f; 40]).collect::<Vec<_>>();
+        let first = blob(&plan, 1);
+        target.apply_sync_chunk(&mut plan, &first).unwrap();
+        assert!(target.unified_subtree_leaf_count("vertex", "adds", &app, &bits) > 0, "leaves are installed");
+        assert!(!has_committed_shard_data(&target, &filter), "but the subtree is not staged");
+        let rest = blob(&plan, 2);
+        target.apply_sync_chunk(&mut plan, &rest).unwrap();
+        target.finish_phase_sync(&plan).unwrap();
+        assert!(has_committed_shard_data(&target, &filter));
     }
 
     #[test]

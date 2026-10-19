@@ -212,7 +212,7 @@ fn the_seam_leader_waits_before_a_private_parent_and_voters_use_it_at_once() {
     use crate::cw_app_seams::AppSeamProposer;
     use quil_cw_consensus::adapters::{GlobalProposer as _, ProposalContext};
     let rig = rig();
-    let parents = Arc::new(executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| true)));
+    let parents = Arc::new(executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(()))));
     let (frame, digest) = parent(&rig, 0);
     offer(&rig, &frame);
     let validator = || Arc::new(BlsAppFrameValidator::new(
@@ -257,7 +257,7 @@ fn the_seam_leader_waits_before_a_private_parent_and_voters_use_it_at_once() {
 #[test]
 fn an_unfinalized_parent_executes_privately_without_touching_canonical_state() {
     let rig = rig();
-    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| true));
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
     let (frame, digest) = parent(&rig, 0);
     offer(&rig, &frame);
     assert!(!executor.is_canonical_parent(digest).unwrap());
@@ -291,6 +291,36 @@ fn an_unfinalized_parent_executes_privately_without_touching_canonical_state() {
     assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
 }
 
+/// A retained parent can outlive its execution view while canonical
+/// materialization stays at the same base. Rebuild it from authenticated
+/// bodies instead of returning the unusable cache entry forever.
+#[test]
+fn a_closed_or_failed_private_parent_is_rebuilt_without_canonical_writes() {
+    let rig = rig();
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
+    let (frame, digest) = parent(&rig, 0);
+    offer(&rig, &frame);
+    let sequence = rig.db.inner().latest_sequence_number();
+    let prepared = executor.prepare(digest, RANK).unwrap();
+    assert!(Arc::ptr_eq(&prepared, &executor.prepare(digest, RANK).unwrap()));
+    prepared._branch.overlay().close();
+    let fresh = executor.prepare(digest, RANK).unwrap();
+    assert!(!Arc::ptr_eq(&prepared, &fresh));
+    assert_eq!(cursor(&fresh.crdt, &rig.filter), Some(1));
+    assert!(fresh._branch.overlay().ensure_readable().is_ok());
+    assert!(Arc::ptr_eq(&fresh, &executor.prepare(digest, RANK).unwrap()));
+
+    fresh._branch.overlay().record_execution_failure();
+    let recovered = executor.prepare(digest, RANK).unwrap();
+    assert!(!Arc::ptr_eq(&fresh, &recovered));
+    assert_eq!(cursor(&recovered.crdt, &rig.filter), Some(1));
+    assert!(recovered._branch.overlay().ensure_readable().is_ok());
+    assert!(Arc::ptr_eq(&recovered, &executor.prepare(digest, RANK).unwrap()));
+    assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
+    assert!(cursor(&rig.manager.crdt(), &rig.filter).is_none());
+    assert!(rig.clock.get_shard_clock_frame(&rig.filter, 1, false).is_err());
+}
+
 /// A restart can leave several frames notarized but not finalized above the
 /// materialized tip (e.g. 5403 and 5404 above 5402, with every member
 /// abstaining). The chain up to the selected parent executes privately,
@@ -299,7 +329,7 @@ fn an_unfinalized_parent_executes_privately_without_touching_canonical_state() {
 #[test]
 fn an_unfinalized_chain_above_the_tip_executes_privately() {
     let rig = rig();
-    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| true));
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
     let (first, first_digest) = parent(&rig, 0);
     offer(&rig, &first);
     // The second frame is a real child of the first: its requests root is
@@ -333,14 +363,14 @@ fn an_unfinalized_chain_above_the_tip_executes_privately() {
     assert!(executor.prepare(stale_digest, RANK).is_err());
     // A node holding the second frame but not the first cannot walk down.
     let other = self::rig();
-    let lone = self::executor(&other, other.clock.clone(), true, Arc::new(|_: &AppShardFrame| true));
+    let lone = self::executor(&other, other.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
     assert!(lone.prepare(offer(&other, &second), RANK + 1).is_err());
 }
 
 #[test]
 fn only_a_validated_child_of_the_materialized_tip_is_executed() {
     let rig = rig();
-    let accept = || Arc::new(|_: &AppShardFrame| true) as AppRequestsRootCheck;
+    let accept = || Arc::new(|_: &AppShardFrame| Ok(())) as AppRequestsRootCheck;
     let sequence = rig.db.inner().latest_sequence_number();
     let executor = executor(&rig, rig.clock.clone(), true, accept());
     // The tip itself uses the canonical path.
@@ -370,7 +400,7 @@ fn only_a_validated_child_of_the_materialized_tip_is_executed() {
     assert!(executor.prepare(digest, RANK + 1).is_err());
     let invalid = self::executor(&rig, rig.clock.clone(), false, accept());
     assert!(invalid.prepare(digest, RANK).is_err());
-    let refused = self::executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| false));
+    let refused = self::executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Err(("refused", String::new()))));
     assert!(refused.prepare(digest, RANK).is_err());
     // Canonical materialization in progress refuses a private copy.
     rig.materialized.store(1, Ordering::SeqCst);
@@ -383,18 +413,18 @@ fn only_a_validated_child_of_the_materialized_tip_is_executed() {
 #[test]
 fn a_child_is_checked_against_the_private_parent_state() {
     let rig = rig();
-    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| true));
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
     let (frame, digest) = parent(&rig, 0);
     offer(&rig, &frame);
     let prepared = executor.prepare(digest, RANK).unwrap();
     let child = child_of(&rig, &prepared, digest);
-    assert!((prepared.check)(&child));
+    assert!((prepared.check)(&child).is_ok());
     // The canonical checks, one height behind, refuse it.
-    assert!(!(canonical_check(&rig))(&child));
+    assert!((canonical_check(&rig))(&child).is_err());
     // A child declaring another fee total is refused on the branch too.
     let mut changed = child.clone();
     changed.header.as_mut().unwrap().fee_total = 7u128.to_be_bytes().to_vec();
-    assert!(!(prepared.check)(&changed));
+    assert_eq!((prepared.check)(&changed).map_err(|(reason, _)| reason), Err("fee total differs"));
 }
 
 #[test]
@@ -423,7 +453,7 @@ fn a_thread_worker_parent_reads_global_frames_through_a_bounded_anchor() {
     }
     let manager = Arc::try_unwrap(rig.manager).ok().unwrap();
     rig.manager = Arc::new(manager.with_global_clock_store(master.clone()).unwrap());
-    let executor = executor(&rig, master.clone(), true, Arc::new(|_: &AppShardFrame| true));
+    let executor = executor(&rig, master.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
     let (frame, digest) = parent(&rig, 3);
     offer(&rig, &frame);
     let master_sequence = master_db.inner().latest_sequence_number();
@@ -468,7 +498,7 @@ fn a_private_session_parent_reads_as_the_committed_checkpoint_it_will_become() {
         session.clone(), global, rig.manager.crdt(), rig.clock.clone(), Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
-    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| true));
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
     let (frame, digest) = parent(&rig, 0);
     offer(&rig, &frame);
     let context = ProposalContext { epoch: 1, view: RANK + 1, parent_view: RANK, parent: digest };
@@ -494,4 +524,49 @@ fn a_private_session_parent_reads_as_the_committed_checkpoint_it_will_become() {
     let canonical = committed(context).unwrap();
     assert_eq!(canonical.checkpoint, private.checkpoint);
     assert_eq!(canonical.closing_request, private.closing_request);
+}
+
+
+#[test]
+fn seal_checkpoint_executes_its_data_view_privately_and_keeps_canonical_state() {
+    let rig = rig();
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
+    let (frame, digest) = parent(&rig, 0);
+    offer(&rig, &frame);
+    let checkpoint = quil_cw_consensus::handoff::Checkpoint {
+        frame: 1, view: RANK + 20, digest: digest.0,
+        state_roots: [[0; 32]; 4], history_root: [0; 32],
+    };
+    let sequence = rig.db.inner().latest_sequence_number();
+    let prepared = executor.prepare_checkpoint(&checkpoint).unwrap();
+    assert_eq!(prepared.view, RANK, "a re-seal's view is not the underlying data view");
+    assert_eq!(prepared.frame_number, 1);
+    assert_eq!(prepared.digest, digest);
+    assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
+    assert!(cursor(&rig.manager.crdt(), &rig.filter).is_none());
+    assert_eq!(cursor(&prepared.crdt, &rig.filter), Some(1));
+    let wrong_height = quil_cw_consensus::handoff::Checkpoint { frame: 2, ..checkpoint.clone() };
+    assert!(executor.prepare_checkpoint(&wrong_height).is_err());
+    let absent = quil_cw_consensus::handoff::Checkpoint { digest: [42; 32], ..checkpoint };
+    assert!(executor.prepare_checkpoint(&absent).is_err());
+}
+
+#[test]
+fn seal_checkpoint_rejects_terminal_and_malformed_bodies_without_execution() {
+    use quil_cw_consensus::handoff::{Checkpoint, Seal};
+    let rig = rig();
+    let executor = executor(&rig, rig.clock.clone(), true, Arc::new(|_: &AppShardFrame| Ok(())));
+    let checkpoint = Checkpoint {
+        frame: 1, view: 5, digest: [42; 32],
+        state_roots: [[0; 32]; 4], history_root: [0; 32],
+    };
+    let seal = Seal { request: [1; 32], session: [2; 32], view: 6, checkpoint: checkpoint.clone() };
+    let sequence = rig.db.inner().latest_sequence_number();
+    for bytes in [seal.encode(), b"QHSL\x02".to_vec(), vec![0xff], prost::Message::encode_to_vec(&AppShardFrame::default())] {
+        rig.blocks.put(digest_from_identity(checkpoint.digest), bytes);
+        assert!(executor.prepare_checkpoint(&checkpoint).is_err());
+        assert_eq!(rig.db.inner().latest_sequence_number(), sequence);
+        assert!(executor.prepared.lock().unwrap().is_none());
+        assert!(cursor(&rig.manager.crdt(), &rig.filter).is_none());
+    }
 }

@@ -1094,10 +1094,14 @@ impl SharedProverRegistry {
         Self::for_execution_capture(store, limits, None, None)
     }
 
-    /// [`Self::for_execution_store`] for a branch captured at `capture`. When
-    /// `seed` holds a scan no watched write has changed since, and a refresh
-    /// with `limits` would accept it, its cache is copied instead of read
-    /// again: the same rows give the same registry. A busy seed is skipped.
+    /// [`Self::for_execution_store`] for a branch captured at `capture`, the
+    /// store's own capture point. When `seed` holds a scan no watched write
+    /// has changed since, its cache is copied instead of read again: the same
+    /// rows give the same registry. A busy seed is skipped.
+    ///
+    /// Those rows are committed state, which every node's canonical registry
+    /// already holds in full, so they are read whole; `limits` then bound
+    /// only what the branch writes above them ([`RegistryLimits::above`]).
     pub fn for_execution_capture(
         store: &dyn HypergraphStore,
         limits: RegistryLimits,
@@ -1107,18 +1111,76 @@ impl SharedProverRegistry {
         let identity = store.backing_store_identity().ok_or_else(|| {
             QuilError::ExecutionUnavailable("registry requires identifiable execution store".into())
         })?;
+        let committed = capture.is_some();
+        let read_limits = if committed { RegistryLimits::UNBOUNDED } else { limits };
         let seeded = seed.zip(capture).and_then(|(seed, capture)| {
             let source = seed.inner.try_read().ok()?;
-            source.reproduces(&capture, limits).then(|| source.clone())
+            source.reproduces(&capture, read_limits).then(|| source.clone())
         });
         let read = seeded.is_none();
-        let registry = Self {
+        let mut registry = Self {
             inner: Arc::new(RwLock::new(seeded.unwrap_or_default())),
-            execution_binding: Some((identity, limits)),
+            execution_binding: Some((identity.clone(), read_limits)),
         };
         if read {
             registry.refresh_from_store(store)?;
         }
+        if committed {
+            let bound = registry.read(|r| limits.above(r.resource_usage(), r.largest_row));
+            registry.execution_binding = Some((identity, bound));
+        }
+        Ok(registry)
+    }
+
+    /// `limits` as headroom above the committed registry this one comes
+    /// from: a branch registry's own bound, or this canonical registry's
+    /// usage. A busy canonical registry leaves `limits` as they are.
+    fn headroom(&self, limits: RegistryLimits) -> RegistryLimits {
+        match &self.execution_binding {
+            Some((_, bound)) => bound.max(limits),
+            None => self
+                .inner
+                .try_read()
+                .map_or(limits, |r| limits.above(r.resource_usage(), r.largest_row)),
+        }
+    }
+
+    /// [`Self::for_execution_capture`] for a branch over `overlay`. A fork of
+    /// a branch that wrote prover rows has no capture point of its own; when
+    /// `seed` holds a scan of the view beneath those writes, its cache is
+    /// copied and brought up to date with the rows the fork carries
+    /// ([`Self::update_written_rows`]), which is what reading every prover
+    /// vertex through the fork gives. Forking a kept GLOBAL execution read
+    /// them all again: 184 MB per fork, 6 s on one archive and 13–18 s on
+    /// another, as long as executing its frames once more (2026-10-11).
+    pub fn for_execution_overlay(
+        store: &dyn HypergraphStore,
+        limits: RegistryLimits,
+        seed: Option<&SharedProverRegistry>,
+        overlay: &quil_forest::ExecutionOverlay,
+    ) -> QuilResult<Self> {
+        if let Some(capture) = overlay.capture_point() {
+            return Self::for_execution_capture(store, limits, seed, Some(capture));
+        }
+        // The view beneath the fork's writes is committed state; `limits`
+        // bound the writes above it, as in `for_execution_capture`.
+        let seeded = seed.zip(overlay.base_capture_point()).and_then(|(seed, base)| {
+            let source = seed.inner.try_read().ok()?;
+            source.reproduces(&base, RegistryLimits::UNBOUNDED).then(|| source.clone())
+        });
+        let Some(seeded) = seeded else {
+            let limits = seed.map_or(limits, |seed| seed.headroom(limits));
+            return Self::for_execution_capture(store, limits, None, None);
+        };
+        let identity = store.backing_store_identity().ok_or_else(|| {
+            QuilError::ExecutionUnavailable("registry requires identifiable execution store".into())
+        })?;
+        let bound = limits.above(seeded.resource_usage(), seeded.largest_row);
+        let registry = Self {
+            inner: Arc::new(RwLock::new(seeded)),
+            execution_binding: Some((identity, bound)),
+        };
+        registry.update_written_rows(store, overlay)?;
         Ok(registry)
     }
 

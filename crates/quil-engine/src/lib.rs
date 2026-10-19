@@ -9,12 +9,14 @@ pub mod app_shard_cache;
 pub mod app_shard_metadata;
 pub mod app_types;
 pub mod multi_proof_cache;
+pub mod outage;
 pub mod committee;
 pub mod consensus_metrics;
 pub mod consensus_types;
 /// Commonware-simplex consensus seams: real-state impls of the
 /// quil-cw-consensus GlobalProposer/FrameSink/FrameFinalizer traits.
 pub mod cw_app_seams;
+mod closing_certificate;
 pub mod cw_global_seams;
 mod cw_host_supervisor;
 pub mod consensus_wire;
@@ -48,11 +50,14 @@ pub mod thread_worker;
 pub mod time_reel;
 pub mod prover_message_transport;
 pub mod prover_pipeline;
+pub mod own_prover_ops;
 pub mod provers;
 pub mod shard_info;
 pub mod worker_allocator;
 pub mod worker_node;
 pub mod worker;
+pub mod worker_payload_eviction;
+pub mod worker_consensus_storage;
 pub mod worker_execution;
 pub mod prover_tree_syncer;
 

@@ -10,7 +10,7 @@ use crate::global_schema::GLOBAL_INTRINSIC_ADDRESS;
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 use num_bigint::BigInt;
 use quil_cw_consensus::handoff::{
-    put_bytes, verify_seal, Checkpoint, Cursor, Seal, Session, MAX_FILTER_BYTES, MAX_MEMBERS,
+    put_bytes, verify_seal_with, Checkpoint, Cursor, Seal, Session, MAX_FILTER_BYTES, MAX_MEMBERS,
     MAX_RECORD_BYTES,
 };
 use quil_types::error::{QuilError, Result};
@@ -318,6 +318,14 @@ pub const MAX_DRAIN_HEADERS: usize = 8;
 /// Encoding: a [`CertificateSubmission`], then, when there are drain headers,
 /// `count(u8) ‖ count × bytes`. Without them the bytes are exactly a
 /// [`CertificateSubmission`]'s, which is what GLOBAL records.
+///
+/// More missing frames than one submission carries: from
+/// [`seal_recovery_frame`] a submission may carry exactly
+/// [`MAX_DRAIN_HEADERS`] headers ending below the checkpoint (a partial
+/// drain). GLOBAL executes them, advancing the source's tip, and leaves the
+/// seal for a later submission whose headers reach the checkpoint. Before it,
+/// a source more than eight frames behind could only be fenced at its tip,
+/// discarding certified frames (a live shard: checkpoint 575, executed 566).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealSubmission {
     pub submission: CertificateSubmission,
@@ -435,6 +443,150 @@ pub fn seal_drain_frame() -> u64 {
 /// Set the seal drain frame for the calling thread only (tests).
 pub fn set_seal_drain_frame_for_thread(frame: Option<u64>) {
     SEAL_DRAIN_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// From this GLOBAL frame GLOBAL accepts two ways out of a stalled close,
+/// both refused before it, as an older build would refuse them: a seal
+/// submission carrying a partial drain ([`SealSubmission`]), and a re-seal of
+/// a seal at the session base, whose checkpoint names the genesis at the
+/// notarized seal's view instead of view zero
+/// ([`quil_cw_consensus::handoff::verify_seal_with`]). Consensus-affecting
+/// for GLOBAL: every archive and GLOBAL prover must run a build with it
+/// before the frame. Mainnet: 875,520, an epoch boundary
+/// (decided 2026-10-11); `QUIL_SEAL_RECOVERY_FRAME` elsewhere, never by
+/// default.
+pub const MAINNET_SEAL_RECOVERY_FRAME: Option<u64> = Some(875_520);
+
+static SEAL_RECOVERY_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SEAL_RECOVERY_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn seal_recovery_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SEAL_RECOVERY_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's seal recovery frame from its network, and return it.
+/// Called at startup before any frame is processed; the first call decides.
+pub fn init_seal_recovery_frame(network: u8) -> u64 {
+    *SEAL_RECOVERY_FRAME.get_or_init(|| {
+        seal_recovery_frame_for(network, std::env::var("QUIL_SEAL_RECOVERY_FRAME").ok().as_deref())
+    })
+}
+
+pub fn seal_recovery_frame() -> u64 {
+    if let Some(frame) = SEAL_RECOVERY_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *SEAL_RECOVERY_FRAME.get_or_init(|| {
+        std::env::var("QUIL_SEAL_RECOVERY_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the seal recovery frame for the calling thread only (tests).
+pub fn set_seal_recovery_frame_for_thread(frame: Option<u64>) {
+    SEAL_RECOVERY_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// From this GLOBAL frame a seal's drain may carry frames that have no
+/// certificate of their own, authenticated by the seal's: its checkpoint
+/// frame, and each frame below it that its child names as parent
+/// (`seal_drain`). A seal built on a notarized checkpoint finalizes that
+/// frame with no certificate of its own, so neither its proof nor a drain
+/// could bring it to GLOBAL, and the seal was refused until the fence
+/// (eight sessions, 2026-10-15). Consensus-affecting for GLOBAL: every
+/// archive and GLOBAL prover must run a build with it before the frame.
+/// Mainnet: 887,040, an epoch boundary (decided 2026-10-16);
+/// `QUIL_SEAL_CHECKPOINT_DRAIN_FRAME` elsewhere, never by default.
+pub const MAINNET_SEAL_CHECKPOINT_DRAIN_FRAME: Option<u64> = Some(887_040);
+
+static SEAL_CHECKPOINT_DRAIN_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SEAL_CHECKPOINT_DRAIN_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn seal_checkpoint_drain_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SEAL_CHECKPOINT_DRAIN_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's seal checkpoint drain frame from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_seal_checkpoint_drain_frame(network: u8) -> u64 {
+    *SEAL_CHECKPOINT_DRAIN_FRAME.get_or_init(|| {
+        seal_checkpoint_drain_frame_for(network, std::env::var("QUIL_SEAL_CHECKPOINT_DRAIN_FRAME").ok().as_deref())
+    })
+}
+
+pub fn seal_checkpoint_drain_frame() -> u64 {
+    if let Some(frame) = SEAL_CHECKPOINT_DRAIN_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *SEAL_CHECKPOINT_DRAIN_FRAME.get_or_init(|| {
+        std::env::var("QUIL_SEAL_CHECKPOINT_DRAIN_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the seal checkpoint drain frame for the calling thread only (tests).
+pub fn set_seal_checkpoint_drain_frame_for_thread(frame: Option<u64>) {
+    SEAL_CHECKPOINT_DRAIN_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// From this GLOBAL frame a fence's membership successor takes the shard's
+/// eligible provers at the fence instead of the committee its request fixed
+/// four epochs earlier (`schedule::fence_stalled_sources`). That committee
+/// had mostly moved on, so the successor could not reach quorum; and the
+/// same pass found it unlike current eligibility and asked it to close at
+/// once. It never sealed, was fenced again, and so on (2026-10-16, sixteen
+/// sessions of one regular node). Consensus-affecting for GLOBAL: every
+/// archive and GLOBAL prover must run a build with it before the frame.
+/// Mainnet: 891,360, an epoch boundary (decided 2026-10-16);
+/// `QUIL_FENCED_SUCCESSOR_ELIGIBILITY_FRAME` elsewhere, never by default.
+pub const MAINNET_FENCED_SUCCESSOR_ELIGIBILITY_FRAME: Option<u64> = Some(891_360);
+
+static FENCED_SUCCESSOR_ELIGIBILITY_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static FENCED_SUCCESSOR_ELIGIBILITY_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn fenced_successor_eligibility_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_FENCED_SUCCESSOR_ELIGIBILITY_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's fenced successor eligibility frame from its network,
+/// and return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_fenced_successor_eligibility_frame(network: u8) -> u64 {
+    *FENCED_SUCCESSOR_ELIGIBILITY_FRAME.get_or_init(|| {
+        fenced_successor_eligibility_frame_for(network,
+            std::env::var("QUIL_FENCED_SUCCESSOR_ELIGIBILITY_FRAME").ok().as_deref())
+    })
+}
+
+pub fn fenced_successor_eligibility_frame() -> u64 {
+    if let Some(frame) = FENCED_SUCCESSOR_ELIGIBILITY_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *FENCED_SUCCESSOR_ELIGIBILITY_FRAME.get_or_init(|| {
+        std::env::var("QUIL_FENCED_SUCCESSOR_ELIGIBILITY_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the fenced successor eligibility frame for the calling thread only (tests).
+pub fn set_fenced_successor_eligibility_frame_for_thread(frame: Option<u64>) {
+    FENCED_SUCCESSOR_ELIGIBILITY_OVERRIDE.with(|cell| cell.set(frame));
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -907,33 +1059,7 @@ pub fn verify_submission_at(
     submission: &CertificateSubmission,
     executed: Option<Checkpoint>,
 ) -> Result<Request> {
-    let request = request(state, &submission.seal.request)?
-        .ok_or_else(|| invalid("closing certificate has no authorized request"))?;
-    if frame <= request.frame {
-        return Err(invalid(
-            "closing request must precede certificate inclusion",
-        ));
-    }
-    let source = request
-        .sources
-        .iter()
-        .find(|s| s.id().ok() == Some(submission.seal.session))
-        .ok_or_else(|| invalid("certificate is not from a requested source"))?;
-    if !matches!(status(state, &submission.seal.session)?, Status::Sealing(r) | Status::Closed(r) if r == submission.seal.request)
-    {
-        return Err(invalid("source is not closing for this request"));
-    }
-    // A fence is terminal: the successor was, or will be, authorized from it.
-    if read(state, b"fence", &seal_key(&submission.seal.request, &submission.seal.session))?.is_some() {
-        return Err(invalid("source was fenced after its closing timeout"));
-    }
-    verify_seal(
-        source,
-        &submission.seal.request,
-        &submission.seal,
-        &submission.certificate,
-    )
-    .ok_or_else(|| invalid("invalid source finalization certificate"))?;
+    let (request, source) = verify_closing_certificate(state, frame, submission)?;
     // A source's last outflows ride only its drain headers, and nothing relays
     // them once it is retired. Accept its seal only after GLOBAL has executed
     // its data frames through the sealed checkpoint; the committee resubmits.
@@ -975,6 +1101,50 @@ pub fn verify_submission_at(
     Ok(request)
 }
 
+/// The closing certificate alone: its request, the requested source it seals
+/// (closing for that request and not fenced) and its finalization under that
+/// source's session. Not whether GLOBAL has executed the source through the
+/// checkpoint ([`verify_submission_at`]); a partial drain carries the frames
+/// toward it ([`SealSubmission`]).
+pub fn verify_closing_certificate(
+    state: &impl Records,
+    frame: u64,
+    submission: &CertificateSubmission,
+) -> Result<(Request, Session)> {
+    let request = request(state, &submission.seal.request)?
+        .ok_or_else(|| invalid("closing certificate has no authorized request"))?;
+    if frame <= request.frame {
+        return Err(invalid(
+            "closing request must precede certificate inclusion",
+        ));
+    }
+    let source = request
+        .sources
+        .iter()
+        .find(|s| s.id().ok() == Some(submission.seal.session))
+        .ok_or_else(|| invalid("certificate is not from a requested source"))?
+        .clone();
+    if !matches!(status(state, &submission.seal.session)?, Status::Sealing(r) | Status::Closed(r) if r == submission.seal.request)
+    {
+        return Err(invalid("source is not closing for this request"));
+    }
+    // A fence is terminal: the successor was, or will be, authorized from it.
+    if read(state, b"fence", &seal_key(&submission.seal.request, &submission.seal.session))?.is_some() {
+        return Err(invalid("source was fenced after its closing timeout"));
+    }
+    // A re-seal of a seal at the base names the genesis at a nonzero view:
+    // accepted from the seal recovery frame.
+    verify_seal_with(
+        &source,
+        &submission.seal.request,
+        &submission.seal,
+        &submission.certificate,
+        frame >= seal_recovery_frame(),
+    )
+    .ok_or_else(|| invalid("invalid source finalization certificate"))?;
+    Ok((request, source))
+}
+
 /// Returns true only when all requested old committees have closed and the
 /// successor authorization has been staged. It becomes usable after global
 /// frame commit/sync, and is never a certificate under the NEW committee.
@@ -1006,6 +1176,21 @@ pub fn apply_submission(
 /// Authorize the successors once every source has ended, by its seal or by a
 /// GLOBAL fence. False while a source is still closing, or once activated.
 fn activate(state: &HypergraphState, frame: u64, request: &Request) -> Result<bool> {
+    activate_with(state, frame, request, None)
+}
+
+/// [`activate`], with `members` (when given) replacing the committee of the
+/// request's one target: a fence's membership successor
+/// (`schedule::fence_stalled_sources`).
+pub(crate) fn activate_with(
+    state: &HypergraphState,
+    frame: u64,
+    request: &Request,
+    members: Option<Vec<Vec<u8>>>,
+) -> Result<bool> {
+    if members.is_some() && request.targets.len() != 1 {
+        return Err(invalid("replacement members need a request with one target"));
+    }
     {
         let request_id = request.id()?;
         if read(state, b"activated", &request_id)?.is_some() {
@@ -1061,7 +1246,7 @@ fn activate(state: &HypergraphState, frame: u64, request: &Request) -> Result<bo
                 genesis: quil_crypto::poseidon::hash_bytes_to_32(&output)?,
                 base_frame,
                 authorization,
-                members: target.committee.members.clone(),
+                members: members.clone().unwrap_or_else(|| target.committee.members.clone()),
             };
             let id = create_session(state, frame, &next)?;
             // The authorization names the complete source partition; the new

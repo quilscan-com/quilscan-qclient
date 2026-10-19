@@ -27,8 +27,8 @@ if [[ -z "${DEV_NODE_SIGNING_PRIVATE_KEY:-}${AGENT_SIGNING_PRIVATE_KEY:-}" ]]; t
   exit 1
 fi
 
-if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){2,3}$ ]]; then
-  echo "version must be numeric dotted format, for example 2.1.0.23" >&2
+if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){2,4}$ ]]; then
+  echo "version must be numeric dotted format, 3–5 numeric parts, for example 2.1.0.25.99" >&2
   exit 1
 fi
 

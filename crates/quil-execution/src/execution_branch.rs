@@ -14,6 +14,8 @@ mod tests;
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutionBranchLimits {
     pub state: ExecutionForkLimits,
+    /// Headroom for the registry rows the branch writes, above the committed
+    /// registry it captures ([`RegistryLimits::above`]).
     pub registry: RegistryLimits,
     /// Pending application summary rebuilds copied from the source manager.
     /// Each entry contains a fixed 32-byte address plus set overhead.
@@ -234,11 +236,11 @@ impl ExecutionEngineManager {
             .shards_store
             .as_ref()
             .map(|_| Arc::new(OverlayShardsStore::new(storage.0.clone())));
-        let registry = SharedProverRegistry::for_execution_capture(
+        let registry = SharedProverRegistry::for_execution_overlay(
             store.as_ref(),
             limits.registry,
             seed,
-            storage.0.capture_point(),
+            &storage.0,
         )?;
         let global_clock_store: Arc<dyn ClockStore> = match &anchor {
             Some((_, view)) => view.clone(),

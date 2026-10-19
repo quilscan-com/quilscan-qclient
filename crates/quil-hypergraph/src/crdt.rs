@@ -157,6 +157,15 @@ pub fn sync_blob_matches(phase_idx: usize, leaf: &[u8], blob: &[u8]) -> Result<b
     Ok(quil_tries::vertex_leaf_value(blob)? == leaf)
 }
 
+/// Marks an application phase whose confinement commit still needs its
+/// records outside the kept shards swept (see `confine_forest`).
+fn confinement_sweep_key(app: &[u8; 32], phase_idx: usize) -> Vec<u8> {
+    let mut key = b"quil/forest-scope/sweep/v1/".to_vec();
+    key.extend_from_slice(app);
+    key.push(phase_idx as u8);
+    key
+}
+
 fn sync_data_key(shard_id: &[u8], phase_idx: usize, bit_path: &[bool]) -> Result<Vec<u8>> {
     if shard_id.len() < 32 || shard_id.len() > u16::MAX as usize || phase_idx >= 4 || bit_path.len() > 256 {
         return Err(QuilError::InvalidArgument("invalid sync data scope".into()));
@@ -170,6 +179,61 @@ fn sync_data_key(shard_id: &[u8], phase_idx: usize, bit_path: &[bool]) -> Result
         key.push(chunk.iter().enumerate().fold(0, |byte, (i, bit)| byte | (u8::from(*bit) << (7 - i))));
     }
     Ok(key)
+}
+
+/// The scopes of one shard whose sync installed some chunks but not the
+/// last, as `(phase, bit path)`: a scope is listed from its first partial
+/// chunk until it completes, across restarts.
+fn sync_incomplete_key(shard_id: &[u8]) -> Vec<u8> {
+    let mut key = b"quil/forest-sync/incomplete/v1/".to_vec();
+    key.extend_from_slice(&(shard_id.len() as u16).to_be_bytes());
+    key.extend_from_slice(shard_id);
+    key
+}
+
+fn decode_sync_scopes(mut bytes: &[u8]) -> Vec<(u8, Vec<bool>)> {
+    let mut scopes = Vec::new();
+    while bytes.len() >= 3 {
+        let (phase, len) = (bytes[0], u16::from_be_bytes([bytes[1], bytes[2]]) as usize);
+        let Some(packed) = bytes.get(3..3 + len.div_ceil(8)) else { break };
+        scopes.push((phase, (0..len).map(|i| packed[i / 8] & (0x80 >> (i % 8)) != 0).collect()));
+        bytes = &bytes[3 + packed.len()..];
+    }
+    scopes
+}
+
+fn encode_sync_scopes(scopes: &[(u8, Vec<bool>)]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (phase, bits) in scopes {
+        bytes.push(*phase);
+        bytes.extend_from_slice(&(bits.len() as u16).to_be_bytes());
+        for chunk in bits.chunks(8) {
+            bytes.push(chunk.iter().enumerate().fold(0, |byte, (i, bit)| byte | (u8::from(*bit) << (7 - i))));
+        }
+    }
+    bytes
+}
+
+/// List or unlist `(phase, bit_path)` among `shard_id`'s incomplete scopes
+/// in `txn`. Callers hold the commit lock, so the read is current.
+fn mark_sync_incomplete(
+    txn: &dyn quil_types::store::Transaction,
+    shard_id: &[u8],
+    phase_idx: usize,
+    bit_path: &[bool],
+    incomplete: bool,
+) -> Result<bool> {
+    let key = sync_incomplete_key(shard_id);
+    let mut scopes = txn.get(&key)?.map(|bytes| decode_sync_scopes(&bytes)).unwrap_or_default();
+    let scope = (phase_idx as u8, bit_path.to_vec());
+    let listed = scopes.contains(&scope);
+    match (incomplete, listed) {
+        (true, false) => scopes.push(scope),
+        (false, true) => scopes.retain(|listed| *listed != scope),
+        _ => return Ok(false),
+    }
+    if scopes.is_empty() { txn.delete(&key)?; } else { txn.set(&key, &encode_sync_scopes(&scopes))?; }
+    Ok(true)
 }
 
 /// Expand a UNIFORM 64-way split `depth` into its complete prefix set: depth 0 ⇒
@@ -291,6 +355,16 @@ pub use execution_capture::{ExecutionCapture, ExecutionFork, ExecutionForkLimits
 pub struct ForestWriteGuard<'a> {
     source: &'a HypergraphCrdt,
     _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+/// What [`HypergraphCrdt::confine_forest`] did: confinement commits, deleted
+/// node and stale records, and leaf-key ranges deleted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ForestConfinement {
+    pub commits: usize,
+    pub nodes: usize,
+    pub stale_records: usize,
+    pub key_ranges: usize,
 }
 
 /// The forest-native hypergraph CRDT.
@@ -1172,6 +1246,18 @@ impl HypergraphCrdt {
         let location = Location { app_address: app, data_address: [0u8; 32] };
         let shard = shard_key_for_location(&location);
         self.store.for_each_vertex_underlying("vertex", "adds", &shard, cb)
+    }
+
+    /// Enumerate committed vertex-adds selected by key before the backend
+    /// retains payloads. The callback and predicate see the full vertex id.
+    pub fn for_each_vertex_adds_blob_matching(
+        &self,
+        domain: &[u8; 32],
+        matches: &dyn Fn(&[u8]) -> bool,
+        cb: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<usize> {
+        let shard = shard_key_for_location(&Location { app_address: *domain, data_address: [0; 32] });
+        self.store.for_each_vertex_underlying_matching("vertex", "adds", &shard, matches, cb)
     }
 
     /// Collect vertex-adds blobs including writes staged since the last forest
@@ -2600,6 +2686,17 @@ impl HypergraphCrdt {
         Ok(ready)
     }
 
+    /// Whether an interrupted sync left a scope of `shard_id` overlapping
+    /// `bit_path` (one path a prefix of the other) partly installed, in any
+    /// phase. Such a subtree holds leaves but not the state it commits to.
+    pub fn sync_incomplete(&self, shard_id: &[u8], bit_path: &[bool]) -> Result<bool> {
+        let txn = self.store.new_transaction(false)?;
+        let scopes = txn.get(&sync_incomplete_key(shard_id))?;
+        txn.abort()?;
+        Ok(scopes.is_some_and(|bytes| decode_sync_scopes(&bytes).iter()
+            .any(|(_, bits)| bits.iter().zip(bit_path).all(|(a, b)| a == b))))
+    }
+
     /// Authenticate and preview a sync before downloading its readable blobs.
     /// Remote reads and reconstruction do not hold the materializer's write
     /// lock. Each later chunk rechecks the local version under that lock.
@@ -2799,6 +2896,9 @@ impl HypergraphCrdt {
         if !plan.repair_existing || final_chunk {
             txn.set(&sync_data_key(&plan.shard_id, plan.phase_idx, &plan.bit_path)?, &[1])?;
         }
+        // Each chunk's blobs match its leaves, but the subtree holds the
+        // state it commits to only once the last chunk is in.
+        mark_sync_incomplete(txn.as_ref(), &plan.shard_id, plan.phase_idx, &plan.bit_path, !final_chunk)?;
         txn.commit()?;
         staged.publish_memory().map_err(|e| QuilError::Internal(format!("publish synced memory tree: {e}")))?;
         self.phase_versions.write().unwrap().insert((plan.shard_id.clone(), plan.phase_idx), version);
@@ -2826,6 +2926,14 @@ impl HypergraphCrdt {
                 && plan.target_root == *b"SPARSE_MERKLE_PLACEHOLDER_HASH__")
         {
             return Err(QuilError::ExecutionUnavailable("sync root changed before completion; retry".into()));
+        }
+        // A retry can find nothing left to install (its source already equal
+        // to the partial tree); the scope is complete all the same.
+        let txn = self.store.new_transaction(false)?;
+        if mark_sync_incomplete(txn.as_ref(), &plan.shard_id, plan.phase_idx, &plan.bit_path, false)? {
+            txn.commit()?;
+        } else {
+            txn.abort()?;
         }
         Ok(plan.target_root)
     }
@@ -2963,6 +3071,109 @@ impl HypergraphCrdt {
         }
         drop(forest);
         self.rebucket_app_locked(&app)
+    }
+
+    /// Confine each application's phase trees to the kept shards in `keep`
+    /// (shard filters, or an application address for all of it). A unified
+    /// store's frames commit only the subtree roots of the shards it serves,
+    /// so the subtrees of shards it left are dead weight. Each phase gets one
+    /// commit at its next version dropping them, then their records at every
+    /// version are deleted in sweeps of at most `scan_budget` node records,
+    /// each under the forest and commit locks and only while the head still
+    /// reaches nothing outside the kept shards, and the tree is compacted.
+    /// Applications without a kept shard are untouched. A later assignment
+    /// syncs a dropped shard as it would on a fresh store.
+    pub fn confine_forest(&self, keep: &[Vec<u8>], scan_budget: usize) -> Result<ForestConfinement> {
+        let mut outcome = ForestConfinement::default();
+        if !self.unified_tree() || !self.forest_is_persistent() {
+            return Ok(outcome);
+        }
+        let mut apps: BTreeMap<[u8; 32], Vec<Vec<bool>>> = BTreeMap::new();
+        for filter in keep {
+            let Some(app) = filter.get(..32).and_then(|app| <[u8; 32]>::try_from(app).ok()) else { continue };
+            let paths = apps.entry(app).or_default();
+            // Both decodings of a filter stay protected where they differ.
+            match (quil_forest::decode_shard_filter_or_root(filter, 32), self.canonical_bits_for_filter(filter)) {
+                (Some((_, decoded)), canonical) => {
+                    paths.push(decoded);
+                    paths.extend(canonical);
+                }
+                // An undecodable kept filter protects its whole application.
+                (None, _) => paths.push(Vec::new()),
+            }
+        }
+        for (app, paths) in apps {
+            if paths.iter().any(|bits| bits.is_empty()) {
+                continue;
+            }
+            {
+                let _forest_guard = self.forest_write_lock.lock().unwrap();
+                let _guard = self.commit_lock.lock().unwrap();
+                if self.pending.read().unwrap().iter().any(|((key, _), values)| key.l2 == app && !values.is_empty())
+                    || self.pending_blobs.read().unwrap().iter().any(|((key, _), values)| key.l2 == app && !values.is_empty())
+                {
+                    return Err(QuilError::ExecutionUnavailable("cannot confine a forest with staged application mutations".into()));
+                }
+                let forest = self.forest.read().unwrap();
+                let txn = self.store.new_transaction(false)?;
+                let mut staged = Vec::new();
+                for phase_idx in 0..4 {
+                    let Some(head) = self.resolve_phase_version_checked(&forest, &app, phase_idx)? else { continue };
+                    let version = head.checked_add(1).ok_or_else(|| QuilError::Internal("confinement version overflow".into()))?;
+                    let Some((_, puts)) = forest.stage_scope_confinement(&app, PHASES[phase_idx], head, version, &paths)
+                        .map_err(|e| QuilError::Internal(format!("confine phase {phase_idx}: {e}")))? else { continue };
+                    for (key, value) in &puts { txn.set(key, value)?; }
+                    if let Some((key, value)) = forest.head_version_put(&app, PHASES[phase_idx], version) {
+                        txn.set(&key, &value)?;
+                    }
+                    txn.set(&confinement_sweep_key(&app, phase_idx), &[1])?;
+                    staged.push((phase_idx, version));
+                }
+                if staged.is_empty() {
+                    txn.abort()?;
+                } else {
+                    txn.commit()?;
+                    for (phase_idx, version) in &staged {
+                        self.phase_versions.write().unwrap().insert((app.to_vec(), *phase_idx), *version);
+                    }
+                    outcome.commits += staged.len();
+                    drop(forest);
+                    self.rebucket_app_locked(&app)?;
+                }
+            }
+            // A sweep the confinement commit recorded, possibly left unfinished
+            // by an earlier pass, until it completes.
+            for phase_idx in 0..4 {
+                let marker = confinement_sweep_key(&app, phase_idx);
+                let txn = self.store.new_transaction(false)?;
+                let pending = txn.get(&marker)?.is_some();
+                txn.abort()?;
+                if !pending {
+                    continue;
+                }
+                let mut cursor = None;
+                loop {
+                    let _forest_guard = self.forest_write_lock.lock().unwrap();
+                    let _guard = self.commit_lock.lock().unwrap();
+                    let forest = self.forest.read().unwrap();
+                    let Some(head) = self.resolve_phase_version_checked(&forest, &app, phase_idx)? else { break };
+                    let deletion = forest.delete_outside_scope(&app, PHASES[phase_idx], head, &paths, cursor, scan_budget)
+                        .map_err(|e| QuilError::ExecutionUnavailable(format!("confine phase {phase_idx} records: {e}")))?;
+                    outcome.nodes += deletion.nodes;
+                    outcome.stale_records += deletion.stale_records;
+                    outcome.key_ranges += deletion.key_ranges;
+                    cursor = deletion.cursor;
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                self.forest.read().unwrap().compact_shard_phase(&app, PHASES[phase_idx]);
+                let txn = self.store.new_transaction(false)?;
+                txn.delete(&marker)?;
+                txn.commit()?;
+            }
+        }
+        Ok(outcome)
     }
 
     /// Forest-sync CLIENT: pull one shard/phase tree from a remote `source` (at
@@ -3383,20 +3594,22 @@ impl HypergraphCrdt {
         // This also works for databases written before subtree sync was wired.
         // Bound unknown-root requests; no unauthenticated tree is returned when
         // a peer is behind or the required history has been pruned.
-        const SUBTREE_ROOT_LOOKBACK: u64 = 720;
+        //
+        // The bound counts the subtree's OWN changes. It used to count the
+        // app's versions, which every sub-shard's frame advances: with a dozen
+        // QUIL shards producing, 720 versions were about 20 minutes, and an
+        // idle shard's state before its last frame could not be served to a
+        // member joining its next session (2026-10-14).
+        const SUBTREE_ROOT_LOOKBACK: usize = 720;
         let bits = self.canonical_bits_for_filter(shard_id)?;
         let app = &shard_id[..32];
         let forest = self.forest.read().ok()?;
         let head = self.resolve_phase_version_with(&forest, app, phase_idx)?;
-        for version in (head.saturating_sub(SUBTREE_ROOT_LOOKBACK - 1)..=head).rev() {
-            if forest.app_subtree_root(app, PHASES[phase_idx], version, &bits).ok() == Some(root) {
-                // Version is exact; a subtree lookup has no recorded global
-                // frame. Its sync caller uses the certified shard header's
-                // frame, never this zero, to advance its materialized cursor.
-                return Some((version, 0));
-            }
-        }
-        None
+        // Version is exact; a subtree lookup has no recorded global frame. Its
+        // sync caller uses the certified shard header's frame, never this zero,
+        // to advance its materialized cursor.
+        forest.app_subtree_version_of(app, PHASES[phase_idx], head, &bits, root, SUBTREE_ROOT_LOOKBACK)
+            .map(|version| (version, 0))
     }
 
     /// Whether this node retains the GLOBAL prover-shard (vertex-adds) tree at
@@ -3847,11 +4060,15 @@ impl HypergraphCrdt {
         // top — so metadata reflects mutations made this frame before commit
         // (the old in-memory KZG tree held them; the forest-native path merges).
         let mut map: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        self.store.for_each_vertex_underlying(set, phase, shard, &mut |k, v| {
-            if path.is_empty() || id_matches_path(&k, path) {
-                map.insert(k, v);
-            }
-        })?;
+        self.store.for_each_vertex_underlying_matching(
+            set,
+            phase,
+            shard,
+            &|key| path.is_empty() || id_matches_path(key, path),
+            &mut |key, blob| {
+                map.insert(key, blob);
+            },
+        )?;
         if let Some(pb) = self.pending_blobs.read().unwrap().get(&(shard.clone(), phase_idx)) {
             for (k, v) in pb {
                 if path.is_empty() || id_matches_path(k, path) {
@@ -4217,6 +4434,42 @@ mod size_index_tests {
 
     fn crdt() -> HypergraphCrdt {
         HypergraphCrdt::new(Arc::new(MemStore::new()), Arc::new(StubProver))
+    }
+
+    #[test]
+    fn selective_phase_serialization_preserves_canonical_bytes_and_pending_overlay() {
+        let store = Arc::new(MemStore::new());
+        let hg = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        let shard = ShardKey { l1: [1, 2, 3], l2: [0x42; 32] };
+        let keys = [vec![0x00; 64], vec![0x03; 64], vec![0x04; 64]];
+        let txn = store.new_transaction(false).unwrap();
+        for (phase_idx, (set, phase)) in PHASE_STR.iter().enumerate() {
+            for (idx, key) in keys.iter().enumerate() {
+                store.save_vertex_underlying(txn.as_ref(), set, phase, &shard, key, &[phase_idx as u8, idx as u8]).unwrap();
+            }
+            hg.pending_blobs.write().unwrap().insert((shard.clone(), phase_idx),
+                [(keys[0].clone(), vec![9, phase_idx as u8]), (vec![0x01; 64], vec![8])].into_iter().collect());
+        }
+        txn.commit().unwrap();
+        for path in [vec![], vec![0], vec![0, 0], vec![1], vec![63], vec![64], vec![-1], vec![0; 86]] {
+            let mut expected = Vec::new();
+            for (phase_idx, (set, phase)) in PHASE_STR.iter().enumerate() {
+                let mut rows = BTreeMap::new();
+                store.for_each_vertex_underlying(set, phase, &shard, &mut |key, blob| {
+                    if id_matches_path(&key, &path) { rows.insert(key, blob); }
+                }).unwrap();
+                for (key, blob) in &hg.pending_blobs.read().unwrap()[&(shard.clone(), phase_idx)] {
+                    if id_matches_path(key, &path) { rows.insert(key.clone(), blob.clone()); }
+                }
+                expected.push(phase_idx as u8);
+                expected.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+                for (key, blob) in rows {
+                    expected.extend_from_slice(&(key.len() as u32).to_be_bytes()); expected.extend_from_slice(&key);
+                    expected.extend_from_slice(&(blob.len() as u32).to_be_bytes()); expected.extend_from_slice(&blob);
+                }
+            }
+            assert_eq!(hg.serialize_phase_subtrees(&shard, &path).unwrap(), expected, "path {path:?}");
+        }
     }
 
     /// The world size is recorded per materialized frame with the prover root

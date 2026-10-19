@@ -282,18 +282,18 @@ pub enum LegacyHistory {
 }
 
 /// Mainnet's committee-handoff activation: the GLOBAL frame whose maintenance
-/// pass authorizes the first sessions, an epoch boundary (1197 × 720). Owner
-/// decision 2026-10-05: a flag day that discards legacy app history.
+/// pass authorizes the first sessions, an epoch boundary (1197 × 720).
+/// Decided 2026-10-05: a flag day that discards legacy app history.
 pub const MAINNET_COMMITTEE_HANDOFF_FRAME: u64 = 861_840;
 
 /// Mainnet's first frame of epoch-boundary membership successors (epoch
-/// 1198). Owner decision 2026-10-06: after activation, every eligible-set
+/// 1198). Decided 2026-10-06: after activation, every eligible-set
 /// change re-sealed every shard its prover sat on, every 8 frames, so no
 /// first session produced a frame.
 pub const MAINNET_MEMBERSHIP_BOUNDARY_FRAME: u64 = 862_560;
 
 /// Mainnet's first frame of epoch-boundary first sessions (epoch 1200).
-/// Owner decision 2026-10-06: with membership frozen mid-epoch, a pass still
+/// Decided 2026-10-06: with membership frozen mid-epoch, a pass still
 /// scanned the whole prover shard every 8 frames only to learn whether a
 /// shard without a session had gained members.
 pub const MAINNET_FIRST_SESSION_BOUNDARY_FRAME: u64 = 864_000;
@@ -591,6 +591,60 @@ impl ProverAllocationInfo {
     /// for Active and non-expired Joining.
     pub fn is_allocated(&self, current_frame: u64) -> bool {
         self.effective_status(current_frame).is_allocated()
+    }
+}
+
+/// Where an allocation stands at a frame, by effective status, with a
+/// confirmed join or leave told apart from an undecided one: a confirmed join
+/// is activating until the next boundary, a confirmed leave departing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocationPhase {
+    Joining,
+    Activating,
+    Active,
+    Paused,
+    Leaving,
+    Departing,
+}
+
+impl ProverAllocationInfo {
+    /// The allocation's [`AllocationPhase`] at `frame`; `None` when it is
+    /// expired, rejected, kicked, historic or unknown.
+    pub fn phase(&self, frame: u64) -> Option<AllocationPhase> {
+        Some(match self.effective_status(frame) {
+            EffectiveStatus::Joining if self.join_confirm_frame_number > 0 => AllocationPhase::Activating,
+            EffectiveStatus::Joining => AllocationPhase::Joining,
+            EffectiveStatus::Active => AllocationPhase::Active,
+            EffectiveStatus::Paused => AllocationPhase::Paused,
+            EffectiveStatus::Leaving if self.leave_confirm_frame_number > 0 => AllocationPhase::Departing,
+            EffectiveStatus::Leaving => AllocationPhase::Leaving,
+            _ => return None,
+        })
+    }
+}
+
+/// A shard's provers counted by [`AllocationPhase`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseCounts {
+    pub joining: u32,
+    pub activating: u32,
+    pub active: u32,
+    pub paused: u32,
+    pub leaving: u32,
+    pub departing: u32,
+}
+
+impl PhaseCounts {
+    pub fn add(&mut self, phase: AllocationPhase) {
+        let count = match phase {
+            AllocationPhase::Joining => &mut self.joining,
+            AllocationPhase::Activating => &mut self.activating,
+            AllocationPhase::Active => &mut self.active,
+            AllocationPhase::Paused => &mut self.paused,
+            AllocationPhase::Leaving => &mut self.leaving,
+            AllocationPhase::Departing => &mut self.departing,
+        };
+        *count += 1;
     }
 }
 
@@ -894,6 +948,8 @@ pub trait RewardIssuance: Send + Sync {
 /// Shard detail for info queries.
 #[derive(Debug, Clone)]
 pub struct ShardDetail {
+    /// Recorded local proposal intent; absent when historical intent is unavailable.
+    pub allocation_reason: Option<String>,
     /// Whether the reward position is established or explicitly projected.
     pub ring_known: bool,
     pub filter: Vec<u8>,
@@ -905,10 +961,15 @@ pub struct ShardDetail {
     pub data_shards: u64,
     pub materialized_frame: u64,
     pub latest_frame: u64,
+    /// The shard's provers by lifecycle phase; `None` when not computed.
+    pub prover_counts: Option<PhaseCounts>,
 }
 
 /// Provides shard-level info.
 pub trait ShardInfoProvider: Send + Sync {
+    /// Local lifecycle scoring strategy, unavailable on older providers.
+    fn allocation_scoring_strategy(&self) -> &'static str { "" }
+
     /// One committed GLOBAL cursor per filter, from a single snapshot.
     /// Missing coverage/session data stays unavailable; zero is a real cursor.
     fn get_global_app_heads(&self, filters: &[Vec<u8>]) -> Result<Vec<Option<proto::node::GlobalAppFrameHead>>> {
@@ -945,6 +1006,39 @@ pub(crate) mod epoch_tests {
 
     pub(crate) fn epoch_length_guard() -> std::sync::MutexGuard<'static, ()> {
         EPOCH_LENGTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Each live allocation has one phase, a confirmed join or leave its own,
+    /// and expired allocations none; counts add them up per shard.
+    #[test]
+    fn allocations_count_by_phase() {
+        let _guard = epoch_length_guard();
+        let e = EPOCH_LENGTH_FRAMES;
+        let frame = 10 * e + 5;
+        let with = |status, f: &dyn Fn(&mut ProverAllocationInfo)| {
+            let mut a = active_alloc(vec![7], 10);
+            a.status = status;
+            f(&mut a);
+            a
+        };
+        let allocations = [
+            with(ProverStatus::Joining, &|a| a.join_frame_number = 10 * e),
+            with(ProverStatus::Active, &|a| a.join_confirm_frame_number = 10 * e + 1),
+            with(ProverStatus::Active, &|_| {}),
+            with(ProverStatus::Active, &|_| {}),
+            with(ProverStatus::Paused, &|_| {}),
+            with(ProverStatus::Leaving, &|a| a.leave_frame_number = 10 * e),
+            with(ProverStatus::Leaving, &|a| { a.leave_frame_number = 9 * e; a.leave_confirm_frame_number = 10 * e + 2; }),
+            with(ProverStatus::Joining, &|a| a.join_frame_number = 2 * e),
+            with(ProverStatus::Active, &|a| a.epoch = 8),
+        ];
+        let mut counts = PhaseCounts::default();
+        for a in &allocations {
+            if let Some(phase) = a.phase(frame) {
+                counts.add(phase);
+            }
+        }
+        assert_eq!(counts, PhaseCounts { joining: 1, activating: 1, active: 2, paused: 1, leaving: 1, departing: 1 });
     }
 
     fn active_alloc(filter: Vec<u8>, epoch: u64) -> ProverAllocationInfo {

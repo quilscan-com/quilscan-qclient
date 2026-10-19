@@ -691,6 +691,21 @@ impl ExecutionOverlay {
         })
     }
 
+    /// The captured database view this branch and its forks read beneath
+    /// their writes, whatever they wrote: `None` once closed, or when its
+    /// database watches no keys. A cache of that view's rows, updated with
+    /// [`Self::written_keys_under`], matches this branch.
+    pub fn base_capture_point(&self) -> Option<quil_types::store::CapturePoint> {
+        let inner = self.lock_cleanup();
+        let base = inner.base.as_ref()?;
+        base._db.watched_prefixes()?;
+        Some(quil_types::store::CapturePoint {
+            database: base._db.instance(),
+            sequence: base.sequence,
+            watched: base.watched?,
+        })
+    }
+
     /// Every key this branch put or deleted under `prefixes`; `None` when a
     /// deleted range reaches into one of them, whose keys cannot be listed.
     pub fn written_keys_under(&self, prefixes: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
@@ -716,6 +731,19 @@ impl ExecutionOverlay {
     /// for inspection/recovery but carries the failure evidence into the child.
     pub fn execution_healthy(&self) -> bool {
         !self.failed_execution.load(Ordering::Acquire) && !self.inner.is_poisoned()
+    }
+
+    /// Check a cached execution branch before reuse, without reading records
+    /// or consuming its read budget. Expired views are released as on a read;
+    /// a closed or failed branch must be discarded by its execution owner.
+    pub fn ensure_readable(&self) -> Result<()> {
+        self.observe((|| {
+            ensure!(self.execution_healthy(), "failed execution overlay cannot be reused");
+            let inner = self.lock_inner()?;
+            let base = inner.base.as_ref().ok_or_else(|| anyhow::anyhow!("execution overlay closed"))?;
+            drop(base.view()?);
+            Ok(())
+        })())
     }
 
     /// Storage adapters call this when staging fails before reaching `apply`.

@@ -222,7 +222,9 @@ impl AppParentExecutor {
             .map_err(|_| unavailable("private parent cache poisoned"))?;
         let tip = self.tip()?;
         if let Some(existing) = prepared.as_ref() {
-            if existing.digest == parent && existing.view == parent_view && existing.base == tip.cursor {
+            if existing.digest == parent && existing.view == parent_view && existing.base == tip.cursor
+                && existing._branch.overlay().ensure_readable().is_ok()
+            {
                 return Ok(existing.clone());
             }
         }
@@ -262,8 +264,8 @@ impl AppParentExecutor {
                 return Err(unavailable("selected parent fails proposal validation"));
             }
         }
-        if !(self.canonical_check)(&chain[0]) {
-            return Err(unavailable("selected parent fails proposal validation"));
+        if let Err((reason, detail)) = (self.canonical_check)(&chain[0]) {
+            return Err(unavailable(format!("selected parent fails proposal validation: {reason} ({detail})")));
         }
         let frame = chain.last().expect("a chain holds the selected parent").clone();
         let header = frame
@@ -310,8 +312,8 @@ impl AppParentExecutor {
                     self.leader.shard_drain.clone(),
                     None,
                 );
-                if !check(frame) {
-                    return Err(unavailable("selected parent fails proposal validation"));
+                if let Err((reason, detail)) = check(frame) {
+                    return Err(unavailable(format!("selected parent fails proposal validation: {reason} ({detail})")));
                 }
             }
             let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?.to_vec();
@@ -378,6 +380,28 @@ impl AppParentExecutor {
         });
         *prepared = Some(result.clone());
         Ok(result)
+    }
+
+    /// A re-seal's checkpoint view names a seal, not necessarily its data
+    /// frame. Recover the data view from its body, then use the ordinary
+    /// bounded, validated private execution path. Roots are checked by the
+    /// handoff automaton against the state this execution actually derives.
+    pub(crate) fn prepare_checkpoint(
+        &self,
+        checkpoint: &quil_cw_consensus::handoff::Checkpoint,
+    ) -> Result<Arc<PrivateAppParent>> {
+        let digest = digest_from_identity(checkpoint.digest);
+        let blocks = self.blocks.get().ok_or_else(|| unavailable("seal checkpoint body is not available"))?;
+        let bytes = blocks.get(&digest).ok_or_else(|| unavailable("seal checkpoint body is not available"))?;
+        if quil_cw_consensus::handoff::Seal::is_encoding(&bytes) {
+            return Err(unavailable("seal checkpoint body is a terminal seal"));
+        }
+        let frame = decode_app_frame(&bytes).ok_or_else(|| unavailable("seal checkpoint body is not a data frame"))?;
+        let header = frame.header.as_ref().ok_or_else(|| unavailable("seal checkpoint has no header"))?;
+        if header.frame_number != checkpoint.frame || app_frame_digest(&frame) != Some(digest) {
+            return Err(unavailable("seal checkpoint body differs from its frame or digest"));
+        }
+        self.prepare(digest, header.rank)
     }
 
     /// The selected parent and its unfinalized ancestors down to the child of

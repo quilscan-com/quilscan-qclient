@@ -29,6 +29,45 @@ fn unavailable(message: impl Into<String>) -> QuilError {
     QuilError::ExecutionUnavailable(format!("app committee session: {}", message.into()))
 }
 
+/// Why [`successor_state_matches`] refuses a member that does not yet hold
+/// its same-filter predecessor's state through the seal.
+const PREDECESSOR_UNRECOVERED: &str = "predecessor state has not been recovered through its seal";
+
+/// Whether `error` is [`successor_state_matches`] waiting for this member to
+/// recover its predecessor's sealed state.
+pub fn predecessor_unrecovered(error: &QuilError) -> bool {
+    matches!(error, QuilError::ExecutionUnavailable(reason) if reason.ends_with(PREDECESSOR_UNRECOVERED))
+}
+
+/// The same-filter predecessor whose state a member of a shard's current
+/// session must hold before it may start ([`successor_state_matches`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredecessorSeal {
+    pub session_generation: u64,
+    pub predecessor_generation: u64,
+    /// The frame its seal, or its fence, names.
+    pub through: u64,
+    pub fenced: bool,
+}
+
+/// The [`PredecessorSeal`] of `filter`'s current session, if it has a
+/// same-filter origin.
+pub fn same_filter_predecessor(global: &Arc<HypergraphCrdt>, filter: &[u8]) -> Result<Option<PredecessorSeal>> {
+    let view = CommittedView::capture(global)?;
+    let Some(session) = handoff::head(&view, filter)? else { return Ok(None) };
+    for (source, checkpoint) in effective_origins(&view, &session)?.origins {
+        if source.filter == session.filter {
+            return Ok(Some(PredecessorSeal {
+                session_generation: session.generation,
+                predecessor_generation: source.generation,
+                through: checkpoint.frame,
+                fenced: handoff::is_fenced(&view, &source.id()?)?,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 /// How this shard's consensus must be started, per committed GLOBAL state.
 pub enum SessionChoice {
     /// The application never entered the protocol: legacy registry committee.
@@ -143,6 +182,22 @@ pub fn retains_worker(global: &Arc<HypergraphCrdt>, filter: &[u8], member: &[u8]
     }
 }
 
+/// Of `filters`, those whose head session counts `member` and is not closed:
+/// the sessions this prover's workers are there to host.
+pub fn member_sessions(global: &Arc<HypergraphCrdt>, filters: &[Vec<u8>], member: &[u8]) -> Result<std::collections::HashSet<Vec<u8>>> {
+    let view = CommittedView::capture(global)?;
+    let mut counted = std::collections::HashSet::new();
+    for filter in filters {
+        let Some(session) = handoff::head(&view, filter)? else { continue };
+        if session.members.iter().any(|key| key == member)
+            && !matches!(handoff::status(&view, &session.id()?)?, Status::Closed(_))
+        {
+            counted.insert(filter.clone());
+        }
+    }
+    Ok(counted)
+}
+
 struct HistoryTip {
     frame: u64,
     root: [u8; 32],
@@ -204,9 +259,20 @@ impl ParentSource {
     }
 
     pub fn reader(self: &Arc<Self>) -> ParentReader {
+        self.reader_of(true)
+    }
+
+    /// The authorized checkpoint at the local materialized tip, whatever the
+    /// selected parent: a re-seal's voters compare the notarized seal they
+    /// extend against it (`HandoffProposer::with_seal_parents`).
+    pub fn tip_reader(self: &Arc<Self>) -> ParentReader {
+        self.reader_of(false)
+    }
+
+    fn reader_of(self: &Arc<Self>, selected: bool) -> ParentReader {
         let source = self.clone();
         Arc::new(move |context| {
-            source.read(context).inspect_err(|error| {
+            source.authorized(context, selected).inspect_err(|error| {
                 // Expected while this member catches up to the selected parent;
                 // persistent repetition means its state or history is incomplete.
                 // This is the only trace of why a member abstains, so surface it
@@ -261,7 +327,14 @@ impl ParentSource {
         Ok(root)
     }
 
+    #[cfg(test)]
     fn read(&self, context: ProposalContext) -> Result<AuthorizedParent> {
+        self.authorized(context, true)
+    }
+
+    /// The authorized checkpoint at the local materialized tip; when
+    /// `selected`, only if it is the selected parent.
+    fn authorized(&self, context: ProposalContext, selected: bool) -> Result<AuthorizedParent> {
         self.check_staged()?;
         let view = CommittedView::capture(&self.global)?;
         let head = handoff::head(&view, &self.session.filter)?
@@ -303,7 +376,7 @@ impl ParentSource {
             }
             (header.rank, quil_crypto::poseidon::hash_bytes_to_32(&header.output)?)
         };
-        if digest != context.parent.0 || view_number != context.parent_view {
+        if selected && (digest != context.parent.0 || view_number != context.parent_view) {
             return Err(unavailable(format!(
                 "selected parent (view {}, {}) is not the local materialized tip (frame {cursor}, view {view_number}, {})",
                 context.parent_view, hex::encode(&context.parent.0[..4]), hex::encode(&digest[..4]),
@@ -449,9 +522,12 @@ pub struct DrainedSeal {
     pub executed: u64,
     pub checkpoint: u64,
     pub attached: usize,
-    /// Why the drain is what it is: `attached`, `executed` (GLOBAL has the
-    /// checkpoint), `inactive` (before the drain frame) or `too_many` (more
-    /// missing than one submission carries; the fence closes the session).
+    /// Why the drain is what it is: `attached`, `partial` (the next
+    /// [`MAX_DRAIN_HEADERS`](quil_execution::global_intrinsic::handoff::MAX_DRAIN_HEADERS)
+    /// of more missing; a later submission brings the rest and the seal),
+    /// `executed` (GLOBAL has the checkpoint), `inactive` (before the drain
+    /// frame) or `too_many` (more missing than one submission carries, before
+    /// the partial drain frame; the fence closes the session).
     pub reason: &'static str,
 }
 
@@ -460,9 +536,10 @@ pub struct DrainedSeal {
 /// through the sealed checkpoint (`handoff::SealSubmission`). GLOBAL accepts a
 /// seal only once it has executed its checkpoint frame, and a sealed session's
 /// last headers can miss their lockstep window for good. None are attached
-/// when GLOBAL has executed the checkpoint, before the drain frame, or when
-/// more are missing than one submission carries (the fence closes such a
-/// session).
+/// when GLOBAL has executed the checkpoint or before the drain frame. When
+/// more are missing than one submission carries, the next ones are (a partial
+/// drain), from the partial drain frame; before it none are, and the fence
+/// closes such a session.
 pub fn drained_seal(global: &Arc<HypergraphCrdt>, clock: &dyn ClockStore, base: &[u8]) -> Result<DrainedSeal> {
     use quil_execution::global_intrinsic::handoff::{self as h, SealSubmission, MAX_DRAIN_HEADERS};
     let submission = CertificateSubmission::from_canonical_bytes(base)?;
@@ -479,10 +556,12 @@ pub fn drained_seal(global: &Arc<HypergraphCrdt>, clock: &dyn ClockStore, base: 
     if view.frame().saturating_add(1) < h::seal_drain_frame() {
         return Ok(plain("inactive"));
     }
-    if checkpoint - executed > MAX_DRAIN_HEADERS as u64 {
+    let partial = checkpoint - executed > MAX_DRAIN_HEADERS as u64;
+    if partial && view.frame().saturating_add(1) < h::seal_recovery_frame() {
         return Ok(plain("too_many"));
     }
-    let drain = (executed + 1..=checkpoint)
+    let through = if partial { executed + MAX_DRAIN_HEADERS as u64 } else { checkpoint };
+    let drain = (executed + 1..=through)
         .map(|number| canonical_header(&clock.get_shard_clock_frame(&session.filter, number, false)?))
         .collect::<Result<Vec<_>>>()?;
     let attached = drain.len();
@@ -491,7 +570,7 @@ pub fn drained_seal(global: &Arc<HypergraphCrdt>, clock: &dyn ClockStore, base: 
         executed,
         checkpoint,
         attached,
-        reason: "attached",
+        reason: if partial { "partial" } else { "attached" },
     })
 }
 
@@ -510,6 +589,27 @@ pub use quil_execution::global_intrinsic::handoff::history::FrameOutgoing;
 const MAX_FETCHED_HISTORY_BYTES: usize = 256 << 20;
 /// Records written per commit when installing verified history.
 const MAX_INSTALL_BATCH_BYTES: usize = 8 << 20;
+
+/// Same-filter predecessors whose certified outgoing history must be audited
+/// before this member can start the successor at its local checkpoint.
+/// Fences supply no certified history root; their checkpoint is verified by
+/// [`successor_state_matches`] instead of delaying startup for a history audit.
+pub fn predecessor_history_sources(
+    view: &CommittedView,
+    session: &Session,
+    cursor: u64,
+) -> Result<Vec<(Session, Checkpoint)>> {
+    let mut sources = Vec::new();
+    for (source, checkpoint) in effective_origins(view, session)?.origins {
+        if source.filter == session.filter
+            && checkpoint.frame == cursor
+            && !handoff::is_fenced(view, &source.id()?)?
+        {
+            sources.push((source, checkpoint));
+        }
+    }
+    Ok(sources)
+}
 
 /// Install a same-filter predecessor's outgoing history this member cannot
 /// re-derive locally (it joined through an archive-anchored jump, or its
@@ -552,9 +652,18 @@ pub async fn recover_sealed_history(
         let mut bytes = 0usize;
         let mut next = source.base_frame + 1;
         while next <= checkpoint.frame {
-            let page = fetch(session.filter.clone(), next, checkpoint.frame).await?;
+            let page = fetch(session.filter.clone(), next, checkpoint.frame).await.map_err(|error| match error {
+                QuilError::ExecutionUnavailable(message) => unavailable(format!(
+                    "generation {} outgoing history (frames {}-{}, sealed root {}): {message}",
+                    source.generation, source.base_frame + 1, checkpoint.frame, hex::encode(&checkpoint.history_root[..8]),
+                )),
+                other => other,
+            })?;
             if page.is_empty() {
-                return Err(unavailable(format!("no archive served outgoing records from frame {next}")));
+                return Err(unavailable(format!(
+                    "no archive served generation {}'s outgoing records from frame {next} through {}",
+                    source.generation, checkpoint.frame,
+                )));
             }
             for outgoing in page {
                 if outgoing.frame != next || next > checkpoint.frame {
@@ -633,7 +742,7 @@ pub fn successor_state_matches(
             .and_then(|bytes| bytes.as_slice().try_into().ok().map(u64::from_be_bytes));
         let cursor = recorded.unwrap_or(0);
         if cursor < checkpoint.frame {
-            return Err(unavailable("predecessor state has not been recovered through its seal"));
+            return Err(unavailable(PREDECESSOR_UNRECOVERED));
         }
         if handoff::is_fenced(&view, &source.id()?)? {
             if cursor > checkpoint.frame {
@@ -757,6 +866,38 @@ pub fn effective_origins(view: &CommittedView, session: &Session) -> Result<Effe
         }
     }
     Ok(EffectiveOrigins { origins, uncertified })
+}
+
+/// The digest (`poseidon(output)`) GLOBAL committed for `filter`'s frame
+/// `number`: the executed tip of the shard's current session or of a
+/// same-filter origin, or the checkpoint an origin sealed or was fenced at.
+/// GLOBAL verified that frame's certificate when it executed or sealed it, so
+/// a frame whose output hashes to this digest is authenticated by committed
+/// state even when it carries no certificate of its own (a frame final only
+/// through a descendant, or a sealed session's last frame).
+pub fn committed_frame_digest(global: &Arc<HypergraphCrdt>, filter: &[u8], number: u64) -> Result<Option<[u8; 32]>> {
+    let view = CommittedView::capture(global)?;
+    let Some(head) = handoff::head(&view, filter)? else { return Ok(None) };
+    let tip_of = |session: &Session| -> Result<Option<[u8; 32]>> {
+        Ok(handoff::session_tip(&view, &session.id()?)?
+            .filter(|tip| tip.frame == number)
+            .map(|tip| tip.digest))
+    };
+    if let Some(digest) = tip_of(&head)? {
+        return Ok(Some(digest));
+    }
+    for (source, checkpoint) in handoff::origins(&view, &head.id()?)? {
+        if source.filter != filter {
+            continue;
+        }
+        if checkpoint.frame == number && checkpoint.frame != source.base_frame {
+            return Ok(Some(checkpoint.digest));
+        }
+        if let Some(digest) = tip_of(&source)? {
+            return Ok(Some(digest));
+        }
+    }
+    Ok(None)
 }
 
 /// The frame GLOBAL has executed `filter`'s current session through: its
@@ -1000,6 +1141,12 @@ mod successor_tests {
         commit(&global, &state, 4);
         let successor = handoff::head(&state, &filter).unwrap().unwrap();
         assert_eq!((successor.generation, successor.base_frame), (2, 3));
+        let view = CommittedView::capture(&global).unwrap();
+        let sources = predecessor_history_sources(&view, &successor, 3).unwrap();
+        assert_eq!(sources.len(), 1, "a sealed predecessor still requires its history");
+        assert_eq!(sources[0].0.id().unwrap(), source.id().unwrap());
+        assert!(predecessor_history_sources(&view, &successor, 2).unwrap().is_empty(),
+            "state below the checkpoint must be recovered first");
 
         let error = successor_state_matches(&global, &shard, &clock, &successor).unwrap_err();
         assert!(matches!(error, QuilError::ExecutionUnavailable(_)), "no acceptance on roots alone: {error}");
@@ -1097,7 +1244,7 @@ mod successor_tests {
             vec![DesiredCommittee { filter: left.clone(), members: members.clone() }]).unwrap();
         commit(&global, &state, 5);
         let due = 5 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
-        assert_eq!(schedule::fence_stalled_sources(&state, due, &[left.clone()]).unwrap(), 1);
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[left.clone()], None).unwrap(), 1);
         commit(&global, &state, due);
         assert!(schedule::activated(&CommittedView::capture(&global).unwrap(), &change.id().unwrap()).unwrap());
         assert_ne!(handoff::head(&state, &left).unwrap().unwrap().id().unwrap(), stalled.id().unwrap());
@@ -1112,7 +1259,7 @@ mod successor_tests {
             vec![DesiredCommittee { filter: right.clone(), members }]).unwrap();
         commit(&global, &state, due + 1);
         let later = due + 1 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
-        assert_eq!(schedule::fence_stalled_sources(&state, later, &[right.clone()]).unwrap(), 1);
+        assert_eq!(schedule::fence_stalled_sources(&state, later, &[right.clone()], None).unwrap(), 1);
         commit(&global, &state, later);
         assert!(origin_anchors(&global, &right).unwrap().is_empty(), "a source fenced after it ran");
     }
@@ -1191,6 +1338,34 @@ mod successor_tests {
         assert!(error.to_string().contains("sealed checkpoint"), "other state is still refused: {error}");
     }
 
+    /// GLOBAL authenticates a frame by the digest it committed for it: the
+    /// checkpoint a predecessor sealed, or an executed tip. A seal at a
+    /// session's base names its genesis, not a frame, and authenticates none.
+    #[test]
+    fn committed_frame_digests_are_sealed_checkpoints_and_executed_tips() {
+        let (global, state) = global_state();
+        let filter = vec![0x07; 32];
+        let (source, signers, request) = closing_session(&global, &state, &filter);
+        assert_eq!(committed_frame_digest(&global, &filter, 3).unwrap(), None);
+        handoff::record_session_tip(&state, 4, &source.id().unwrap(),
+            &Checkpoint { frame: 2, view: 3, digest: [0x22; 32], state_roots: [[1; 32]; 4], history_root: [0; 32] }).unwrap();
+        commit(&global, &state, 4);
+        assert_eq!(committed_frame_digest(&global, &filter, 2).unwrap(), Some([0x22; 32]), "the executed tip");
+        let seal = Seal {
+            request: request.id().unwrap(), session: source.id().unwrap(), view: 9,
+            checkpoint: Checkpoint { frame: 3, view: 5, digest: [0x33; 32], state_roots: [[1; 32]; 4], history_root: [0x44; 32] },
+        };
+        let certificate = crate::test_support::certify_seal(&source, &signers, &seal);
+        handoff::record_session_tip(&state, 5, &seal.session, &seal.checkpoint).unwrap();
+        assert!(handoff::apply_submission(&state, 5, &CertificateSubmission { seal, certificate }).unwrap());
+        commit(&global, &state, 5);
+        let successor = handoff::head(&state, &filter).unwrap().unwrap();
+        assert_eq!(successor.generation, 2);
+        assert_eq!(committed_frame_digest(&global, &filter, 3).unwrap(), Some([0x33; 32]), "the sealed checkpoint");
+        assert_eq!(committed_frame_digest(&global, &filter, 2).unwrap(), None, "below the predecessor's tip");
+        assert_eq!(committed_frame_digest(&global, &[0x08; 32], 3).unwrap(), None, "another shard");
+    }
+
     #[test]
     fn successor_of_a_fenced_predecessor_requires_exactly_the_fenced_frame() {
         use quil_types::store::ClockStore as _;
@@ -1219,12 +1394,15 @@ mod successor_tests {
         handoff::record_session_tip(&state, 4, &source.id().unwrap(),
             &Checkpoint { frame: 3, view: 5, digest, state_roots: [[1; 32]; 4], history_root: [2; 32] }).unwrap();
         let due = 3 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
-        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()]).unwrap(), 1);
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
         commit(&global, &state, due);
         assert!(handoff::is_fenced(&CommittedView::capture(&global).unwrap(), &source.id().unwrap()).unwrap());
         assert!(schedule::activated(&CommittedView::capture(&global).unwrap(), &request.id().unwrap()).unwrap());
         let successor = handoff::head(&state, &filter).unwrap().unwrap();
         assert_eq!(successor.base_frame, 3);
+        assert!(predecessor_history_sources(
+            &CommittedView::capture(&global).unwrap(), &successor, 3,
+        ).unwrap().is_empty(), "a fenced predecessor has no certified history to audit");
 
         let cursor_key = quil_store::encoding::consensus_materialized_cursor_key(&filter);
         let at_fence = crdt();
@@ -1312,7 +1490,7 @@ mod successor_tests {
         handoff::record_session_tip(&state, 4, &source.id().unwrap(),
             &Checkpoint { frame: 3, view: 5, digest: fenced_digest, state_roots: [[1; 32]; 4], history_root: [2; 32] }).unwrap();
         let due = 3 + schedule::FENCE_AFTER_EPOCHS * quil_types::consensus::epoch_length_frames();
-        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()]).unwrap(), 1);
+        assert_eq!(schedule::fence_stalled_sources(&state, due, &[filter.clone()], None).unwrap(), 1);
         commit(&global, &state, due);
         let successor = handoff::head(&state, &filter).unwrap().unwrap();
         assert!(successor_state_matches(&global, &shard, &clock, &successor).is_err(), "wedged past the fence");

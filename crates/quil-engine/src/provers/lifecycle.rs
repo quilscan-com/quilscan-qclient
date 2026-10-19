@@ -29,7 +29,7 @@ use quil_types::error::Result;
 
 use crate::halt_state::HaltState;
 use crate::provers::proposer::{self, ShardDescriptor, Strategy};
-use crate::worker::{WorkerManager, WorkerView};
+use crate::worker::{manually_managed_filters, WorkerManager, WorkerView};
 use crate::worker_allocator::WorkerAllocator;
 
 /// Confirm window for pending joins/leaves (matches Go's 360 frames).
@@ -480,7 +480,14 @@ pub struct ProverLifecycle {
     /// Serialize candidate construction and accepted-plan bookkeeping across
     /// the gossip and poller callers. No network work runs under this lock.
     evaluation_lock: std::sync::Mutex<()>,
+    /// Whether evaluations keep failing: a failed evaluation decides no
+    /// joins, confirms or leaves for its frame.
+    evaluation_outage: std::sync::Mutex<crate::outage::Outage>,
+    /// How long each bound seat's worker has not hosted the committee
+    /// session that counts it; a seat an epoch unhosted is not renewed.
+    session_hosting: std::sync::Mutex<super::session_hosting::SessionHosting>,
     leave_decisions: super::leave_decisions::LeaveDecisions,
+    pub allocation_reasons: super::allocation_reasons::AllocationReasons,
     /// This node's prover address (32 bytes, Poseidon hash of BLS pubkey).
     pub prover_address: Vec<u8>,
     /// Whether a VDF computation is currently in progress. While set,
@@ -629,11 +636,16 @@ impl ProverLifecycle {
         current_frame: Arc<crate::current_frame::CurrentFrame>,
         strategy: Strategy,
     ) -> Self {
+        let submission_attempts = allocator.submission_attempts.clone();
         Self {
             evaluation_lock: std::sync::Mutex::new(()),
             leave_decisions: super::leave_decisions::LeaveDecisions::default(),
+            allocation_reasons: super::allocation_reasons::AllocationReasons::default(),
             prover_address,
             proof_in_progress: AtomicBool::new(false),
+            // Evaluated once per GLOBAL frame: three failed frames in a row.
+            evaluation_outage: std::sync::Mutex::new(crate::outage::Outage::begin_after(3)),
+            session_hosting: Default::default(),
             initial_sync_complete: AtomicBool::new(false),
             prover_root_verified_frame: AtomicU64::new(0),
             current_frame,
@@ -651,7 +663,7 @@ impl ProverLifecycle {
             last_leave_attempt: RwLock::new(HashMap::new()),
             last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
-            submission_attempts: Arc::new(crate::submission_attempts::SubmissionAttempts::default()),
+            submission_attempts,
             gone_shard_leaves_await_sync: AtomicBool::new(false),
             registry_syncs_begun: AtomicU64::new(0),
             registry_synced_through: AtomicU64::new(0),
@@ -810,18 +822,23 @@ impl ProverLifecycle {
     /// `gone_shard_leaves_await_sync`.
     pub fn hold_gone_shard_leaves_for_sync(&self) {
         self.gone_shard_leaves_await_sync.store(true, Ordering::SeqCst);
+        // Such a registry also shows a landed join only after a sync.
+        self.allocator.hold_pending_joins_for_registry_sync();
     }
 
     /// A prover-tree sync is starting; pass the returned number to
     /// [`Self::note_registry_synced`] once the registry is refreshed from it.
     pub fn begin_registry_sync(&self) -> u64 {
-        self.registry_syncs_begun.fetch_add(1, Ordering::SeqCst) + 1
+        let sync = self.registry_syncs_begun.fetch_add(1, Ordering::SeqCst) + 1;
+        self.allocator.note_registry_sync_begun(sync, self.current_frame.effective());
+        sync
     }
 
     /// The registry now reflects the sync [`Self::begin_registry_sync`]
     /// numbered `sync`.
     pub fn note_registry_synced(&self, sync: u64) {
         self.registry_synced_through.fetch_max(sync, Ordering::SeqCst);
+        self.allocator.note_registry_synced(sync);
     }
 
     /// The gone shards a leave may be proposed off now, and how many wait
@@ -872,6 +889,7 @@ impl ProverLifecycle {
 
     /// Load durable rejection decisions before enabling lifecycle dispatch.
     pub fn configure_leave_decision_store(&self, db: Arc<quil_store::RocksDb>) -> Result<()> {
+        self.allocation_reasons.attach(db.clone(), &self.prover_address)?;
         self.leave_decisions.attach(db, &self.prover_address)
     }
 
@@ -1010,57 +1028,21 @@ impl ProverLifecycle {
         }
     }
 
-    /// Port of Go's `selectExcessPendingFilters` at
-    /// `worker_allocator.go:1319-1385`. Returns filters that should be
-    /// force-rejected because the number of non-expired pending joins
-    /// exceeds our worker capacity minus active allocations.
-    ///
-    /// Go uses `config.Engine.DataWorkerCount` for capacity; we use the
-    /// total worker count (`workers.len()`) which is equivalent since
-    /// workers are provisioned from `data_worker_count`.
-    ///
-    /// Mirrors Go's `rand.Shuffle(pending)` so each node submits an
-    /// independent random subset of excess filters — over time this
-    /// converges every shard's pending list back to capacity without
-    /// any single shard being preferentially rejected.
+    /// Go's `selectExcessPendingFilters` (`worker_allocator.go:1319-1385`)
+    /// force-rejects a random subset of pending joins above the worker
+    /// capacity. Here it selects none: the chain admits a reject of
+    /// a Joining allocation only in its confirm epoch (`validate_confirm_timing`),
+    /// sooner it refuses it, and in that epoch `decide_joins` already rejects
+    /// every pending join above the free-worker cap in rank order. A random
+    /// pick here could reject the join the decision keeps, since a reject
+    /// outranks a confirm in the compiled plan.
     fn select_excess_pending_filters(
         &self,
-        active_filters: &[Vec<u8>],
-        joining_filters: &[(Vec<u8>, u64)],
-        worker_capacity: usize,
+        _active_filters: &[Vec<u8>],
+        _joining_filters: &[(Vec<u8>, u64)],
+        _worker_capacity: usize,
     ) -> Vec<Vec<u8>> {
-        if worker_capacity == 0 {
-            return Vec::new();
-        }
-
-        let active = active_filters.len();
-        let last_observed = self.current_frame.effective();
-
-        let mut pending: Vec<Vec<u8>> = joining_filters.iter()
-            .filter(|(filter, join_frame)| {
-                if filter.is_empty() { return false; }
-                // Skip expired joins — implicitly rejected. Uses
-                // the same grace constant as `effective_status`.
-                last_observed
-                    <= *join_frame
-                        + quil_types::consensus::ALLOCATION_GRACE_FRAMES
-            })
-            .map(|(f, _)| f.clone())
-            .collect();
-
-        let allowed = worker_capacity.saturating_sub(active);
-        if pending.len() <= allowed {
-            return Vec::new();
-        }
-
-        let excess = pending.len() - allowed;
-        // Random shuffle — matches Go's `rand.Shuffle(pending)` at
-        // worker_allocator.go:1380-1382.
-        use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
-        pending.shuffle(&mut rng);
-        pending.truncate(excess);
-        pending
+        Vec::new()
     }
 
     /// Pick auto-managed Active filters to leave when the prover holds
@@ -1078,11 +1060,7 @@ impl ProverLifecycle {
         difficulty: u64,
         world_bytes: &BigInt,
     ) -> Vec<Vec<u8>> {
-        let mm_filters: std::collections::HashSet<Vec<u8>> = workers
-            .iter()
-            .filter(|w| w.manually_managed && !w.filter.is_empty())
-            .map(|w| w.filter.clone())
-            .collect();
+        let mm_filters = manually_managed_filters(workers);
         let bound_filters: std::collections::HashSet<Vec<u8>> = workers
             .iter()
             .filter(|w| !w.filter.is_empty())
@@ -1209,7 +1187,36 @@ impl ProverLifecycle {
     /// effect per affected prover address per frame.
     ///
     /// `difficulty` must be the current frame's difficulty (used in PoMW basis).
+    ///
+    /// Logs an outage while evaluations keep failing.
     pub fn evaluate(
+        &self,
+        frame_number: u64,
+        difficulty: u64,
+        registry: &dyn ProverRegistry,
+        worker_manager: &dyn WorkerManager,
+    ) -> Result<Vec<LifecycleAction>> {
+        use crate::outage::OutageEvent;
+        let result = self.evaluate_frame(frame_number, difficulty, registry, worker_manager);
+        let event = self.evaluation_outage.lock()
+            .map(|mut outage| outage.observe(std::time::Instant::now(), result.is_ok()))
+            .unwrap_or(None);
+        let error = result.as_ref().err().map(ToString::to_string).unwrap_or_default();
+        match event {
+            Some(OutageEvent::Began) => tracing::warn!(frame = frame_number, error = %error,
+                scope = "local", action = "report",
+                "prover lifecycle evaluation failing; no joins, confirms or leaves are decided until it succeeds"),
+            Some(OutageEvent::Continues { secs, failures }) => tracing::warn!(frame = frame_number, secs,
+                failures, error = %error, scope = "local", action = "report",
+                "prover lifecycle evaluation still failing"),
+            Some(OutageEvent::Ended { secs, failures }) => tracing::info!(frame = frame_number, secs,
+                failures, "prover lifecycle evaluation recovered"),
+            None => {}
+        }
+        result
+    }
+
+    fn evaluate_frame(
         &self,
         frame_number: u64,
         difficulty: u64,
@@ -1354,7 +1361,7 @@ impl ProverLifecycle {
         let recovery_filters: std::collections::HashSet<Vec<u8>> = prover_info
             .as_ref()
             .map(|p| p.allocations.iter()
-                .filter(|a| crate::worker_allocator::epoch_renewal_recovery_pending(a, frame_number))
+                .filter(|a| self.allocator.renewal_recovering(a, frame_number))
                 .map(|a| a.confirmation_filter.clone()).collect())
             .unwrap_or_default();
         let expired_epoch_for_orphan_sweep: Vec<Vec<u8>> = expired_epoch_filters.iter()
@@ -1425,11 +1432,13 @@ impl ProverLifecycle {
             !awaiting_refresh.contains(filter)
                 && is_settled_split_parent(filter, &known_shards, &shards_store_filters, &remote_shards, &arriving_shards)
         };
+        let proposal_grid = proposal_grid_filters(
+            &shards_store_filters, &current_summaries, &remote_shards);
         let mut proposal_descriptors = build_proposal_descriptors(
             &current_summaries,
             &all_our_filters,
             &shard_sizes_snapshot,
-            &shards_store_filters,
+            &proposal_grid,
         );
         // Recently-rejected join backoff: drop any shard that rejected our
         // join within the last `JOIN_REJECT_BACKOFF_FRAMES`. A Rejected
@@ -1491,7 +1500,7 @@ impl ProverLifecycle {
             let allocation = prover_info.as_ref().and_then(|p| p.allocations.iter()
                 .find(|a| a.confirmation_filter == descriptor.filter
                     && (a.is_live(frame_number)
-                        || crate::worker_allocator::epoch_renewal_recovery_pending(a, frame_number))));
+                        || self.allocator.renewal_recovering(a, frame_number))));
             if let Some(estimate) = reward_rings.get(&descriptor.filter) {
                 if allocation.is_some() && estimate.source == "new_join_projection" { return false; }
                 descriptor.ring = estimate.ring;
@@ -1553,6 +1562,25 @@ impl ProverLifecycle {
         // departure boundary, so their unbound slots are reserved too.
         let worker_bound_filters: std::collections::HashSet<Vec<u8>> =
             worker_view.filter_set().map(|w| w.filter.clone()).collect();
+        // Whether each bound seat's worker hosts the committee session that
+        // counts this prover, for the renewal below.
+        if let Some(prover) = prover_info.as_ref() {
+            let bound: Vec<(u32, Vec<u8>)> = worker_view.filter_set()
+                .map(|w| (w.core_id, w.filter.clone())).collect();
+            let filters: Vec<Vec<u8>> = bound.iter().map(|(_, filter)| filter.clone()).collect();
+            let members = self.allocator.session_member_filters(&filters, &prover.public_key);
+            let executions = worker_manager.worker_execution();
+            let now = crate::worker_execution::now_ms();
+            let mut hosting = self.session_hosting.lock().unwrap_or_else(|e| e.into_inner());
+            for (core_id, filter) in &bound {
+                let report = executions.iter()
+                    .find(|(id, reported, _)| id == core_id && reported == filter)
+                    .map(|(_, _, execution)| execution);
+                hosting.observe(frame_number, filter, *core_id, members.contains(filter),
+                    super::session_hosting::classify(report, now));
+            }
+            hosting.retain_bound(&worker_bound_filters);
+        }
         let unbound_held_count = all_our_filters
             .iter()
             .filter(|f| !worker_bound_filters.contains(*f))
@@ -1632,6 +1660,7 @@ impl ProverLifecycle {
         }
 
         let mut actions: Vec<LifecycleAction> = Vec::new();
+        let mut proposal_reasons: Vec<(Vec<u8>, bool, &str)> = Vec::new();
         let mut join_proposed_this_cycle = false;
         let mut forced_rejection = false;
 
@@ -1642,11 +1671,46 @@ impl ProverLifecycle {
         // while the round-trip is in flight. This runs regardless of coverage
         // halts: a prover maintaining its own storage commitment is never the
         // cause of a halt and must not be evicted for one.
-        let renewal_filters: Vec<Vec<u8>> = expired_epoch_filters.into_iter()
-            .filter(|f| active_filters.contains(f)
-                || recovery_filters.contains(f)
-                || worker_bound_filters.contains(f))
-            .collect();
+        //
+        // Only a filter a worker is bound to renews (decided 2026-10-17). A
+        // seat nothing serves casts no votes and submits no openings. An
+        // unbound seat due for renewal is already left by the orphan sweep
+        // below, but one recovering from a missed renewal or a rejected leave
+        // was renewed unbound from the master's own store, and a leave the
+        // chain rejected put it back into recovery, so it could stay eligible
+        // for committees it never voted in (2026-10-17, sessions whose silent
+        // members exceeded a third). It lapses to `ExpiredEpoch` instead,
+        // which removes it from committee eligibility. The allocator binds
+        // free workers to recovering allocations, which then renew here; one
+        // still unbound after the grace is left by the orphan sweep.
+        //
+        // Nor does a bound seat whose worker has gone an epoch without
+        // hosting the committee session that counts it (decided 2026-10-18,
+        // `session_hosting`): workers refused their predecessor's state for
+        // hours while their seats renewed, so their committees stayed below
+        // quorum. Hosting again renews it, late if need be (through the
+        // recovery epoch); otherwise it lapses, the allocator releases the
+        // worker and the orphan sweep leaves it.
+        let epoch_frames = quil_types::consensus::epoch_length_frames();
+        let renewal_filters: Vec<Vec<u8>> = {
+            let mut hosting = self.session_hosting.lock().unwrap_or_else(|e| e.into_inner());
+            expired_epoch_filters.into_iter()
+                .filter(|f| worker_bound_filters.contains(f))
+                .filter(|f| match hosting.withhold(f, frame_number, epoch_frames) {
+                    None => true,
+                    Some(withheld) => {
+                        if withheld.first {
+                            tracing::warn!(frame = frame_number, filter = hex::encode(f), core_id = withheld.run.core_id,
+                                unhosted_since = withheld.run.since, state = %withheld.run.state,
+                                blocker = %withheld.run.blocker, scope = "local", action = "check",
+                                "seat renewal withheld: its worker has not hosted the committee session that counts it \
+                                 for an epoch; renewed once the worker hosts, otherwise the seat lapses and is left");
+                        }
+                        false
+                    }
+                })
+                .collect()
+        };
         if !renewal_filters.is_empty() {
             // Never renew an abandoned orphan we may propose leaving below.
             // The pipeline reserves filters before spawning; failed preparation
@@ -1774,6 +1838,7 @@ impl ProverLifecycle {
                         reason = "capacity reduction (active count exceeds worker count)",
                         "proposing leaves for surplus actives"
                     );
+                    proposal_reasons.extend(surplus.iter().cloned().map(|f| (f, false, "C")));
                     actions.push(LifecycleAction::ProposeLeave {
                         filters: surplus,
                         frame_number,
@@ -1917,6 +1982,12 @@ impl ProverLifecycle {
                         "proposing join for shards"
                     );
 
+                    for filter in &filters {
+                        let reason = if proposal_descriptors_filtered.iter().any(|d| &d.filter == filter
+                            && d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT) { "H" }
+                            else if self.strategy == Strategy::RewardGreedy { "$" } else { "D" };
+                        proposal_reasons.push((filter.clone(), true, reason));
+                    }
                     actions.push(LifecycleAction::ProposeJoin {
                         filters,
                         worker_ids,
@@ -1958,17 +2029,19 @@ impl ProverLifecycle {
             .collect();
 
         if !ready_join_filters.is_empty() {
+            // Judge split-away joins by the proposals' shard view. A regular
+            // node keeps its genesis grid, so the raw grid still names the
+            // children of a parent the archives report; proposals drop those
+            // rows, and every join they proposed for such a parent was
+            // rejected here at the next epoch.
+            let known_shards = known_shard_filters(&current_summaries, &shard_sizes_snapshot, &proposal_grid);
             // A pending join on a shard that has since split, or has retired,
             // is rejected: the chain no longer confirms it, and it holds a
             // worker until it lapses.
             let (split_away, ready_join_filters): (Vec<Vec<u8>>, Vec<Vec<u8>>) = ready_join_filters
                 .into_iter()
                 .partition(|f| is_split_parent(f, &known_shards) || retired.contains(f));
-            let manual_bound_filters: std::collections::HashSet<Vec<u8>> = workers
-                .iter()
-                .filter(|w| w.manually_managed && !w.filter.is_empty())
-                .map(|w| w.filter.clone())
-                .collect();
+            let manual_bound_filters = manually_managed_filters(&workers);
 
             let (manual_ready, auto_ready): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
                 ready_join_filters
@@ -2026,6 +2099,10 @@ impl ProverLifecycle {
                 auto_capacity,
             );
 
+            for filter in &split_away {
+                info!(filter = %hex::encode(filter), retired = retired.contains(filter),
+                    "join decision: pending join rejected, its shard has split or retired");
+            }
             let mut combined_reject = split_away;
             combined_reject.extend(manual_reject);
             combined_reject.extend(auto_reject);
@@ -2102,11 +2179,7 @@ impl ProverLifecycle {
             && !(active_filters.is_empty() && expired_epoch_for_orphan_sweep.is_empty())
             && !self.halt_state.any_halted()
         {
-            let manually_managed_filters: std::collections::HashSet<Vec<u8>> = workers
-                .iter()
-                .filter(|w| w.manually_managed && !w.filter.is_empty())
-                .map(|w| w.filter.clone())
-                .collect();
+            let manually_managed_filters = manually_managed_filters(&workers);
             let pending_leave_filters: std::collections::HashSet<Vec<u8>> = leaving_filters
                 .iter()
                 .map(|(f, _)| f.clone())
@@ -2315,9 +2388,15 @@ impl ProverLifecycle {
             } else {
                 available_replacements.as_slice()
             };
+            // Exclude operator pins before ranking so score replacements and
+            // halt-risk swaps can only propose leaving auto-managed holdings.
+            let auto_allocated_descriptors: Vec<_> = allocated_descriptors.iter()
+                .filter(|d| !manually_managed_filters.contains(&d.filter))
+                .cloned()
+                .collect();
             let leave_plan = if !proposal_descriptors.is_empty() {
                 proposer::plan_leaves_releasing_spread(
-                    &allocated_descriptors,
+                    &auto_allocated_descriptors,
                     replacement_descriptors,
                     difficulty,
                     &world_bytes,
@@ -2435,6 +2514,11 @@ impl ProverLifecycle {
                         6
                     };
                     by_cause[cause] += 1;
+                    let reason = if cause == 6 && remote_shards.iter().any(|parent|
+                        is_split_parent(parent, std::iter::once(f))) { "G" }
+                        else if cause == 0 && self.strategy == Strategy::DataGreedy { "D" }
+                        else { ["$", "H", "E", "O", "C", "S", "T"][cause] };
+                    proposal_reasons.push((f.clone(), false, reason));
                 }
                 let leave_summary: Vec<String> = leave_candidates
                     .iter()
@@ -2487,11 +2571,7 @@ impl ProverLifecycle {
             .collect();
 
         if !ready_leave_filters.is_empty() {
-            let manual_bound_filters: std::collections::HashSet<Vec<u8>> = workers
-                .iter()
-                .filter(|w| w.manually_managed && !w.filter.is_empty())
-                .map(|w| w.filter.clone())
-                .collect();
+            let manual_bound_filters = manually_managed_filters(&workers);
             // Filters any worker is currently bound to — used to
             // identify orphans (leaves with no worker). Orphans skip
             // the score-driven decide because there's nothing to
@@ -2643,6 +2723,14 @@ impl ProverLifecycle {
                 }).flatten().filter_map(|filter| leaving_filters.iter()
                     .find(|(f, _)| f == filter).cloned()).collect();
                 self.leave_decisions.commit(&rejected, frame_number)?;
+                for (filter, joining, reason) in proposal_reasons {
+                    let accepted = actions.iter().any(|a| match a {
+                        LifecycleAction::ProposeJoin { filters, .. } if joining => filters.contains(&filter),
+                        LifecycleAction::ProposeLeave { filters, .. } if !joining => filters.contains(&filter),
+                        _ => false,
+                    });
+                    if accepted { self.allocation_reasons.record(&[filter], joining, frame_number, reason)?; }
+                }
                 self.commit_plan_attempts(&actions, frame_number, forced_rejection);
                 if !actions.is_empty() && tracing::enabled!(tracing::Level::INFO) {
                     let inputs: Vec<_> = held_descriptors.iter().map(|d| {
@@ -2737,6 +2825,21 @@ pub(crate) fn is_split_parent<'a>(filter: &[u8], shards: impl IntoIterator<Item 
                     && quil_forest::bit_path_starts_with(&gb, &fb)
         )
     })
+}
+
+/// An archive-reported ancestor replaces a grid-only child after a merge.
+/// Regular nodes can retain their genesis grid indefinitely. A child still
+/// reported by an archive or holding live allocations remains split evidence;
+/// an empty stale grid row alone must not hide the current merged parent.
+fn proposal_grid_filters(
+    grid: &[Vec<u8>], summaries: &[ProverShardSummary],
+    remote: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    grid.iter().filter(|filter| {
+        remote.contains(*filter)
+            || summaries.iter().any(|s| s.filter == **filter && has_live_allocation(s))
+            || !remote.iter().any(|parent| is_split_parent(parent, std::iter::once(*filter)))
+    }).cloned().collect()
 }
 
 /// Filters known to be current shards, for telling a split-away parent:
@@ -3725,6 +3828,50 @@ mod proposal_loop_tests {
         assert_eq!(missing.ring_source, "summary_tail");
     }
 
+    /// A worker manager whose workers cannot be listed, so every evaluation
+    /// fails once past its readiness gates.
+    struct UnlistableWorkers;
+
+    impl WorkerManager for UnlistableWorkers {
+        fn set_worker_filter(&self, _: u32, _: &[u8], _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn deallocate_worker(&self, _: u32) -> Result<()> {
+            Ok(())
+        }
+        fn check_workers_connected(&self) -> Result<Vec<u32>> {
+            Ok(Vec::new())
+        }
+        fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
+            Err(quil_types::error::QuilError::Store("workers unreadable".into()))
+        }
+        fn respawn_worker(&self, _: u32, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Evaluations that keep failing decide no joins, confirms or leaves; the
+    /// operator sees one warning once three frames in a row failed, with the
+    /// frame and the error, not one line per frame.
+    #[test]
+    fn failing_evaluations_warn_once_after_three_frames() {
+        let logs = crate::outage::test_logs::CapturedLogs::default();
+        let _guard = logs.install();
+        let address = vec![0xCD; 32];
+        let wm: Arc<dyn WorkerManager> = Arc::new(UnlistableWorkers);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), Vec::new()));
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        for frame in 100..106 {
+            lc.set_prover_root_verified_frame(frame);
+            assert!(lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).is_err());
+        }
+        let warns = logs.lines_with("prover lifecycle evaluation failing");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("frame=102") && warns[0].contains("workers unreadable"), "{}", warns[0]);
+        assert!(warns[0].contains("scope") && warns[0].contains("report"), "{}", warns[0]);
+    }
+
     #[test]
     fn confirmed_ring_protects_an_early_high_reward_holding() {
         let address = vec![0xCD; 32];
@@ -3852,6 +3999,99 @@ mod proposal_loop_tests {
         assert_eq!(lc.last_leave_attempt.read().unwrap().get(&held), Some(&725));
     }
 
+    /// A seat whose worker has gone an epoch without hosting the committee
+    /// session that counts it is not renewed (decided 2026-10-18); a hosting
+    /// worker, an unobservable one, and a seat its session does not count
+    /// renew as before.
+    #[test]
+    fn a_seat_whose_worker_never_hosts_its_session_is_not_renewed() {
+        use quil_cw_consensus::handoff::Session;
+        use quil_execution::global_intrinsic::handoff;
+        use quil_execution::hypergraph_state::HypergraphState;
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::node::WorkerExecution;
+
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let state = HypergraphState::new(global.clone());
+        let commit = |frame: u64| {
+            state.commit().unwrap();
+            state.abort();
+            global.commit_with_global_cursor(frame, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        };
+        let signers: Vec<_> = (0..2).map(|_| quil_crypto::FalconSigner::generate()).collect();
+        let local_key = signers[0].public_key().to_vec();
+        let mut members: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
+        members.sort();
+        let address = vec![0xCD; 32];
+        // Sessions name full 32-byte shard filters.
+        let held = vec![0xA1; 32];
+        let outside = vec![0xA2; 32];
+        let session = |filter: &Vec<u8>, members: Vec<Vec<u8>>| Session {
+            chain_id: [7; 32], filter: filter.clone(), generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame: 0, authorization: [0; 32], members,
+        };
+        commit(1);
+        handoff::initialize(&state, 2, &session(&held, members)).unwrap();
+        // `outside`'s session does not count this prover.
+        handoff::initialize(&state, 2, &session(&outside, vec![signers[1].public_key().to_vec()])).unwrap();
+        commit(2);
+
+        let report = |state: &str| WorkerExecution {
+            state: state.into(), blocker: "predecessor state has not been recovered through its seal".into(),
+            observed_unix_ms: crate::worker_execution::now_ms(), ..Default::default()
+        };
+        let renews = |actions: &[LifecycleAction], filter: &Vec<u8>| actions.iter().any(|a|
+            matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(filter)));
+        // (worker report on `held`, whether `held` renews at 725)
+        for (observed, renewed) in [(Some("blocked"), false), (Some("syncing"), false),
+            (Some("serving"), true), (None, true)]
+        {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, held.clone()));
+            wm.add(allocated_worker(2, outside.clone()));
+            if let Some(state) = observed {
+                wm.set_execution(1, &held, report(state));
+            }
+            wm.set_execution(2, &outside, report("blocked"));
+            let reg = Arc::new(ConfigurableRegistry::new());
+            // Confirmed for epoch 1: renewal for epoch 2 is due from frame 720.
+            let due = |filter: &Vec<u8>| {
+                let mut allocation = alloc(filter.clone(), ProverStatus::Active, 10);
+                allocation.epoch = 1;
+                allocation
+            };
+            reg.set_prover(ProverInfo { public_key: local_key.clone(),
+                ..prover(address.clone(), vec![due(&held), due(&outside)]) });
+            reg.set_summaries(vec![shard_summary(held.clone(), 50), shard_summary(outside.clone(), 50)]);
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.allocator.set_session_authority(global.clone());
+            // Observed from frame 5 (not yet due), then when renewal is due,
+            // an epoch later.
+            lc.set_prover_root_verified_frame(5);
+            let early = lc.evaluate(5, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            assert!(!renews(&early, &held), "{early:?}");
+            lc.set_prover_root_verified_frame(725);
+            let actions = lc.evaluate(725, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+            assert_eq!(renews(&actions, &held), renewed, "{observed:?}: {actions:?}");
+            assert!(renews(&actions, &outside), "a seat its session does not count owes no hosting: {actions:?}");
+            assert_eq!(count_proposed_leaves(&actions), 0, "a withheld renewal is not a leave: {actions:?}");
+            if !renewed {
+                // Hosting again renews it.
+                wm.set_execution(1, &held, report("serving"));
+                lc.set_prover_root_verified_frame(730);
+                let late = lc.evaluate(730, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
+                assert!(renews(&late, &held), "{late:?}");
+            }
+        }
+    }
+
     #[test]
     fn bootstrap_after_epoch_expiry_renews_without_shedding_allocations() {
         let _epoch = super::buckets_tests::epoch_length_guard();
@@ -3869,7 +4109,13 @@ mod proposal_loop_tests {
             for frame in [725, 1439] {
                 lc.set_prover_root_verified_frame(frame);
                 let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
-                assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))));
+                // Renewal waits for the allocator to bind a worker (an idle
+                // one is bound to a recovering allocation); the grace holds
+                // cleanup off either way.
+                assert_eq!(
+                    actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))),
+                    initially_bound, "{actions:?}",
+                );
                 assert_eq!(count_proposed_leaves(&actions), 0,
                     "a delayed bootstrap renewal must not race cleanup: {actions:?}");
             }
@@ -3917,7 +4163,7 @@ mod proposal_loop_tests {
     }
 
     #[test]
-    fn rejected_leave_renews_before_orphan_cleanup_and_grace_is_bounded() {
+    fn rejected_leave_grace_holds_orphan_cleanup_and_is_bounded() {
         let address = vec![0xCD; 32];
         let held = filter_bytes(0xA1);
         let wm = Arc::new(ConfigurableWorkerManager::new());
@@ -3933,7 +4179,9 @@ mod proposal_loop_tests {
         for frame in [725, 1439] {
             lc.set_prover_root_verified_frame(frame);
             let actions = lc.evaluate(frame, 50_000, reg.as_ref(), wm.as_ref()).unwrap();
-            assert!(actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))));
+            // Unbound: no renewal until the allocator binds a worker, and the
+            // grace holds cleanup off.
+            assert!(!actions.iter().any(|a| matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))));
             assert_eq!(count_proposed_leaves(&actions), 0,
                 "renewal must not race orphan cleanup after rejecting a leave; actions={actions:?}");
         }
@@ -4252,8 +4500,12 @@ mod proposal_loop_tests {
         );
     }
 
+    /// The chain refuses a reject of a Joining allocation before the epoch
+    /// after the join, so excess joins are rejected only then, by the
+    /// decision: on mainnet a regular node re-sent such a refused reject every
+    /// four frames for the rest of the join's epoch.
     #[test]
-    fn excess_pending_joins_get_rejected() {
+    fn excess_pending_joins_get_rejected_in_their_confirm_epoch() {
         let address = vec![0xCDu8; 32];
         let wm = Arc::new(ConfigurableWorkerManager::new());
         let reg = Arc::new(ConfigurableRegistry::new());
@@ -4284,13 +4536,24 @@ mod proposal_loop_tests {
             reg.clone() as Arc<dyn ProverRegistry>,
         );
         lifecycle.set_prover_root_verified_frame(100);
-
+        lifecycle.current_frame.observe(100);
         let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
-        let rejected = count_rejects(&actions);
-        assert_eq!(
-            rejected, 3,
-            "expected 3 excess pending joins rejected (capacity=2, active=1, allowed=1, pending=4 → excess=3); got {} in {:?}",
-            rejected, actions
+        assert_eq!(count_rejects(&actions), 0, "the chain refuses rejects in the join's own epoch: {actions:?}");
+
+        let confirm_epoch = quil_types::consensus::epoch_length_frames();
+        lifecycle.set_prover_root_verified_frame(confirm_epoch);
+        lifecycle.current_frame.observe(confirm_epoch);
+        let actions = lifecycle.evaluate(confirm_epoch, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        let rejected: std::collections::HashSet<Vec<u8>> = actions.iter()
+            .filter_map(|a| match a {
+                LifecycleAction::RejectJoins { filters, .. } => Some(filters.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            rejected.len() >= 3,
+            "capacity=2, active=1, allowed=1, pending=4 → at least 3 rejected in the confirm epoch; got {rejected:?} in {actions:?}"
         );
     }
 
@@ -5977,8 +6240,12 @@ mod proposal_loop_tests {
             actions
         );
 
-        lifecycle.set_prover_root_verified_frame(100);
-        let actions = lifecycle.evaluate(100, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        // Synced in the joins' confirm epoch, where the chain admits their
+        // confirms and rejects.
+        let confirm_epoch = quil_types::consensus::epoch_length_frames();
+        lifecycle.current_frame.observe(confirm_epoch);
+        lifecycle.set_prover_root_verified_frame(confirm_epoch);
+        let actions = lifecycle.evaluate(confirm_epoch, 1, reg.as_ref(), wm.as_ref()).unwrap();
         assert!(
             !actions.is_empty(),
             "actions should emit once tree is synced; got empty"
@@ -6278,9 +6545,61 @@ mod proposal_loop_tests {
             txn.commit().unwrap();
         }
         lifecycle.set_shards_store(shards);
+        // The archives report the children too, once their sizes refresh.
+        lifecycle.set_remote_shard_sizes([false, true].into_iter().map(|bit| {
+            (quil_forest::shard_prefix_to_filter(&app, &quil_forest::bit_path_to_prefix(&[bit])), 64u64)
+        }).collect());
         let actions = evaluate();
         assert!(count_reject_filters(&actions).contains(&root), "{actions:?}");
         assert!(!count_confirms(&actions).contains(&root), "{actions:?}");
+    }
+
+    /// The local grid alone does not split a shard the archives report: a
+    /// regular node keeps its genesis grid after the network merges it back,
+    /// and the planner proposes joins for the reported parent.
+    #[test]
+    fn a_pending_join_on_a_reported_parent_of_stale_grid_rows_is_confirmed() {
+        use quil_types::store::{KvDb as _, ShardInfo, ShardsStore};
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let app = [0x13u8; 32];
+        let root = app.to_vec();
+        wm.add(WorkerInfo {
+            core_id: 1, filter: root.clone(), available_storage: 0, total_storage: 0,
+            manually_managed: false, pending_filter_frame: 0, allocated: false,
+        });
+        reg.set_prover(prover(address.clone(), vec![alloc(root.clone(), ProverStatus::Joining, 50)]));
+        let mut status_counts = HashMap::new();
+        status_counts.insert(ProverStatus::Joining, 1);
+        reg.set_summaries(vec![ProverShardSummary { filter: root.clone(), status_counts, total_size: 5 }]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(800);
+
+        let evaluate = || lifecycle.evaluate(800, 1, reg.as_ref(), wm.as_ref()).unwrap();
+        assert!(count_confirms(&evaluate()).contains(&root), "a live root's join is confirmed");
+
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let shards: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(db.inner()));
+        let mut grid = quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
+        grid.extend_from_slice(&app);
+        for bit in [false, true] {
+            let txn = db.new_batch(false).unwrap();
+            shards.put_app_shard(txn.as_ref(), &ShardInfo {
+                shard_key: grid.clone(), prefix: quil_forest::bit_path_to_prefix(&[bit]),
+                size: vec![], data_shards: 0, commitment: vec![],
+            }).unwrap();
+            txn.commit().unwrap();
+        }
+        lifecycle.set_shards_store(shards);
+        lifecycle.set_remote_shard_sizes(HashMap::from([(root.clone(), 64u64)]));
+        let actions = evaluate();
+        assert!(count_confirms(&actions).contains(&root), "{actions:?}");
+        assert!(!count_reject_filters(&actions).contains(&root), "{actions:?}");
     }
 
     // Every joiner of a halt-risk shard confirms regardless of score, though
@@ -6441,6 +6760,82 @@ mod proposal_loop_tests {
         assert!(!leaves().contains(&parent), "nor one still running");
         lifecycle.note_registry_synced(later);
         assert!(leaves().contains(&parent), "a registry synced since still holds it there: the split did not move it");
+    }
+
+    /// A regular node's registry shows a landed join only with the next
+    /// prover-tree sync, five minutes apart. The join's worker stays reserved
+    /// until a sync begun after the join's inclusion has refreshed the
+    /// registry; freed after `PROPOSAL_TIMEOUT_FRAMES` alone, it was proposed
+    /// for a second shard 11 frames after the first in every epoch.
+    #[test]
+    fn a_proposed_join_holds_its_worker_until_a_registry_sync_begun_since() {
+        use crate::worker_allocator::PROPOSAL_TIMEOUT_FRAMES;
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(idle_worker(1));
+        reg.set_prover(prover(address.clone(), vec![]));
+        let lifecycle = make_lifecycle(address, wm.clone() as Arc<dyn WorkerManager>, reg.clone() as Arc<dyn ProverRegistry>);
+        lifecycle.hold_gone_shard_leaves_for_sync();
+        let proposed = 100u64;
+        wm.set_pending_filter_frame(1, proposed).unwrap();
+        let pending = |frame: u64| {
+            lifecycle.allocator.on_new_frame(frame).unwrap();
+            wm.range_workers().unwrap()[0].pending_filter_frame
+        };
+        let timed_out = proposed + PROPOSAL_TIMEOUT_FRAMES + 1;
+
+        lifecycle.current_frame.observe(proposed + 1);
+        let before = lifecycle.begin_registry_sync();
+        lifecycle.note_registry_synced(before);
+        assert_eq!(pending(timed_out), proposed, "a sync anchored before the join's inclusion cannot show it");
+        lifecycle.current_frame.observe(proposed + 2);
+        let since = lifecycle.begin_registry_sync();
+        assert_eq!(pending(timed_out + 1), proposed, "nor one still running");
+        lifecycle.note_registry_synced(since);
+        assert_eq!(pending(timed_out + 2), 0, "a registry synced since without the join frees the worker");
+    }
+
+    #[test]
+    fn merged_parent_is_joinable_despite_historic_children_in_local_grid() {
+        let address = vec![0xCD; 32];
+        let app = [0x2A; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let child = quil_forest::encode_shard_bit_path(&app, &[false, false]);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        wm.add(idle_worker(1));
+        reg.set_prover(prover(address.clone(), vec![]));
+        let mut historic = HashMap::new();
+        historic.insert(ProverStatus::Historic, 20);
+        reg.set_summaries(vec![shard_summary(parent.clone(), 20),
+            ProverShardSummary { filter: child.clone(), status_counts: historic, total_size: 0 }]);
+        let lifecycle = make_lifecycle(address, wm.clone(), reg.clone());
+        lifecycle.set_shards_store(put_grid(&app, &[&[false, false], &[false, true]], None));
+        lifecycle.set_prover_root_verified_frame(900);
+        lifecycle.set_remote_shard_sizes([(parent.clone(), 655_152_864)].into_iter().collect());
+        let joins = || lifecycle.evaluate(900, 50_000, reg.as_ref(), wm.as_ref()).unwrap()
+            .into_iter().filter_map(|action| match action {
+                LifecycleAction::ProposeJoin { filters, .. } => Some(filters), _ => None,
+            }).flatten().collect::<Vec<_>>();
+        assert!(joins().contains(&parent), "empty stale children cannot hide an archive-reported merged parent");
+
+        reg.set_summaries(vec![shard_summary(parent.clone(), 20), shard_summary(child.clone(), 4)]);
+        assert!(!joins().contains(&parent), "live children still establish a split-away parent");
+    }
+
+    #[test]
+    fn proposal_grid_keeps_unreported_branches_and_archive_reported_children() {
+        let app = [0x2B; 32];
+        let parent = quil_forest::encode_shard_bit_path(&app, &[false]);
+        let child = quil_forest::encode_shard_bit_path(&app, &[false, false]);
+        let other = quil_forest::encode_shard_bit_path(&app, &[true]);
+        let grid = vec![child.clone(), other.clone()];
+        let remote = [parent.clone()].into_iter().collect();
+        assert_eq!(super::proposal_grid_filters(&grid, &[], &remote), vec![other.clone()]);
+        let remote = [parent, child].into_iter().collect();
+        assert_eq!(super::proposal_grid_filters(&grid, &[], &remote), grid);
+        assert_eq!(super::proposal_grid_filters(&grid, &[], &std::collections::HashSet::new()), grid);
     }
 
     /// Mainnet's merged parents: a legacy merge moves only committee

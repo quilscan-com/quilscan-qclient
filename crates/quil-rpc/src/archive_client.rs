@@ -65,13 +65,16 @@ impl ArchiveClientError {
         causes(self).any(|cause| cause.downcast_ref::<OwnEndpoint>().is_some())
     }
 
-    /// The request failed in the transport (the connection was closed, reset
-    /// or went away), not with a status the archive sent. An archive closes
-    /// connections a client leaves idle; such a request can go again at once
-    /// on a fresh connection.
     /// The archive answered that its forest reads are busy.
     pub fn is_busy(&self) -> bool {
         matches!(self, Self::Rpc(status) if status.code() == tonic::Code::ResourceExhausted)
+    }
+
+    /// The request outran this client's per-request deadline, which tonic
+    /// reports as `Cancelled` ("Timeout expired"): the archive took the
+    /// request but did not answer in time.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::Rpc(status) if status.code() == tonic::Code::Cancelled)
     }
 
     /// The archive lacks the call (an older build).
@@ -79,6 +82,10 @@ impl ArchiveClientError {
         matches!(self, Self::Rpc(status) if status.code() == tonic::Code::Unimplemented)
     }
 
+    /// The request failed in the transport (the connection was closed, reset
+    /// or went away), not with a status the archive sent. An archive closes
+    /// connections a client leaves idle; such a request can go again at once
+    /// on a fresh connection.
     pub fn is_transport_failure(&self) -> bool {
         causes(self).any(|cause| {
             cause.downcast_ref::<hyper::Error>().is_some()
@@ -643,7 +650,24 @@ impl ArchiveClient {
     ) -> Result<GlobalFrame, ArchiveClientError> {
         let resp = self
             .inner
-            .get_global_frame(GetGlobalFrameRequest { frame_number })
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false })
+            .await?
+            .into_inner();
+        resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
+    }
+
+    /// Historical GLOBAL frame `frame_number` from this worker's own master
+    /// (see [`Self::connect_own_master`]), which needs only its header: the
+    /// master serves it even when it pruned the frame's request bodies, and
+    /// fetches an authenticated copy from an archive when it never held it.
+    /// Any other server treats this as [`Self::get_global_frame`].
+    pub async fn get_global_anchor(
+        &mut self,
+        frame_number: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: true })
             .await?
             .into_inner();
         resp.frame.ok_or(ArchiveClientError::MissingField("frame"))

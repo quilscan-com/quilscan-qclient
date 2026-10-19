@@ -45,6 +45,8 @@ hex = "0.4"
 sha2 = "0.10"
 sha3 = "0.10"
 md-5 = "0.10"
+flate2 = "1"
+regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 num-bigint = "0.4"

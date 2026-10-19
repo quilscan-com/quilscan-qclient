@@ -1,8 +1,17 @@
+use std::collections::HashSet;
+
 use quil_types::error::Result;
 
 /// Worker manager: coordinates data worker processes for parallel
 /// proof computation across shards.
 pub trait WorkerManager: Send + Sync {
+    /// Ask the worker to remove application payload outside `keep` from its
+    /// own store. The worker revalidates its binding before any write;
+    /// managers without worker-owned stores ignore the request.
+    fn evict_payload(&self, _core_id: u32, _keep: Vec<Vec<u8>>) -> Result<()> {
+        Ok(())
+    }
+
     /// Bind `core_id` to `filter` and (re)start the consensus engine.
     /// Equivalent to `set_worker_filter(core_id, filter, true)`.
     /// Kept as the default for callers that always want full
@@ -68,6 +77,14 @@ pub trait WorkerManager: Send + Sync {
         let _ = (core_id, allocated);
         Ok(())
     }
+
+    /// Stop every worker and wait up to `deadline` for each to finish,
+    /// returning the core ids still running then. Managers whose workers
+    /// are separate processes have nothing to wait for.
+    fn shutdown(&self, deadline: std::time::Duration) -> Vec<u32> {
+        let _ = deadline;
+        Vec::new()
+    }
 }
 
 /// Information about a worker process.
@@ -93,6 +110,15 @@ pub struct WorkerInfo {
     /// `proposer.go:537-553` counts workers with `!Allocated` — the
     /// availableWorkers cap in `decide_joins` derives from this count.
     pub allocated: bool,
+}
+
+/// Filters pinned to manual workers, including pending joins. Idle manual
+/// workers have no filter to protect.
+pub(crate) fn manually_managed_filters(workers: &[WorkerInfo]) -> HashSet<Vec<u8>> {
+    workers.iter()
+        .filter(|w| w.manually_managed && !w.filter.is_empty())
+        .map(|w| w.filter.clone())
+        .collect()
 }
 
 /// Classified snapshot of every worker known to a `WorkerManager`,

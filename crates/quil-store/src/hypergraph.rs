@@ -392,9 +392,9 @@ impl RocksHypergraphStore {
         let v2_prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix(
             set_type, phase_type, shard_key,
         );
-        let latest = match self.newest_v2_blobs(&v2_prefix)? {
+        let latest = match self.newest_v2_blobs_matching(&v2_prefix, &|_| true)? {
             Some(latest) => latest,
-            None => self.newest_v2_blobs_general(&v2_prefix)?,
+            None => self.newest_v2_blobs_general_matching(&v2_prefix, &|_| true)?,
         };
         let mut count = 0usize;
         let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(latest.len());
@@ -1266,6 +1266,10 @@ mod retention_tests;
 mod orphaned_head_tests;
 
 #[cfg(test)]
+#[path = "hypergraph_selective_tests.rs"]
+mod selective_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::rocksdb_store::RocksDb;
@@ -1291,10 +1295,10 @@ mod tests {
             }
             let prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", &shard);
             let started = std::time::Instant::now();
-            let general = store.newest_v2_blobs_general(&prefix).unwrap().len();
+            let general = store.newest_v2_blobs_general_matching(&prefix, &|_| true).unwrap().len();
             let general_time = started.elapsed();
             let started = std::time::Instant::now();
-            let fast = store.newest_v2_blobs(&prefix).unwrap().unwrap().len();
+            let fast = store.newest_v2_blobs_matching(&prefix, &|_| true).unwrap().unwrap().len();
             eprintln!("{vertices} vertices x {versions} versions: general {general_time:?} ({general}), newest-only {:?} ({fast})",
                 started.elapsed());
         }
@@ -1326,8 +1330,8 @@ mod tests {
             }
         }
         let prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", &shard);
-        let fast = store.newest_v2_blobs(&prefix).unwrap().expect("uniform key lengths");
-        let mut general = store.newest_v2_blobs_general(&prefix).unwrap();
+        let fast = store.newest_v2_blobs_matching(&prefix, &|_| true).unwrap().expect("uniform key lengths");
+        let mut general = store.newest_v2_blobs_general_matching(&prefix, &|_| true).unwrap();
         general.sort();
         let mut fast_sorted = fast.clone();
         fast_sorted.sort();
@@ -1343,7 +1347,7 @@ mod tests {
 
         // A key of another length: the general walk, same answer.
         put(&[9u8; 40], 5, b"odd");
-        assert!(store.newest_v2_blobs(&prefix).unwrap().is_none());
+        assert!(store.newest_v2_blobs_matching(&prefix, &|_| true).unwrap().is_none());
         let walked = collect(&store);
         assert_eq!(walked.len(), 41);
         assert!(walked.contains(&(vec![9u8; 40], b"odd".to_vec())));
@@ -2025,6 +2029,9 @@ mod tests {
             assert_eq!(target.get_vertex_data_checked(&location(first)).unwrap(), Some(vec![first; 48]));
             let committed = target.serve_forest_head(&app, 0).unwrap();
             assert_ne!(committed.1, root, "one chunk is not the complete sync");
+            assert!(target.sync_incomplete(&app, &[]).unwrap(), "a partial scope is incomplete");
+            assert!(target.sync_incomplete(&app, &[true, false]).unwrap(), "and so is every range inside it");
+            assert!(!target.sync_incomplete(&[0x22; 32], &[]).unwrap());
             let next = plan.remaining()[0].0[0];
             let next_blob = blobs(&plan, 1);
             store.fail_commit.store(true, Ordering::Relaxed);
@@ -2035,6 +2042,7 @@ mod tests {
             // Drop the plan and process state while only the first chunk exists.
         }
         let (_target_db, _, target) = open(target_dir.path());
+        assert!(target.sync_incomplete(&app, &[false]).unwrap(), "an interrupted scope stays incomplete across restarts");
         let mut resumed = target.prepare_phase_sync(&reader, version, &app, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
         for key in (1..=3).filter(|key| *key != first) {
             assert!(resumed.remaining().iter().any(|(address, _)| address[0] == key),
@@ -2045,6 +2053,7 @@ mod tests {
         let remaining = blobs(&resumed, resumed.remaining().len());
         target.apply_sync_chunk(&mut resumed, &remaining).unwrap();
         assert_eq!(target.finish_phase_sync(&resumed).unwrap(), root);
+        assert!(!target.sync_incomplete(&app, &[]).unwrap(), "the last chunk completes the scope");
         for key in 1..=3 {
             assert_eq!(target.get_vertex_data_checked(&location(key)).unwrap(), Some(vec![key; 48]));
         }

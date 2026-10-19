@@ -1,0 +1,23 @@
+# qclient upstream source baseline
+
+Pinned source: `QuilibriumNetwork/monorepo` `v2.1.0.25@b77ddfbe5785b6e56a46339e9cdeeef20b7f5dfc`, fetched 2026-10-19. Previous official baseline: `68baba6fb01090d92628d655bbac0fc4026172f8`. Local starting commit: `e13bde85`.
+
+Only paths changed between those official commits are imported within the 32-directory Rust client dependency closure. Its 14 changed directories are `commonware-consensus`, `libp2p-gossipsub`, `quil-client`, `quil-config`, `quil-crypto`, `quil-cw-consensus`, `quil-engine`, `quil-execution`, `quil-forest`, `quil-hypergraph`, `quil-p2p`, `quil-rpc`, `quil-store`, and `quil-types`. The complete new commonware vendor includes its licenses and PATCHES.md, with root workspace exclusion and crates.io patch. The root workspace retains local `quil-wallet`.
+
+Both changed `protobufs/node.proto` and `protobufs/global.proto` follow the pinned source, including DataIPCService.GetWorkerExecution. Other protobufs, retro compatibility JSON inputs, hydrated mainnet seniority, mainnet genesis, and native vendor/build assets remain intact. No unrelated Go source or quil-node deployment source is imported.
+
+Local adapters retained: manage JSON snapshot/tests; once dispatch alongside official render/help controls; full semantic/model-aware execution state and the detailed compatibility sentence. Interactive view.rs follows upstream exactly. The independent token claimable-rewards command remains intact. See QCLIENT_OUTPUT_MIGRATION.md for the additive schema-1 contract.
+
+Version policy: `quil-config/src/version.rs` remains exactly local PATCH_NUMBER 29 / VERSION_STRING 2.1.0.29. Existing client main/version dispatch, commands module and version.rs remain intact; official subpatch/build.rs integration is omitted. Client Cargo retains md-5 alongside upstream flate2/regex. Cargo.lock is merged by dependency/source edges rather than replaced, preserving local wallet/platform packages. Release metadata remains manifest-authoritative; workflow/signing validation accepts 3–5 numeric components, including user-selected 88/99 suffixes. This sync does not publish, install or select a new release number.
+
+Verification completed on macOS arm64:
+
+- Baseline client tests: 161 passed, 10 existing ignored. Four initial localhost-listener sandbox denials disappeared on the same-command retry outside the sandbox.
+- Updated client: 277 library tests passed, 10 existing ignored; token-domain integration: 1 passed. Config support: 39 passed. Root independently repeated all of these with `--release --locked --offline`.
+- Explicit normal release build passed after tests, without test-only feature unification. Root then checked 9 actual CLI cases: offline help, once/render/help conflicts, independent claimable rewards, direct action help, log export help, and the preserved version/checksum command.
+- Production-profile binary SHA256: `ee422e634783deb606b61e193eea80acd91d3560a3a49a33ca8083ca500473e4`.
+- Existing Agent schema-1 parser consumed a synthetic exported snapshot and preserved all old top-level, allocation, nested execution and available-shard fields. Older Agent DTOs ignore additive telemetry; exposing those new fields in Agent/browser status is separate work.
+- Synthetic signing fixtures verified manifest version, filenames, hashes and Ed25519 signatures for `2.1.0.29`, `2.1.0.25.88` and `2.1.0.25.99`; malformed versions were rejected. Only newly generated fixture keys and fake binaries were used.
+- Independent SPEC and QUALITY reviews passed. All 254 expected exact-import paths match pinned upstream Git blobs; five preserved local version/token files match the starting commit. Diff checks pass.
+
+No paid chain RPC, real node log cleanup/export, binary installation, service restart, publishing or deployment was used for verification. Linux compilation and interactive terminal visual acceptance were not executed on this macOS host.

@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use quil_cw_consensus::adapters::{ProposalContext, 
     digest_from_identity, digest_to_identity, Digest, FrameFinalizer, FrameSink, GlobalProposer,
-    Recipients,
+    Liveness, Recipients, Step,
 };
 use quil_cw_consensus::falcon_base::FalconPublicKey;
 use quil_cw_consensus::handoff::automaton::{HandoffProposer, ParentReader};
@@ -79,8 +79,11 @@ pub type AppFinalizedSink = Arc<dyn Fn(AppShardFrame, Vec<u8>, bool, Vec<(AppSha
 
 /// Called with a finalized terminal seal's bytes and its finalization
 /// certificate. Same contract as [`AppFinalizedSink`]: nonblocking, returns
-/// true only when the engine accepted the notification.
-pub type AppSealedSink = Arc<dyn Fn(Vec<u8>, Vec<u8>) -> bool + Send + Sync>;
+/// true only when the engine accepted the notification. The last argument
+/// carries the data frames the seal makes final that never finalized on their
+/// own, lowest first, its checkpoint frame last (see
+/// [`AppSeamFinalizer::seal_implied`]).
+pub type AppSealedSink = Arc<dyn Fn(Vec<u8>, Vec<u8>, Vec<(AppShardFrame, bool)>) -> bool + Send + Sync>;
 
 /// A globally authorized committee session for this host. Its namespace, epoch
 /// and genesis replace the legacy `appshard‖filter` / epoch-zero configuration,
@@ -91,9 +94,18 @@ pub struct SessionHost {
     /// Authorizes a selected parent that is notarized but not yet
     /// materialized, from its private execution (see `AppParentExecutor`).
     pub read_private_parent: Option<ParentReader>,
+    /// Locally reconstruct the data state underlying an unmaterialized seal.
+    pub read_private_checkpoint: Option<quil_cw_consensus::handoff::automaton::CheckpointReader>,
+    /// The authorized checkpoint at the materialized tip, whatever the
+    /// selection: what a re-seal of a notarized seal is checked against
+    /// (`HandoffProposer::with_seal_parents`).
+    pub read_tip: ParentReader,
     pub on_sealed: AppSealedSink,
     /// Records the session's votes and certificates for operators.
     pub liveness: Arc<quil_cw_consensus::adapters::Liveness>,
+    /// Told whether each seal this member verifies shares its state roots
+    /// (`HandoffProposer::with_checkpoint_votes`).
+    pub checkpoint_votes: Option<quil_cw_consensus::handoff::automaton::CheckpointVotes>,
 }
 
 /// Build the full `AppShardFrame` from a produced consensus state + the leader's
@@ -174,7 +186,7 @@ pub(crate) fn decode_app_frame(bytes: &[u8]) -> Option<AppShardFrame> {
 /// Builds/validates app-shard frames via the engine's own `AppLeaderProvider`
 /// (passed as `Arc<dyn LeaderProvider<AppShardState>>`) + `BlsAppFrameValidator`.
 /// Engine-supplied proposal predicate run in `verify` BEFORE signing; returns
-/// `true` iff the proposal is safe to sign. It performs the two body/state
+/// `Ok` iff the proposal is safe to sign, else why not. It performs the two body/state
 /// integrity checks the lightweight seam validator can't (no exec manager /
 /// inclusion prover / hypergraph):
 /// - **body-root** — recompute `requests_root` from the carried
@@ -192,7 +204,11 @@ pub(crate) fn decode_app_frame(bytes: &[u8]) -> Option<AppShardFrame> {
 /// The engine builds it capturing its deps; `None` disables proposing and
 /// verification because the body and state cannot be checked.
 pub type AppRequestsRootCheck =
-    Arc<dyn Fn(&quil_types::proto::global::AppShardFrame) -> bool + Send + Sync>;
+    Arc<dyn Fn(&quil_types::proto::global::AppShardFrame) -> Result<(), CheckRefusal> + Send + Sync>;
+
+/// Why a proposal failed an [`AppRequestsRootCheck`]: a short reason, counted
+/// per session ([`Liveness`]), and its specifics.
+pub type CheckRefusal = (&'static str, String);
 
 /// Durable copies of the proposal bodies this node SEALED: the ones it built
 /// or verified, which are exactly the ones its votes refer to.
@@ -446,6 +462,12 @@ impl<P: GlobalProposer> GlobalProposer for PersistingSeals<P> {
     fn propose_retry(&self) -> Option<std::time::Duration> {
         self.inner.propose_retry()
     }
+    fn proposal_pacing(&self, context: ProposalContext) -> Option<std::time::Duration> {
+        self.inner.proposal_pacing(context)
+    }
+    fn verify_delay(&self, context: ProposalContext, bytes: &[u8]) -> Option<std::time::Duration> {
+        self.inner.verify_delay(context, bytes)
+    }
     fn propose_with_context(&self, context: quil_cw_consensus::adapters::ProposalContext) -> Option<(Digest, Vec<u8>)> {
         self.inner.propose_with_context(context).filter(|(digest, bytes)| self.keep(digest, bytes))
     }
@@ -492,6 +514,8 @@ pub struct AppSeamProposer {
     gate_private_proposals: bool,
     /// `(view, retries)` spent waiting for the selected parent to materialize.
     private_waits: Mutex<(u64, u32)>,
+    /// Where a session notes why this member declines a turn or refuses a vote.
+    liveness: Option<Arc<Liveness>>,
 }
 
 /// How far ahead of this node's latest GLOBAL frame a proposal's anchor may
@@ -528,6 +552,18 @@ impl AppSeamProposer {
             private_parents: None,
             gate_private_proposals: true,
             private_waits: Mutex::new((0, 0)),
+            liveness: None,
+        }
+    }
+
+    pub fn with_liveness(mut self, liveness: Option<Arc<Liveness>>) -> Self {
+        self.liveness = liveness;
+        self
+    }
+
+    fn note(&self, step: Step, view: u64, reason: &'static str, detail: impl Into<String>) {
+        if let Some(liveness) = self.liveness.as_ref() {
+            liveness.note(step, view, reason, detail);
         }
     }
 
@@ -604,6 +640,8 @@ impl GlobalProposer for AppSeamProposer {
             let mut waits = self.private_waits.lock().unwrap_or_else(|e| e.into_inner());
             *waits = if waits.0 == context.view { (context.view, waits.1 + 1) } else { (context.view, 1) };
             if waits.1 <= PRIVATE_PARENT_WAITS {
+                self.note(Step::Propose, context.view, "waiting for the selected parent to materialize",
+                    format!("parent view {}", context.parent_view));
                 self.paced.store(true, std::sync::atomic::Ordering::Release);
                 return None;
             }
@@ -615,6 +653,7 @@ impl GlobalProposer for AppSeamProposer {
             Ok(leader) => leader,
             Err(error) => {
                 tracing::debug!(view = context.view, %error, "cw app propose: selected parent not executable privately");
+                self.note(Step::Propose, context.view, "selected parent not executable privately", error.to_string());
                 self.paced.store(true, std::sync::atomic::Ordering::Release);
                 return None;
             }
@@ -631,7 +670,13 @@ impl GlobalProposer for AppSeamProposer {
                 Ok(parent) => self.verify_with(Some(&parent.check), context.view, context.parent, digest, bytes),
                 Err(error) => {
                     tracing::debug!(view = context.view, %error, "cw app verify: selected parent not executable privately");
-                    self.verify(context.view, context.parent, digest, bytes)
+                    // The canonical check then fails for lack of the parent;
+                    // the private failure is the reason.
+                    let verified = self.verify(context.view, context.parent, digest, bytes);
+                    if !verified {
+                        self.note(Step::Verify, context.view, "selected parent not executable privately", error.to_string());
+                    }
+                    verified
                 }
             },
             Ok(true) | Err(_) => self.verify(context.view, context.parent, digest, bytes),
@@ -648,22 +693,19 @@ impl GlobalProposer for AppSeamProposer {
     /// their proposals instead. The adapter asks again while the view lasts;
     /// an anchor further ahead, or one below this node's head (a hole), is
     /// checked and refused as before.
-    fn verify_or_defer(
-        &self,
-        context: ProposalContext,
-        digest: Digest,
-        bytes: Option<Vec<u8>>,
-    ) -> Result<bool, std::time::Duration> {
-        if let Some(frame) = bytes.as_deref().and_then(decode_app_frame) {
-            if let Some((wanted, Some(latest))) = self.validator.missing_global_anchor(&frame) {
-                if wanted > latest && wanted - latest <= ANCHOR_DEFER_AHEAD {
-                    tracing::debug!(view = context.view, wanted, latest,
-                        "cw app verify: anchored global frame not here yet; deferring the vote");
-                    return Err(ANCHOR_DEFER);
-                }
-            }
+    fn verify_delay(&self, context: ProposalContext, bytes: &[u8]) -> Option<std::time::Duration> {
+        let frame = decode_app_frame(bytes)?;
+        let (wanted, Some(latest)) = self.validator.missing_global_anchor(&frame)? else {
+            return None;
+        };
+        if wanted > latest && wanted - latest <= ANCHOR_DEFER_AHEAD {
+            tracing::debug!(view = context.view, wanted, latest,
+                "cw app verify: anchored global frame not here yet; deferring the vote");
+            self.note(Step::Verify, context.view, "anchored GLOBAL frame not here yet",
+                format!("anchor {wanted}, latest {latest}"));
+            return Some(ANCHOR_DEFER);
         }
-        Ok(self.verify_with_context(context, digest, bytes))
+        None
     }
 }
 
@@ -688,6 +730,7 @@ impl AppSeamProposer {
                 validator = self.requests_root_check.is_some(),
                 "cw app propose: not ready — skipping turn",
             );
+            self.note(Step::Propose, view, self.unready_reason(), String::new());
             return None;
         }
         tracing::debug!(view, "cw app propose: building proposal");
@@ -700,6 +743,7 @@ impl AppSeamProposer {
             .copied()
         else {
             tracing::warn!(view, "cw app propose: parent block metadata unknown — skipping turn");
+            self.note(Step::Propose, view, "parent block unknown", hex::encode(&prior_state_id[..4]));
             return None;
         };
 
@@ -720,8 +764,12 @@ impl AppSeamProposer {
                 }
                 if error.to_string().contains("no vote:") {
                     tracing::debug!(view, prior_frame_number, %error, "cw app propose: parent not local yet — skipping turn");
+                    self.note(Step::Propose, view, "leader not ready to build on the parent",
+                        format!("parent frame {prior_frame_number}: {error}"));
                 } else {
                     tracing::warn!(view, prior_frame_number, %error, "cw app propose: prove_next_state failed — skipping turn");
+                    self.note(Step::Propose, view, "building the next state failed",
+                        format!("parent frame {prior_frame_number}: {error}"));
                 }
                 return None;
             }
@@ -730,20 +778,25 @@ impl AppSeamProposer {
         // The engine assembles the FULL frame (header + recorded requests).
         let Some(frame) = (self.assemble)(&state) else {
             tracing::warn!(view, prior_frame_number, "cw app propose: frame assembly failed — skipping turn");
+            self.note(Step::Propose, view, "frame assembly failed", format!("parent frame {prior_frame_number}"));
             return None;
         };
-        let header = frame.header.as_ref()?;
+        let (Some(header), Some(digest)) = (frame.header.as_ref(), app_frame_digest(&frame)) else {
+            self.note(Step::Propose, view, "frame assembly failed", "no header or identity");
+            return None;
+        };
         if header.address != self.filter || header.rank != view
             || header.parent_selector != parent_digest.as_ref()
         {
             tracing::warn!(view, "cw app propose: assembled frame changed the selected shard, view or parent");
+            self.note(Step::Propose, view, "assembled frame changed its shard, view or parent", String::new());
             return None;
         }
-        let digest = app_frame_digest(&frame)?;
-        let frame_number = frame.header.as_ref()?.frame_number;
+        let frame_number = header.frame_number;
         let bytes = encode_app_frame(&frame);
 
         if !self.persist_sealed(&digest, &bytes) {
+            self.note(Step::Propose, view, "proposal body not persisted", String::new());
             return None;
         }
         self.block_meta.lock().unwrap().insert(digest, frame_number);
@@ -764,23 +817,31 @@ impl AppSeamProposer {
             || requests_root_check.is_none()
         {
             tracing::warn!("cw app verify: state or validation dependencies unavailable");
+            self.note(Step::Verify, view, self.unready_reason(), String::new());
             return false;
         }
         let Some(bytes) = bytes else {
             tracing::warn!("cw app verify: block not delivered (nullify)");
+            self.note(Step::Verify, view, "block not delivered", String::new());
             return false;
         };
         let Some(frame) = decode_app_frame(&bytes) else {
             tracing::warn!("cw app verify: undecodable block (nullify)");
+            self.note(Step::Verify, view, "undecodable block", format!("{} bytes", bytes.len()));
             return false;
         };
         let Some(header) = frame.header.as_ref() else {
+            self.note(Step::Verify, view, "undecodable block", "no header");
             return false;
         };
         if header.address != self.filter || header.rank != view
             || header.parent_selector != parent.as_ref()
         {
             tracing::warn!(view, rank = header.rank, "cw app verify: shard, view or parent mismatch");
+            self.note(Step::Verify, view, "shard, view or parent differs", format!(
+                "frame {} rank {}, shard matches {}, parent matches {}", header.frame_number, header.rank,
+                header.address == self.filter, header.parent_selector == parent.as_ref(),
+            ));
             return false;
         }
         if app_frame_digest(&frame) != Some(digest) {
@@ -788,6 +849,7 @@ impl AppSeamProposer {
                 frame = header.frame_number,
                 "cw app verify: digest mismatch"
             );
+            self.note(Step::Verify, view, "digest mismatch", format!("frame {}", header.frame_number));
             return false;
         }
         // Validate the app digest, storage attestation and structure before voting.
@@ -803,12 +865,13 @@ impl AppSeamProposer {
                 // a vote. A node must finish synchronization before participating.
                 match requests_root_check {
                     Some(check) => {
-                        if !check(&frame) {
+                        if let Err((reason, detail)) = check(&frame) {
                             tracing::warn!(
-                                frame = header.frame_number,
+                                frame = header.frame_number, reason, %detail,
                                 "cw app verify: requests_root/state-root check failed \
                                  (body/pre-state does not match declared roots) — nullify",
                             );
+                            self.note(Step::Verify, view, reason, detail);
                             return false;
                         }
                     }
@@ -817,6 +880,7 @@ impl AppSeamProposer {
                     }
                 }
                 if !self.persist_sealed(&digest, &bytes) {
+                    self.note(Step::Verify, view, "proposal body not persisted", String::new());
                     return false;
                 }
                 self.block_meta
@@ -827,9 +891,39 @@ impl AppSeamProposer {
             }
             other => {
                 tracing::warn!(frame = header.frame_number, result = ?other, "cw app verify: validate failed");
+                let detail = match &other {
+                    Err(error) => error.to_string(),
+                    _ => "invalid".to_string(),
+                };
+                self.note(Step::Verify, view, validation_reason(&detail), format!("frame {}: {detail}", header.frame_number));
                 false
             }
         }
+    }
+
+    fn unready_reason(&self) -> &'static str {
+        if !self.data_ready.load(std::sync::atomic::Ordering::Acquire) {
+            "covered shard data not staged"
+        } else {
+            "no state to check proposals against"
+        }
+    }
+}
+
+/// The counted reason for a proposal `validate_proposal` refused.
+fn validation_reason(error: &str) -> &'static str {
+    if error.contains("anchored global frame") || error.contains("storage attestation: global frame") {
+        "anchored GLOBAL frame missing"
+    } else if error.contains("historical storage registration unavailable") {
+        "storage registration unavailable"
+    } else if error.contains("storage attestation rejected") {
+        "storage attestation rejected"
+    } else if error.contains("deterministic output") {
+        "output does not match the header"
+    } else if error.contains("timestamp") {
+        "timestamp out of range"
+    } else {
+        "frame validation failed"
     }
 }
 
@@ -886,6 +980,8 @@ pub struct AppSeamFinalizer {
     /// Receives a finalized terminal seal and its certificate (session hosts).
     on_sealed: Option<AppSealedSink>,
     sealed_bodies: Option<Arc<SealedBodies>>,
+    closing_certificate: Option<Arc<crate::closing_certificate::ClosingCertificate>>,
+    seal_persist_error: std::sync::atomic::AtomicBool,
     /// See [`FinalizedRecords`]. `None` for an ephemeral (journal-less) host.
     finalized_records: Option<Arc<FinalizedRecords>>,
     /// The engine's contiguous materialized cursor: bodies and records at or
@@ -911,6 +1007,7 @@ impl AppSeamFinalizer {
         filter: Vec<u8>,
     ) -> Self {
         Self { on_notarized, on_finalized, store, filter, on_sealed: None, sealed_bodies: None,
+            closing_certificate: None, seal_persist_error: Default::default(),
             finalized_records: None, materialized: None, delivered: std::sync::atomic::AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()), reported: Default::default() }
     }
@@ -980,6 +1077,22 @@ impl AppSeamFinalizer {
         }
     }
 
+    fn with_closing_certificate(mut self, record: Arc<crate::closing_certificate::ClosingCertificate>) -> Self {
+        self.closing_certificate = Some(record);
+        self
+    }
+
+    fn replay_closing_certificate(&self) -> std::io::Result<bool> {
+        let Some(record) = self.closing_certificate.as_ref() else { return Ok(false) };
+        let Some(submission) = record.load()? else { return Ok(false) };
+        let digest = digest_from_identity(submission.seal.digest());
+        self.store.seal(digest, submission.seal.encode());
+        self.pending.lock().unwrap().entry(digest)
+            .or_insert((submission.seal.view, submission.certificate));
+        self.retry_pending();
+        Ok(true)
+    }
+
     pub fn with_sealed_sink(mut self, on_sealed: AppSealedSink) -> Self {
         self.on_sealed = Some(on_sealed);
         self
@@ -1026,6 +1139,53 @@ impl AppSeamFinalizer {
         chain
     }
 
+    /// The data frames `seal`'s finalization makes final that the engine has
+    /// not been handed: its checkpoint frame, when it never finalized on its
+    /// own, and that frame's own implied ancestors, lowest first. A seal
+    /// built on a notarized parent finalizes it with no certificate of its
+    /// own; handed nothing, the engine never committed the checkpoint frame,
+    /// its seal went to GLOBAL without the frame as a drain header, and was
+    /// refused until GLOBAL fenced the session (eight sessions, 2026-10-15).
+    /// Empty when the chain is incomplete, as for a data frame.
+    fn seal_implied(&self, seal: &Seal) -> Vec<(AppShardFrame, bool, Vec<u8>)> {
+        use std::sync::atomic::Ordering;
+        let Some(materialized) = self.materialized.as_ref() else { return Vec::new() };
+        let floor = materialized.load(Ordering::SeqCst).max(self.delivered.load(Ordering::SeqCst));
+        if seal.checkpoint.frame <= floor {
+            return Vec::new();
+        }
+        let digest = digest_from_identity(seal.checkpoint.digest);
+        let Some((bytes, verified)) = self.store.get_with_verification(&digest) else { return Vec::new() };
+        if Seal::is_encoding(&bytes) {
+            return Vec::new();
+        }
+        let Some(frame) = decode_app_frame(&bytes) else { return Vec::new() };
+        let sealed = frame.header.as_ref().is_some_and(|header| {
+            header.address == self.filter && header.frame_number == seal.checkpoint.frame
+        });
+        if !sealed || app_frame_digest(&frame) != Some(digest) {
+            return Vec::new();
+        }
+        let mut chain = self.implied_ancestors(&frame);
+        if chain.is_empty() && seal.checkpoint.frame > floor.saturating_add(1) {
+            return Vec::new();
+        }
+        chain.push((frame, verified, bytes));
+        chain
+    }
+
+    /// Record `implied` durably before it goes to the engine: a restart
+    /// between the send and the engine's commit must not lose them.
+    fn persist_implied(&self, implied: &[(AppShardFrame, bool, Vec<u8>)]) {
+        let Some(records) = self.finalized_records.as_ref() else { return };
+        for (frame, verified, bytes) in implied {
+            let number = frame.header.as_ref().map_or(0, |h| h.frame_number);
+            if let Err(error) = records.persist_implied(number, *verified, bytes) {
+                tracing::warn!(frame = number, %error, "could not record an implied app frame; delivering it anyway");
+            }
+        }
+    }
+
     fn try_deliver(&self, digest: Digest) -> bool {
         // Serializes delivery across the host, ingress and retry timer. The
         // engine callback only attempts a nonblocking channel send.
@@ -1036,9 +1196,29 @@ impl AppSeamFinalizer {
             // A terminal seal is not a data frame. Only a session host installs
             // the sink; elsewhere the reserved encoding can never be delivered.
             let Some(on_sealed) = self.on_sealed.as_ref() else { return false };
-            let matches = Seal::decode(&bytes).is_ok_and(|seal| seal.digest() == digest.0);
-            if matches && on_sealed(bytes, cert.clone()) {
+            let Some(seal) = Seal::decode(&bytes).ok().filter(|seal| seal.digest() == digest.0) else { return false };
+            if let Some(record) = self.closing_certificate.as_ref() {
+                if let Err(error) = record.persist(&bytes, cert) {
+                    if !self.seal_persist_error.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(%error, "closing certificate persistence failed; retaining for retry");
+                    }
+                    return false;
+                }
+                self.seal_persist_error.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            let implied = self.seal_implied(&seal);
+            self.persist_implied(&implied);
+            let through = implied.last().and_then(|(frame, _, _)| frame.header.as_ref().map(|h| h.frame_number));
+            if !implied.is_empty() {
+                tracing::info!(checkpoint = seal.checkpoint.frame, implied = implied.len(),
+                    "finalized seal makes its notarized checkpoint final; delivering it with the seal");
+            }
+            let implied = implied.into_iter().map(|(frame, verified, _)| (frame, verified)).collect();
+            if on_sealed(bytes, cert.clone(), implied) {
                 pending.remove(&digest);
+                if let Some(number) = through {
+                    self.delivered.fetch_max(number, std::sync::atomic::Ordering::SeqCst);
+                }
                 return true;
             }
             return false;
@@ -1054,12 +1234,7 @@ impl AppSeamFinalizer {
         // Durable before the queue send: a restart between the send and the
         // engine's commit must not lose a finalized frame.
         if let (Some(records), Some(number)) = (self.finalized_records.as_ref(), delivered) {
-            for (ancestor, verified, ancestor_bytes) in &implied {
-                let ancestor_number = ancestor.header.as_ref().map_or(0, |h| h.frame_number);
-                if let Err(error) = records.persist_implied(ancestor_number, *verified, ancestor_bytes) {
-                    tracing::warn!(frame = ancestor_number, %error, "could not record an implied app frame; delivering it anyway");
-                }
-            }
+            self.persist_implied(&implied);
             if let Err(error) = records.persist(number, cert, locally_verified, &bytes) {
                 tracing::warn!(frame = number, %error, "could not record a finalized app frame; delivering it anyway");
             }
@@ -1228,6 +1403,9 @@ pub fn restart_finalization(
 /// - channels 0/1/2 (vote/cert/resolver) → `inbound[channel].send(...)`;
 /// - channel 3 (block) → `ingest_block(bytes)` (feeds the shared `BlockStore`).
 pub struct AppConsensusCwHandle {
+    /// Declared first so it drops first: the shutdown flag is set before the
+    /// inbound senders close, and the host reports a requested stop.
+    _stop_on_drop: StopOnDrop,
     pub inbound: [tokio::sync::mpsc::UnboundedSender<
         quil_cw_consensus::p2p_bridge::Message<FalconPublicKey>,
     >; 3],
@@ -1247,6 +1425,16 @@ pub struct AppConsensusCwHandle {
     pub finalized: Arc<std::sync::atomic::AtomicBool>,
     thread: std::thread::JoinHandle<()>,
     outbound_task: tokio::task::JoinHandle<()>,
+}
+
+/// Sets a host's shutdown flag when its handle is dropped without
+/// `shutdown_and_join`, as when the owning runtime is torn down.
+struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl AppConsensusCwHandle {
@@ -1350,6 +1538,7 @@ pub fn activate_app_consensus_cw(
     if let Some(bodies) = sealed_bodies.clone() {
         proposer = proposer.with_sealed_bodies(bodies);
     }
+    proposer = proposer.with_liveness(session.as_ref().map(|host| host.liveness.clone()));
     let store = BlockStore::new();
     if let Some(parents) = private_parents {
         parents.bind_blocks(store.clone());
@@ -1378,6 +1567,13 @@ pub fn activate_app_consensus_cw(
     );
     if let Some(host) = session.as_ref() {
         finalizer = finalizer.with_sealed_sink(host.on_sealed.clone());
+        if let Some(directory) = storage_directory.as_ref() {
+            finalizer = finalizer.with_closing_certificate(Arc::new(
+                crate::closing_certificate::ClosingCertificate::new(
+                    directory.with_extension("closing-certificate"), host.session.clone(),
+                ),
+            ));
+        }
     }
     if let Some(bodies) = sealed_bodies.clone() {
         finalizer = finalizer.with_sealed_bodies(bodies);
@@ -1394,6 +1590,12 @@ pub fn activate_app_consensus_cw(
     if replayed > 0 {
         tracing::info!(filter = %hex::encode(&proposer.filter), replayed,
             "delivering app frames finalized before a restart");
+    }
+    if finalizer.replay_closing_certificate()
+        .map_err(|error| quil_types::error::QuilError::Internal(format!("load finalized closing certificate: {error}")))?
+    {
+        tracing::info!(filter = %hex::encode(&proposer.filter),
+            "replaying authenticated closing certificate after restart");
     }
     let mut params = GlobalEngineParams::new(partition, epoch, genesis_digest)
         .with_leader_timeout_secs(leader_timeout_secs);
@@ -1476,7 +1678,11 @@ pub fn activate_app_consensus_cw(
                 inner: HandoffProposer::new(
                     proposer.clone() as Arc<dyn GlobalProposer>, host.session, host.read_parent,
                 )?
-                .with_private_reader(host.read_private_parent),
+                .with_private_reader(host.read_private_parent)
+                .with_private_checkpoint_reader(host.read_private_checkpoint)
+                .with_seal_parents(store.clone(), host.read_tip)
+                .with_checkpoint_votes(host.checkpoint_votes)
+                .with_liveness(Some(host.liveness)),
                 bodies: sealed_bodies.clone(),
             }),
             sink,
@@ -1552,6 +1758,7 @@ pub fn activate_app_consensus_cw(
     };
 
     Ok(AppConsensusCwHandle {
+        _stop_on_drop: StopOnDrop(shutdown.clone()),
         inbound,
         ingest_block,
         shutdown,
@@ -1587,6 +1794,7 @@ mod tests {
             })
         };
         let handle = AppConsensusCwHandle {
+            _stop_on_drop: StopOnDrop(shutdown.clone()),
             inbound: std::array::from_fn(|_| tokio::sync::mpsc::unbounded_channel().0),
             ingest_block: Arc::new(|_| {}),
             shutdown,
@@ -1601,6 +1809,36 @@ mod tests {
         release_tx.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), joining).await.unwrap().unwrap().unwrap();
         assert!(stopped.load(Ordering::Acquire));
+    }
+
+    /// A handle dropped without `shutdown_and_join` (its runtime torn down at
+    /// process stop) asks its host to stop before closing the host's inputs,
+    /// so the host reports a requested stop rather than a failure.
+    #[tokio::test]
+    async fn a_dropped_handle_requests_the_stop_before_closing_inputs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let observer = {
+            let flag = shutdown.clone();
+            std::thread::spawn(move || {
+                assert!(rx.blocking_recv().is_none());
+                flag.load(Ordering::Acquire)
+            })
+        };
+        let handle = AppConsensusCwHandle {
+            _stop_on_drop: StopOnDrop(shutdown.clone()),
+            inbound: [tx, tokio::sync::mpsc::unbounded_channel().0, tokio::sync::mpsc::unbounded_channel().0],
+            ingest_block: Arc::new(|_| {}),
+            shutdown: shutdown.clone(),
+            adopted_genesis: None,
+            finalized: Default::default(),
+            thread: std::thread::spawn(|| {}),
+            outbound_task: tokio::spawn(std::future::pending()),
+        };
+        assert!(!shutdown.load(Ordering::Acquire));
+        drop(handle);
+        assert!(observer.join().unwrap(), "inputs closed before the stop was requested");
     }
 
     /// Certify `header` (its output digest at its rank) by `signer` alone.
@@ -1676,10 +1914,12 @@ mod tests {
     async fn a_host_that_returns_unasked_is_dead() {
         use std::sync::atomic::AtomicBool;
         let (exit_tx, exit_rx) = std::sync::mpsc::channel::<()>();
+        let shutdown = Arc::new(AtomicBool::new(false));
         let handle = AppConsensusCwHandle {
+            _stop_on_drop: StopOnDrop(shutdown.clone()),
             inbound: std::array::from_fn(|_| tokio::sync::mpsc::unbounded_channel().0),
             ingest_block: Arc::new(|_| {}),
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown,
             adopted_genesis: None,
             finalized: Default::default(),
             thread: std::thread::spawn(move || { let _ = exit_rx.recv(); }),
@@ -1692,6 +1932,112 @@ mod tests {
         }
         assert!(handle.is_dead());
         handle.shutdown_and_join().await.unwrap();
+    }
+
+    fn closing_test_certificate() -> (Session, Seal, Vec<u8>) {
+        use quil_types::crypto::Signer;
+        let signer = quil_crypto::FalconSigner::generate();
+        let session = Session {
+            chain_id: [1; 32], filter: vec![1; 32], generation: 1, genesis: [2; 32],
+            base_frame: 0, authorization: [3; 32], members: vec![signer.public_key().to_vec()],
+        };
+        let seal = Seal {
+            request: [4; 32], session: session.id().unwrap(), view: 9,
+            checkpoint: quil_cw_consensus::handoff::Checkpoint {
+                frame: 0, view: 0, digest: session.genesis, state_roots: [[5; 32]; 4], history_root: [6; 32],
+            },
+        };
+        let certificate = crate::test_support::certify_seal(&session, &[signer], &seal);
+        (session, seal, certificate)
+    }
+
+    #[test]
+    fn closing_certificate_survives_restart_before_or_after_queue_acceptance() {
+        let (session, seal, certificate) = closing_test_certificate();
+        let digest = digest_from_identity(seal.digest());
+        for (durable, accepted) in [(false, true), (true, false), (true, true)] {
+            let directory = test_directory("closing-certificate-replay");
+            std::fs::create_dir_all(&directory).unwrap();
+            let record = Arc::new(crate::closing_certificate::ClosingCertificate::new(
+                directory.join("certificate"), session.clone(),
+            ));
+            let host = |store: BlockStore, seen: Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>, accepted| {
+                let mut finalizer = AppSeamFinalizer::new(
+                    Arc::new(|_| panic!("seal cannot become data")),
+                    Arc::new(|_, _, _, _| panic!("seal cannot become data")), store, session.filter.clone(),
+                ).with_sealed_sink(Arc::new(move |bytes, cert, _| {
+                    seen.lock().unwrap().push((bytes, cert)); accepted
+                }));
+                if durable { finalizer = finalizer.with_closing_certificate(record.clone()); }
+                finalizer
+            };
+            let store = BlockStore::new();
+            store.seal(digest, seal.encode());
+            let first = host(store, Default::default(), accepted);
+            first.on_finalized(seal.view, digest, None, Some(certificate.clone()), true);
+            assert_eq!(first.pending.lock().unwrap().is_empty(), accepted);
+            drop(first);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let restarted = host(BlockStore::new(), seen.clone(), true);
+            assert_eq!(restarted.replay_closing_certificate().unwrap(), durable);
+            assert_eq!(seen.lock().unwrap().as_slice(), if durable {
+                vec![(seal.encode(), certificate.clone())]
+            } else { vec![] }.as_slice());
+            assert!(restarted.pending.lock().unwrap().is_empty());
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn closing_certificate_replay_requires_the_original_session_and_valid_finalization() {
+        let (session, seal, certificate) = closing_test_certificate();
+        let directory = test_directory("closing-certificate-auth");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("certificate");
+        let record = crate::closing_certificate::ClosingCertificate::new(path.clone(), session.clone());
+        assert!(record.persist(&seal.encode(), &[]).is_err(), "notarization/body alone is insufficient");
+        assert!(record.load().unwrap().is_none());
+        record.persist(&seal.encode(), &certificate).unwrap();
+        let mut wrong = session;
+        wrong.generation += 1;
+        assert!(crate::closing_certificate::ClosingCertificate::new(path.clone(), wrong).load().is_err());
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(record.load().is_err(), "corrupted finalization must not be replayed");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn closing_certificate_io_failure_retains_pending_delivery_until_durable() {
+        let (session, seal, certificate) = closing_test_certificate();
+        let directory = test_directory("closing-certificate-io");
+        std::fs::create_dir_all(&directory).unwrap();
+        let blocked = directory.join("blocked");
+        std::fs::write(&blocked, b"preserve").unwrap();
+        let record = Arc::new(crate::closing_certificate::ClosingCertificate::new(
+            blocked.join("certificate"), session.clone(),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let store = BlockStore::new();
+        let digest = digest_from_identity(seal.digest());
+        store.seal(digest, seal.encode());
+        let finalizer = AppSeamFinalizer::new(
+            Arc::new(|_| unreachable!()), Arc::new(|_, _, _, _| unreachable!()), store, session.filter,
+        ).with_closing_certificate(record.clone()).with_sealed_sink(Arc::new(move |bytes, cert, _| {
+            captured.lock().unwrap().push((bytes, cert)); true
+        }));
+        finalizer.on_finalized(seal.view, digest, None, Some(certificate.clone()), true);
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(finalizer.pending.lock().unwrap().contains_key(&digest));
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"preserve");
+        std::fs::remove_file(&blocked).unwrap();
+        finalizer.retry_pending();
+        assert_eq!(*seen.lock().unwrap(), vec![(seal.encode(), certificate)]);
+        assert!(record.load().unwrap().is_some());
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn finalized_test_frame(number: u64) -> AppShardFrame {
@@ -1765,6 +2111,79 @@ mod tests {
         let (_, restarted) = implied_host(&directory, 1, again.clone());
         assert_eq!(restarted.replay_finalized_records().unwrap(), 1);
         assert_eq!(*again.lock().unwrap(), vec![(3, vec![3], vec![2])]);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A seal built on a notarized checkpoint makes that frame (and a notarized
+    /// frame under it) final with no certificate of its own. They reach the
+    /// engine with the seal, and again after a restart that kept only the
+    /// records; one already delivered, or a broken chain, is not handed over.
+    #[test]
+    fn a_finalized_seal_delivers_the_notarized_checkpoint_it_makes_final() {
+        use quil_types::crypto::Signer;
+        let signer = quil_crypto::FalconSigner::generate();
+        let session = Session {
+            chain_id: [1; 32], filter: vec![1; 32], generation: 1, genesis: [2; 32],
+            base_frame: 0, authorization: [3; 32], members: vec![signer.public_key().to_vec()],
+        };
+        let frames = linked_frames(1, 3);
+        let checkpoint = &frames[2];
+        let seal = Seal {
+            request: [4; 32], session: session.id().unwrap(), view: 20,
+            checkpoint: quil_cw_consensus::handoff::Checkpoint {
+                frame: 3, view: checkpoint.header.as_ref().unwrap().rank,
+                digest: app_frame_digest(checkpoint).unwrap().0, state_roots: [[5; 32]; 4], history_root: [6; 32],
+            },
+        };
+        let certificate = crate::test_support::certify_seal(&session, &[signer], &seal);
+        let digest = digest_from_identity(seal.digest());
+        type Sealed = Arc<Mutex<Vec<Vec<u64>>>>;
+        let host = |directory: &std::path::Path, cursor: u64, sealed: Sealed| {
+            let store = BlockStore::new();
+            let finalizer = AppSeamFinalizer::new(
+                Arc::new(|_| {}), Arc::new(|_, _, _, _| panic!("no data frame finalized")), store.clone(), vec![1; 32],
+            )
+            .with_finalized_records(
+                Arc::new(FinalizedRecords::open(directory.join("records")).unwrap()),
+                Arc::new(std::sync::atomic::AtomicU64::new(cursor)),
+            )
+            .with_closing_certificate(Arc::new(crate::closing_certificate::ClosingCertificate::new(
+                directory.join("certificate"), session.clone(),
+            )))
+            .with_sealed_sink(Arc::new(move |_, _, implied: Vec<(AppShardFrame, bool)>| {
+                sealed.lock().unwrap().push(implied.into_iter().map(|(frame, _)| frame.header.unwrap().frame_number).collect());
+                true
+            }));
+            (store, finalizer)
+        };
+        let deliver = |directory: &std::path::Path, cursor: u64, bodies: &[&AppShardFrame]| {
+            std::fs::create_dir_all(directory).unwrap();
+            let sealed: Sealed = Default::default();
+            let (store, finalizer) = host(directory, cursor, sealed.clone());
+            for frame in bodies {
+                store.seal(app_frame_digest(frame).unwrap(), encode_app_frame(frame));
+            }
+            store.seal(digest, seal.encode());
+            finalizer.on_finalized(seal.view, digest, None, Some(certificate.clone()), true);
+            assert!(finalizer.pending.lock().unwrap().is_empty());
+            let delivered = sealed.lock().unwrap().clone();
+            delivered
+        };
+
+        let directory = test_directory("seal-implied");
+        assert_eq!(deliver(&directory, 1, &[&frames[1], &frames[2]]), vec![vec![2, 3]]);
+        let again: Sealed = Default::default();
+        let (_, restarted) = host(&directory, 1, again.clone());
+        assert_eq!(restarted.replay_finalized_records().unwrap(), 0, "implied frames are bodies only");
+        assert!(restarted.replay_closing_certificate().unwrap());
+        assert_eq!(*again.lock().unwrap(), vec![vec![2, 3]]);
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        let directory = test_directory("seal-implied-delivered");
+        assert_eq!(deliver(&directory, 3, &[&frames[1], &frames[2]]), vec![Vec::<u64>::new()]);
+        std::fs::remove_dir_all(&directory).unwrap();
+        let directory = test_directory("seal-implied-broken");
+        assert_eq!(deliver(&directory, 1, &[&frames[2]]), vec![Vec::<u64>::new()], "frame 2's body is missing");
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -1993,7 +2412,7 @@ mod tests {
             );
             if with_sink {
                 let sealed = sealed.clone();
-                finalizer = finalizer.with_sealed_sink(Arc::new(move |bytes, cert| {
+                finalizer = finalizer.with_sealed_sink(Arc::new(move |bytes, cert, _| {
                     sealed.lock().unwrap().push((bytes, cert));
                     true
                 }));
@@ -2074,7 +2493,7 @@ mod tests {
                 Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
             ));
             let check: Option<AppRequestsRootCheck> = has_check.then(|| {
-                Arc::new(|_: &AppShardFrame| -> bool { panic!("state is unavailable") })
+                Arc::new(|_: &AppShardFrame| -> Result<(), CheckRefusal> { panic!("state is unavailable") })
                     as AppRequestsRootCheck
             });
             let proposer = AppSeamProposer::new(
@@ -2103,9 +2522,11 @@ mod tests {
             )),
             Arc::new(|_| unreachable!()),
             filter.clone(),
-            Some(Arc::new(|_| true)),
+            Some(Arc::new(|_| Ok(()))),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
         );
+        let liveness = Arc::new(Liveness::default());
+        let proposer = proposer.with_liveness(Some(liveness.clone()));
         let mut header = quil_types::proto::global::FrameHeader {
             address: filter,
             frame_number: 7,
@@ -2130,6 +2551,14 @@ mod tests {
         let mut wrong_shard = frame;
         wrong_shard.header.as_mut().unwrap().address = vec![2; 32];
         assert!(!proposer.verify(43, parent, digest, Some(encode_app_frame(&wrong_shard))));
+        // Each refusal is noted under its view with why.
+        liveness.settle(Step::Verify, 43, false);
+        liveness.settle(Step::Verify, 44, false);
+        let refused = liveness.decisions().refused;
+        assert_eq!(refused.get("shard, view or parent differs"), Some(&2));
+        assert!(!proposer.verify(43, parent, digest, None));
+        liveness.settle(Step::Verify, 43, false);
+        assert_eq!(liveness.decisions().refused.get("block not delivered"), Some(&1));
     }
 
     /// A proposal anchored one or two GLOBAL frames past this node's latest
@@ -2172,7 +2601,7 @@ mod tests {
             validator.clone(),
             Arc::new(|_| unreachable!()),
             filter.clone(),
-            Some(Arc::new(|_| true)),
+            Some(Arc::new(|_| Ok(()))),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
         );
         let proposal = |anchor: u64| {
@@ -2222,7 +2651,7 @@ mod tests {
             )),
             Arc::new(|_| unreachable!()),
             vec![1; 32],
-            Some(Arc::new(|_| true)),
+            Some(Arc::new(|_| Ok(()))),
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
         );
         proposer.note_frame(digest_from_identity([1; 32]), 0);

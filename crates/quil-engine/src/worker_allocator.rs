@@ -17,6 +17,23 @@ use quil_types::error::Result;
 
 use crate::worker::{WorkerInfo, WorkerManager};
 
+/// A binding must stay unchanged this long before its worker evicts payload
+/// outside it: the previous engine's background tasks have finished by then.
+pub(crate) const PAYLOAD_EVICTION_SETTLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Repeat interval for a settled binding. Requests are idempotent; repeats
+/// retry refusals (pending mutations, an unfinished sync) and are cheap once
+/// nothing remains outside the protected scopes.
+const PAYLOAD_EVICTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+pub type PendingShardChanges =
+    Arc<dyn Fn() -> Result<Vec<quil_types::store::PendingShardChange>> + Send + Sync>;
+
+struct EvictionTrack {
+    filter: Vec<u8>,
+    since: std::time::Instant,
+    requested: Option<std::time::Instant>,
+}
+
 /// A rejected leave restores Active without renewing storage. Keep its worker
 /// available to encode renewal until the end of the rejection epoch. This is
 /// local recovery scheduling only: the allocation remains ExpiredEpoch for
@@ -217,6 +234,10 @@ pub fn apply_config_worker_filters(
 
 /// Proposal never landed in the registry within this many frames → clear.
 pub const PROPOSAL_TIMEOUT_FRAMES: u64 = 10;
+/// Ceiling on holding a proposal's worker for a registry sync (see
+/// `WorkerAllocator::hold_pending_joins_for_registry_sync`), so failing
+/// syncs cannot pin it: about three five-minute syncs.
+pub const PROPOSAL_SYNC_CEILING_FRAMES: u64 = 60;
 /// Pending join/leave not confirmed within this many frames → clear.
 pub const PENDING_FILTER_GRACE_FRAMES: u64 = 720;
 // Confirm window lives on `ProverLifecycle` so testnet bootstraps can
@@ -427,6 +448,12 @@ pub enum Cooldown {
 const COOLDOWN_KINDS: usize = 3;
 
 pub struct WorkerAllocator {
+    /// Serialize frame-driven and registry-sync reconciliation so their
+    /// release/bind passes cannot compete for the same idle worker.
+    reconcile_lock: std::sync::Mutex<()>,
+    /// Shard operations in progress, shared with the lifecycle that
+    /// dispatches them.
+    pub(crate) submission_attempts: Arc<crate::submission_attempts::SubmissionAttempts>,
     worker_manager: Arc<dyn WorkerManager>,
     prover_registry: Arc<dyn ProverRegistry>,
     /// This node's prover address (32 bytes).
@@ -454,6 +481,12 @@ pub struct WorkerAllocator {
     /// it was logged at, for the rate limiter in `log_rebind_outcome`.
     last_rebind_outcome: std::sync::atomic::AtomicU64,
     last_rebind_outcome_frame: std::sync::atomic::AtomicU64,
+    /// See `hold_pending_joins_for_registry_sync`.
+    pending_joins_await_sync: std::sync::atomic::AtomicBool,
+    /// Frame at which each running prover-tree sync began.
+    registry_syncs_running: std::sync::Mutex<HashMap<u64, u64>>,
+    /// Latest begin frame of a sync that has refreshed the registry.
+    registry_synced_from_frame: std::sync::atomic::AtomicU64,
     /// Once-guard for the prover-reset-v3 worker-filter reset (mainnet frame
     /// 747_000). Fires exactly at that frame in `on_new_frame`, clearing every
     /// AUTO-managed worker's persisted deep filter so re-join lands on the clean
@@ -467,9 +500,29 @@ pub struct WorkerAllocator {
     /// is recorded, whatever the registry says about the allocation meanwhile.
     /// The closing committee needs its quorum to finalize that seal.
     session_authority: RwLock<Option<Arc<quil_hypergraph::HypergraphCrdt>>>,
+    /// Staged splits and merges. A confirmation encodes their targets from the
+    /// confirming worker's store, so they stay protected from eviction. Unset
+    /// means unknown: no eviction is requested.
+    pending_shard_changes: RwLock<Option<PendingShardChanges>>,
+    payload_eviction: std::sync::Mutex<HashMap<u32, EvictionTrack>>,
 }
 
 impl WorkerAllocator {
+    /// Whether a missed renewal may keep or recover its worker: within the
+    /// recovery epoch, or for as long as this node's renewal of it is still
+    /// running or awaiting its retry. A renewal stuck in preparation past the
+    /// recovery epoch would otherwise lose its worker, and the orphan sweep
+    /// then proposes leaving a registration the protocol still accepts.
+    pub(crate) fn renewal_recovering(
+        &self,
+        allocation: &quil_types::consensus::ProverAllocationInfo,
+        frame: u64,
+    ) -> bool {
+        epoch_renewal_recovery_pending(allocation, frame)
+            || (allocation.effective_status(frame) == quil_types::consensus::EffectiveStatus::ExpiredEpoch
+                && self.submission_attempts.owned(&allocation.confirmation_filter, frame))
+    }
+
     /// Free a worker, unless its committee session is still closing.
     fn release_worker(&self, worker: &WorkerInfo, retained: bool) -> Result<()> {
         if retained {
@@ -484,12 +537,31 @@ impl WorkerAllocator {
         *self.session_authority.write().unwrap_or_else(|e| e.into_inner()) = Some(global);
     }
 
+    /// Of `filters`, those whose current committee session counts `member`
+    /// ([`crate::app_handoff::member_sessions`]). None without authenticated
+    /// GLOBAL state or when it is unreadable: no seat is then held to
+    /// hosting a session.
+    pub(crate) fn session_member_filters(&self, filters: &[Vec<u8>], member: &[u8]) -> std::collections::HashSet<Vec<u8>> {
+        let Some(global) = self.session_authority.read().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return Default::default();
+        };
+        match crate::app_handoff::member_sessions(&global, filters, member) {
+            Ok(members) => members,
+            Err(error) => {
+                debug!(%error, "committee sessions unreadable; no seat is held to hosting");
+                Default::default()
+            }
+        }
+    }
+
     pub fn new(
         worker_manager: Arc<dyn WorkerManager>,
         prover_registry: Arc<dyn ProverRegistry>,
         local_prover_address: Vec<u8>,
     ) -> Self {
         Self {
+            reconcile_lock: std::sync::Mutex::new(()),
+            submission_attempts: Arc::new(crate::submission_attempts::SubmissionAttempts::default()),
             worker_manager,
             prover_registry,
             local_prover_address,
@@ -504,8 +576,93 @@ impl WorkerAllocator {
             last_priority_review_frame: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome_frame: std::sync::atomic::AtomicU64::new(0),
+            pending_joins_await_sync: std::sync::atomic::AtomicBool::new(false),
+            registry_syncs_running: std::sync::Mutex::new(HashMap::new()),
+            registry_synced_from_frame: std::sync::atomic::AtomicU64::new(0),
             worker_reset_v3_done: std::sync::atomic::AtomicBool::new(false),
+            pending_shard_changes: RwLock::new(None),
+            payload_eviction: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn set_pending_shard_changes(&self, changes: PendingShardChanges) {
+        *self.pending_shard_changes.write().unwrap_or_else(|e| e.into_inner()) = Some(changes);
+    }
+
+    /// Ask each settled, serving worker to drop payload its store keeps from
+    /// shards it no longer serves. Protected: the binding (a closing session
+    /// keeps it bound) and staged split/merge filters of the bound
+    /// application.
+    pub(crate) fn schedule_payload_eviction(&self, now: std::time::Instant) -> Result<()> {
+        let _reconcile = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(changes) = self.pending_shard_changes.read().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return Ok(());
+        };
+        let workers = self.worker_manager.range_workers()?;
+        let mut tracks = self.payload_eviction.lock().unwrap_or_else(|e| e.into_inner());
+        tracks.retain(|core, _| workers.iter().any(|w| w.core_id == *core));
+        let mut due = Vec::new();
+        for worker in &workers {
+            if worker.filter.is_empty() || !worker.allocated || worker.pending_filter_frame != 0 {
+                tracks.remove(&worker.core_id);
+                continue;
+            }
+            let track = tracks.entry(worker.core_id).or_insert_with(|| EvictionTrack {
+                filter: worker.filter.clone(),
+                since: now,
+                requested: None,
+            });
+            if track.filter != worker.filter {
+                *track = EvictionTrack { filter: worker.filter.clone(), since: now, requested: None };
+            }
+            let settled = now.saturating_duration_since(track.since) >= PAYLOAD_EVICTION_SETTLE;
+            let repeat = track.requested.is_none_or(|at| now.saturating_duration_since(at) >= PAYLOAD_EVICTION_INTERVAL);
+            if settled && repeat {
+                due.push(worker.core_id);
+            }
+        }
+        if due.is_empty() {
+            return Ok(());
+        }
+        let staged = changes()?;
+        // A regular node never consumes staged changes, so a change whose
+        // shards are all gone would protect their payload forever. Retained
+        // historic, rejected or kicked slots do not hold a shard.
+        let held: std::collections::HashSet<Vec<u8>> = if staged.is_empty() {
+            Default::default()
+        } else {
+            self.prover_registry.get_all_active_app_shard_provers()?
+                .into_iter()
+                .flat_map(|p| p.allocations)
+                .filter(|a| matches!(a.status, ProverStatus::Joining | ProverStatus::Active
+                    | ProverStatus::Paused | ProverStatus::Leaving))
+                .map(|a| a.confirmation_filter)
+                .chain(workers.iter().map(|w| w.filter.clone()))
+                .filter(|f| !f.is_empty())
+                .collect()
+        };
+        let staged: Vec<_> = staged.into_iter()
+            .filter(|c| std::iter::once(&c.parent).chain(c.children.iter()).any(|f| held.contains(f)))
+            .collect();
+        for worker in workers.iter().filter(|w| due.contains(&w.core_id)) {
+            let application = &worker.filter[..worker.filter.len().min(32)];
+            let mut keep = vec![worker.filter.clone()];
+            keep.extend(
+                staged.iter()
+                    .flat_map(|c| std::iter::once(&c.parent).chain(c.children.iter()))
+                    .filter(|f| f.len() >= 32 && f[..32] == *application)
+                    .cloned(),
+            );
+            keep.sort();
+            keep.dedup();
+            match self.worker_manager.evict_payload(worker.core_id, keep) {
+                Ok(()) => if let Some(track) = tracks.get_mut(&worker.core_id) {
+                    track.requested = Some(now);
+                },
+                Err(error) => warn!(core_id = worker.core_id, %error, "worker payload eviction request failed"),
+            }
+        }
+        Ok(())
     }
 
     /// Cached config-derived seniority estimate. Computed once at
@@ -565,6 +722,42 @@ impl WorkerAllocator {
     /// the next 4 frames are cooled down.
     pub fn set_last_join_attempt(&self, frame_number: u64) {
         self.record_attempt(Cooldown::Join, frame_number);
+    }
+
+    /// For a node whose registry shows a landed join only after the next
+    /// prover-tree sync (every five minutes, about 20 frames on mainnet):
+    /// keep a proposal's worker reserved past `PROPOSAL_TIMEOUT_FRAMES` until
+    /// a sync begun after the join's inclusion has refreshed the registry.
+    /// Freed earlier, the worker is proposed for a second shard while the
+    /// first join is still on its way.
+    pub fn hold_pending_joins_for_registry_sync(&self) {
+        self.pending_joins_await_sync.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A prover-tree sync numbered `sync` began at `frame_number`.
+    pub fn note_registry_sync_begun(&self, sync: u64, frame_number: u64) {
+        if let Ok(mut running) = self.registry_syncs_running.lock() {
+            running.insert(sync, frame_number);
+        }
+    }
+
+    /// The registry now reflects the prover-tree sync numbered `sync`.
+    pub fn note_registry_synced(&self, sync: u64) {
+        let Ok(mut running) = self.registry_syncs_running.lock() else { return };
+        if let Some(frame) = running.remove(&sync) {
+            self.registry_synced_from_frame.fetch_max(frame, std::sync::atomic::Ordering::SeqCst);
+        }
+        running.retain(|later, _| *later > sync);
+    }
+
+    /// Whether a join proposed at `pending_frame` (included at the next
+    /// frame) may still appear with the next registry sync. A sync anchors
+    /// at the frame before its begin frame.
+    fn join_awaits_registry_sync(&self, pending_frame: u64, frame_number: u64) -> bool {
+        pending_frame > 0
+            && self.pending_joins_await_sync.load(std::sync::atomic::Ordering::SeqCst)
+            && frame_number <= pending_frame + PROPOSAL_SYNC_CEILING_FRAMES
+            && self.registry_synced_from_frame.load(std::sync::atomic::Ordering::SeqCst) <= pending_frame + 1
     }
 
     /// Publish the lifecycle's per-filter ranking for `frame_number`.
@@ -665,6 +858,15 @@ impl WorkerAllocator {
     /// - `PROPOSAL_TIMEOUT_FRAMES = 10`: proposal never landed → clear filter
     /// - `PENDING_FILTER_GRACE_FRAMES = 720`: pending join not confirmed → clear
     pub fn on_new_frame(&self, frame_number: u64) -> Result<()> {
+        let result = self.reconcile(frame_number);
+        if let Err(error) = self.schedule_payload_eviction(std::time::Instant::now()) {
+            warn!(%error, "worker payload eviction not scheduled");
+        }
+        result
+    }
+
+    fn reconcile(&self, frame_number: u64) -> Result<()> {
+        let _reconcile = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Prover-reset v3 (mainnet 747_000): clear every AUTO-managed worker's
         // persisted filter so it re-joins onto the clean genesis grid instead of
         // the deep filter that survived the v2 tree wipe in the local worker store
@@ -784,6 +986,7 @@ impl WorkerAllocator {
                 if worker.pending_filter_frame > 0
                     && frame_number
                         > worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES
+                    && !self.join_awaits_registry_sync(worker.pending_filter_frame, frame_number)
                 {
                     // Warn, not info — silent failures are exactly the
                     // class of bug this telemetry needs to surface. A
@@ -824,15 +1027,18 @@ impl WorkerAllocator {
                                 | EffectiveStatus::Paused
                                 | EffectiveStatus::Joining
                                 | EffectiveStatus::Leaving
-                        ) || epoch_renewal_recovery_pending(a, frame_number)
+                        ) || self.renewal_recovering(a, frame_number)
                     })
                     .unwrap_or(false);
                 // Protect a still-in-flight ProposeJoin (pending window not yet
                 // elapsed) so we don't cancel a legitimately pending bind.
-                let pending_in_flight = worker.pending_filter_frame > 0
+                let pending_in_flight = self.join_awaits_registry_sync(worker.pending_filter_frame, frame_number)
+                    || worker.pending_filter_frame > 0
                     && frame_number
                         <= worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES;
-                if !f_resolvable && !pending_in_flight {
+                // A retained worker is not stranded: its closing session still
+                // counts its vote, and the pass below restarts its engine.
+                if !f_resolvable && !pending_in_flight && !retained {
                     warn!(
                         core_id = worker.core_id,
                         stale_filter = hex::encode(&worker.filter),
@@ -853,7 +1059,8 @@ impl WorkerAllocator {
                     // worker while a live allocation is unbound.
                     if alloc.effective_status(frame_number)
                         == quil_types::consensus::EffectiveStatus::ExpiredEpoch
-                        && !epoch_renewal_recovery_pending(alloc, frame_number)
+                        && !self.renewal_recovering(alloc, frame_number)
+                        && !retained
                     {
                         info!(
                             core_id = worker.core_id,
@@ -879,6 +1086,16 @@ impl WorkerAllocator {
                         alloc.status,
                         ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
                     );
+
+                    // The join has landed once its allocation is confirmed. The
+                    // pending marker would otherwise exclude the worker from
+                    // priority replacement for as long as it stays bound.
+                    if worker.pending_filter_frame > 0 && matches!(
+                        alloc.status,
+                        ProverStatus::Active | ProverStatus::Paused | ProverStatus::Leaving
+                    ) {
+                        let _ = self.worker_manager.set_pending_filter_frame(worker.core_id, 0);
+                    }
 
                     match alloc.status {
                         ProverStatus::Active | ProverStatus::Paused => {
@@ -946,6 +1163,7 @@ impl WorkerAllocator {
                             // explicitly asked to leave, forever.
                             if alloc.effective_status(frame_number)
                                 == quil_types::consensus::EffectiveStatus::ExpiredLeaving
+                                && !retained
                             {
                                 desired_allocated = false;
                                 info!(
@@ -997,6 +1215,7 @@ impl WorkerAllocator {
                     }
                     if worker.pending_filter_frame > 0
                         && frame_number > worker.pending_filter_frame + PROPOSAL_TIMEOUT_FRAMES
+                        && !self.join_awaits_registry_sync(worker.pending_filter_frame, frame_number)
                     {
                         info!(
                             core_id = worker.core_id,
@@ -1115,7 +1334,7 @@ impl WorkerAllocator {
                 | EffectiveStatus::Paused
                 | EffectiveStatus::Joining => {}
                 EffectiveStatus::ExpiredEpoch
-                    if epoch_renewal_recovery_pending(alloc, frame_number) => {}
+                    if self.renewal_recovering(alloc, frame_number) => {}
                 // Both proposed and confirmed leaves serve until their
                 // protocol departure boundary; confirmation does not free
                 // the worker or change the frozen committee mid-epoch.
@@ -1606,6 +1825,17 @@ mod tests {
         let _ = wm.set_allocated(1, false);
         active.on_new_frame(102).unwrap();
         assert!(wm.range_workers().unwrap()[0].allocated, "retention must not skip the Active transition");
+        // …nor the engine restart of a member whose allocation already ended,
+        // while another allocation waits for a worker.
+        let restarted = WorkerAllocator::new(wm.clone(), Arc::new(TestProverRegistry::with_provers(vec![ProverInfo {
+            allocations: vec![kicked.clone(), make_alloc(vec![0x02; 32])], ..prover(kicked.clone())
+        }])), vec![0xAA; 32]);
+        restarted.set_session_authority(global.clone());
+        wm.set_worker_filter(1, &filter, false).unwrap();
+        restarted.on_new_frame(102).unwrap();
+        let worker = wm.range_workers().unwrap()[0].clone();
+        assert_eq!(worker.filter, filter);
+        assert!(worker.allocated, "a closing member must restart its engine while another allocation waits");
 
         // Once GLOBAL state records the seal, the worker is released.
         let seal = Seal {
@@ -1666,6 +1896,51 @@ mod tests {
             "stuck pending-join marker must be cleared so the worker is free \
              again and the lifecycle can re-propose"
         );
+    }
+
+    /// Held for a registry sync, a stuck marker still clears at the ceiling,
+    /// so failing syncs cannot pin the worker.
+    #[test]
+    fn a_marker_held_for_a_registry_sync_clears_at_the_ceiling() {
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(crate::worker::WorkerInfo {
+            core_id: 1,
+            filter: Vec::new(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 100,
+            allocated: false,
+        });
+        let alloc = WorkerAllocator::new(wm.clone(), Arc::new(TestProverRegistry::new()), vec![0xAAu8; 32]);
+        alloc.hold_pending_joins_for_registry_sync();
+        let pending = |frame: u64| {
+            alloc.on_new_frame(frame).unwrap();
+            wm.range_workers().unwrap()[0].pending_filter_frame
+        };
+        assert_eq!(pending(100 + PROPOSAL_SYNC_CEILING_FRAMES), 100, "no sync has refreshed the registry since");
+        assert_eq!(pending(100 + PROPOSAL_SYNC_CEILING_FRAMES + 1), 0);
+    }
+
+    #[test]
+    fn landed_join_clears_its_pending_marker() {
+        let filter = vec![0x01; 32];
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(crate::worker::WorkerInfo {
+            core_id: 1,
+            filter: filter.clone(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 100,
+            allocated: true,
+        });
+        let alloc = WorkerAllocator::new(
+            wm.clone(), Arc::new(TestProverRegistry::with_prover(prover_with_active(&[filter.clone()], 200))), vec![0xAAu8; 32]);
+        alloc.on_new_frame(200).unwrap();
+        let workers = wm.range_workers().unwrap();
+        assert_eq!(workers[0].filter, filter);
+        assert_eq!(workers[0].pending_filter_frame, 0, "a landed join must not stay pending");
     }
 
     #[test]
@@ -1965,6 +2240,31 @@ mod tests {
             allocator.on_new_frame(1440).unwrap();
             assert!(wm.range_workers().unwrap()[0].filter.is_empty(),
                 "an unrenewed registration cannot reserve capacity indefinitely");
+        }
+    }
+
+    #[test]
+    fn running_renewal_keeps_or_recovers_worker_past_the_recovery_epoch() {
+        use quil_types::consensus::EffectiveStatus;
+        let filter = vec![0x01; 32];
+        for initially_bound in [false, true] {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, if initially_bound { &filter } else { &[] }).unwrap();
+            let mut renewing = make_alloc(filter.clone());
+            renewing.epoch = 0;
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![renewing.clone()])));
+            let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+            let renewal = allocator.submission_attempts.begin(std::slice::from_ref(&filter), 1400).unwrap();
+            for frame in [1440, 2160, 2900] {
+                allocator.on_new_frame(frame).unwrap();
+                assert_eq!(wm.range_workers().unwrap()[0].filter, filter,
+                    "a renewal still in preparation keeps its worker");
+                assert_eq!(renewing.effective_status(frame), EffectiveStatus::ExpiredEpoch);
+            }
+            drop(renewal);
+            allocator.on_new_frame(2901).unwrap();
+            assert!(wm.range_workers().unwrap()[0].filter.is_empty(),
+                "a failed renewal no longer reserves the worker");
         }
     }
 
@@ -2590,5 +2890,73 @@ mod tests {
         assert_eq!(stats.skipped_empty, 1);
 
         assert!(find_worker(&wm, 1).filter.is_empty());
+    }
+
+    /// Eviction waits for a settled binding, protects every scope the worker
+    /// may still read (binding, staged changes of its own application),
+    /// repeats on its interval and restarts its wait on rebind.
+    #[test]
+    fn payload_eviction_waits_for_settled_bindings_and_protects_live_scopes() {
+        use quil_types::store::{PendingShardChange, ShardChangeKind};
+        let minutes = |m: u64| std::time::Duration::from_secs(m * 60);
+        let filter = |app: u8, tail: u8| { let mut f = vec![app; 32]; f.extend([0, 1, tail]); f };
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add_with_filter(1, filter(7, 0x00));
+        wm.add_with_filter(2, filter(7, 0x80));
+        wm.add(WorkerInfo { pending_filter_frame: 5, ..find_worker(&wm, 2) });
+        wm.add_with_filter(3, Vec::new());
+        let reg = Arc::new(TestProverRegistry::new());
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        let t0 = std::time::Instant::now();
+        alloc.schedule_payload_eviction(t0 + minutes(120)).unwrap();
+        assert!(wm.evictions().is_empty(), "unknown staged changes must not evict");
+
+        let staged = vec![
+            PendingShardChange { kind: ShardChangeKind::Merge, parent: vec![7; 32], children: vec![filter(7, 0x00), filter(7, 0x80)], effective_epoch: 9, proposed_frame: 1 },
+            PendingShardChange { kind: ShardChangeKind::Split, parent: filter(8, 0x00), children: vec![], effective_epoch: 9, proposed_frame: 1 },
+        ];
+        alloc.set_pending_shard_changes(Arc::new(move || Ok(staged.clone())));
+        alloc.schedule_payload_eviction(t0).unwrap();
+        alloc.schedule_payload_eviction(t0 + minutes(29)).unwrap();
+        assert!(wm.evictions().is_empty(), "an unsettled binding must not evict");
+        alloc.schedule_payload_eviction(t0 + minutes(30)).unwrap();
+        let mut expected = vec![filter(7, 0x00), filter(7, 0x80), vec![7; 32]];
+        expected.sort();
+        assert_eq!(wm.evictions(), vec![(1, expected)], "pending joins and idle workers never evict");
+        alloc.schedule_payload_eviction(t0 + minutes(89)).unwrap();
+        assert_eq!(wm.evictions().len(), 1);
+        alloc.schedule_payload_eviction(t0 + minutes(90)).unwrap();
+        assert_eq!(wm.evictions().len(), 2, "settled bindings repeat on their interval");
+
+        wm.add_with_filter(1, filter(7, 0xc0));
+        alloc.schedule_payload_eviction(t0 + minutes(100)).unwrap();
+        alloc.schedule_payload_eviction(t0 + minutes(129)).unwrap();
+        assert_eq!(wm.evictions().len(), 2, "a rebind restarts the settle period");
+        alloc.schedule_payload_eviction(t0 + minutes(130)).unwrap();
+        assert_eq!(wm.evictions().len(), 3);
+        assert!(wm.evictions()[2].1.contains(&filter(7, 0xc0)));
+    }
+
+    /// A staged change protects its shards only while a prover or worker holds
+    /// one of them.
+    #[test]
+    fn payload_eviction_ignores_staged_changes_of_shards_nobody_holds() {
+        use quil_types::store::{PendingShardChange, ShardChangeKind};
+        let filter = |tail: u8| { let mut f = vec![7; 32]; f.extend([0, 1, tail]); f };
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add_with_filter(1, filter(0x00));
+        let mut prover = prover_with_active(&[filter(0x60), filter(0x40)], 100);
+        prover.allocations[1].status = ProverStatus::Historic;
+        let reg = Arc::new(TestProverRegistry::with_provers(vec![prover]));
+        let alloc = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        let split = |parent: u8| PendingShardChange { kind: ShardChangeKind::Split, parent: filter(parent),
+            children: vec![filter(parent + 1), filter(parent + 2)], effective_epoch: 9, proposed_frame: 1 };
+        let staged = vec![split(0x40), split(0x60)];
+        alloc.set_pending_shard_changes(Arc::new(move || Ok(staged.clone())));
+        let t0 = std::time::Instant::now();
+        alloc.schedule_payload_eviction(t0).unwrap();
+        alloc.schedule_payload_eviction(t0 + PAYLOAD_EVICTION_SETTLE).unwrap();
+        assert_eq!(wm.evictions(), vec![(1, vec![filter(0x00), filter(0x60), filter(0x61), filter(0x62)])],
+            "a change of shards nobody holds protects nothing");
     }
 }

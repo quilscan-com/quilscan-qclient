@@ -1341,8 +1341,6 @@ dependencies = [
 [[package]]
 name = "commonware-consensus"
 version = "2026.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "acf15e3402e26f062695d4dd5e4b5967f601dc7303d06b9fafdb20a6485a3a0a"
 dependencies = [
  "bytes",
  "cfg-if",
@@ -5804,6 +5802,7 @@ dependencies = [
  "anyhow",
  "clap 4.5.4",
  "crossterm",
+ "flate2",
  "futures",
  "hex 0.4.3",
  "md-5",
@@ -5823,6 +5822,7 @@ dependencies = [
  "quil-types",
  "rand 0.8.5",
  "ratatui",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -5891,6 +5891,7 @@ dependencies = [
  "pqcrypto-traits",
  "quil-types",
  "rand 0.8.5",
+ "rayon",
  "sha2 0.10.9",
  "sha3 0.10.8",
  "tracing",
@@ -5957,6 +5958,7 @@ dependencies = [
  "quil-tries",
  "quil-types",
  "rand 0.8.5",
+ "rocksdb",
  "serde",
  "serde_json",
  "sha2 0.10.9",

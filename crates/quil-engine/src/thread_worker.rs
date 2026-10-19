@@ -17,6 +17,10 @@ use quil_types::error::{QuilError, Result};
 
 use crate::worker::{WorkerInfo, WorkerManager};
 
+/// Forest node records a confinement sweep examines per hold of the worker's
+/// forest and commit locks, keeping each pause of its frame commits short.
+const FOREST_SCAN_BUDGET: usize = 250_000;
+
 /// Archive shard recoveries this process runs at once (see the recovery
 /// spawn below).
 static SHARD_RECOVERY_TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
@@ -38,6 +42,12 @@ pub enum MasterToWorker {
     /// Mirrors Go's `worker.Filter`-set / `worker.Allocated=false`
     /// state from `worker_allocator.go:421-440`.
     Respawn { filter: Vec<u8>, start_consensus: bool },
+    /// Remove application payload outside `keep` from this worker's store,
+    /// once its running engine serves only kept scopes and the binding has
+    /// settled.
+    EvictPayload {
+        keep: Vec<Vec<u8>>,
+    },
     /// Request the worker to compute a join proof.
     CreateJoinProof {
         challenge: [u8; 32],
@@ -242,6 +252,9 @@ pub struct WorkerOwnedDeps {
     /// Committees that certified legacy frames today's registry no longer
     /// reproduces (see `historical_committee`).
     pub historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
+    /// Authenticated archive copies of GLOBAL frames the master never held,
+    /// which app frames this worker validates are anchored to.
+    pub global_anchor_source: Option<crate::global_anchor::GlobalAnchorSource>,
 }
 
 /// Thread-based worker manager. Core 0 is reserved for the master;
@@ -322,6 +335,25 @@ impl ThreadWorkerManager {
     /// across restarts.
     pub fn set_worker_store(&self, store: Arc<dyn quil_types::store::WorkerStore>) {
         *self.worker_store.lock().unwrap() = Some(store);
+    }
+
+    /// Cancel every worker thread and join each one that finishes within
+    /// `deadline`, returning the core ids of those still running then. A
+    /// worker closes its own RocksDB stores as its thread ends; returning
+    /// from `main` first lets process exit destroy RocksDB's static state
+    /// under that thread, which aborts ("pthread lock: Invalid argument").
+    pub fn shutdown_workers(&self, deadline: std::time::Duration) -> Vec<u32> {
+        let handles: Vec<(u32, JoinHandle<()>)> = self
+            .workers
+            .lock()
+            .unwrap()
+            .values_mut()
+            .filter_map(|w| {
+                w.cancel.cancel();
+                w.handle.take().map(|handle| (w.core_id, handle))
+            })
+            .collect();
+        join_within(handles, deadline)
     }
 
     /// Returns persisted worker state for the given core, when a
@@ -445,6 +477,10 @@ impl ThreadWorkerManager {
                     // drains before its flip) go on to the replacement's
                     // engine instead of being dropped with the old engine.
                     let mut retained_mempool: Option<(Vec<u8>, Arc<crate::message_collector::MessageCollector>)> = None;
+                    // When the engine generation last changed: eviction waits for
+                    // the previous engine's detached tasks to finish with its scope.
+                    let mut bound_since = std::time::Instant::now();
+                    let evicting = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
                     // Per-worker memory tick. Each worker owns its own RocksDB
                     // (block cache + memtables + table readers) in this thread,
@@ -481,6 +517,7 @@ impl ThreadWorkerManager {
                             cmd = rx.recv() => {
                                 match cmd {
                                     Some(MasterToWorker::Respawn { filter, start_consensus }) => {
+                                        bound_since = std::time::Instant::now();
                                         // Retire telemetry before replacing the engine generation.
                                         *execution_slot.lock().unwrap() = None;
                                         // Stop existing engine if any
@@ -632,6 +669,8 @@ impl ThreadWorkerManager {
                                                         owned.as_ref().and_then(|o| o.outgoing_history_source.clone()),
                                                     ).with_historical_committee_source(
                                                         owned.as_ref().and_then(|o| o.historical_committee_source.clone()),
+                                                    ).with_global_anchor_source(
+                                                        owned.as_ref().and_then(|o| o.global_anchor_source.clone()),
                                                     );
 
                                                     // Tell the master a shard engine just came online.
@@ -784,13 +823,14 @@ impl ThreadWorkerManager {
                                                                         // A node's workers share its archive identity and
                                                                         // so its per-peer read slots: a few recover at a
                                                                         // time rather than all failing busy together.
-                                                                        let _turn = SHARD_RECOVERY_TURNS.acquire().await;
-                                                                        match crate::prover_tree_syncer::recover_shard_from_latest(
-                                                                            syncer.as_ref(), &filter, local, &lb,
-                                                                        ).await {
-                                                                            Ok(progress) => info!(filter = %hex::encode(&filter), ?progress, "archive recovery batch complete"),
-                                                                            Err(error) => warn!(filter = %hex::encode(&filter), %error, "archive recovery failed; will retry"),
-                                                                        }
+                                                                        let attempt = async {
+                                                                            crate::worker_execution::recovery_phase("waiting_for_permit");
+                                                                            let _turn = SHARD_RECOVERY_TURNS.acquire().await;
+                                                                            crate::prover_tree_syncer::recover_shard_from_latest(
+                                                                                syncer.as_ref(), &filter, local, &lb,
+                                                                            ).await
+                                                                        };
+                                                                        let _ = lb.execution_record().recovering(&filter, attempt).await;
                                                                     });
                                                                 }
                                                                 _ => {
@@ -854,6 +894,77 @@ impl ThreadWorkerManager {
                                         let _ = master_tx
                                             .send(WorkerToMaster::Ready { core_id })
                                             .await;
+                                    }
+                                    Some(MasterToWorker::EvictPayload { keep }) => {
+                                        let Some(owned) = worker_owned.clone() else { continue };
+                                        let serving = execution_slot.lock().unwrap().as_ref()
+                                            .is_some_and(|h| h.filter == current_filter && h.is_running());
+                                        let refusal = if current_filter.is_empty() || !keep.contains(&current_filter) {
+                                            Some("binding is not protected")
+                                        } else if !serving {
+                                            Some("engine is not serving the binding")
+                                        } else if bound_since.elapsed() < crate::worker_allocator::PAYLOAD_EVICTION_SETTLE {
+                                            Some("binding has not settled")
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(reason) = refusal {
+                                            info!(core_id, reason, "worker payload eviction deferred");
+                                            continue;
+                                        }
+                                        if evicting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                            continue;
+                                        }
+                                        let flag = evicting.clone();
+                                        let crdt = owned.hypergraph.clone();
+                                        let filter = hex::encode(&current_filter);
+                                        let storage = consensus_deps.clone().and_then(|deps|
+                                            crate::app_engine::cw_app_storage_base(&deps.db_config, core_id).map(|base| (base, deps)));
+                                        let storage_keep = keep.clone();
+                                        let (forest_crdt, forest_keep) = (crdt.clone(), keep.clone());
+                                        tokio::spawn(async move {
+                                            let started = std::time::Instant::now();
+                                            let outcome = tokio::task::spawn_blocking(move ||
+                                                crate::worker_payload_eviction::evict_outside(&crdt, &keep)).await;
+                                            match outcome {
+                                                Ok(Ok(o)) if o.ranges > 0 || o.compacted_ranges > 0 => info!(core_id, filter, removed_records = o.removed_records,
+                                                    removed_bytes = o.removed_bytes, ranges = o.ranges, invalidated_markers = o.invalidated_markers,
+                                                    compacted_ranges = o.compacted_ranges, reclaimable_bytes = o.reclaimable_bytes,
+                                                    secs = started.elapsed().as_secs(), "worker payload outside served scopes evicted"),
+                                                Ok(Ok(_)) => debug!(core_id, "no worker payload outside served scopes"),
+                                                Ok(Err(error)) => warn!(core_id, filter, %error, "worker payload eviction refused"),
+                                                Err(error) => warn!(core_id, filter, %error, "worker payload eviction task failed"),
+                                            }
+                                            // The forest subtrees of the shards this worker left.
+                                            let started = std::time::Instant::now();
+                                            let outcome = tokio::task::spawn_blocking(move ||
+                                                forest_crdt.confine_forest(&forest_keep, FOREST_SCAN_BUDGET)).await;
+                                            match outcome {
+                                                Ok(Ok(o)) if o.commits > 0 || o.nodes > 0 => info!(core_id, filter, commits = o.commits,
+                                                    nodes = o.nodes, stale_records = o.stale_records, key_ranges = o.key_ranges,
+                                                    secs = started.elapsed().as_secs(), "worker forest outside served scopes removed"),
+                                                Ok(Ok(_)) => debug!(core_id, "no worker forest outside served scopes"),
+                                                Ok(Err(error)) => warn!(core_id, filter, %error, "worker forest confinement refused"),
+                                                Err(error) => warn!(core_id, filter, %error, "worker forest confinement task failed"),
+                                            }
+                                            // Consensus storage of shards this worker left, unless it
+                                            // still owes that shard's committee a vote or seal.
+                                            if let Some((base, deps)) = storage {
+                                                let outcome = tokio::task::spawn_blocking(move || {
+                                                    let retained = |shard: &[u8]| deps.hypergraph.as_ref().is_none_or(|global|
+                                                        crate::app_handoff::retains_worker(global, shard, &deps.local_bls_pubkey));
+                                                    crate::worker_consensus_storage::remove_outside(&base, &storage_keep, retained)
+                                                }).await;
+                                                match outcome {
+                                                    Ok(Ok(o)) if o.entries > 0 => info!(core_id, filter, entries = o.entries, bytes = o.bytes,
+                                                        "worker consensus storage outside served scopes removed"),
+                                                    Ok(Ok(_)) => debug!(core_id, "no worker consensus storage outside served scopes"),
+                                                    Ok(Err(error)) => warn!(core_id, filter, %error, "worker consensus storage removal failed"),
+                                                    Err(error) => warn!(core_id, filter, %error, "worker consensus storage removal task failed"),
+                                                }
+                                            }
+                                            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        });
                                     }
                                     Some(MasterToWorker::CreateJoinProof {
                                         challenge,
@@ -930,6 +1041,20 @@ impl ThreadWorkerManager {
 }
 
 impl WorkerManager for ThreadWorkerManager {
+    fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
+        let workers = self
+            .workers
+            .lock()
+            .map_err(|_| QuilError::Internal("worker table poisoned".into()))?;
+        let worker = workers
+            .get(&core_id)
+            .ok_or_else(|| QuilError::InvalidArgument("eviction worker missing".into()))?;
+        worker
+            .tx
+            .try_send(MasterToWorker::EvictPayload { keep })
+            .map_err(|e| QuilError::ExecutionUnavailable(format!("payload eviction: {e}")))
+    }
+
     fn set_worker_filter(
         &self,
         core_id: u32,
@@ -1043,6 +1168,10 @@ impl WorkerManager for ThreadWorkerManager {
         self.mutate(core_id, |w| w.allocated = allocated);
         Ok(())
     }
+
+    fn shutdown(&self, deadline: std::time::Duration) -> Vec<u32> {
+        self.shutdown_workers(deadline)
+    }
 }
 
 /// Capture the persistable subset of a `WorkerState` while we hold
@@ -1065,9 +1194,77 @@ fn snapshot_state(w: &WorkerState) -> WorkerState {
     }
 }
 
+/// Join each thread that finishes within `deadline`; return the ids of the
+/// rest, which are left detached.
+fn join_within(mut handles: Vec<(u32, JoinHandle<()>)>, deadline: std::time::Duration) -> Vec<u32> {
+    let started = std::time::Instant::now();
+    loop {
+        let (finished, running): (Vec<_>, Vec<_>) = handles.into_iter().partition(|(_, h)| h.is_finished());
+        for (core_id, handle) in finished {
+            if handle.join().is_err() {
+                warn!(core_id, "worker thread panicked while stopping");
+            }
+        }
+        handles = running;
+        if handles.is_empty() || started.elapsed() >= deadline {
+            return handles.into_iter().map(|(core_id, _)| core_id).collect();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_within_waits_for_finishing_threads_and_reports_the_rest() {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = closed.clone();
+        let slow = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _ = wait.recv();
+        });
+        let running = join_within(vec![(1, slow), (2, stuck)], std::time::Duration::from_secs(1));
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst), "a thread finishing within the deadline is joined");
+        assert_eq!(running, vec![2], "a thread still running at the deadline is reported");
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn shutdown_workers_stops_and_joins_every_worker() {
+        let mgr = ThreadWorkerManager::new();
+        let _rx = mgr.take_master_rx().unwrap();
+        mgr.allocate_worker(1, b"test-filter").unwrap();
+        mgr.allocate_worker(2, b"other-filter").unwrap();
+        let running = tokio::task::spawn_blocking(move || mgr.shutdown_workers(std::time::Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert!(running.is_empty(), "workers still running: {running:?}");
+        #[cfg(target_os = "linux")]
+        {
+            // pthread_join returns once the kernel clears the thread's id,
+            // before it releases the task, so a joined thread can stay listed
+            // for a moment; by then it carries PF_EXITING. A thread that was
+            // never joined is still running without it.
+            const PF_EXITING: u64 = 0x4;
+            let names: Vec<String> = std::fs::read_dir("/proc/self/task").unwrap()
+                .filter_map(|task| {
+                    let path = task.ok()?.path();
+                    let name = std::fs::read_to_string(path.join("comm")).ok()?.trim().to_string();
+                    let stat = std::fs::read_to_string(path.join("stat")).ok()?;
+                    let flags: u64 = stat.rsplit_once(')')?.1.split_whitespace().nth(6)?.parse().ok()?;
+                    (flags & PF_EXITING == 0).then_some(name)
+                })
+                .collect();
+            assert!(!names.iter().any(|name| name == "worker-1" || name == "worker-2"),
+                "a joined worker thread is gone: {names:?}");
+        }
+    }
 
     #[test]
     fn worker_manager_construction() {
