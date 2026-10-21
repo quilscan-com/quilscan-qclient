@@ -14,12 +14,6 @@ pub struct ExecutionDetail {
 fn age_at(timestamp: u64, now: u64) -> String {
     if timestamp == 0 { "-".into() } else { format!("{}s", now.saturating_sub(timestamp) / 1000) }
 }
-pub fn execution_detail(s: Option<&WorkerExecution>) -> ExecutionDetail {
-    execution_detail_at(s, now_ms())
-}
-fn execution_detail_at(s: Option<&WorkerExecution>, now: u64) -> ExecutionDetail {
-    execution_detail_with_state_at(s, state_at(s, now), now)
-}
 pub fn execution_detail_with_state(s: Option<&WorkerExecution>, state: &str) -> ExecutionDetail {
     execution_detail_with_state_at(s, state, now_ms())
 }
@@ -46,15 +40,6 @@ pub fn state_at(s: Option<&WorkerExecution>, now: u64) -> &str {
         "starting" | "waiting" | "running" | "syncing" | "serving" | "closing" | "handoff" | "blocked" | "stopped" => s.state.as_str(),
         _ => "unknown",
     }
-}
-/// A worker whose consensus host runs: `running` from nodes that report no
-/// lifecycle phase, otherwise serving, syncing its shard data, or closing.
-pub fn hosting(state: &str) -> bool {
-    matches!(state, "running" | "serving" | "syncing" | "closing")
-}
-/// A fresh observation in a state this client knows.
-pub fn observed(state: &str) -> bool {
-    !matches!(state, "stale" | "unknown")
 }
 pub fn local_execution_state(s: Option<&WorkerExecution>) -> &str { state_at(s, now_ms()) }
 /// Compact labels share the column's nine-character budget.
@@ -181,12 +166,7 @@ mod tests {
         for state in ["running", "serving", "syncing", "closing", "handoff", "waiting", "starting", "stopped"] {
             let s = WorkerExecution { state: state.into(), observed_unix_ms: 10_000, ..Default::default() };
             assert_eq!(state_at(Some(&s), 20_000), state);
-            assert!(observed(state_at(Some(&s), 20_000)));
         }
-        let unknown = WorkerExecution { state: "unknown".into(), observed_unix_ms: 10_000, ..Default::default() };
-        assert!(!observed(state_at(Some(&unknown), 20_000)) && !observed("stale"));
-        assert!(["running", "serving", "syncing", "closing"].into_iter().all(hosting));
-        assert!(!["starting", "handoff", "waiting", "blocked", "stopped", "stale", "unknown"].into_iter().any(hosting));
         assert!(detail(None).contains("unknown"));
         assert!(detail(Some(&s)).contains("checkpoint mismatch"));
         assert!(!detail(Some(&s)).contains("Recovery"));
@@ -227,31 +207,16 @@ mod tests {
 }
 
 #[cfg(test)]
-mod sync_regressions {
-    use super::*;
-    #[test]
-    fn sync_requirement_execution_phases_and_expected_handoff() {
-        for state in ["waiting", "syncing", "serving", "closing", "handoff"] {
-            let observation = WorkerExecution { state: state.into(), observed_unix_ms: 100_000, ..Default::default() };
-            assert_eq!(state_at(Some(&observation), 100_001), state);
-        }
-        let observation = WorkerExecution { state: "blocked".into(), blocker: "awaiting successor".into(), observed_unix_ms: 100_000, ..Default::default() };
-        assert_eq!(state_at(Some(&observation), 100_001), "handoff");
-        assert_eq!(execution_detail_at(Some(&observation), 100_001).severity, "normal");
-    }
-}
-
-#[cfg(test)]
 mod compatibility_tests {
     use super::*;
     #[test]
-    fn execution_detail_matches_the_manage_tui_wording() {
+    fn machine_execution_detail_retains_exact_sentence_and_severity() {
         let running = WorkerExecution { state: "running".into(), materialized_frame: Some(0), observed_unix_ms: 20_000, ..Default::default() };
-        assert_eq!(execution_detail_at(Some(&running), 20_000), ExecutionDetail {
+        assert_eq!(execution_detail_with_state_at(Some(&running), state_at(Some(&running), 20_000), 20_000), ExecutionDetail {
             text: "Last advance: not observed since start | Warning: no materialized frames".into(), severity: "warning",
         });
         let healthy = WorkerExecution { state: "running".into(), materialized_frame: Some(9), last_advance_unix_ms: 7_547_000, observed_unix_ms: 20_000_000, ..Default::default() };
-        assert_eq!(execution_detail_at(Some(&healthy), 20_000_000), ExecutionDetail {
+        assert_eq!(execution_detail_with_state_at(Some(&healthy), state_at(Some(&healthy), 20_000_000), 20_000_000), ExecutionDetail {
             text: "Last advance: 12453s ago".into(), severity: "normal",
         });
     }

@@ -19,7 +19,7 @@ struct GlobalFlags {
 
     /// Verify the binary's release signatures before running
     /// (default true, or the value of QUILIBRIUM_SIGNATURE_CHECK).
-    #[arg(long = "signature-check", global = true, env = "QUILIBRIUM_SIGNATURE_CHECK", default_value_t = true)]
+    #[arg(long = "signature-check", global = true, env = "QUILIBRIUM_SIGNATURE_CHECK", default_value_t = true, action = clap::ArgAction::Set)]
     signature_check: bool,
 
     /// Auto-approve prompts and bypass the signature check.
@@ -104,6 +104,12 @@ enum Commands {
     },
     /// Create a symlink to the qclient binary in /usr/local/bin (requires sudo).
     Link,
+    /// Diagnostics identities: ask other nodes for diagnostics without
+    /// revealing this node's identity.
+    Diagnostics {
+        #[command(subcommand)]
+        command: commands::node::diagnostics_logs::IdentityCommand,
+    },
 }
 
 fn main() {
@@ -134,6 +140,7 @@ fn real_main() -> anyhow::Result<()> {
         Commands::Alias { command } => commands::alias::run(global, command),
         Commands::Key { command } => commands::key::run(global, command),
         Commands::Link => commands::link::run(),
+        Commands::Diagnostics { command } => commands::node::diagnostics_logs::run_identity(command),
 
         // Async (RPC-bearing) commands run on a Tokio runtime.
         Commands::Token(args) => runtime()?.block_on(commands::token::run(global, args)),

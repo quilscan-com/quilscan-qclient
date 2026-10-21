@@ -1093,6 +1093,7 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
+                    last_signed_frame_number: 0,
                     // Confirmed for the current epoch (eval frame 2000 → epoch 2)
                     // so always-on epoch expiry doesn't read it as ExpiredEpoch.
                     epoch: 2,
@@ -1114,6 +1115,7 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
+                    last_signed_frame_number: 0,
                     epoch: 0,
                     ring: 0,
                     vertex_address: vec![],
@@ -1134,6 +1136,7 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 0,
+                    last_signed_frame_number: 0,
                     epoch: 0,
                     ring: 0,
                     vertex_address: vec![],
@@ -1347,6 +1350,7 @@ mod tests {
                     leave_confirm_frame_number: 0,
                     leave_reject_frame_number: 0,
                     last_active_frame_number: 100,
+                    last_signed_frame_number: 0,
                     epoch: 0,
                     ring: 0,
                     vertex_address: vec![],
@@ -1482,7 +1486,7 @@ mod tests {
         crdt.add_vertex(&loc_a, b"data-a").unwrap();
 
         // Persist three shard entries — only the first has trie data.
-        let mut shard_key = |a: &[u8; 32]| {
+        let shard_key = |a: &[u8; 32]| {
             let typed = quil_hypergraph::addressing::shard_key_for_location(&Location {
                 app_address: *a,
                 data_address: [0u8; 32],

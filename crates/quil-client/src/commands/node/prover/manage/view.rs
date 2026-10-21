@@ -759,7 +759,7 @@ fn alloc_heading_lines(m: &Model, sorted: &[AllocationRow], width: u16) -> Vec<L
         } else { vec![line] }).collect()
 }
 
-fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
+fn avail_kpis(m: &Model, sorted: &[ShardRow]) -> Vec<String> {
     let mut blocks = vec!["Available Shards".to_string()];
     if m.header_kpi_visible("Available count") { blocks.push(format!("Count {}", sorted.len())); }
     if !m.compact_actions && m.header_kpi_visible("Available GLOBAL snapshot") {
@@ -769,7 +769,11 @@ fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
     if !m.avail_selected.is_empty() && m.header_kpi_visible("Selected shards") {
         blocks.push(format!("Selected {}", m.avail_selected.len()));
     }
-    panel_title(blocks.join(" · "))
+    blocks
+}
+
+fn avail_title(m: &Model, sorted: &[ShardRow]) -> Line<'static> {
+    panel_title(avail_kpis(m, sorted).join(" · "))
 }
 
 // ── Allocations panel ────────────────────────────────────────────────────
@@ -859,6 +863,35 @@ fn alloc_display_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> St
 fn avail_display_cell(m: &Model, s: &ShardRow, col: usize, fw: usize) -> String {
     let text = avail_cell(m, s, col, fw);
     if matches!(col, 9 | AVAIL_PROVER_PHASES_COL) { warning_slot(&text, m.color_coding) } else { text }
+}
+
+/// Shared semantic cell styles, independent of terminal padding or cursor background.
+fn alloc_cell_color(m: &Model, a: &AllocationRow, col: usize, selected: bool) -> Option<Color> {
+    if !m.color_coding { return None; }
+    match col {
+        6 | 9 => Some(local_color(m, a)),
+        7 if m.reported_app_stalled(&a.filter) => Some(WARNING),
+        ALLOC_PROVER_PHASES_COL if prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size) => Some(WARNING),
+        10 if a.worker_id < 0 => Some(ERROR),
+        12 => Some(status_color(&a.status_name)),
+        3 if !selected => Some(ring_color(a.ring)),
+        7 | 8 if !selected => Some(HELP),
+        11 if !selected => worker_color(a.worker_id),
+        13 if !selected => Some(mode_color(a.mode())),
+        _ => None,
+    }
+}
+
+fn avail_cell_color(m: &Model, s: &ShardRow, col: usize, selected: bool) -> Option<Color> {
+    if !m.color_coding { return None; }
+    match col {
+        7 | 9 if m.reported_app_stalled(&s.filter) => Some(WARNING),
+        AVAIL_PROVER_PHASES_COL if prover_halt_risk(s.prover_counts.as_ref(), &s.shard_size) => Some(WARNING),
+        6 | 9 => Some(materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame))),
+        3 if !selected => Some(ring_color(s.ring)),
+        7 | 8 if !selected => Some(HELP),
+        _ => None,
+    }
 }
 
 fn alloc_marker(m: &Model, a: &AllocationRow) -> &'static str {
@@ -1233,11 +1266,7 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
                 let cell = &cells[ci];
                 if !m.alloc_column_visible(ci) { continue; }
                 if ci > 0 { spans.push(Span::raw(" ")); }
-                let color = if m.color_coding && matches!(ci, 6 | 9) { local_color(m, a) }
-                    else if ci == 7 && m.color_coding && m.reported_app_stalled(&a.filter) { WARNING }
-                    else if ci == ALLOC_PROVER_PHASES_COL && m.color_coding && prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size) { WARNING }
-                    else if ci == 10 && m.color_coding && a.worker_id < 0 { ERROR }
-                    else if ci == 12 && m.color_coding { status_color(&a.status_name) } else { TEXT };
+                let color = alloc_cell_color(m, a, ci, true).unwrap_or(TEXT);
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
             }
             let used = cells.iter().enumerate().filter(|(col, _)| m.alloc_column_visible(*col)).map(|(_, cell)| printed_width(cell)).sum::<usize>()
@@ -1252,33 +1281,9 @@ fn render_alloc_panel(m: &mut Model, sorted: &[AllocationRow], area: Rect, align
                 if ci > 0 {
                     spans.push(Span::raw(" "));
                 }
-                let span = match ci {
-                    3 if m.color_coding => {
-                        Span::styled(cell.clone(), Style::new().fg(ring_color(a.ring)))
-                    }
-                    // Local engine health and the peer gap are separate observations.
-                    6 | 9 if m.color_coding => {
-                        Span::styled(cell.clone(), Style::new().fg(local_color(m, a)))
-                    }
-                    7 if m.color_coding && m.reported_app_stalled(&a.filter) => Span::styled(cell.clone(), Style::new().fg(WARNING)),
-                    7 | 8 if m.color_coding => Span::styled(cell.clone(), Style::new().fg(HELP)),
-                    ALLOC_PROVER_PHASES_COL if m.color_coding && prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size) => {
-                        Span::styled(cell.clone(), Style::new().fg(WARNING))
-                    }
-                    11 if m.color_coding => match worker_color(a.worker_id) {
-                        Some(color) => Span::styled(cell.clone(), Style::new().fg(color)),
-                        None => Span::raw(cell.clone()),
-                    },
-                    10 if m.color_coding && a.worker_id < 0 => {
-                        Span::styled(cell.clone(), Style::new().fg(ERROR))
-                    }
-                    12 if m.color_coding => {
-                        Span::styled(cell.clone(), Style::new().fg(status_color(&a.status_name)))
-                    }
-                    13 if m.color_coding => {
-                        Span::styled(cell.clone(), Style::new().fg(mode_color(a.mode())))
-                    }
-                    _ => Span::raw(cell.clone()),
+                let span = match alloc_cell_color(m, a, ci, false) {
+                    Some(color) => Span::styled(cell.clone(), Style::new().fg(color)),
+                    None => Span::raw(cell.clone()),
                 };
                 spans.push(span);
             }
@@ -1566,8 +1571,7 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
                 let cell = &cells[c];
                 if !m.avail_column_visible(c) { continue; }
                 if c > 0 { spans.push(Span::raw(" ")); }
-                let color = if m.color_coding && matches!(c, 7 | 9) && m.reported_app_stalled(&s.filter) { WARNING } else if m.color_coding && matches!(c, 6 | 9) { materialization_state_color(materialization_state(s.materialized_frame, s.latest_frame)) }
-                    else if m.color_coding && c == AVAIL_PROVER_PHASES_COL && prover_halt_risk(s.prover_counts.as_ref(), &s.shard_size) { WARNING } else { TEXT };
+                let color = avail_cell_color(m, s, c, true).unwrap_or(TEXT);
                 spans.push(Span::styled(cell.clone(), Style::new().fg(color)));
             }
             let used = cells.iter().enumerate().filter(|(col, _)| m.avail_column_visible(*col)).map(|(_, cell)| printed_width(cell)).sum::<usize>()
@@ -1586,21 +1590,9 @@ fn render_avail_panel(m: &mut Model, sorted: &[ShardRow], area: Rect, aligned: O
                 let cell = if c == 1 && shared_address { filter_label(&s.filter_hex, fw, longest_suffix) }
                     else { avail_display_cell(m, s, c, fw) };
                 let cell = pad_cell(&cell, widths[c], c == 1);
-                spans.push(match c {
-                    3 if m.color_coding => Span::styled(cell, Style::new().fg(ring_color(s.ring))),
-                    7 | 9 if m.color_coding && m.reported_app_stalled(&s.filter) => Span::styled(cell, Style::new().fg(WARNING)),
-                    7 | 8 if m.color_coding => Span::styled(cell, Style::new().fg(HELP)),
-                    AVAIL_PROVER_PHASES_COL if m.color_coding && prover_halt_risk(s.prover_counts.as_ref(), &s.shard_size) => {
-                        Span::styled(cell, Style::new().fg(WARNING))
-                    }
-                    6 | 9 if m.color_coding => {
-                        let color = materialization_state_color(materialization_state(
-                            s.materialized_frame,
-                            s.latest_frame,
-                        ));
-                        Span::styled(cell, Style::new().fg(color))
-                    }
-                    _ => Span::raw(cell),
+                spans.push(match avail_cell_color(m, s, c, false) {
+                    Some(color) => Span::styled(cell, Style::new().fg(color)),
+                    None => Span::raw(cell),
                 });
             }
             lines.push(Line::from(spans));
@@ -5035,5 +5027,179 @@ mod visibility_grid_tests {
         handle_key(&mut m, key(KeyCode::Esc));
         let (alloc, avail) = tables(&mut m);
         assert!(!alloc[0].to_string().contains("ProverPhases") && !avail[0].to_string().contains("ProverPhases"));
+    }
+}
+
+// Stable names identify columns across consumers; their values and labels stay
+// owned by the same helpers as the terminal view.
+const ALLOC_COLUMN_KEYS: [&str; 18] = ["select", "filter", "provers", "ring", "size", "shards", "local_mat", "peer_head", "global_head", "execution", "reward", "worker", "status", "mode", "next_action", "default_action", "interval", "prover_phases"];
+const AVAIL_COLUMN_KEYS: [&str; 13] = ["select", "filter", "provers", "ring", "size", "shards", "peer_mat", "peer_head", "global_head", "peer_state", "reward", "interval", "prover_phases"];
+
+fn presentation_tone(color: Option<Color>) -> &'static str {
+    match color {
+        Some(ERROR) => "error", Some(WARNING) => "warning", Some(SUCCESS) => "success",
+        Some(HELP | DIM) => "muted", None | Some(TEXT | Color::Reset) => "default",
+        _ => "info",
+    }
+}
+
+fn detail_tone(line: &Line<'_>) -> &'static str {
+    // Available detail can append muted coverage to a warning span. Retain the
+    // strongest actual style rather than reclassifying its observation.
+    line.spans.iter().map(|span| presentation_tone(span.style.fg.or(line.style.fg)))
+        .max_by_key(|tone| match *tone { "error" => 5, "warning" => 4, "success" => 3, "info" => 2, "muted" => 1, _ => 0 })
+        .unwrap_or("default")
+}
+
+fn row_presentation(
+    columns: &[usize], keys: &[&str], cell: impl Fn(usize) -> String,
+    color: impl Fn(usize) -> Option<Color>, detail: Line<'static>,
+) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+    let cells: Map<String, Value> = columns.iter().copied().filter(|&col| col != 0)
+        .map(|col| (keys[col].into(), json!(cell(col).trim()))).collect();
+    let tones: Map<String, Value> = columns.iter().copied().filter(|&col| col != 0)
+        .map(|col| (keys[col].into(), json!(presentation_tone(color(col))))).collect();
+    json!({ "cells": cells, "detail": detail.to_string(), "tone": detail_tone(&detail), "tones": tones })
+}
+
+/// Structured presentation of both actual TUI layouts, without drawing a
+/// terminal or truncating identities. Only presentation options are changed;
+/// caller state, observations, sorting, and machine values are retained.
+pub(super) fn snapshot_presentation(
+    m: &mut Model, allocations: &[AllocationRow], available: &[ShardRow],
+) -> (serde_json::Value, Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    use serde_json::{json, Value};
+    let saved = (m.compact_actions, m.compact_units, m.color_coding, m.reward_windows,
+        m.interval_windows, m.global_interval_windows, m.global_fields);
+    let saved_hidden = std::mem::take(&mut m.hidden_header_kpis);
+    // This RPC batch does not fetch the independent verified reward witness.
+    m.hidden_header_kpis.insert("Claimable".into());
+    m.color_coding = true;
+    m.reward_windows = 7;
+    m.interval_windows = 3;
+    m.global_interval_windows = 3;
+    m.global_fields = 7;
+    let mut top = json!({"schema_version": 1});
+    let mut alloc_rows = vec![json!({}); allocations.len()];
+    let mut avail_rows = vec![json!({}); available.len()];
+    for (mode, compact) in [("compact", true), ("expanded", false)] {
+        m.compact_actions = compact;
+        m.compact_units = compact;
+        let alloc_columns: Vec<Value> = ALLOC_DISPLAY_COLS.iter().copied().filter(|&col| col != 0)
+            .map(|col| json!({"key": ALLOC_COLUMN_KEYS[col], "label": alloc_header(m, col).trim()})).collect();
+        let avail_columns: Vec<Value> = AVAIL_DISPLAY_COLS.iter().copied().filter(|&col| col != 0)
+            .map(|col| json!({"key": AVAIL_COLUMN_KEYS[col], "label": avail_header(m, col).trim()})).collect();
+        top[mode] = json!({
+            "header": header_kpis(m).iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "allocations": {"heading": alloc_kpis(m, allocations), "columns": alloc_columns},
+            "available_shards": {"heading": avail_kpis(m, available), "columns": avail_columns},
+        });
+        for (exported, a) in alloc_rows.iter_mut().zip(allocations) {
+            exported[mode] = row_presentation(ALLOC_DISPLAY_COLS, &ALLOC_COLUMN_KEYS,
+                |col| alloc_display_cell(m, a, col, a.filter_hex.len()),
+                |col| alloc_cell_color(m, a, col, false), allocation_detail(m, a));
+        }
+        for (exported, s) in avail_rows.iter_mut().zip(available) {
+            exported[mode] = row_presentation(AVAIL_DISPLAY_COLS, &AVAIL_COLUMN_KEYS,
+                |col| avail_display_cell(m, s, col, s.filter_hex.len()),
+                |col| avail_cell_color(m, s, col, false), available_detail(m, s));
+        }
+    }
+    (m.compact_actions, m.compact_units, m.color_coding, m.reward_windows,
+        m.interval_windows, m.global_interval_windows, m.global_fields) = saved;
+    m.hidden_header_kpis = saved_hidden;
+    (top, alloc_rows, avail_rows)
+}
+
+#[cfg(test)]
+mod snapshot_presentation_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn once_presentation_tracks_current_execution_and_recovery_without_reclassifying() {
+        use quil_types::proto::node::{ShardRecovery, WorkerExecution};
+        let mut m = Model::new();
+        let mut a = super::tests::row("abcd", 0, 0, 1, "", "");
+        a.status_name = "active".into();
+        for (state, observed, expected_state, expected_tone) in [
+            ("blocked", 1, "stale", "muted"),
+            ("blocked", u64::MAX, "blocked", "error"),
+            ("serving", u64::MAX, "serve", "warning"),
+        ] {
+            a.execution = Some(WorkerExecution { state: state.into(), blocker: "archive unavailable".into(),
+                observed_unix_ms: observed, materialized_frame: Some(0),
+                recovery: Some(ShardRecovery { phase: "idle".into(), last_error: "old failure".into(),
+                    last_error_unix_ms: 1, last_outcome: "installed".into(), last_outcome_unix_ms: 2,
+                    ..Default::default() }), ..Default::default() });
+            m.allocations = vec![a.clone()];
+            let exported: Value = serde_json::from_str(&super::super::snapshot::format_snapshot(&mut m).unwrap()).unwrap();
+            for (mode, compact) in [("compact", true), ("expanded", false)] {
+                m.compact_actions = compact;
+                let shown = &exported["allocations"][0]["tui"][mode];
+                assert_eq!(shown["cells"]["execution"], expected_state);
+                assert_eq!(shown["tone"], expected_tone);
+                assert_eq!(shown["tones"]["execution"], expected_tone);
+                assert_eq!(shown["detail"], allocation_detail(&m, &a).to_string());
+                assert!(!shown["detail"].as_str().unwrap().contains("old failure"));
+                if !compact { assert!(shown["detail"].as_str().unwrap().contains("installed")); }
+            }
+        }
+    }
+
+    #[test]
+    fn once_exports_the_actual_tui_presentation_in_both_modes() {
+        let filter = "ab".repeat(64);
+        let mut m = Model::new();
+        m.data_loaded = true;
+        m.last_fetch_success = Some(std::time::Instant::now());
+        m.peer_id = "presentation-peer".into();
+        let mut a = super::tests::row(&filter, 3, 2, 7, "confirm", "activate");
+        a.allocation_reason = Some("H".into());
+        a.filter = vec![0xab; 64];
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        m.node_app_cadence.insert(a.filter.clone(), quil_types::proto::node::FrameCadence {
+            last_observed_unix_seconds: now,
+            hour: Some(quil_types::proto::node::FrameWindow { window_seconds: 3600, observed_seconds: 3600, advanced_frames: 180 }),
+            day: Some(quil_types::proto::node::FrameWindow { window_seconds: 86400, observed_seconds: 86400, advanced_frames: 0 }),
+        });
+        a.shard_size = BigInt::from(1_500_000_000u64);
+        a.estimated_reward = BigInt::from(100_000_000);
+        m.allocations.push(a.clone());
+        let mut s = super::tests::shard(&filter, 1_500_000_000, 100_000_000);
+        s.filter = a.filter.clone();
+        m.available.push(s.clone());
+        let exported: Value = serde_json::from_str(&super::super::snapshot::format_snapshot(&mut m).unwrap()).unwrap();
+        assert_eq!(exported["tui"]["schema_version"], 1);
+        for (mode, compact) in [("compact", true), ("expanded", false)] {
+            m.compact_actions = compact;
+            m.compact_units = compact;
+            m.hidden_header_kpis.insert("Claimable".into());
+            assert_eq!(exported["tui"][mode]["header"], json!(header_kpis(&m).iter().map(ToString::to_string).collect::<Vec<_>>()));
+            assert_eq!(exported["tui"][mode]["allocations"]["heading"], json!(alloc_kpis(&m, &[a.clone()])));
+            for col in 1..ALLOC_COL_NAMES.len() {
+                let key = ALLOC_COL_NAMES[col];
+                let columns = exported["tui"][mode]["allocations"]["columns"].as_array().unwrap();
+                let index = ALLOC_DISPLAY_COLS.iter().filter(|&&i| i != 0).position(|&i| i == col).unwrap();
+                let metadata = &columns[index];
+                assert!(metadata["key"].is_string(), "missing {key}");
+                assert_eq!(metadata["label"], alloc_header(&m, col).trim());
+                let expected = alloc_display_cell(&m, &a, col, filter.len());
+                assert_eq!(exported["allocations"][0]["tui"][mode]["cells"][metadata["key"].as_str().unwrap()], expected.trim());
+            }
+            let columns = exported["tui"][mode]["available_shards"]["columns"].as_array().unwrap();
+            for (&col, metadata) in AVAIL_DISPLAY_COLS.iter().filter(|&&col| col != 0).zip(columns) {
+                assert_eq!(metadata["label"], avail_header(&m, col).trim());
+                assert_eq!(exported["available_shards"][0]["tui"][mode]["cells"][metadata["key"].as_str().unwrap()], avail_display_cell(&m, &s, col, filter.len()).trim());
+            }
+            assert_eq!(exported["tui"][mode]["available_shards"]["heading"], json!(avail_kpis(&m, &[s.clone()])));
+            assert_eq!(exported["allocations"][0]["tui"][mode]["cells"]["reward"], "4320.0/0.0/8640.0");
+            assert_eq!(exported["allocations"][0]["tui"][mode]["cells"]["interval"], "20.0/-");
+            assert_eq!(exported["allocations"][0]["tui"][mode]["detail"], allocation_detail(&m, &a).to_string());
+            assert_eq!(exported["available_shards"][0]["tui"][mode]["detail"], available_detail(&m, &s).to_string());
+            assert_eq!(exported["allocations"][0]["tui"][mode]["cells"]["filter"], filter);
+            assert_eq!(exported["allocations"][0]["tui"][mode]["cells"]["size"], "1.5");
+        }
     }
 }

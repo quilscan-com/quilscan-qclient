@@ -3,6 +3,7 @@ pub mod storage_history;
 pub mod global_anchor;
 pub mod app_handoff;
 mod app_history_recovery;
+mod bounded_warn;
 pub mod app_glue;
 pub mod archive_ingest;
 pub mod app_shard_cache;
@@ -51,6 +52,7 @@ pub mod time_reel;
 pub mod prover_message_transport;
 pub mod prover_pipeline;
 pub mod own_prover_ops;
+pub mod presence_reports;
 pub mod provers;
 pub mod shard_info;
 pub mod worker_allocator;
@@ -60,6 +62,7 @@ pub mod worker_payload_eviction;
 pub mod worker_consensus_storage;
 pub mod worker_execution;
 pub mod prover_tree_syncer;
+mod recovery_turns;
 
 /// Test support mocks (TestProverRegistry, TestWorkerManager).
 /// Exposed for integration tests in `tests/`; hidden from public

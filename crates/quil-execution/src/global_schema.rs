@@ -111,6 +111,19 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
             // materialized (or at the flag day, for allocations already
             // confirmed). Ranks a cohort, most senior first; never updated.
             FieldTag { name: "RingSeniority",           order: 17, size: 8,  rdf_type: RdfType::Uint },
+            // order 18 — not in the Go schema: the last GLOBAL frame that
+            // included an app frame this allocation signed. Written only for
+            // the signers of an included app frame, from
+            // `SIGNED_FRAME_ACTIVATION_FRAME`; confirms never write it, unlike
+            // `LastActiveFrameNumber`. Absent before then. Key 0x48: no other
+            // class has an order-18 field.
+            FieldTag { name: "LastSignedFrameNumber",   order: 18, size: 8,  rdf_type: RdfType::Uint },
+            // order 19 — not in the Go schema: the release (version, patch,
+            // subpatch; `prover_release::Release`) the allocation's last confirm
+            // signed. Written by confirms from `confirm_release_frame`; absent
+            // before then; a confirm without a release leaves it as it is.
+            // Signed by the prover's own key, but self-attested. Key 0x4C.
+            FieldTag { name: "Release",                 order: 19, size: 6,  rdf_type: RdfType::ByteArray },
         ],
     },
     ClassDef {
@@ -205,12 +218,12 @@ pub const GLOBAL_CLASSES: &[ClassDef] = &[
     },
 ];
 
-/// The schema's max `order` across all classes — now 17 (allocation's
-/// `RingEpoch`/`RingSeniority`). Still within the single-byte band (`≤ 63`),
+/// The schema's max `order` across all classes — now 19 (allocation's
+/// `Release`). Still within the single-byte band (`≤ 63`),
 /// so `order_to_key` returns `order << 2` exactly as before: every existing
 /// field key is unchanged, no allocation vertex is re-keyed. Used to decide
 /// the `order_to_key` encoding width.
-pub const GLOBAL_MAX_ORDER: u16 = 17;
+pub const GLOBAL_MAX_ORDER: u16 = 19;
 
 /// Encoding boundaries from `types/schema/order_encoding.go`.
 pub const MAX_ORDER_SINGLE_BYTE: u16 = 63;
@@ -463,6 +476,59 @@ mod tests {
         assert_eq!(field_key("prover:Prover", "AvailableStorage"), Some(vec![0x08]));
         assert_eq!(field_key("prover:Prover", "Seniority"), Some(vec![0x0C]));
         assert_eq!(field_key("prover:Prover", "KickFrameNumber"), Some(vec![0x10]));
+    }
+
+    #[test]
+    fn last_signed_frame_number_key_is_unique_across_classes() {
+        // Order 18 → 0x48 in the single-byte band. Readers probe one class's
+        // key on another class's tree (the kicked-prover gate reads the
+        // allocation KickFrameNumber key on a prover tree), so the new key
+        // must name no other field of any class.
+        let cls = "allocation:ProverAllocation";
+        assert_eq!(field_key(cls, "LastSignedFrameNumber"), Some(vec![0x48]));
+        for class in GLOBAL_CLASSES {
+            for field in class.fields {
+                if class.name == cls && field.name == "LastSignedFrameNumber" {
+                    continue;
+                }
+                assert_ne!(
+                    order_to_key(field.order, GLOBAL_MAX_ORDER),
+                    vec![0x48],
+                    "{}.{} shares the LastSignedFrameNumber key",
+                    class.name,
+                    field.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_key_is_unique_across_classes_and_keeps_every_key() {
+        // Order 19 → 0x4C, still in the single-byte band: no existing key
+        // changes width, and no other field of any class shares it.
+        let cls = "allocation:ProverAllocation";
+        assert_eq!(field_key(cls, "Release"), Some(vec![0x4C]));
+        assert_eq!(GLOBAL_MAX_ORDER, 19);
+        assert!(GLOBAL_MAX_ORDER <= MAX_ORDER_SINGLE_BYTE);
+        assert_eq!(
+            GLOBAL_CLASSES.iter().flat_map(|c| c.fields.iter()).map(|f| f.order).max(),
+            Some(GLOBAL_MAX_ORDER)
+        );
+        for class in GLOBAL_CLASSES {
+            for field in class.fields {
+                assert_eq!(order_to_key(field.order, GLOBAL_MAX_ORDER), vec![(field.order as u8) << 2]);
+                if class.name == cls && field.name == "Release" {
+                    continue;
+                }
+                assert_ne!(
+                    order_to_key(field.order, GLOBAL_MAX_ORDER),
+                    vec![0x4C],
+                    "{}.{} shares the Release key",
+                    class.name,
+                    field.name
+                );
+            }
+        }
     }
 
     #[test]

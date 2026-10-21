@@ -9,6 +9,7 @@ mod key_manager;
 pub mod poseidon;
 pub mod porep;
 pub mod sdr;
+pub mod seal;
 mod secp256k1;
 pub mod sntrup761;
 
@@ -28,7 +29,7 @@ pub use sntrup761::{
     SNTRUP761_SECRET_KEY_LEN, SNTRUP761_SHARED_SECRET_LEN,
 };
 #[cfg(feature = "vdf-prover")]
-pub use frame_prover::WesolowskiFrameProver;
+pub use frame_prover::{WesolowskiFrameProver, GLOBAL_FLAG_DAY_LAST_LEGACY_FRAME};
 pub use inclusion::KzgInclusionProver;
 pub use key_manager::DefaultKeyManager;
 pub use poseidon::{hash_bytes_to_32, hash_elements};

@@ -14,6 +14,8 @@ mod snapshot;
 #[cfg(test)]
 mod snapshot_tests;
 #[cfg(test)]
+mod once_timeout_tests;
+#[cfg(test)]
 mod cadence;
 mod filter;
 mod model;
@@ -48,6 +50,12 @@ use super::ProverCtx;
 type Client = NodeServiceClient<Channel>;
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
+// Node + worker reads are sequential; shard reads run concurrently. These
+// budgets bound reads to 90s, leaving room for the 20s connect timeout inside
+// the Agent's existing 120s command deadline.
+const ONCE_NODE_RPC_TIMEOUT: Duration = Duration::from_secs(75);
+const ONCE_SHARD_RPC_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// `qclient node prover manage` entry point (`NodeProverManageCmd.Run`).
 pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     let client = pc.connect().await?;
@@ -72,12 +80,29 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
 /// Machine interface: no terminal initialization and no partial snapshot on errors.
 pub(super) async fn run_once(pc: &ProverCtx) -> anyhow::Result<()> {
     let client = pc.connect().await?;
-    let (node_refresh, shard_refresh) = tokio::join!(
-        actions::fetch_data(client.clone()),
-        actions::fetch_shards(client),
-    );
-    println!("{}", snapshot::from_refresh(node_refresh, shard_refresh)?);
+    let snapshot = fetch_once_snapshot(
+        client,
+        ONCE_NODE_RPC_TIMEOUT,
+        actions::RPC_TIMEOUT,
+        ONCE_SHARD_RPC_TIMEOUT,
+    ).await?;
+    println!("{snapshot}");
     Ok(())
+}
+
+async fn fetch_once_snapshot(
+    client: Client,
+    node_timeout: Duration,
+    worker_timeout: Duration,
+    shard_timeout: Duration,
+) -> anyhow::Result<String> {
+    let (node_refresh, shard_refresh) = tokio::join!(
+        actions::fetch_data_with_timeouts(client.clone(), node_timeout, worker_timeout),
+        actions::fetch_shards_with_timeout(client, shard_timeout),
+    );
+    snapshot::from_refresh(node_refresh, shard_refresh).map_err(|err| anyhow::anyhow!(
+        "{err} (one-shot deadlines: GetNodeInfo {node_timeout:?}, GetWorkerInfo {worker_timeout:?}, GetShardInfo {shard_timeout:?})"
+    ))
 }
 
 async fn event_loop(

@@ -89,6 +89,9 @@ mod execution_fork;
 /// Global execution engine — handles prover joins/leaves, shard management,
 /// and global state transitions.
 pub struct GlobalExecutionEngine {
+    /// Held so the engine can commit request trees once global inclusion
+    /// proving is wired in; the intrinsic does its own committing today.
+    #[allow(dead_code)]
     inclusion_prover: Arc<dyn InclusionProver>,
     intrinsic: Option<crate::global_intrinsic::intrinsic::GlobalIntrinsic>,
     crdt: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
@@ -296,6 +299,16 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
         // Helper: validate a single inner op with full signature verification.
         // Loads prover/allocation trees from the CRDT for BLS signature checks.
         let validate_inner = |inner_bytes: &[u8], inner_tp: u32| -> Result<()> {
+            if inner_tp == crate::global_intrinsic::handoff::TYPE_PRESENCE_REPORT {
+                use crate::global_intrinsic::handoff::presence;
+                presence::require_active(frame_number)?;
+                let (Some(intrinsic), Some(state)) = (&self.intrinsic, &self.state) else {
+                    return Err(QuilError::ExecutionUnavailable(
+                        "presence report validation requires authenticated global state".into()));
+                };
+                let report = presence::PresenceReport::from_canonical_bytes(inner_bytes)?;
+                return intrinsic.verify_presence_report(frame_number, &report, state.as_ref());
+            }
             if inner_tp == crate::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF {
                 let state = self.state.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(
                     "handoff validation requires authenticated global state".into()))?;
@@ -362,6 +375,18 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
         match tp {
             TYPE_MESSAGE_BUNDLE => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
+                // A refused request skips its whole bundle: a presence report
+                // travels alone, so it neither drops other requests nor rides
+                // in with them.
+                if bundle.requests.len() != 1
+                    && bundle.requests.iter().flatten().any(|request| {
+                        request.inner_type_prefix == crate::global_intrinsic::handoff::TYPE_PRESENCE_REPORT
+                    })
+                {
+                    return Err(QuilError::InvalidArgument(
+                        "global: a presence report must be its bundle's only request".into(),
+                    ));
+                }
                 for req in &bundle.requests {
                     if let Some(r) = req {
                         validate_inner(&r.inner_bytes, r.inner_type_prefix)?;
@@ -395,7 +420,8 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
 
         let checkpoint = self.state.as_ref().map_or(0, |state| state.changeset_len());
         let invoke = |inner_bytes: &[u8], inner_tp: u32| -> Result<()> {
-            if inner_tp == crate::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF
+            if (inner_tp == crate::global_intrinsic::handoff::TYPE_COMMITTEE_HANDOFF
+                || inner_tp == crate::global_intrinsic::handoff::TYPE_PRESENCE_REPORT)
                 && (self.intrinsic.is_none() || self.state.is_none())
             {
                 return Err(QuilError::ExecutionUnavailable("handoff execution requires authenticated global state".into()));
@@ -456,7 +482,8 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
             | Some(MessageRequestInner::Update(_))
             | Some(MessageRequestInner::Shard(_))
             | Some(MessageRequestInner::SeniorityMerge(_))
-            | Some(MessageRequestInner::CommitteeHandoff(_)) => true,
+            | Some(MessageRequestInner::CommitteeHandoff(_))
+            | Some(MessageRequestInner::PresenceReport(_)) => true,
             _ => false,
         }, "global")
     }
@@ -485,6 +512,9 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
 /// Confidential operations require the configured QCT3 policy, state and
 /// isolated amount-proof worker. Retired confidential formats are rejected.
 pub struct TokenExecutionEngine {
+    /// Set at construction and carried for parity with the Go engines;
+    /// dispatch no longer branches on it.
+    #[allow(dead_code)]
     mode: ExecutionMode,
     #[cfg(feature = "native-proof")]
     token_policy: Option<crate::token_intrinsic::dispatch::TokenPolicy>,
@@ -1464,6 +1494,9 @@ fn run_token_bundle(
 /// Crypto + compiler dependencies are mandatory. There is no longer a
 /// "structural peek only" fallback at dispatch time.
 pub struct ComputeExecutionEngine {
+    /// Set at construction and carried for parity with the Go engines;
+    /// dispatch no longer branches on it.
+    #[allow(dead_code)]
     mode: ExecutionMode,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
     key_manager: Arc<dyn quil_types::crypto::KeyManager>,
@@ -1858,6 +1891,9 @@ impl ComputeExecutionEngine {
 
 /// Hypergraph execution engine — handles vertex/hyperedge add/remove.
 pub struct HypergraphExecutionEngine {
+    /// Set at construction and carried for parity with the Go engines;
+    /// dispatch no longer branches on it.
+    #[allow(dead_code)]
     mode: ExecutionMode,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
     inclusion_prover: Arc<dyn InclusionProver>,
@@ -1932,6 +1968,9 @@ impl HypergraphExecutionEngine {
         self
     }
 
+    // Accessor for the mandatory dependency above; the op paths hold their
+    // own reference.
+    #[allow(dead_code)]
     fn inclusion_prover(&self) -> &Arc<dyn InclusionProver> {
         &self.inclusion_prover
     }
@@ -2071,7 +2110,7 @@ impl HypergraphExecutionEngine {
         msg: &hg_dispatch::DispatchedMessage,
     ) -> Result<()> {
         use crate::hypergraph_intrinsic::auth::{
-            verify_op_signature, AuthCheck, OpForAuth,
+            verify_op_signature, OpForAuth,
         };
         let op = match msg {
             hg_dispatch::DispatchedMessage::VertexAdd(v) => OpForAuth::VertexAdd(v),

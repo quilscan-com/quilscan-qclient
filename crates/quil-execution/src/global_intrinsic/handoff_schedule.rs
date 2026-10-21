@@ -11,7 +11,8 @@
 //! the grid flips and allocations move.
 //!
 //! A source committee that can no longer assemble a quorum never seals. After
-//! [`FENCE_AFTER_EPOCHS`] epochs GLOBAL fences it instead
+//! [`FENCE_AFTER_EPOCHS`] epochs (one from [`super::early_fence_frame`]:
+//! [`fence_due_frame`]) GLOBAL fences it instead
 //! ([`fence_stalled_sources`]): the session ends at the last data frame GLOBAL
 //! executed for it (its `tip`), frames beyond that are refused like frames after
 //! a seal, and the successor is authorized from that checkpoint. A fenced
@@ -51,10 +52,44 @@ pub enum TopologyGate {
 /// Sorted, unique Falcon keys of the provers committee-eligible on `filter`.
 /// Keys that are not well-formed Falcon public keys cannot sign in a session
 /// and are left out deterministically.
+///
+/// While a step of the release eligibility schedule applies at `frame`, the
+/// frame the session is formed at, only allocations whose recorded release is
+/// at least that step's minimum are seated; one without a recorded release is
+/// not ([`super::super::prover_release::seat_eligible`]). The recorded
+/// release is signed by the prover's own key but self-attested: the schedule
+/// removes honest but outdated provers, and a false claim gains a prover
+/// nothing an eligible member does not have. Callers keep a shard's current
+/// session when no member remains. Committee eligibility, splits, merges and
+/// reassignment do not apply the gate.
 pub fn desired_members(scan: &CommittedProverScan, filter: &[u8], frame: u64) -> Vec<Vec<u8>> {
+    use super::super::prover_release::{minimum_release_at, seat_eligible};
+    if minimum_release_at(frame).is_none() {
+        return members_where(scan, filter, frame, |_| true);
+    }
+    let releases = scan.releases_on_filter(filter);
+    members_where(scan, filter, frame, |address| seat_eligible(releases.get(address), frame))
+}
+
+/// [`desired_members`] without the release gate: the committee a merge's
+/// successor takes, which, like a split's, seats every eligible prover of its
+/// sources. A merge whose successor would have no member is dropped, unlike
+/// a membership change, which keeps the current session; the next membership
+/// boundary applies the gate to the merged shard.
+fn merge_members(scan: &CommittedProverScan, filter: &[u8], frame: u64) -> Vec<Vec<u8>> {
+    members_where(scan, filter, frame, |_| true)
+}
+
+fn members_where(
+    scan: &CommittedProverScan,
+    filter: &[u8],
+    frame: u64,
+    seat: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
     let mut members: Vec<Vec<u8>> = scan
         .active_on_filter(filter, frame)
         .into_iter()
+        .filter(|(_, address)| seat(address))
         .map(|(public_key, _)| public_key)
         .filter(|key| FalconPublicKey::from_bytes(key).is_some())
         .collect();
@@ -219,6 +254,40 @@ pub fn genesis_output(state: &impl Records, session: &Session) -> Result<Vec<u8>
     Ok(output)
 }
 
+/// The shards `change` removes from the grid and the shards it registers: the
+/// REAL topology, as `apply_due_shard_changes` will register it. A deep split
+/// replaces the parent by its two leaves AND the co-path spine, and a merge
+/// removes exactly the shards it names; only that complete set covers the same
+/// address range on both sides.
+fn change_topology(change: &PendingShardChange) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+    let bit_path_mode = change.proposed_frame >= super::super::materialize::unified_tree_cutover_frame();
+    let bits = |filter: &[u8]| quil_forest::decode_shard_filter_or_root(filter, 32).map(|(_, bits)| bits);
+    Ok(match change.kind {
+        ShardChangeKind::Split => {
+            let output = super::super::materialize::materialize_shard_split(
+                &change.parent, &change.children, bit_path_mode)?;
+            let registered = output.new_shards.iter()
+                .map(|(l2, path)| quil_forest::shard_prefix_to_filter(l2, path));
+            // Allocations move to `change.children` byte for byte; keep that
+            // spelling for the shards they name.
+            let new = registered.map(|filter| {
+                change.children.iter().find(|child| bits(child) == bits(&filter)).cloned().unwrap_or(filter)
+            }).collect();
+            (vec![change.parent.clone()], new)
+        }
+        ShardChangeKind::Merge => {
+            let output = super::super::materialize::materialize_shard_merge(
+                &change.children, &change.parent, bit_path_mode)?;
+            let old = output.removed_shards.iter()
+                .map(|(l2, path)| quil_forest::shard_prefix_to_filter(l2, path))
+                .map(|filter| {
+                    change.children.iter().find(|child| bits(child) == bits(&filter)).cloned().unwrap_or(filter)
+                }).collect();
+            (old, vec![change.parent.clone()])
+        }
+    })
+}
+
 /// Decide whether a due split/merge may apply, scheduling its source sessions
 /// to close on first sight. `even` selects the post-cutover round-robin split
 /// assignment, exactly as the reassignment does.
@@ -269,36 +338,7 @@ pub fn gate_topology_change_sized<'s>(
             TopologyGate::Wait
         });
     }
-    // The REAL topology, as `apply_due_shard_changes` will register it. A deep
-    // split replaces the parent by its two leaves AND the co-path spine, and a
-    // merge removes exactly the shards it names; only that complete set covers
-    // the same address range on both sides.
-    let bit_path_mode = change.proposed_frame >= super::super::materialize::unified_tree_cutover_frame();
-    let bits = |filter: &[u8]| quil_forest::decode_shard_filter_or_root(filter, 32).map(|(_, bits)| bits);
-    let (old, new): (Vec<Vec<u8>>, Vec<Vec<u8>>) = match change.kind {
-        ShardChangeKind::Split => {
-            let output = super::super::materialize::materialize_shard_split(
-                &change.parent, &change.children, bit_path_mode)?;
-            let registered = output.new_shards.iter()
-                .map(|(l2, path)| quil_forest::shard_prefix_to_filter(l2, path));
-            // Allocations move to `change.children` byte for byte; keep that
-            // spelling for the shards they name.
-            let new = registered.map(|filter| {
-                change.children.iter().find(|child| bits(child) == bits(&filter)).cloned().unwrap_or(filter)
-            }).collect();
-            (vec![change.parent.clone()], new)
-        }
-        ShardChangeKind::Merge => {
-            let output = super::super::materialize::materialize_shard_merge(
-                &change.children, &change.parent, bit_path_mode)?;
-            let old = output.removed_shards.iter()
-                .map(|(l2, path)| quil_forest::shard_prefix_to_filter(l2, path))
-                .map(|filter| {
-                    change.children.iter().find(|child| bits(child) == bits(&filter)).cloned().unwrap_or(filter)
-                }).collect();
-            (old, vec![change.parent.clone()])
-        }
-    };
+    let (old, new) = change_topology(change)?;
     let mut sources = Vec::new();
     let mut vacant = Vec::new();
     for filter in old {
@@ -338,7 +378,7 @@ pub fn gate_topology_change_sized<'s>(
         }
         ShardChangeKind::Merge => {
             let mut members: Vec<Vec<u8>> = sources.iter()
-                .flat_map(|source| desired_members(scan, source, frame)).collect();
+                .flat_map(|source| merge_members(scan, source, frame)).collect();
             members.sort();
             members.dedup();
             new.into_iter().map(|filter| DesiredCommittee { filter, members: members.clone() }).collect()
@@ -382,14 +422,273 @@ pub fn topology_targets(state: &impl Records, change: &PendingShardChange) -> Re
     }))
 }
 
+/// The request a scheduled topology change waits for, once scheduled.
+pub fn topology_request(state: &impl Records, change: &PendingShardChange) -> Result<Option<[u8; 32]>> {
+    read(state, b"topology", &topology_key(change))?.map(request_id).transpose()
+}
+
+/// The request `filter`'s head session is closing, or has closed, for: `None`
+/// when the shard has no session or its session is active.
+pub fn retiring_request(state: &impl Records, filter: &[u8]) -> Result<Option<[u8; 32]>> {
+    let Some(bytes) = read(state, b"head", filter)? else { return Ok(None) };
+    Ok(match status(state, &request_id(bytes)?)? {
+        Status::Active => None,
+        Status::Sealing(request) | Status::Closed(request) => Some(request),
+    })
+}
+
+static RECOVERY_EXAMINATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many requests [`recover_topology_change`] has examined in this process
+/// (each examination may search up to [`RECOVERY_SEARCH_EPOCHS`] epochs of
+/// topology records), for tests and diagnostics.
+pub fn recovery_examinations() -> u64 {
+    RECOVERY_EXAMINATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Epochs searched, back from the epoch a lost change came due in, for the
+/// frame that proposed it ([`recover_topology_change`]).
+pub const RECOVERY_SEARCH_EPOCHS: u64 = 16;
+
+/// The frames before which [`recover_topology_change`] rebuilds nothing: a
+/// request scheduled before `request_frame` or a change proposed before
+/// `proposed_frame` (the last grid reset, which dropped pending changes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryFloor {
+    pub request_frame: u64,
+    pub proposed_frame: u64,
+}
+
+/// What committed state says about a request one of whose sources is still
+/// in the local grid with no pending change of the request naming it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Recovery {
+    /// The split or merge the request was scheduled for, rebuilt from the
+    /// request and verified against its committed `topology` record.
+    Restore(PendingShardChange),
+    /// A source left the local grid, its head moved on, a later request named
+    /// it as a target, the grid holds a shard the change registers or one
+    /// overlapping a source, or a staffed target was split or merged away:
+    /// the change was applied here, and a later one may have registered the
+    /// shard again. Names the guard that decided.
+    Applied(&'static str),
+    /// Not a split or merge this repair restores (a membership request, or
+    /// one before the floor), now or on any later frame.
+    Never,
+    /// A split or merge whose change cannot be rebuilt unambiguously; this
+    /// does not change on later frames.
+    Unresolved(&'static str),
+}
+
+/// Rebuild the split or merge request `id` was scheduled for, for a node whose
+/// local store lost the pending record (a store rewritten or restored outside
+/// execution, say) while the request reached it with committed state.
+///
+/// A request is written only from a live pending change (the gate above), and
+/// that change is consumed only when its flip removes the request's sources
+/// from the grid. A source still in the grid, still headed by the request's
+/// source session, and named as a target by no later request, therefore means
+/// the change has not applied here, and the network's archives still hold it
+/// (or applied it at the same gate this node will now pass).
+///
+/// The request keeps everything but the change's proposal frame and effective
+/// epoch, which `topology_key` needs: the proposal frame is searched over the
+/// [`RECOVERY_SEARCH_EPOCHS`] epochs before the request's due epoch, and the
+/// rebuilt change is accepted only if its committed `topology` record names
+/// `id`. A split's children are the targets with members: the gate gives every
+/// member to a child, and a child goes without members only when the parent
+/// had fewer provers than children, which then leaves every other child with
+/// at most one; that case is ambiguous with the spine and is not rebuilt.
+///
+/// `in_grid` says whether the local grid holds a shard, and `overlapped`
+/// whether it holds another shard covering part of a shard's range (an
+/// ancestor or a descendant). A shard the request authorized with members,
+/// or one overlapping a source, in the grid means the change applied here and
+/// a later change re-registered a source: a merge whose ranges had no
+/// committee needs no request, so it can bring a split's parent back beside
+/// the split's children. So does a staffed target whose head is closing or
+/// closed for a request that does not name it as a target: a later split or
+/// merge took it away, and a chain of such changes may have brought a source
+/// back by ungoverned ones. The price is that a store which lost the change
+/// and whose children the network has since split or merged away is not
+/// rebuilt. A merge's children come back sorted; the caller restores the
+/// proposal's order.
+pub fn recover_topology_change(
+    state: &impl Records,
+    id: &[u8; 32],
+    floor: RecoveryFloor,
+    in_grid: &dyn Fn(&[u8]) -> bool,
+    overlapped: &dyn Fn(&[u8]) -> bool,
+) -> Result<Recovery> {
+    RECOVERY_EXAMINATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(scheduled) = request(state, id)? else {
+        return Ok(Recovery::Unresolved("the request record is absent"));
+    };
+    if scheduled.frame < floor.request_frame {
+        return Ok(Recovery::Never);
+    }
+    let sources: Vec<Vec<u8>> = scheduled.sources.iter().map(|source| source.filter.clone()).collect();
+    let targets: Vec<Vec<u8>> = scheduled.targets.iter().map(|target| target.committee.filter.clone()).collect();
+    let split = sources.len() == 1
+        && scheduled.vacant.is_empty()
+        && targets.len() >= 2
+        && !targets.contains(&sources[0]);
+    let merge = targets.len() == 1
+        && sources.len() + scheduled.vacant.len() >= 2
+        && !sources.contains(&targets[0])
+        && !scheduled.vacant.contains(&targets[0]);
+    if !split && !merge {
+        return Ok(Recovery::Never);
+    }
+    // The change applied here if any of these holds, and a later change then
+    // registered a source again. They run before every unresolved verdict, so
+    // a healthy store never reports one.
+    // - Before its flip, a prefix-free grid that holds the sources holds none
+    //   of the shards the flip registers, and nothing else in their ranges.
+    if scheduled.targets.iter().any(|target| !target.committee.members.is_empty() && in_grid(&target.committee.filter)) {
+        return Ok(Recovery::Applied("a shard the change registers is in the grid"));
+    }
+    if scheduled.sources.iter().any(|source| overlapped(&source.filter)) {
+        return Ok(Recovery::Applied("a shard overlapping a source is in the grid"));
+    }
+    // - Once the request activated, a staffed target's session came from it.
+    //   Until the flip the target is outside the grid and nothing closes it
+    //   but a membership successor, so a head closing or closed for a request
+    //   that does not name it as a target means a later split or merge took
+    //   it away. (Before activation the request reserves its targets, and a
+    //   target's head is an older session that earlier changes may have
+    //   closed.)
+    if activated(state, id)? {
+        for target in scheduled.targets.iter().filter(|target| !target.committee.members.is_empty()) {
+            let Some(closing) = retiring_request(state, &target.committee.filter)? else { continue };
+            let named = request(state, &closing)?.is_some_and(|later| {
+                later.targets.iter().any(|next| next.committee.filter == target.committee.filter)
+            });
+            if !named {
+                return Ok(Recovery::Applied("a staffed target was split or merged away"));
+            }
+        }
+    }
+    // - Every source is in the grid, headed by its source session, and named
+    //   as a target by no later request.
+    for source in &scheduled.sources {
+        if !in_grid(&source.filter) {
+            return Ok(Recovery::Applied("a source is not in the grid"));
+        }
+        let Some(bytes) = read(state, b"head", &source.filter)? else {
+            return Ok(Recovery::Applied("a source has no head"));
+        };
+        if request_id(bytes)? != source.id()? {
+            return Ok(Recovery::Applied("a source's head moved on"));
+        }
+        if let Some(bytes) = read(state, b"reserved", &source.filter)? {
+            let later = request(state, &request_id(bytes)?)?.map_or(true, |named| named.frame >= scheduled.frame);
+            if later {
+                return Ok(Recovery::Applied("a later request names a source as a target"));
+            }
+        }
+    }
+    let (kind, parent, mut children) = if split {
+        let crowded = scheduled.targets.iter().any(|target| target.committee.members.len() >= 2);
+        let unmanned = scheduled.targets.iter().any(|target| target.committee.members.is_empty());
+        if unmanned && !crowded {
+            return Ok(Recovery::Unresolved("a split child may have received no members"));
+        }
+        let children: Vec<Vec<u8>> = scheduled.targets.iter()
+            .filter(|target| !target.committee.members.is_empty())
+            .map(|target| target.committee.filter.clone())
+            .collect();
+        if children.len() > 8 {
+            return Ok(Recovery::Unresolved("a split names more than eight children"));
+        }
+        (ShardChangeKind::Split, sources[0].clone(), children)
+    } else {
+        let mut children = sources.clone();
+        children.extend(scheduled.vacant.iter().cloned());
+        (ShardChangeKind::Merge, targets[0].clone(), children)
+    };
+    children.sort();
+    let mut shards: Vec<_> = children.iter()
+        .map(|child| quil_forest::decode_shard_filter_or_root(child, 32))
+        .collect();
+    shards.sort();
+    shards.dedup();
+    if children.len() < 2 || shards.len() != children.len() || shards.iter().any(Option::is_none) {
+        return Ok(Recovery::Unresolved("the children cannot be identified"));
+    }
+    let cutover = super::super::materialize::unified_tree_cutover_frame();
+    let first_frame = floor.proposed_frame.max(cutover);
+    let mut change = PendingShardChange { kind, parent, children, effective_epoch: 0, proposed_frame: first_frame };
+    let sorted = |mut filters: Vec<Vec<u8>>| { filters.sort(); filters };
+    let (old, new) = match change_topology(&change) {
+        Ok((old, new)) => (sorted(old), sorted(new)),
+        Err(QuilError::InvalidArgument(_)) => return Ok(Recovery::Unresolved("the rebuilt change does not materialize")),
+        Err(error) => return Err(error),
+    };
+    let expected = match kind {
+        ShardChangeKind::Split => (vec![change.parent.clone()], sorted(targets)),
+        ShardChangeKind::Merge => (change.children.clone(), vec![change.parent.clone()]),
+    };
+    if (old, new) != expected {
+        return Ok(Recovery::Unresolved("the rebuilt change does not cover the request's shards"));
+    }
+    // Due at the request's frame: proposed two or more epochs before it.
+    let length = quil_types::consensus::epoch_length_frames();
+    let Some(proposal_epoch) = quil_types::consensus::epoch_for_frame(scheduled.frame).checked_sub(2) else {
+        return Ok(Recovery::Never);
+    };
+    let last = (proposal_epoch + 1) * length - 1;
+    let first = (proposal_epoch.saturating_sub(RECOVERY_SEARCH_EPOCHS - 1) * length).max(first_frame);
+    if last < first {
+        return Ok(Recovery::Never);
+    }
+    for frame in (first..=last).rev() {
+        change.proposed_frame = frame;
+        change.effective_epoch = quil_types::consensus::epoch_for_frame(frame) + 2;
+        let key = topology_key(&change);
+        if read(state, b"topology", &key)?.as_deref() == Some(id.as_slice()) {
+            if read(state, b"dropped", &key)?.is_some() {
+                return Ok(Recovery::Never);
+            }
+            return Ok(Recovery::Restore(change));
+        }
+    }
+    Ok(Recovery::Unresolved("no topology record of the searched proposal frames names the request"))
+}
+
 /// Epochs a closing session may take to seal before GLOBAL fences it.
 pub const FENCE_AFTER_EPOCHS: u64 = 4;
 
+/// Epochs a closing session requested at or after
+/// [`super::early_fence_frame`] may take to seal before GLOBAL fences it.
+pub const EARLY_FENCE_AFTER_EPOCHS: u64 = 1;
+
+/// Epochs a closing session whose request GLOBAL made at `request_frame` may
+/// take to seal before GLOBAL fences it. The request's committed frame
+/// selects the rule, so a request's timeout never changes once it is made.
+pub fn fence_after_epochs(request_frame: u64) -> u64 {
+    if request_frame >= super::early_fence_frame() {
+        EARLY_FENCE_AFTER_EPOCHS
+    } else {
+        FENCE_AFTER_EPOCHS
+    }
+}
+
+/// The first GLOBAL frame at which [`fence_stalled_sources`] fences a
+/// closing session whose request GLOBAL made at `request_frame` and which has
+/// not sealed. Members date a fence by it too (the engine's fence rewind),
+/// so they and GLOBAL agree on it.
+pub fn fence_due_frame(request_frame: u64) -> u64 {
+    request_frame.saturating_add(
+        fence_after_epochs(request_frame).saturating_mul(quil_types::consensus::epoch_length_frames()),
+    )
+}
+
 /// Fence every closing source among `filters`' head sessions whose request is
-/// [`FENCE_AFTER_EPOCHS`] epochs old and which has not sealed, then authorize
-/// the successors of any request that thereby has every source ended. Reads
-/// committed state only, so every materializing node fences the same sessions.
-/// Returns how many sessions were fenced.
+/// [`fence_after_epochs`] epochs old ([`fence_due_frame`]) and which has not
+/// sealed, then authorize the successors of any request that thereby has
+/// every source ended. Reads committed state only, so every materializing
+/// node fences the same sessions. Returns how many sessions were fenced.
 ///
 /// The fence is the session's executed tip: its frame, view and digest, with
 /// zero state and history roots (nothing certifies the state after the tip).
@@ -412,7 +711,6 @@ pub fn fence_stalled_sources(
     filters: &[Vec<u8>],
     mut eligible: Option<&mut dyn FnMut(&[u8]) -> Result<Vec<Vec<u8>>>>,
 ) -> Result<usize> {
-    let timeout = FENCE_AFTER_EPOCHS.saturating_mul(quil_types::consensus::epoch_length_frames());
     let mut fenced = 0;
     for filter in filters {
         let Some(session) = head(state, filter)? else { continue };
@@ -424,7 +722,7 @@ pub fn fence_stalled_sources(
         }
         let pending = request(state, &request_id)?
             .ok_or_else(|| QuilError::Store("closing session's request is absent".into()))?;
-        if frame < pending.frame.saturating_add(timeout) {
+        if frame < fence_due_frame(pending.frame) {
             continue;
         }
         let checkpoint = match session_tip(state, &id)? {
@@ -466,6 +764,7 @@ pub fn fence_stalled_sources(
             generation = session.generation,
             fenced_at = checkpoint.frame,
             request = hex::encode(request_id),
+            after_epochs = fence_after_epochs(pending.frame),
             "committee handoff: closing session did not seal in time; fenced at its executed tip"
         );
         fenced += 1;
@@ -484,10 +783,11 @@ pub fn fence_stalled_sources(
 }
 
 /// The committee a fence's membership successor takes: its shard's eligible
-/// provers now. Its request fixed the committee when it was scheduled, four
-/// epochs earlier, from provers that have since mostly moved on, so it could
-/// not reach quorum; and the same pass's reconciliation found it unlike
-/// current eligibility and asked it to close at once (decided 2026-10-16).
+/// provers now. Its request fixed the committee when it was scheduled,
+/// [`fence_after_epochs`] epochs earlier, from provers that have since
+/// mostly moved on, so it could not reach quorum; and the same pass's
+/// reconciliation found it unlike current eligibility and asked it to close
+/// at once (decided 2026-10-16).
 /// `None` keeps the request's committee: a split's or merge's, one whose
 /// shard has no valid eligible committee now, or one that still matches.
 fn fenced_committee(

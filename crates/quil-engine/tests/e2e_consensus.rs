@@ -299,6 +299,7 @@ async fn app_consensus_cw_single_prover_finalizes() {
 
     let harness = AppShardHarness::build_cw(1);
     assert_deterministic_app_chain(&harness, std::time::Duration::from_secs(60)).await;
+    harness.shutdown().await;
 }
 
 /// A 3-prover shard committee driven by commonware-simplex + Falcon
@@ -320,6 +321,7 @@ async fn app_consensus_cw_multi_prover_finalizes() {
 
     let harness = AppShardHarness::build_cw(3);
     assert_deterministic_app_chain(&harness, std::time::Duration::from_secs(90)).await;
+    harness.shutdown().await;
 }
 
 /// A legacy shard whose committee changed restarts from the head the old
@@ -487,6 +489,7 @@ async fn worker_active_storage_attestation() {
                 leave_confirm_frame_number: 0,
                 leave_reject_frame_number: 0,
                 last_active_frame_number: 1000,
+                last_signed_frame_number: 0,
                 epoch: quil_types::consensus::epoch_for_frame(1000),
                 ring: 0,
                 vertex_address: Vec::new(),
@@ -1263,6 +1266,7 @@ async fn tier2_adversarial_premature_confirm_rejected() {
         }),
         filters: vec![filter.clone()],
         leaf_roots: Vec::new(),
+        release: None,
     };
     let confirm_bytes = confirm.to_canonical_bytes().expect("encode confirm");
 
@@ -1454,6 +1458,7 @@ async fn tier2_adversarial_wrong_signer_confirm_does_not_steal_allocation() {
         }),
         filters: vec![filter.clone()],
         leaf_roots: Vec::new(),
+        release: None,
     };
     let confirm_bytes = confirm.to_canonical_bytes().expect("encode");
 

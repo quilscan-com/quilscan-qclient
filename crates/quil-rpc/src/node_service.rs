@@ -403,6 +403,8 @@ impl NodeRpcServer {
     /// than returning an empty answer that a caller cannot tell apart from
     /// "there is nothing there". Applications with no declared coverage hook
     /// are served as before.
+    // Regression helper for the production serves_application/coverage_error policy.
+    #[allow(dead_code)]
     fn require_application_coverage(&self, application: &[u8]) -> Result<(), Status> {
         if self.serves_application(application) {
             return Ok(());
@@ -1457,6 +1459,7 @@ fn describe_message_bundle(bundle: &global::MessageBundle) -> String {
             Some(R::ShardSplit(_)) => "ShardSplit",
             Some(R::ShardMerge(_)) => "ShardMerge",
             Some(R::CommitteeHandoff(_)) => "CommitteeHandoff",
+            Some(R::PresenceReport(_)) => "PresenceReport",
         });
     }
     tags.join(",")

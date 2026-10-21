@@ -5875,6 +5875,7 @@ dependencies = [
 name = "quil-crypto"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "bls48581",
  "channel",
  "criterion 0.5.1",
@@ -6398,21 +6399,6 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tonic-build",
-]
-
-[[package]]
-name = "quil-wallet"
-version = "0.1.0"
-dependencies = [
- "ed448-bulletproofs",
- "hex 0.4.3",
- "num-bigint 0.4.6",
- "quil-crypto",
- "quil-execution",
- "quil-types",
- "rand 0.8.5",
- "sha3 0.10.8",
- "thiserror 2.0.12",
 ]
 
 [[package]]

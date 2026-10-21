@@ -170,6 +170,11 @@ pub struct ProverAllocationInfo {
     pub leave_confirm_frame_number: u64,
     pub leave_reject_frame_number: u64,
     pub last_active_frame_number: u64,
+    /// The last GLOBAL frame that included an app frame this allocation
+    /// signed. Unlike `last_active_frame_number`, confirms do not advance it.
+    /// `0` when never recorded, including every frame before
+    /// [`SIGNED_FRAME_ACTIVATION_FRAME`].
+    pub last_signed_frame_number: u64,
     /// The storage epoch this allocation was last confirmed for. A data-shard
     /// (non-empty filter) Active allocation whose `epoch` is older than the
     /// current epoch is read as [`EffectiveStatus::ExpiredEpoch`]. `0` is the
@@ -699,6 +704,55 @@ pub struct ProverShardSummary {
 /// eviction-risk display so they agree exactly.
 pub const EVICTION_INACTIVITY_START_FRAME: u64 = 674_000;
 
+/// First mainnet GLOBAL frame finalized by the successor GLOBAL committee:
+/// the four genesis archives still running after QmQfp3 was decommissioned
+/// (2026-10-20), in consensus epoch 1, with a quorum of 3 of 4. Every earlier
+/// frame is finalized by all five genesis archives (4 of 5) in epoch 0, and is
+/// verified against them for good. The first frame of epoch 1,261; decided
+/// 2026-10-20.
+pub const MAINNET_GLOBAL_COMMITTEE_SUCCESSION_FRAME: u64 = 907_920;
+
+static GLOBAL_COMMITTEE_SUCCESSION_FRAME: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Pin the GLOBAL committee succession from the network id at node startup,
+/// like [`init_committee_handoff_for_network`]. Only mainnet has one, and its
+/// frame cannot be changed.
+pub fn init_global_committee_succession_for_network(network: u8) {
+    set_global_committee_succession_frame(if network == 0 {
+        MAINNET_GLOBAL_COMMITTEE_SUCCESSION_FRAME
+    } else {
+        u64::MAX
+    });
+}
+
+/// Set the succession frame directly (tests). `u64::MAX`: no succession.
+pub fn set_global_committee_succession_frame(frame: u64) {
+    GLOBAL_COMMITTEE_SUCCESSION_FRAME.store(frame, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The first GLOBAL frame the successor committee finalizes; `u64::MAX` when
+/// this network has none.
+pub fn global_committee_succession_frame() -> u64 {
+    GLOBAL_COMMITTEE_SUCCESSION_FRAME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The GLOBAL consensus epoch, and so the committee, that finalizes GLOBAL
+/// frame `frame`: 0 below the succession frame, 1 from it on.
+pub fn global_committee_epoch(frame: u64) -> u64 {
+    u64::from(frame >= global_committee_succession_frame())
+}
+
+/// First GLOBAL frame whose included app frames record each signer's
+/// `LastSignedFrameNumber` on its allocation. One inactivity threshold later,
+/// when every member has had a full window to sign, the eviction stall census
+/// counts an allocation as fresh by that field instead of
+/// `LastActiveFrameNumber`, which confirms also advance. Recording the field
+/// changes committed allocation trees, so every archive must start at the same
+/// frame. `u64::MAX` disables both: no frame records the field and the census
+/// keeps reading `LastActiveFrameNumber`.
+pub const SIGNED_FRAME_ACTIVATION_FRAME: u64 = u64::MAX;
+
 /// Minimum number of effectively-active provers a shard needs to run its
 /// app-shard consensus (form a committee and reach quorum). A shard with
 /// FEWER than this many active provers is under a coverage halt and cannot
@@ -727,10 +781,47 @@ pub struct ProverLifecycleView {
     pub reward_rings: HashMap<Vec<u8>, crate::reward_ring::RewardRingEstimate>,
 }
 
+/// A shard's provers as the lifecycle counts them at one frame: who is a
+/// member after the next epoch boundary, and whose leave is still undecided.
+/// By effective status, not the raw status byte: a confirmed join's byte is
+/// already Active but it becomes a member only at the boundary, a confirmed
+/// leave keeps its Leaving byte while it departs regardless, and a departed or
+/// stale-epoch allocation keeps its byte for good.
 #[derive(Debug, Clone, Default)]
 pub struct LifecycleMembers {
+    /// Effective Active members.
     pub active: Vec<Vec<u8>>,
+    /// Confirmed joins that become members at the next boundary.
+    pub activating: Vec<Vec<u8>>,
+    /// Members whose leave is proposed but not yet confirmed.
     pub leaving: Vec<Vec<u8>>,
+}
+
+impl LifecycleMembers {
+    /// Count `address`, whose allocation on this shard is `alloc`, by its
+    /// effective status at `frame`; confirmed leaves, paused, expired and
+    /// terminal allocations are not counted.
+    pub fn add(&mut self, address: Vec<u8>, alloc: &ProverAllocationInfo, frame: u64) {
+        match alloc.effective_status(frame) {
+            EffectiveStatus::Active => self.active.push(address),
+            EffectiveStatus::Joining if alloc.join_confirm_frame_number > 0 => self.activating.push(address),
+            EffectiveStatus::Leaving if alloc.leave_confirm_frame_number == 0 => self.leaving.push(address),
+            _ => {}
+        }
+    }
+
+    /// How many provers remain members after the boundary if no undecided
+    /// leave departs.
+    pub fn staying(&self) -> usize {
+        self.active.len() + self.activating.len()
+    }
+
+    /// Sort each list, so every node orders members the same way.
+    pub fn sort(&mut self) {
+        self.active.sort();
+        self.activating.sort();
+        self.leaving.sort();
+    }
 }
 
 /// Manages the prover trie: state transitions, lookups, eviction.
@@ -757,11 +848,16 @@ pub trait ProverRegistry: Send + Sync {
             if let Some(estimate) = self.get_reward_ring_estimate(address, &filter, frame)? {
                 reward_rings.insert(filter.clone(), estimate);
             }
-            let active = self.get_provers_by_status(&filter, ProverStatus::Active)?
-                .into_iter().map(|p| p.address).collect();
-            let leaving = self.get_provers_by_status(&filter, ProverStatus::Leaving)?
-                .into_iter().map(|p| p.address).collect();
-            members.insert(filter, LifecycleMembers { active, leaving });
+            let mut shard = LifecycleMembers::default();
+            for status in [ProverStatus::Active, ProverStatus::Leaving] {
+                for p in self.get_provers_by_status(&filter, status)? {
+                    if let Some(alloc) = p.allocations.iter().find(|a| a.confirmation_filter == filter && a.status == status) {
+                        shard.add(p.address.clone(), alloc, frame);
+                    }
+                }
+            }
+            shard.sort();
+            members.insert(filter, shard);
         }
         Ok(ProverLifecycleView { prover, summaries, members, reward_rings })
     }
@@ -810,6 +906,20 @@ pub trait ProverRegistry: Send + Sync {
     fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Result<Vec<ProverInfo>>;
     fn get_prover_count(&self, filter: &[u8]) -> Result<usize>;
     fn get_provers(&self, filter: &[u8]) -> Result<Vec<ProverInfo>>;
+    /// The provers of [`Self::get_provers`] over all of `filters` (the empty
+    /// filter is the global committee), each once. The default asks
+    /// `get_provers` per filter, cloning a prover once per filter it holds;
+    /// the persistent registry clones each prover once.
+    fn get_provers_on_filters(&self, filters: &[Vec<u8>]) -> Result<Vec<ProverInfo>> {
+        let mut by_address: std::collections::HashMap<Vec<u8>, ProverInfo> =
+            std::collections::HashMap::new();
+        for filter in filters {
+            for prover in self.get_provers(filter)? {
+                by_address.entry(prover.address.clone()).or_insert(prover);
+            }
+        }
+        Ok(by_address.into_values().collect())
+    }
     fn get_provers_by_status(
         &self,
         filter: &[u8],
@@ -1056,6 +1166,7 @@ pub(crate) mod epoch_tests {
             leave_confirm_frame_number: 0,
             leave_reject_frame_number: 0,
             last_active_frame_number: 0,
+            last_signed_frame_number: 0,
             epoch,
             ring: 0,
             vertex_address: Vec::new(),
@@ -1339,6 +1450,58 @@ pub(crate) mod epoch_tests {
         set_epoch_length_frames(0);
         assert_eq!(epoch_length_frames(), EPOCH_LENGTH_FRAMES);
         assert_eq!(epoch_for_frame(720), 1);
+    }
+
+    /// Members are counted by effective status: a confirmed join is
+    /// activating, a confirmed leave and every expired, stale-epoch or paused
+    /// allocation is not counted, and only an undecided leave is leaving.
+    #[test]
+    fn lifecycle_members_count_by_effective_status() {
+        let _guard = epoch_length_guard();
+        let e = EPOCH_LENGTH_FRAMES;
+        let frame = 10 * e + 5;
+        let with = |status, f: &dyn Fn(&mut ProverAllocationInfo)| {
+            let mut a = active_alloc(vec![7], 10);
+            a.status = status;
+            f(&mut a);
+            a
+        };
+        let cases = [
+            (1u8, with(ProverStatus::Active, &|_| {})),
+            (2, with(ProverStatus::Active, &|a| a.join_confirm_frame_number = 10 * e + 1)),
+            (3, with(ProverStatus::Active, &|a| a.epoch = 8)),
+            (4, with(ProverStatus::Leaving, &|a| { a.leave_frame_number = 9 * e; a.leave_confirm_frame_number = 10 * e + 2; })),
+            (5, with(ProverStatus::Leaving, &|a| a.leave_frame_number = 2 * e)),
+            (6, with(ProverStatus::Leaving, &|a| a.leave_frame_number = 9 * e + 3)),
+            (7, with(ProverStatus::Paused, &|_| {})),
+        ];
+        let mut members = LifecycleMembers::default();
+        for (id, a) in &cases {
+            members.add(vec![*id], a, frame);
+        }
+        assert_eq!(members.active, vec![vec![1]]);
+        assert_eq!(members.activating, vec![vec![2]]);
+        assert_eq!(members.leaving, vec![vec![6]]);
+        assert_eq!(members.staying(), 2);
+    }
+}
+
+#[cfg(test)]
+mod global_committee_succession_tests {
+    use super::*;
+
+    // The only test in this crate that sets the succession frame.
+    #[test]
+    fn only_mainnet_hands_global_consensus_to_the_successor_committee_at_its_frame() {
+        init_global_committee_succession_for_network(1);
+        assert_eq!(global_committee_epoch(u64::MAX - 1), 0);
+        init_global_committee_succession_for_network(0);
+        assert_eq!(global_committee_succession_frame(), 907_920);
+        assert_eq!(global_committee_epoch(907_919), 0);
+        assert_eq!(global_committee_epoch(907_920), 1);
+        assert_eq!(global_committee_epoch(907_921), 1);
+        set_global_committee_succession_frame(u64::MAX);
+        assert_eq!(global_committee_epoch(907_920), 0);
     }
 }
 

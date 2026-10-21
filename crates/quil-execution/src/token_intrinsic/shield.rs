@@ -1,23 +1,23 @@
 //! Shield admission: the checks a legacy transparent coin's move into the
 //! confidential accumulator needs, which verification runs and the global
 //! commit then decides.
+#[cfg(test)]
+use super::{roots, spent_check, state::{self, SnapshotLimits}};
 use super::{
-    roots,
-    state::{self, SnapshotLimits},
-    legacy_migration, materialize, spent_check,
+    legacy_migration, materialize,
 };
 use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
 #[cfg(test)]
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
+use quil_lattice_ct::confidential::shield::AnyShield;
+#[cfg(test)]
 use quil_lattice_ct::confidential::{
     relation::backend::native::{self, NativeBudget},
-    shield::{AnyShield, ShieldStatement},
     transfer::parameter_context,
 };
 #[cfg(test)]
-use quil_lattice_ct::confidential::shield::Shield;
+use quil_lattice_ct::confidential::shield::{Shield, ShieldStatement};
 use quil_types::error::{QuilError, Result};
-use std::collections::BTreeSet;
 
 fn invalid(message: &str) -> QuilError {
     QuilError::InvalidArgument(format!("shield: {message}"))
@@ -27,11 +27,12 @@ fn invalid(message: &str) -> QuilError {
 /// exactly the shielded amount, and belongs to the signing key. Legacy coins
 /// never change once written, so this holds wherever it is checked; whether
 /// the source was already shielded is a consume-once decision made elsewhere.
-pub(crate) fn check_source(state: &HypergraphState, s: &ShieldStatement) -> Result<()> {
+#[cfg(test)]
+fn check_source(state: &HypergraphState, s: &ShieldStatement) -> Result<()> {
     check_coin(state, &s.application, &s.transparent_address, s.amount, &s.owner_public_key)
 }
 
-/// Every source of `shield` passes [`check_source`]'s checks. From the batch
+/// Every source of `shield` passes `check_source`'s checks. From the batch
 /// shield frame (`active`), every source must also lie in the executing
 /// shard's range: a shard reads only its own store, so a source elsewhere is
 /// refused for that reason, identically on every member and on an archive

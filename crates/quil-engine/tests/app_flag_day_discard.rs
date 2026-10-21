@@ -21,7 +21,6 @@ use quil_execution::{
 use quil_types::{
     consensus::{CommitteeHandoffPolicy, LegacyHistory, ProverRegistry},
     proto::global::AppShardFrame,
-    store::ClockStore as _,
 };
 
 const APP: [u8; 32] = [0x55; 32];
@@ -209,5 +208,8 @@ async fn legacy_history_is_discarded_and_the_first_session_certifies_from_frame_
         let view = CommittedView::capture(&global).unwrap();
         assert_eq!(session_of(&view, &head).as_ref(), Some(&first), "the stored chain is the session's");
     }
+    // Join every consensus host before the stores drop: a detached host
+    // can close RocksDB while the process exits (`AppShardHarness::shutdown`).
+    harness.shutdown().await;
     quil_types::consensus::set_committee_handoff_policy(None);
 }

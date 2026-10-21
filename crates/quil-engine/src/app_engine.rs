@@ -24,6 +24,7 @@ use quil_types::error::{QuilError, Result};
 use quil_types::store::ClockStore;
 
 use crate::app_types::AppShardState;
+use crate::bounded_warn::{self, Report};
 use crate::outage::OutageEvent;
 
 #[path = "app_parent.rs"]
@@ -451,6 +452,8 @@ pub fn set_app_proposal_duration_ms(ms: u64) {
 }
 
 /// The configured app-shard proposal/QC cadence.
+// Retained cadence accessor; consensus configuration supplies current timing.
+#[allow(dead_code)]
 fn app_proposal_duration() -> Duration {
     Duration::from_millis(APP_PROPOSAL_DURATION_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
@@ -649,6 +652,14 @@ const GLOBAL_ANCHOR_SAFETY_MARGIN: u64 = quil_execution::token_intrinsic::consta
 ///
 /// Free function so BOTH the `AppLeaderProvider` (propose/leader) and the
 /// `AppConsensusEngine` (CW committee activation) compute the identical anchor.
+/// A new session host's liveness. Its notarize votes keep their signatures
+/// only while the presence report frame is set, for presence reports.
+fn new_session_liveness() -> Arc<quil_cw_consensus::adapters::Liveness> {
+    let liveness = Arc::new(quil_cw_consensus::adapters::Liveness::default());
+    liveness.keep_votes(quil_execution::global_intrinsic::handoff::presence_report_frame() != u64::MAX);
+    liveness
+}
+
 pub(crate) fn resolve_global_anchor(store: &dyn ClockStore) -> (u64, Vec<u8>) {
     let gf_to_anchor = |f: quil_types::proto::global::GlobalFrame| -> (u64, Vec<u8>) {
         let n = f.header.as_ref().map(|h| h.frame_number).unwrap_or(0);
@@ -1062,7 +1073,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // archive can recompute it byte-for-byte from `frame.requests`.
         // A shard a recorded split or merge is retiring finalizes only empty
         // frames near its flip: GLOBAL may refuse them (crate::shard_drain).
-        let draining = self.shard_drain.as_ref().is_some_and(|drain| drain.drains_at(anchor_gfn));
+        let draining = self.shard_drain.as_ref().is_some_and(|drain| drain.drains_at(anchor_gfn, crate::shard_drain::DrainRole::Leader));
         if draining {
             info!(frame = frame_number, anchor = anchor_gfn, "retiring shard drains: proposing an empty frame");
         }
@@ -2163,12 +2174,19 @@ pub struct AppConsensusEngine {
     /// member that cannot re-derive its sealed history locally.
     outgoing_history_source: Option<crate::app_handoff::OutgoingHistorySource>,
     global_anchor_source: Option<crate::global_anchor::GlobalAnchorSource>,
+    /// How long the shard head has lain past its session fence without a
+    /// local rewind, for bounded logging.
+    unrewindable_fence: UnrewindableFenceBlock,
     /// Committees that certified legacy frames, when today's registry no
     /// longer reproduces them (see `historical_committee`).
     historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
     /// How long this successor has been unable to start on its predecessor's
     /// state, and why the shard sync last failed to recover it.
     predecessor_block: PredecessorBlock,
+    /// How long consensus has been refused a start, for bounded logging.
+    start_block: StartBlock,
+    /// What the last start attempt learned before it was refused.
+    start_context: StartContext,
 
     // Identity
     local_prover_address: Vec<u8>,
@@ -2188,6 +2206,8 @@ pub struct AppConsensusEngine {
     /// `None` falls back to the in-memory stub.
     kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
     /// Drive this shard with commonware-simplex + Falcon instead of legacy.
+    // Retained configuration field; simplex startup selects the active engine.
+    #[allow(dead_code)]
     app_consensus_cw: bool,
     /// Handle to the running simplex engine (kept alive; the outbound drain
     /// + block ingress live in it). Populated by `start_consensus_cw`.
@@ -2217,6 +2237,9 @@ pub struct AppConsensusEngine {
     /// logged ([`Self::log_session_liveness`]).
     session_liveness: Option<Arc<quil_cw_consensus::adapters::Liveness>>,
     session_liveness_logged: Option<std::time::Instant>,
+    /// This node's presence reports of the running session
+    /// ([`Self::report_presence`]).
+    presence: crate::presence_reports::PresenceReporter,
     /// Consensus messages received for the running session, per channel, and
     /// those dropped because the master could not name their author's key
     /// (no PeerInfo for it): a member whose votes never arrive, or arrive
@@ -2227,6 +2250,9 @@ pub struct AppConsensusEngine {
     /// or foreign PeerInfo key): Simplex drops such a vote as a signer
     /// mismatch.
     cw_nonmember: u64,
+    /// Which members of the running session were heard, to name those that
+    /// never voted while it lacks a quorum ([`Self::log_silent_members`]).
+    session_silent: SilentMembers,
     /// Executes an unfinalized selected parent for the running consensus host.
     private_parents: Option<Arc<AppParentExecutor>>,
     /// A finalized terminal seal: `(session id, canonical CommitteeHandoff)`.
@@ -2368,8 +2394,11 @@ impl AppConsensusEngine {
             storage_history_source: None,
             outgoing_history_source: None,
             global_anchor_source: None,
+            unrewindable_fence: UnrewindableFenceBlock::default(),
             historical_committee_source: None,
             predecessor_block: PredecessorBlock::default(),
+            start_block: StartBlock::default(),
+            start_context: StartContext::default(),
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2384,9 +2413,11 @@ impl AppConsensusEngine {
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_liveness: None,
             session_liveness_logged: None,
+            presence: Default::default(),
             cw_inbound: [0; 4],
             cw_unresolved: 0,
             cw_nonmember: 0,
+            session_silent: SilentMembers::default(),
             private_parents: None,
             sealed_session: None,
             seal_published_at: None,
@@ -2577,9 +2608,12 @@ impl AppConsensusEngine {
 
     /// When this shard's session was authorized from a GLOBAL fence below
     /// the local head, rewind the shard to the fence
-    /// ([`crate::app_handoff::rewind_past_fence`]) and bring the engine's own
+    /// ([`crate::app_handoff::fence_rewind`]) and bring the engine's own
     /// view back with it: materialized frame, head, fee window and the
-    /// finalized records of the discarded frames. True when it rewound.
+    /// finalized records of the discarded frames. True when it rewound. A
+    /// head past the fence that cannot be rewound here is warned about
+    /// ([`Self::note_unrewindable_fence`]) and, as before, not rewound, or
+    /// fails with the rewind's refusal.
     fn rewind_past_fence(&mut self) -> Result<bool> {
         let (Some(global), Some(shard)) = (
             self.global_hypergraph.clone(), self.execution_engine.as_ref().map(|m| m.crdt()),
@@ -2596,9 +2630,21 @@ impl AppConsensusEngine {
         else {
             return Ok(false);
         };
-        let Some(fence) = crate::app_handoff::rewind_past_fence(&global, &shard, self.clock_store.as_ref(), &session)? else {
-            return Ok(false);
+        let fence = match crate::app_handoff::fence_rewind(&global, &shard, self.clock_store.as_ref(), &session)? {
+            crate::app_handoff::FenceRewind::Rewound(fence) => fence,
+            crate::app_handoff::FenceRewind::Untouched => {
+                self.end_unrewindable_fence("nothing past the fence to rewind", std::time::Instant::now());
+                return Ok(false);
+            }
+            crate::app_handoff::FenceRewind::Unrewindable { fence, error } => {
+                self.note_unrewindable_fence(&fence, std::time::Instant::now());
+                return match error {
+                    Some(error) => Err(error),
+                    None => Ok(false),
+                };
+            }
         };
+        self.end_unrewindable_fence("rewound to the fence", std::time::Instant::now());
         self.set_materialized_frame(fence);
         self.shard_frame_number = fence;
         let _ = self.fee_manager.rewind_to_frame(&self.filter, fence);
@@ -2609,6 +2655,29 @@ impl AppConsensusEngine {
             }
         }
         Ok(true)
+    }
+
+    /// Name a shard head past its session fence that this node cannot rewind
+    /// ([`crate::app_handoff::UnrewindableFence`]) when first found or its
+    /// reason changes, then every [`UNREWINDABLE_FENCE_REPEAT`] with how long
+    /// it has lasted.
+    fn note_unrewindable_fence(&mut self, fence: &crate::app_handoff::UnrewindableFence, now: std::time::Instant) {
+        let Some(elapsed) = self.unrewindable_fence.observe(now, &self.filter, fence.reason) else { return };
+        let session_tip = fence.session_tip.map_or_else(|| "none".to_string(), |n| n.to_string());
+        warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = fence.generation,
+            local_head = fence.local_head, fence = fence.fence, session_tip = %session_tip, reason = fence.reason,
+            action = "needs a re-anchor at the fence from an archive; report it if it persists",
+            elapsed_secs = elapsed.as_secs(),
+            "local shard head lies past the session fence and cannot be rewound locally");
+    }
+
+    /// Once a head warned about no longer lies past the fence unrewound (it
+    /// rewound, or a sync replaced its state), say so and how long it lasted.
+    fn end_unrewindable_fence(&mut self, outcome: &'static str, now: std::time::Instant) {
+        if let Some(elapsed) = self.unrewindable_fence.cleared(now) {
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), outcome = outcome,
+                elapsed_secs = elapsed.as_secs(), "local shard head past the session fence resolved");
+        }
     }
 
     fn set_materialized_frame(&mut self, n: u64) {
@@ -3018,6 +3087,8 @@ impl AppConsensusEngine {
     /// ([`PredecessorBlock::blocked`]), naming the predecessor and the shard
     /// sync's last anchor refusal.
     fn warn_predecessor_blocked(&mut self, now: std::time::Instant) {
+        // Its archive recoveries go first while it waits (thread_worker).
+        self.execution.set_successor_blocked(true);
         let Some(blocked) = self.predecessor_block.blocked(now) else { return };
         let predecessor = self.global_hypergraph.as_ref()
             .and_then(|global| crate::app_handoff::same_filter_predecessor(global, &self.filter).ok().flatten())
@@ -3046,14 +3117,103 @@ impl AppConsensusEngine {
             "successor session blocked: predecessor state not recovered through its seal");
     }
 
+    /// Follow a consensus start attempt: whether it left this successor
+    /// waiting on its predecessor's state.
+    fn note_predecessor_block(&mut self, refused: Option<&QuilError>, now: std::time::Instant) {
+        match refused {
+            None => self.end_predecessor_block("consensus started", now),
+            Some(error) if predecessor_recovery_pending(error) => self.warn_predecessor_blocked(now),
+            Some(_) => self.end_predecessor_block("startup now waits on something else", now),
+        }
+    }
+
     /// Once this successor no longer waits on its predecessor's state, say
     /// so if it was warned about, with how long it waited.
     fn end_predecessor_block(&mut self, outcome: &'static str, now: std::time::Instant) {
+        self.execution.set_successor_blocked(false);
         if let Some(blocked) = self.predecessor_block.cleared(now) {
             info!(core_id = self.core_id, filter = hex::encode(&self.filter), outcome = outcome,
                 blocked_secs = blocked.as_secs(),
                 "successor session no longer blocked on predecessor state");
         }
+    }
+
+    /// Name a refused consensus start ([`StartBlock`]): its reason, scope and
+    /// what ends it when first refused, and how long it lasts while it does.
+    /// Without a committee-handoff policy only an allocation's activation
+    /// wait is named; the legacy passive retry stays at debug.
+    fn note_start_refused(&mut self, error: &QuilError, now: std::time::Instant) {
+        debug!(core_id = self.core_id, %error, "cw retry: app consensus not startable yet");
+        if quil_types::consensus::committee_handoff_policy().is_none() && !expected_admission_wait(error) {
+            return;
+        }
+        let refusal = classify_start_refusal(error, &self.start_context);
+        let Some(log) = self.start_block.observe(now, &refusal) else { return };
+        let or_none = |value: Option<u64>| value.map_or_else(|| "none".to_string(), |n| n.to_string());
+        let filter = hex::encode(&self.filter);
+        let generation = or_none(self.start_context.generation);
+        let members = or_none(self.start_context.members.map(|n| n as u64));
+        let scope = refusal.scope.label();
+        match log {
+            StartLog::Refused => info!(core_id = self.core_id, filter = %filter, session_generation = %generation,
+                members = %members, scope = scope, reason = %refusal.reason, action = refusal.action,
+                "app consensus cannot start"),
+            StartLog::Continues { blocked, warn: true } => warn!(core_id = self.core_id, filter = %filter,
+                session_generation = %generation, members = %members, scope = scope, reason = %refusal.reason,
+                action = refusal.action, blocked_secs = blocked.as_secs(),
+                "app consensus still cannot start"),
+            StartLog::Continues { blocked, warn: false } => info!(core_id = self.core_id, filter = %filter,
+                session_generation = %generation, members = %members, scope = scope, reason = %refusal.reason,
+                action = refusal.action, blocked_secs = blocked.as_secs(),
+                "app consensus still waiting to start"),
+        }
+    }
+
+    /// Once consensus starts, say how long it was refused, if it was.
+    fn end_start_block(&mut self, now: std::time::Instant) {
+        if let Some(blocked) = self.start_block.started(now) {
+            let generation = self.cw_session.as_ref().map(|session| session.generation)
+                .or(self.start_context.generation)
+                .map_or_else(|| "none".to_string(), |n| n.to_string());
+            let secs = blocked.as_secs();
+            info!(core_id = self.core_id, filter = hex::encode(&self.filter), session_generation = %generation,
+                blocked_secs = secs, "app consensus started after {secs}s blocked");
+        }
+    }
+
+    /// This prover's allocations for the shard at the latest GLOBAL frame,
+    /// for a worker whose key is not in the committee it would start
+    /// (`session`, when one governs the shard).
+    fn local_seat(&self, session: Option<&quil_cw_consensus::handoff::Session>) -> NotSeated {
+        let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
+            .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+        let allocations = self.prover_registry.get_prover_info(&self.local_prover_address).ok().flatten()
+            .map(|p| p.allocations.iter().filter(|a| a.confirmation_filter == self.filter)
+                .map(|a| a.effective_status(global_frame)).collect())
+            .unwrap_or_default();
+        let release = session.and_then(|session| self.release_shortfall(session, global_frame));
+        NotSeated { allocations, global_frame, release }
+    }
+
+    /// This prover's recorded release on the shard, when the minimum GLOBAL
+    /// applied to `session`'s committee is above it. The minimum is the one
+    /// GLOBAL used ([`prover_release::minimum_release_at`]) at the frame the
+    /// session's authorizing request was scheduled; a session no request
+    /// authorized (a first session) is judged at `global_frame` instead.
+    ///
+    /// [`prover_release::minimum_release_at`]: quil_execution::global_intrinsic::prover_release::minimum_release_at
+    fn release_shortfall(
+        &self,
+        session: &quil_cw_consensus::handoff::Session,
+        global_frame: u64,
+    ) -> Option<ReleaseShortfall> {
+        use quil_execution::global_intrinsic::{handoff, prover_release};
+        let view = handoff::CommittedView::capture(self.global_hypergraph.as_ref()?).ok()?;
+        let scheduled = handoff::scheduled_frame(&view, &session.id().ok()?).ok().flatten();
+        let frame = scheduled.unwrap_or(global_frame);
+        let minimum = prover_release::minimum_release_at(frame)?;
+        let recorded = prover_release::recorded_release(&view, &self.local_bls_pubkey, &self.filter).ok()?;
+        ReleaseShortfall::of(recorded, minimum, frame, scheduled.is_some())
     }
 
     /// A finalized header carries the quorum-certified fee total of its
@@ -3213,7 +3373,7 @@ impl AppConsensusEngine {
     ///
     /// The request made at committee build fires when the worker is spawned,
     /// which on a fresh boot is before peer discovery has put any archive in
-    /// the pool: the syncer then resolves an EMPTY endpoint ("invalid URI"),
+    /// the pool: the syncer then finds no archive ("no archive known yet"),
     /// gives up, and nothing retries it until the next committee rebuild. A
     /// node restarting into a SPLIT application has no stored frames for its
     /// child shard either, so it takes the bootstrap branch, fails it once, and
@@ -3570,8 +3730,12 @@ impl AppConsensusEngine {
                             }
                             if quil_cw_consensus::falcon_base::FalconPublicKey::from_bytes(&from).is_none() {
                                 self.cw_unresolved += 1;
-                            } else if self.cw_session.as_ref().is_some_and(|session| !session.members.contains(&from)) {
-                                self.cw_nonmember += 1;
+                            } else {
+                                match self.cw_session.as_ref().map(|session| session.members.binary_search(&from)) {
+                                    Some(Ok(member)) => self.session_silent.record(member, channel),
+                                    Some(Err(_)) => self.cw_nonmember += 1,
+                                    None => {}
+                                }
                             }
                             if let Some(h) = self.cw_handle.as_ref() {
                                 if channel == crate::cw_app_seams::CW_APP_BLOCK_CHANNEL {
@@ -3617,14 +3781,19 @@ impl AppConsensusEngine {
                         Some(AppEngineMessage::CwTransportReady) => {
                             if !cw_transport_ready {
                                 cw_transport_ready = true;
-                                match self.start_consensus_cw((bls_signer_factory)()).await {
+                                let started = self.start_consensus_cw((bls_signer_factory)()).await;
+                                // A successor's first start may already wait on
+                                // its predecessor's state: its recoveries go first.
+                                self.note_predecessor_block(started.as_ref().err(), std::time::Instant::now());
+                                match started {
                                     Ok(handle) => {
                                         self.cw_handle = Some(handle);
                                         info!(core_id = self.core_id, filter = hex::encode(&self.filter),
                                             "shard commonware-simplex consensus running after transport readiness");
                                     }
-                                    Err(e) if expected_admission_wait(&e) => info!(core_id = self.core_id,
-                                        "app worker preparing; awaiting allocation activation"),
+                                    Err(e) if expected_admission_wait(&e)
+                                        || quil_types::consensus::committee_handoff_policy().is_some() =>
+                                        self.note_start_refused(&e, std::time::Instant::now()),
                                     Err(e) => warn!(core_id = self.core_id, error = %e,
                                         "failed to start shard simplex after transport readiness — will retry"),
                                 }
@@ -3671,6 +3840,7 @@ impl AppConsensusEngine {
                     // messages that the barrier is meant to prevent.
                     self.maintain_committee_session().await;
                     self.log_session_liveness();
+                    self.report_presence();
                     if self.cw_handle.as_ref().is_some_and(|h| h.is_dead()) {
                         self.execution.state("starting", "restarting consensus host");
                         error!(core_id = self.core_id, filter = hex::encode(&self.filter),
@@ -3690,27 +3860,14 @@ impl AppConsensusEngine {
                                     filter = hex::encode(&self.filter),
                                     "shard commonware-simplex consensus started on retry (EQUAL VOTES)"
                                 );
-                                self.end_predecessor_block("consensus started", std::time::Instant::now());
+                                self.note_predecessor_block(None, std::time::Instant::now());
+                                self.end_start_block(std::time::Instant::now());
                             }
                             Err(e) => {
-                                if predecessor_recovery_pending(&e) {
-                                    self.warn_predecessor_blocked(std::time::Instant::now());
-                                } else {
-                                    self.end_predecessor_block("startup now waits on something else", std::time::Instant::now());
-                                }
+                                self.note_predecessor_block(Some(&e), std::time::Instant::now());
                                 // Under committee sessions this is the only
                                 // trace of why a shard is not running yet.
-                                if expected_admission_wait(&e) {
-                                    debug!(core_id = self.core_id, "app worker awaiting allocation activation");
-                                } else if quil_types::consensus::committee_handoff_policy().is_some() {
-                                    info!(core_id = self.core_id, error = %e, "cw retry: app consensus not startable yet");
-                                } else {
-                                    debug!(
-                                        core_id = self.core_id,
-                                        error = %e,
-                                        "cw retry: committee not yet buildable"
-                                    );
-                                }
+                                self.note_start_refused(&e, std::time::Instant::now());
                             }
                         }
                     } else if cw_transport_ready && self.cw_session.is_none() {
@@ -3938,6 +4095,7 @@ impl AppConsensusEngine {
         let seen = liveness.snapshot();
         let decided = liveness.decisions();
         let members = session.members.len();
+        let quorum = members - members.saturating_sub(1) / 3;
         let tally = |t: quil_cw_consensus::adapters::ViewTally| format!(
             "view {}: notarize {} ({} proposals), nullify {}, finalize {}",
             t.view, t.notarize, t.proposals, t.nullify, t.finalize,
@@ -3946,7 +4104,7 @@ impl AppConsensusEngine {
             format!("view {}: {} ({})", o.view, o.reason, o.detail)
         });
         info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
-            base = session.base_frame, members, quorum = members - members.saturating_sub(1) / 3,
+            base = session.base_frame, members, quorum,
             voters = seen.voters, view = seen.view, notarized = seen.notarized, nullified = seen.nullified,
             finalized = seen.finalized, notarize_votes = seen.notarize_votes, nullify_votes = seen.nullify_votes,
             finalize_votes = seen.finalize_votes, current_view = %tally(seen.current), best_view = %tally(seen.best),
@@ -3958,6 +4116,161 @@ impl AppConsensusEngine {
             inbound_by_channel = ?self.cw_inbound, inbound_unattributed = self.cw_unresolved,
             inbound_from_nonmembers = self.cw_nonmember,
             "app session liveness");
+        self.log_silent_members(seen.voters, quorum);
+    }
+
+    /// While the running session's committed tip stands still, carry the
+    /// notarize votes this node received to GLOBAL as evidence of which
+    /// members are present ([`crate::presence_reports`]). Nothing is read
+    /// while the presence report frame is unset; once it is set, the session
+    /// is looked at every few committed GLOBAL frames, and only the member first in the
+    /// epoch's order of verified voters submits. A report is checked first
+    /// as GLOBAL checks it, against the committed view, so one GLOBAL would
+    /// refuse is not sent. Its inclusion is logged by the own-operation
+    /// tracker of the master that publishes it.
+    fn report_presence(&mut self) {
+        use crate::presence_reports::{Hold, Look, Outcome, Pace};
+        use quil_execution::global_intrinsic::handoff;
+        // Unset (mainnet, and by default): nothing is read.
+        if handoff::presence_report_frame() == u64::MAX || self.halted.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let (Some(global), Some(liveness), Some(session), Some(publish)) = (
+            self.global_hypergraph.as_ref(),
+            self.session_liveness.as_ref(),
+            self.cw_session.as_ref(),
+            self.coverage_publish.as_ref(),
+        ) else {
+            return;
+        };
+        let Ok(view) = handoff::CommittedView::capture(global) else { return };
+        let latest = self.global_anchor_store.get_latest_global_clock_frame().ok()
+            .and_then(|frame| frame.header.as_ref().map(|header| header.frame_number));
+        let (anchors, clock) = (&self.global_anchor_store, &self.clock_store);
+        let look = Look {
+            view: &view, frame: view.frame(), latest, session, key: &self.local_bls_pubkey, pace: Pace::current(),
+        };
+        let Some(attempt) = self.presence.attempt(look, liveness.as_ref(), |anchor| {
+            anchors
+                .get_global_clock_frame_header(anchor)
+                .or_else(|_| clock.get_global_clock_frame_header(anchor))
+                .map(|header| header.output)
+        }) else {
+            return;
+        };
+        let (core_id, filter, id) = (self.core_id, hex::encode(&self.filter), hex::encode(attempt.session));
+        let (generation, epoch, frame, stalled) = (session.generation, attempt.epoch, attempt.inclusion, attempt.stalled);
+        let members = session.members.len();
+        // A submission is always published; other outcomes are logged when
+        // the reporter says so (once per cause and epoch, refusals bounded).
+        if let Outcome::Submit { built, bytes, added, voters } = attempt.outcome {
+            info!(core_id, filter = %filter, session = %id, generation, epoch, frame, stalled_frames = stalled,
+                reported = built.members.len(), new_members = added, voters, members, views = ?built.views(),
+                bytes = bytes.len(),
+                "submitting presence report: the session's GLOBAL tip stands still; carrying its members' \
+                 notarize votes to GLOBAL");
+            publish(bytes);
+            return;
+        }
+        if !attempt.log {
+            return;
+        }
+        match attempt.outcome {
+            Outcome::Submit { .. } => {}
+            Outcome::Refused { built, error, refusals, since } => warn!(core_id, filter = %filter, session = %id,
+                generation, epoch, frame, reported = built.members.len(), views = ?built.views(), %error,
+                refusals_this_epoch = refusals, first_refused_frame = since, scope = "local", action = "report",
+                "presence report not submitted: it fails the check GLOBAL applies although its session and anchors \
+                 are in place; this node's votes, headers or anchor outputs disagree with GLOBAL's rules, a defect to \
+                 report with this line (repeated at every {}th refusal of an epoch)",
+                crate::presence_reports::REFUSALS_LOGGED_EVERY),
+            Outcome::Wait(wait) => info!(core_id, filter = %filter, session = %id, generation, epoch, frame,
+                stalled_frames = stalled, cause = wait.cause(), ends = wait.ends(),
+                anchor = match wait { crate::presence_reports::Wait::Anchor { anchor } => anchor, _ => 0 },
+                "presence report waits: an expected condition on this node; nothing to fix, it is retried until \
+                 the named event ends it"),
+            Outcome::Held(hold) => {
+                let (reason, latest_global_frame) = match hold {
+                    Hold::EpochEnd { landing } => ("it would land in the last frames of the epoch, where its \
+                        anchors could expire; resumes next epoch", landing.saturating_sub(1)),
+                    Hold::ViewBehind { latest } => ("this node's committed GLOBAL view trails its latest GLOBAL \
+                        frame into another epoch; resumes when the view catches up", latest),
+                };
+                info!(core_id, filter = %filter, session = %id, generation, epoch, frame, stalled_frames = stalled,
+                    committed_frame = view.frame(), latest_global_frame, reason,
+                    "presence report held: the session's GLOBAL tip stands still, but a report now could reach \
+                     GLOBAL in another epoch than its anchors")
+            }
+            Outcome::NotDesignated { designated: Some(designated), voters } => info!(core_id, filter = %filter,
+                session = %id, generation, epoch, frame, stalled_frames = stalled, designated_member = designated,
+                voters, members,
+                "presence report: the session's GLOBAL tip stands still; another member submits this epoch \
+                 (the first in this epoch's order of members whose votes this node verified)"),
+            Outcome::NotDesignated { designated: None, .. } => info!(core_id, filter = %filter, session = %id,
+                generation, epoch, frame, stalled_frames = stalled, members,
+                "presence report: the session's GLOBAL tip stands still, but no notarize vote of its recent views \
+                 verified on this node, its own included, so it cannot tell which member submits; an expected wait \
+                 that ends when a member's notarize vote reaches this node"),
+            Outcome::NothingEligible(why) => info!(core_id, filter = %filter, session = %id, generation, epoch, frame,
+                stalled_frames = stalled, committed_frame = view.frame(), sealed_proposals = why.sealed,
+                anchored_ahead = why.anchored_ahead, anchored_before = why.anchored_before,
+                without_verified_votes = why.unverified,
+                "presence report: this member submits this epoch, but no recent proposal can be reported yet; \
+                 anchored_ahead means this node's committed GLOBAL view trails its committee's anchors, \
+                 anchored_before that the proposals predate this epoch"),
+        }
+    }
+
+    /// While the running session lacks a voting quorum, the members never
+    /// heard on the vote channel ([`SilentMembers`]), each with its prover
+    /// registry allocation on this shard: an Active prover that never takes
+    /// part, or a Leaving one still counted, is a remote problem only its
+    /// prover or the protocol can fix (public issue #748).
+    fn log_silent_members(&mut self, voters: usize, quorum: usize) {
+        let now = std::time::Instant::now();
+        let report = self.session_silent.report(voters >= quorum, now);
+        let (Some(report), Some(session)) = (report, self.cw_session.as_ref()) else {
+            return;
+        };
+        let observed_secs = self.session_silent.observed(now).as_secs();
+        let never_voted = match report {
+            SilentReport::Cleared => {
+                info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
+                    members = session.members.len(), quorum, voters, observed_secs,
+                    "app session no longer below quorum with members that never voted");
+                return;
+            }
+            SilentReport::NeverVoted(never_voted) => never_voted,
+        };
+        let global_frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
+            .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
+        let describe = |&(member, heard): &(usize, bool)| {
+            let address = session.members.get(member)
+                .and_then(|key| quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(key).ok());
+            let prover = address.and_then(|address| self.prover_registry.get_prover_info(&address).ok().flatten());
+            let allocation = prover.as_ref()
+                .map(|prover| prover.allocations.iter().find(|a| a.confirmation_filter == self.filter));
+            let registry = match allocation {
+                Some(Some(a)) => format!("{:?}/{:?} join {} leave {} last active {}", a.status,
+                    a.effective_status(global_frame), a.join_frame_number, a.leave_frame_number,
+                    a.last_active_frame_number),
+                Some(None) => "no allocation on this shard".to_string(),
+                None => "not registered".to_string(),
+            };
+            let address = address.map_or_else(|| "unknown".to_string(), |address| hex::encode(&address[..8]));
+            // The peer ID is what an operator knows their node by.
+            let peer = session.members.get(member)
+                .map_or_else(|| "unknown".to_string(), |key| bs58::encode(quil_p2p::peer_id_from_falcon_pubkey(key)).into_string());
+            format!("{member} {address} peer {peer} {registry}{}", if heard { "" } else { ", sent nothing" })
+        };
+        let listed = never_voted.iter().take(SILENT_LISTED).map(describe).collect::<Vec<_>>().join("; ");
+        warn!(core_id = self.core_id, filter = hex::encode(&self.filter), generation = session.generation,
+            members = session.members.len(), quorum, voters, never_voted = never_voted.len(),
+            silent = never_voted.iter().filter(|&&(_, heard)| !heard).count(), observed_secs, global_frame,
+            never_voted_members = %listed, unlisted = never_voted.len().saturating_sub(SILENT_LISTED), scope = "peer",
+            action = "nothing to fix on this node; ends when they vote or a successor session replaces the committee; \
+                report it with this line if it persists",
+            "app session below voting quorum: members never voted");
     }
 
     /// Timer-driven session upkeep: republish an unrecorded closing certificate,
@@ -4032,6 +4345,7 @@ impl AppConsensusEngine {
                     }
                 }
                 self.cw_session = None;
+                self.session_liveness = None;
                 self.execution.state("handoff", "awaiting successor");
             }
             // Logged above, at its transitions.
@@ -4338,6 +4652,7 @@ impl AppConsensusEngine {
     ) -> Result<crate::cw_app_seams::AppConsensusCwHandle> {
         let filter = self.filter.clone();
         let app_address = self.app_address.clone();
+        self.start_context = StartContext::default();
         self.discard_legacy_history_if_due().await?;
         self.drop_discarded_finalized_records()?;
         self.rewind_past_fence()?;
@@ -4393,6 +4708,16 @@ impl AppConsensusEngine {
             }
             None => None,
         };
+        // Whether this worker is seated is known now; the gates below may
+        // refuse first, and a worker that is not seated never passes them all.
+        self.start_context.generation = session.as_ref().map(|session| session.generation);
+        if let Some(session) = session.as_ref() {
+            self.start_context.members = Some(session.members.len());
+            let my_pk = bls_signer.public_key();
+            if !session.members.iter().any(|key| key.as_slice() == my_pk) {
+                self.start_context.not_seated = Some(self.local_seat(Some(session)));
+            }
+        }
         let mut session_genesis = None;
         if let Some(session) = session.as_ref() {
             let session_id = session.id()?;
@@ -4421,16 +4746,32 @@ impl AppConsensusEngine {
                         &source, manager.clone(), self.clock_store.clone(), self.frame_validator(),
                         self.delivery_frame_source.as_ref(), checkpoint.frame,
                     ).await {
-                        Ok(true) => {}
+                        Ok(true) => {
+                            let key = ("history-headers", session.filter.clone(), session.generation, source.generation);
+                            if let Some(Report::Recovered { attempts, duration }) = bounded_warn::succeeded(&key, 0) {
+                                info!(
+                                    filter = hex::encode(&session.filter), session_generation = session.generation,
+                                    predecessor_generation = source.generation, through = checkpoint.frame,
+                                    attempts, duration_secs = duration.as_secs(),
+                                    "predecessor outgoing history recovered from certified headers after earlier failures",
+                                );
+                            }
+                        }
                         Ok(false) => {
                             return Err(QuilError::ExecutionUnavailable(
                                 "predecessor outgoing history recovery is still in progress".into()));
                         }
-                        Err(error) => warn!(
-                            filter = hex::encode(&session.filter), session_generation = session.generation,
-                            predecessor_generation = source.generation, through = checkpoint.frame, %error,
-                            "predecessor outgoing history could not be recovered from certified headers",
-                        ),
+                        Err(error) => {
+                            let key = ("history-headers", session.filter.clone(), session.generation, source.generation);
+                            if let Some(Report::Failing { attempts, duration }) = bounded_warn::failed(&key, 0) {
+                                warn!(
+                                    filter = hex::encode(&session.filter), session_generation = session.generation,
+                                    predecessor_generation = source.generation, through = checkpoint.frame,
+                                    attempts, ongoing_secs = duration.as_secs(), %error,
+                                    "predecessor outgoing history could not be recovered from certified headers",
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -4438,9 +4779,22 @@ impl AppConsensusEngine {
             // no carry, a header this member cannot fetch), an archive's
             // records can, accepted only against the sealed history root.
             if let Some(fetch) = self.outgoing_history_source.as_ref() {
-                if let Err(error) = crate::app_handoff::recover_sealed_history(global, &shard, session, fetch).await {
-                    warn!(filter = hex::encode(&session.filter), session_generation = session.generation, %error,
-                        "predecessor outgoing history could not be recovered from an archive");
+                let key = ("history-archive", session.filter.clone(), session.generation, 0);
+                match crate::app_handoff::recover_sealed_history(global, &shard, session, fetch).await {
+                    Ok(_) => {
+                        if let Some(Report::Recovered { attempts, duration }) = bounded_warn::succeeded(&key, 0) {
+                            info!(filter = hex::encode(&session.filter), session_generation = session.generation,
+                                attempts, duration_secs = duration.as_secs(),
+                                "predecessor outgoing history recovered from an archive after earlier failures");
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(Report::Failing { attempts, duration }) = bounded_warn::failed(&key, 0) {
+                            warn!(filter = hex::encode(&session.filter), session_generation = session.generation,
+                                attempts, ongoing_secs = duration.as_secs(), %error,
+                                "predecessor outgoing history could not be recovered from an archive");
+                        }
+                    }
                 }
             }
             if let Err(error) = crate::app_handoff::successor_state_matches(global, &shard, self.clock_store.as_ref(), session) {
@@ -4501,12 +4855,15 @@ impl AppConsensusEngine {
         self.cw_committee_fp = Some(Self::committee_fp(&member_pubkeys));
         let my_sk = bls_signer.private_key().to_vec();
         let my_pk = bls_signer.public_key().to_vec();
+        self.start_context.members = Some(member_pubkeys.len());
         if !member_pubkeys.iter().any(|key| key == &my_pk) {
-            let frame = self.global_anchor_store.get_latest_global_clock_frame().ok()
-                .and_then(|f| f.header.map(|h| h.frame_number)).unwrap_or(0);
-            if self.prover_registry.get_prover_info(&self.local_prover_address).ok().flatten()
-                .is_some_and(|p| p.allocations.iter().any(|a| a.confirmation_filter == filter
-                    && a.effective_status(frame) == quil_types::consensus::EffectiveStatus::Joining)) {
+            let seat = match self.start_context.not_seated.take() {
+                Some(seat) => seat,
+                None => self.local_seat(session.as_ref()),
+            };
+            let joining = seat.joining();
+            self.start_context.not_seated = Some(seat);
+            if joining {
                 return Err(QuilError::ExecutionUnavailable("awaiting allocation activation".into()));
             }
         }
@@ -4524,9 +4881,32 @@ impl AppConsensusEngine {
         if let (Some(session), Some(manager)) = (session.as_ref(), self.execution_engine.clone()) {
             let validator = self.frame_validator();
             let recovered = crate::app_history_recovery::recover(
-                session, manager, self.clock_store.clone(), validator,
+                session, manager.clone(), self.clock_store.clone(), validator.clone(),
                 self.delivery_frame_source.as_ref(), self.last_materialized_frame,
             ).await;
+            // The next header's accumulator field reads the carry window below
+            // the tip, which a member that joined at the tip never executed.
+            if matches!(recovered, Ok(true)) {
+                let cursor = self.last_materialized_frame;
+                match crate::app_history_recovery::recover_carry_window(
+                    &filter, manager, self.clock_store.clone(), validator,
+                    self.delivery_frame_source.as_ref(), cursor,
+                ).await {
+                    Ok((0, None)) => {}
+                    Ok((frames, None)) => info!(core_id = self.core_id, filter = hex::encode(&filter), cursor, frames,
+                        "recovered the accumulator records of the carry window below this member's tip from certified headers"),
+                    Ok((frames, Some(frame))) => warn!(core_id = self.core_id, filter = hex::encode(&filter), cursor, frames,
+                        unresolved_frame = frame, scope = "this node",
+                        action = "this member declines the next header's accumulator field until a heartbeat or a later \
+                            carried report decides it; report it with this line if the shard stalls",
+                        "accumulator carry window below this member's tip not decided by certified headers"),
+                    Err(error) => warn!(core_id = self.core_id, filter = hex::encode(&filter), cursor, %error,
+                        scope = "this node",
+                        action = "this member declines the next header's accumulator field; the next consensus start retries; \
+                            report it with this line if the shard stalls",
+                        "accumulator carry window below this member's tip not recovered"),
+                }
+            }
             // A completed batch may have corrected old records. No host is
             // running yet, so its parent/history cache will be built afresh.
             self.frame_outflows.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -4864,11 +5244,14 @@ impl AppConsensusEngine {
                             })
                     }) as quil_cw_consensus::handoff::automaton::ParentReader
                 });
-                let liveness = Arc::new(quil_cw_consensus::adapters::Liveness::default());
+                let liveness = new_session_liveness();
                 self.session_liveness = Some(liveness.clone());
                 self.cw_inbound = [0; 4];
                 self.cw_unresolved = 0;
                 self.cw_nonmember = 0;
+                self.session_silent.restart(
+                    session.members.len(), session.members.binary_search(&my_pk).ok(), std::time::Instant::now(),
+                );
                 Some(crate::cw_app_seams::SessionHost {
                     session: session.clone(),
                     read_parent: source.reader(),
@@ -5619,6 +6002,8 @@ impl AppConsensusEngine {
 
     /// Flush spillover messages into the collector for the target rank.
     /// Called on rank change (ControlEventAppNewHead equivalent).
+    // Retained legacy rank-transition helper; simplex handles current transitions.
+    #[allow(dead_code)]
     fn flush_deferred_messages(&mut self, target_rank: u64) {
         if let Some(messages) = self.message_spillover.remove(&target_rank) {
             for msg in messages {
@@ -6142,6 +6527,8 @@ fn bootstrap_frame_route(
 /// Verify the structural relation between an archive anchor N and its required
 /// predecessor N-1. Certificate validation remains in `install_archive_bootstrap`;
 /// keeping this portion pure makes the fail-closed bootstrap boundary testable.
+// Test adapter without session genesis; production uses the context-aware variant.
+#[allow(dead_code)]
 fn validate_archive_sync_anchor(
     filter: &[u8],
     materialized: u64,
@@ -6176,6 +6563,8 @@ fn validate_archive_sync_anchor_in(
     Ok(height)
 }
 
+// Test adapter without session genesis; production uses the context-aware variant.
+#[allow(dead_code)]
 fn archive_bootstrap_predecessor_height(
     app_address: &[u8],
     anchor: &quil_types::proto::global::AppShardFrame,
@@ -6339,14 +6728,22 @@ mod consensus_wire_ext {
     /// `protobufs.AppShardProposal.FromCanonicalBytes`.
     pub struct AppShardProposal {
         /// Decoded `AppShardFrame` header.
+        // Decoded wire fields retained for compatibility; consumers use state_bytes.
+        #[allow(dead_code)]
         pub header: CanonicalFrameHeader,
         /// Inner state bytes (the AppShardFrame canonical-bytes payload).
         /// We keep them around in case downstream wants to re-cache the
         /// raw proposal bytes by rank.
         #[allow(dead_code)]
         pub state_bytes: Vec<u8>,
+        // Retained decoded certificate.
+        #[allow(dead_code)]
         pub parent_qc: WireQc,
+        // Retained decoded timeout certificate.
+        #[allow(dead_code)]
         pub prior_tc: Option<WireTc>,
+        // Retained decoded vote.
+        #[allow(dead_code)]
         pub vote: WireVote,
     }
 
@@ -6633,7 +7030,7 @@ pub(crate) fn build_requests_root_check(
             // A retiring shard finalizes only empty frames near its flip
             // (crate::shard_drain).
             if !frame.requests.is_empty()
-                && drain.as_ref().is_some_and(|drain| drain.drains_at(header.global_frame_number))
+                && drain.as_ref().is_some_and(|drain| drain.drains_at(header.global_frame_number, crate::shard_drain::DrainRole::Voter))
             {
                 tracing::warn!(frame = header.frame_number, anchor = header.global_frame_number,
                     "cw app verify: a retiring shard's proposal carries requests inside its drain");
@@ -7740,15 +8137,37 @@ async fn storage_history_unavailable(
     // Every certified frame taken from an archive or the local store passes
     // here before it is validated: a legacy certificate today's registry no
     // longer reproduces gets its historical committees first.
-    if let Err(error) = validator.prepare_historical_committee(frame).await {
-        warn!(frame = frame.header.as_ref().map_or(0, |header| header.frame_number), %error,
-            "historical committee of a certified legacy frame unavailable");
-    }
-    match validator.prepare_storage_history(frame).await {
-        Ok(()) => None,
+    // One condition per shard, whichever of its frames is being checked.
+    let (filter, number) = frame.header.as_ref().map_or((Vec::new(), 0), |h| (h.address.clone(), h.frame_number));
+    let committee_key = ("history-committee", filter.clone(), 0, 0);
+    match validator.prepare_historical_committee(frame).await {
+        Ok(()) => {
+            if let Some(Report::Recovered { attempts, duration }) = bounded_warn::succeeded(&committee_key, number) {
+                info!(filter = hex::encode(&filter), frame = number, attempts, duration_secs = duration.as_secs(),
+                    "historical committee of a certified legacy frame available after earlier failures");
+            }
+        }
         Err(error) => {
-            warn!(frame = frame.header.as_ref().map_or(0, |header| header.frame_number), %error,
-                "storage history of a certified frame unavailable; validating its certificate without possession");
+            if let Some(Report::Failing { attempts, duration }) = bounded_warn::failed(&committee_key, number) {
+                warn!(filter = hex::encode(&filter), frame = number, attempts, ongoing_secs = duration.as_secs(), %error,
+                    "historical committee of a certified legacy frame unavailable");
+            }
+        }
+    }
+    let history_key = ("history-storage", filter.clone(), 0, 0);
+    match validator.prepare_storage_history(frame).await {
+        Ok(()) => {
+            if let Some(Report::Recovered { attempts, duration }) = bounded_warn::succeeded(&history_key, number) {
+                info!(filter = hex::encode(&filter), frame = number, attempts, duration_secs = duration.as_secs(),
+                    "storage history of a certified frame available after earlier failures");
+            }
+            None
+        }
+        Err(error) => {
+            if let Some(Report::Failing { attempts, duration }) = bounded_warn::failed(&history_key, number) {
+                warn!(filter = hex::encode(&filter), frame = number, attempts, ongoing_secs = duration.as_secs(), %error,
+                    "storage history of a certified frame unavailable; validating its certificate without possession");
+            }
             Some(error)
         }
     }
@@ -7892,6 +8311,481 @@ mod predecessor_block_tests {
     }
 }
 
+/// How long a start refused for this node or committed GLOBAL state lasts
+/// before it warns. As for a successor's predecessor wait
+/// ([`PREDECESSOR_BLOCKED_AFTER`]), a start that can succeed does so within
+/// a few 10 s retries and the shard syncs they request; ten minutes is about
+/// sixty refused attempts.
+const START_BLOCKED_AFTER: Duration = PREDECESSOR_BLOCKED_AFTER;
+
+/// How often a start still refused past [`START_BLOCKED_AFTER`] warns again.
+const START_BLOCKED_REPEAT: Duration = Duration::from_secs(5 * 60);
+
+/// How often an expected wait is repeated, at info. Such a wait lasts until
+/// an activation epoch or a handoff, so a repeat only shows it continues.
+const START_WAIT_REPEAT: Duration = Duration::from_secs(30 * 60);
+
+/// Refusals a block remembers as named, so two that alternate are not
+/// named again on every retry.
+const START_REFUSALS_NAMED: usize = 8;
+
+/// Whose problem a refused start is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartScope {
+    /// This worker's state, allocation or setup.
+    ThisNode,
+    /// The shard's committed GLOBAL state, for every worker of the shard.
+    CommittedGlobal,
+    /// A lifecycle wait that a named event ends.
+    ExpectedWait,
+}
+
+impl StartScope {
+    fn label(self) -> &'static str {
+        match self {
+            StartScope::ThisNode => "this node",
+            StartScope::CommittedGlobal => "committed GLOBAL state",
+            StartScope::ExpectedWait => "expected wait",
+        }
+    }
+}
+
+/// A worker whose key is not in the committee it would start, and this
+/// prover's allocations for the shard as the registry has them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotSeated {
+    allocations: Vec<quil_types::consensus::EffectiveStatus>,
+    global_frame: u64,
+    /// Set when sessions require a release this prover has not recorded.
+    release: Option<ReleaseShortfall>,
+}
+
+/// A recorded release below the minimum a session's committee required:
+/// none when this prover's confirms recorded none (sent before the release
+/// frame, by an older build or without a release).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReleaseShortfall {
+    recorded: Option<quil_execution::global_intrinsic::prover_release::Release>,
+    minimum: quil_execution::global_intrinsic::prover_release::Release,
+    /// The GLOBAL frame the minimum was evaluated at.
+    frame: u64,
+    /// Whether that is the frame the session was scheduled at, or, for a
+    /// session no request authorized, the latest GLOBAL frame.
+    scheduled: bool,
+}
+
+impl ReleaseShortfall {
+    fn of(
+        recorded: Option<quil_execution::global_intrinsic::prover_release::Release>,
+        minimum: quil_execution::global_intrinsic::prover_release::Release,
+        frame: u64,
+        scheduled: bool,
+    ) -> Option<Self> {
+        recorded.is_none_or(|release| release < minimum).then_some(Self { recorded, minimum, frame, scheduled })
+    }
+}
+
+impl NotSeated {
+    fn joining(&self) -> bool {
+        self.allocations.contains(&quil_types::consensus::EffectiveStatus::Joining)
+    }
+
+    fn describe(&self) -> String {
+        if self.allocations.is_empty() {
+            return "none".into();
+        }
+        self.allocations.iter().map(|status| format!("{status:?}")).collect::<Vec<_>>().join(",")
+    }
+}
+
+/// What a start attempt learned before it was refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StartContext {
+    /// The committee session it resolved from committed GLOBAL state.
+    generation: Option<u64>,
+    members: Option<usize>,
+    not_seated: Option<NotSeated>,
+}
+
+/// A refused start, as an operator reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartRefusal {
+    /// What makes two refusals the same: digit runs folded, so a frame or
+    /// count advancing in an error is not a new refusal.
+    key: String,
+    reason: String,
+    scope: StartScope,
+    action: &'static str,
+    /// Whether it repeats while it lasts; a predecessor wait has its own
+    /// warning ([`PredecessorBlock`]).
+    repeats: bool,
+}
+
+fn refusal_key(reason: &str) -> String {
+    let mut key = String::with_capacity(reason.len());
+    let mut digits = false;
+    for c in reason.chars() {
+        if c.is_ascii_digit() {
+            if !digits {
+                key.push('#');
+            }
+            digits = true;
+        } else {
+            key.push(c);
+            digits = false;
+        }
+    }
+    key
+}
+
+/// Why a start was refused, whose problem it is and what ends it. A worker
+/// whose key is not in the committee is named as such whichever gate
+/// refused it first: it cannot start before a session seats it.
+fn classify_start_refusal(error: &QuilError, context: &StartContext) -> StartRefusal {
+    use quil_types::consensus::EffectiveStatus;
+    use StartScope::{CommittedGlobal, ExpectedWait, ThisNode};
+    let text = error.to_string();
+    let refusal = |key: String, reason: String, scope: StartScope, action: &'static str, repeats: bool| {
+        StartRefusal { key: refusal_key(&key), reason, scope, action, repeats }
+    };
+    if expected_admission_wait(error) || context.not_seated.as_ref().is_some_and(NotSeated::joining) {
+        let reason = "this worker's allocation is joining".to_string();
+        return refusal(reason.clone(), reason, ExpectedWait,
+            "it starts when the allocation activates at its activation epoch", true);
+    }
+    if let Some(seat) = context.not_seated.as_ref() {
+        if let Some(shortfall) = seat.release {
+            let recorded = shortfall.recorded.map_or_else(|| "none".to_string(), |release| release.to_string());
+            let at = if shortfall.scheduled {
+                "the frame its session was scheduled"
+            } else {
+                "the latest GLOBAL frame; its session records no scheduling frame"
+            };
+            return refusal(
+                "not seated: release below minimum".into(),
+                format!("not seated: release below minimum: this worker's allocation records release {recorded}, \
+                    below the minimum {} the release eligibility schedule sets at GLOBAL frame {} ({at}; \
+                    this build: {}); start refused with: {text}",
+                    shortfall.minimum,
+                    shortfall.frame,
+                    quil_execution::global_intrinsic::prover_release::Release::current()),
+                ExpectedWait,
+                "this build records its release with the allocation's next epoch reconfirm, and a session formed \
+                    after that seats it; check this worker's prover confirmation (dispatch and publish in the \
+                    master log) if it persists past the next epoch",
+                true,
+            );
+        }
+        let action = if seat.allocations.is_empty() {
+            "the prover registry holds no allocation of this prover for the shard: check this worker's \
+                allocation (join and confirm); it starts only once a committee session seats it"
+        } else if seat.allocations.contains(&EffectiveStatus::ExpiredEpoch) {
+            "this worker's allocation missed its epoch reconfirm: check this worker's prover confirmation \
+                (dispatch and publish in the master log); it starts only once a later session seats it"
+        } else {
+            "this worker is not a member of the shard's committee session: check the reconfirm and renewal \
+                of this worker's allocation; it starts only once a later session seats it"
+        };
+        return refusal(
+            format!("not seated: {}", seat.describe()),
+            format!("this worker's prover is not seated in the committee (allocation status {} at GLOBAL frame {}); \
+                start refused with: {text}", seat.describe(), seat.global_frame),
+            ThisNode, action, true,
+        );
+    }
+    let (scope, action, repeats) = if text.contains("awaiting its successor") || text.contains("head session is retired") {
+        (ExpectedWait, "this shard's session is sealed or retired; it starts when GLOBAL authorizes its successor session", true)
+    } else if text.contains("first session not authorized yet") || text.contains("shard has no session") {
+        (ExpectedWait, "it starts when GLOBAL authorizes a committee session for this shard", true)
+    } else if text.contains("to look through") {
+        (CommittedGlobal, "the shard's session chain in committed GLOBAL state is not resolvable by this build, \
+            for every worker of the shard; report it to the maintainer with this line", true)
+    } else if predecessor_recovery_pending(error) {
+        (ThisNode, "the shard sync recovers the predecessor's sealed state from an archive; \
+            the 'successor session blocked' warning tracks it", false)
+    } else if text.contains("authenticated GLOBAL state") {
+        (ThisNode, "this worker has no authenticated GLOBAL state yet; it waits for its master's GLOBAL sync; \
+            check the master if it persists", true)
+    } else if matches!(error, QuilError::ExecutionUnavailable(_)) {
+        (ThisNode, "this worker's shard state is not ready (sync or recovery in progress); it retries every 10 s; \
+            report it with this line if it persists", true)
+    } else {
+        (ThisNode, "this worker refuses the start on its local state; it retries every 10 s; \
+            report it with this line if it persists", true)
+    };
+    refusal(text.clone(), text, scope, action, repeats)
+}
+
+/// What to log for a refused start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartLog {
+    /// The first refusal of a block, or one not yet named in it: info.
+    Refused,
+    /// The block continues: a warning unless it is an expected wait.
+    Continues { blocked: Duration, warn: bool },
+}
+
+/// Consensus refused a start, from the first refusal to the next start.
+#[derive(Default)]
+struct StartBlock {
+    since: Option<std::time::Instant>,
+    /// The first refusal that is not an expected wait.
+    owned_since: Option<std::time::Instant>,
+    logged: Option<std::time::Instant>,
+    current: Option<String>,
+    named: VecDeque<String>,
+}
+
+impl StartBlock {
+    /// A start refused at `now`: name a refusal not yet named in this block;
+    /// repeat one that is not an expected wait once refusals of that kind
+    /// have lasted [`START_BLOCKED_AFTER`], every [`START_BLOCKED_REPEAT`];
+    /// repeat an expected wait every [`START_WAIT_REPEAT`].
+    fn observe(&mut self, now: std::time::Instant, refusal: &StartRefusal) -> Option<StartLog> {
+        let since = *self.since.get_or_insert(now);
+        let expected = refusal.scope == StartScope::ExpectedWait;
+        if !expected {
+            self.owned_since.get_or_insert(now);
+        }
+        let changed = self.current.as_deref() != Some(refusal.key.as_str());
+        if changed {
+            self.current = Some(refusal.key.clone());
+            if !self.named.contains(&refusal.key) {
+                if self.named.len() == START_REFUSALS_NAMED {
+                    self.named.pop_front();
+                }
+                self.named.push_back(refusal.key.clone());
+                self.logged = Some(now);
+                return Some(StartLog::Refused);
+            }
+        }
+        if !refusal.repeats {
+            return None;
+        }
+        let (from, after, every) = if expected {
+            (since, START_WAIT_REPEAT, START_WAIT_REPEAT)
+        } else {
+            (self.owned_since.unwrap_or(since), START_BLOCKED_AFTER, START_BLOCKED_REPEAT)
+        };
+        if now.saturating_duration_since(from) < after
+            || self.logged.is_some_and(|at| now.saturating_duration_since(at) < every)
+        {
+            return None;
+        }
+        self.logged = Some(now);
+        Some(StartLog::Continues { blocked: now.saturating_duration_since(since), warn: !expected })
+    }
+
+    /// Consensus started at `now`: how long it was refused, if it was.
+    fn started(&mut self, now: std::time::Instant) -> Option<Duration> {
+        let since = self.since?;
+        *self = StartBlock::default();
+        Some(now.saturating_duration_since(since))
+    }
+}
+
+#[cfg(test)]
+mod start_block_tests {
+    use super::*;
+    use quil_types::consensus::EffectiveStatus;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    fn refusal(error: QuilError) -> StartRefusal {
+        classify_start_refusal(&error, &StartContext::default())
+    }
+
+    fn unready(what: &str) -> StartRefusal {
+        refusal(QuilError::ExecutionUnavailable(what.into()))
+    }
+
+    fn joining() -> StartRefusal {
+        unready("awaiting allocation activation")
+    }
+
+    fn committee_build_failed() -> QuilError {
+        QuilError::Consensus("app CW committee build failed (this node's key not in the active set?)".into())
+    }
+
+    /// The first refusal is named at once; the same one again, on every
+    /// 10 s retry, is not, until it has lasted the threshold.
+    #[test]
+    fn the_first_refusal_is_named_and_the_same_one_stays_quiet() {
+        let start = std::time::Instant::now();
+        let mut block = StartBlock::default();
+        let gap = unready("covered shard data is not staged");
+        assert_eq!(block.observe(start, &gap), Some(StartLog::Refused));
+        for tick in 1..60u64 {
+            assert_eq!(block.observe(start + Duration::from_secs(10 * tick), &gap), None, "tick {tick}");
+        }
+    }
+
+    /// A lasting refusal warns at the threshold with its duration, then once
+    /// per repeat interval.
+    #[test]
+    fn a_lasting_refusal_warns_after_the_threshold_and_then_every_interval() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let gap = unready("covered shard data is not staged");
+        block.observe(at(0), &gap);
+        assert_eq!(block.observe(at(9), &gap), None);
+        assert_eq!(block.observe(at(10), &gap), Some(StartLog::Continues { blocked: MINUTE * 10, warn: true }));
+        assert_eq!(block.observe(at(11), &gap), None);
+        assert_eq!(block.observe(at(14), &gap), None);
+        assert_eq!(block.observe(at(15), &gap), Some(StartLog::Continues { blocked: MINUTE * 15, warn: true }));
+    }
+
+    /// A different refusal is named again; an advancing number is not a
+    /// different refusal, and one already named that comes back is not
+    /// named again.
+    #[test]
+    fn a_changed_refusal_is_named_again_but_an_alternating_one_is_not() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let behind = unready("generation zero starts at the legacy tip 10; materialized through 4");
+        let further = unready("generation zero starts at the legacy tip 10; materialized through 7");
+        let diverged = refusal(QuilError::Consensus(
+            "local outgoing history differs from the predecessor's sealed history".into()));
+        assert_eq!(block.observe(at(0), &behind), Some(StartLog::Refused));
+        assert_eq!(block.observe(at(1), &further), None, "the same refusal, further along");
+        assert_eq!(block.observe(at(2), &diverged), Some(StartLog::Refused));
+        assert_eq!(block.observe(at(3), &behind), None, "already named in this block");
+        assert_eq!(block.observe(at(4), &diverged), None);
+        assert_eq!(block.observe(at(12), &diverged), Some(StartLog::Continues { blocked: MINUTE * 12, warn: true }));
+    }
+
+    /// An expected wait never warns; it repeats at info on its own interval.
+    #[test]
+    fn an_expected_wait_repeats_at_info_only() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let wait = joining();
+        assert_eq!(wait.scope, StartScope::ExpectedWait);
+        assert_eq!(block.observe(at(0), &wait), Some(StartLog::Refused));
+        assert_eq!(block.observe(at(10), &wait), None);
+        assert_eq!(block.observe(at(29), &wait), None);
+        assert_eq!(block.observe(at(30), &wait), Some(StartLog::Continues { blocked: MINUTE * 30, warn: false }));
+        assert_eq!(block.observe(at(45), &wait), None);
+        assert_eq!(block.observe(at(60), &wait), Some(StartLog::Continues { blocked: MINUTE * 60, warn: false }));
+    }
+
+    /// After an expected wait, the warning threshold runs from the first
+    /// refusal that is not one; the duration logged is the whole block.
+    #[test]
+    fn the_warning_threshold_counts_from_the_first_refusal_this_node_owns() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let gap = unready("covered shard data is not staged");
+        block.observe(at(0), &joining());
+        assert_eq!(block.observe(at(120), &gap), Some(StartLog::Refused));
+        assert_eq!(block.observe(at(125), &gap), None);
+        assert_eq!(block.observe(at(129), &gap), None);
+        assert_eq!(block.observe(at(130), &gap), Some(StartLog::Continues { blocked: MINUTE * 130, warn: true }));
+    }
+
+    /// A predecessor wait is named once; its repeats are the successor
+    /// warning's.
+    #[test]
+    fn a_predecessor_wait_leaves_its_repeats_to_the_successor_warning() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let wait = unready("predecessor outgoing history recovery is still in progress");
+        assert!(!wait.repeats);
+        assert_eq!(block.observe(at(0), &wait), Some(StartLog::Refused));
+        assert_eq!(block.observe(at(10), &wait), None);
+        assert_eq!(block.observe(at(60), &wait), None);
+    }
+
+    /// A start ends a block with its duration, once; a start never refused
+    /// says nothing; a later block is named afresh.
+    #[test]
+    fn a_start_names_how_long_it_was_blocked_only_after_a_block() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = StartBlock::default();
+        let gap = unready("covered shard data is not staged");
+        assert_eq!(block.started(at(0)), None, "never refused");
+        block.observe(at(1), &gap);
+        assert_eq!(block.started(at(7)), Some(MINUTE * 6));
+        assert_eq!(block.started(at(8)), None, "named once");
+        assert_eq!(block.observe(at(9), &gap), Some(StartLog::Refused), "a later block is named afresh");
+    }
+
+    /// A refusal says whose problem it is: a worker the committee does not
+    /// seat, whichever gate refused it; a joining one waits; a session chain
+    /// no build resolves is committed GLOBAL state.
+    #[test]
+    fn a_refusal_names_whose_problem_it_is() {
+        let lapsed = StartContext {
+            generation: Some(19),
+            members: Some(4),
+            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::ExpiredEpoch], global_frame: 1234, release: None }),
+        };
+        let seat = classify_start_refusal(&committee_build_failed(), &lapsed);
+        assert_eq!(seat.scope, StartScope::ThisNode);
+        assert!(seat.reason.contains("not seated") && seat.reason.contains("ExpiredEpoch"), "{}", seat.reason);
+        assert!(seat.action.contains("reconfirm"), "{}", seat.action);
+        let earlier = classify_start_refusal(
+            &QuilError::ExecutionUnavailable("covered shard data is not staged".into()), &lapsed);
+        assert!(earlier.reason.contains("not seated"), "{}", earlier.reason);
+        assert_eq!(earlier.key, seat.key, "the gate that refused first does not change the refusal");
+
+        let unseated_joining = StartContext {
+            not_seated: Some(NotSeated { allocations: vec![EffectiveStatus::Joining], global_frame: 1, release: None }),
+            ..StartContext::default()
+        };
+        assert_eq!(classify_start_refusal(&committee_build_failed(), &unseated_joining).scope, StartScope::ExpectedWait);
+        assert!(!refusal(committee_build_failed()).reason.contains("not seated"), "no committee read, no seat claim");
+
+        let look_through = unready("app committee session: too many sessions sealed at their base to look through");
+        assert_eq!(look_through.scope, StartScope::CommittedGlobal);
+        assert!(look_through.action.contains("maintainer"), "{}", look_through.action);
+        let sealed = refusal(QuilError::Consensus("app committee session is sealed; awaiting its successor".into()));
+        assert_eq!(sealed.scope, StartScope::ExpectedWait);
+        let retired = refusal(QuilError::Consensus("app committee session unavailable: head session is retired".into()));
+        assert_eq!(retired.scope, StartScope::ExpectedWait);
+        assert_eq!(joining().scope, StartScope::ExpectedWait);
+    }
+
+    /// A worker sessions do not seat for its recorded release says so, with
+    /// both releases, as an expected wait for its next reconfirm.
+    #[test]
+    fn a_seat_refused_for_its_release_names_both_releases() {
+        use quil_execution::global_intrinsic::prover_release::Release;
+        let minimum = Release { version: [2, 1, 0], patch: 25, subpatch: 90 };
+        assert_eq!(ReleaseShortfall::of(Some(minimum), minimum, 7, true), None, "the minimum is seated");
+        assert_eq!(ReleaseShortfall::of(Some(Release { subpatch: 91, ..minimum }), minimum, 7, true), None);
+        let older = Release { subpatch: 89, ..minimum };
+        for (recorded, scheduled) in [(None, true), (Some(older), false)] {
+            let shortfall = ReleaseShortfall::of(recorded, minimum, 777, scheduled).expect("below the minimum");
+            let context = StartContext {
+                not_seated: Some(NotSeated {
+                    allocations: vec![EffectiveStatus::Active], global_frame: 1234, release: Some(shortfall),
+                }),
+                ..StartContext::default()
+            };
+            let seat = classify_start_refusal(&committee_build_failed(), &context);
+            assert_eq!(seat.scope, StartScope::ExpectedWait);
+            assert!(seat.repeats);
+            assert!(seat.reason.starts_with("not seated: release below minimum"), "{}", seat.reason);
+            let recorded = recorded.map_or_else(|| "none".to_string(), |release| release.to_string());
+            assert!(seat.reason.contains(&format!("records release {recorded},")), "{}", seat.reason);
+            assert!(seat.reason.contains(&format!("minimum {minimum} the release eligibility schedule sets at GLOBAL frame 777")),
+                "{}", seat.reason);
+            assert_eq!(seat.reason.contains("the frame its session was scheduled"), scheduled, "{}", seat.reason);
+            assert!(seat.action.contains("reconfirm"), "{}", seat.action);
+            let earlier = classify_start_refusal(
+                &QuilError::ExecutionUnavailable("covered shard data is not staged".into()), &context);
+            assert_eq!(earlier.key, seat.key, "one refusal, whichever gate refused first");
+        }
+    }
+}
+
 /// A certified frame, with its possession proof when `retained`.
 fn validate_certified_frame(
     validator: &BlsAppFrameValidator,
@@ -7932,6 +8826,208 @@ fn session_view_behind(committed_frame: u64, latest_global_frame: u64, epoch_fra
     latest_global_frame.saturating_sub(committed_frame) > epoch_frames
 }
 
+/// Simplex's vote channel (`cw_app_seams` routes channels 0/1/2 as
+/// vote/certificate/resolver).
+const VOTE_CHANNEL: u64 = 0;
+
+/// How long a session is observed before members are named as never voting.
+const SILENT_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// How often unchanged non-voting members are named again.
+const SILENT_REPEAT: Duration = Duration::from_secs(30 * 60);
+
+/// Non-voting members named in one line; the rest are counted.
+const SILENT_LISTED: usize = 32;
+
+/// Which members of one session's host this node heard from, and on the vote
+/// channel, so the members that never voted can be named while the session
+/// lacks a quorum.
+#[derive(Default)]
+struct SilentMembers {
+    /// When the host started; `None` before any session ran.
+    since: Option<std::time::Instant>,
+    /// This member's own index: its votes are not received.
+    me: Option<usize>,
+    /// Per member: heard at all, and heard on the vote channel.
+    heard: Vec<(bool, bool)>,
+    /// The non-voters last named, and when.
+    named: Option<(Vec<(usize, bool)>, std::time::Instant)>,
+    /// Named since the session last had a quorum.
+    open: bool,
+}
+
+/// What [`SilentMembers::report`] names.
+#[derive(Debug, PartialEq, Eq)]
+enum SilentReport {
+    /// Members never heard on the vote channel, each with whether it was
+    /// heard at all.
+    NeverVoted(Vec<(usize, bool)>),
+    /// Named non-voters no longer keep the session below quorum: it has one,
+    /// or every member voted.
+    Cleared,
+}
+
+impl SilentMembers {
+    fn restart(&mut self, members: usize, me: Option<usize>, now: std::time::Instant) {
+        *self = Self { since: Some(now), me, heard: vec![(false, false); members], ..Self::default() };
+    }
+
+    fn record(&mut self, member: usize, channel: u64) {
+        if let Some((any, votes)) = self.heard.get_mut(member) {
+            *any = true;
+            *votes |= channel == VOTE_CHANNEL;
+        }
+    }
+
+    fn observed(&self, now: std::time::Instant) -> Duration {
+        self.since.map_or(Duration::ZERO, |since| now.duration_since(since))
+    }
+
+    /// What to log at `now`: nothing until the session was observed for
+    /// [`SILENT_AFTER`] (nothing heard yet is not silence) or while it has a
+    /// quorum; the non-voters when first known, when they change, and every
+    /// [`SILENT_REPEAT`] while they persist; and once that they cleared.
+    fn report(&mut self, quorate: bool, now: std::time::Instant) -> Option<SilentReport> {
+        if self.since.is_none() || self.observed(now) < SILENT_AFTER {
+            return None;
+        }
+        let never_voted: Vec<_> = self.heard.iter().enumerate()
+            .filter_map(|(member, &(any, votes))| (Some(member) != self.me && !votes).then_some((member, any)))
+            .collect();
+        if quorate || never_voted.is_empty() {
+            return std::mem::take(&mut self.open).then_some(SilentReport::Cleared);
+        }
+        // A quorum that comes and goes does not name the same members sooner.
+        let unchanged = self.named.as_ref()
+            .is_some_and(|(named, at)| *named == never_voted && now.duration_since(*at) < SILENT_REPEAT);
+        if unchanged {
+            return None;
+        }
+        self.open = true;
+        self.named = Some((never_voted.clone(), now));
+        Some(SilentReport::NeverVoted(never_voted))
+    }
+}
+
+#[cfg(test)]
+mod silent_member_tests {
+    use super::*;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// Nothing heard is not silence until the session was observed for a
+    /// while; this member and a quorate session are never reported.
+    #[test]
+    fn non_voters_are_named_only_once_the_session_was_observed() {
+        let start = std::time::Instant::now();
+        let mut silent = SilentMembers::default();
+        assert_eq!(silent.report(false, start + MINUTE * 60), None, "no session ran");
+        silent.restart(3, Some(0), start);
+        assert_eq!(silent.report(false, start + MINUTE * 4), None, "not yet observed");
+        assert_eq!(silent.report(true, start + MINUTE * 5), None, "quorate");
+        assert_eq!(
+            silent.report(false, start + MINUTE * 5),
+            Some(SilentReport::NeverVoted(vec![(1, false), (2, false)])),
+        );
+    }
+
+    /// Unchanged non-voters are named again only half an hour later, a
+    /// change at once; their end is named once, and a quorum that comes and
+    /// goes does not repeat them sooner.
+    #[test]
+    fn non_voters_are_named_on_change_and_every_half_hour() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut silent = SilentMembers::default();
+        silent.restart(4, Some(0), start);
+        silent.record(1, VOTE_CHANNEL);
+        silent.record(2, crate::cw_app_seams::CW_APP_BLOCK_CHANNEL);
+        assert_eq!(silent.report(false, at(5)), Some(SilentReport::NeverVoted(vec![(2, true), (3, false)])));
+        assert_eq!(silent.report(false, at(6)), None);
+        silent.record(3, crate::cw_app_seams::CW_APP_RESOLVER_CHANNEL);
+        let heard = || Some(SilentReport::NeverVoted(vec![(2, true), (3, true)]));
+        assert_eq!(silent.report(false, at(7)), heard());
+        assert_eq!(silent.report(false, at(36)), None);
+        assert_eq!(silent.report(false, at(37)), heard());
+        assert_eq!(silent.report(true, at(38)), Some(SilentReport::Cleared));
+        assert_eq!(silent.report(true, at(39)), None);
+        assert_eq!(silent.report(false, at(40)), None, "named three minutes ago");
+        assert_eq!(silent.report(false, at(67)), heard());
+        silent.record(2, VOTE_CHANNEL);
+        silent.record(3, VOTE_CHANNEL);
+        assert_eq!(silent.report(false, at(68)), Some(SilentReport::Cleared), "every member voted");
+    }
+}
+
+/// How often a shard head past its session fence that cannot be rewound
+/// locally is warned about again while it lasts. It lasts until the shard
+/// state is replaced, so a repeat only shows it continues.
+const UNREWINDABLE_FENCE_REPEAT: Duration = Duration::from_secs(30 * 60);
+
+/// A shard head past its session fence that cannot be rewound locally, from
+/// the first rewind check that found it to the first that did not.
+#[derive(Default)]
+struct UnrewindableFenceBlock {
+    since: Option<std::time::Instant>,
+    /// When it was last warned about, and for which filter and reason.
+    logged: Option<(std::time::Instant, Vec<u8>, &'static str)>,
+}
+
+impl UnrewindableFenceBlock {
+    /// Found at `now` on `filter` for `reason`: how long it has lasted, when
+    /// it is new, its filter or reason changed, or [`UNREWINDABLE_FENCE_REPEAT`]
+    /// passed since the last warning; otherwise `None`.
+    fn observe(&mut self, now: std::time::Instant, filter: &[u8], reason: &'static str) -> Option<Duration> {
+        let since = *self.since.get_or_insert(now);
+        if self.logged.as_ref().is_some_and(|(at, logged_filter, logged_reason)| {
+            logged_filter.as_slice() == filter && *logged_reason == reason
+                && now.saturating_duration_since(*at) < UNREWINDABLE_FENCE_REPEAT
+        }) {
+            return None;
+        }
+        self.logged = Some((now, filter.to_vec(), reason));
+        Some(now.saturating_duration_since(since))
+    }
+
+    /// No longer found at `now`: how long it lasted, if it was.
+    fn cleared(&mut self, now: std::time::Instant) -> Option<Duration> {
+        let since = self.since?;
+        *self = UnrewindableFenceBlock::default();
+        Some(now.saturating_duration_since(since))
+    }
+}
+
+#[cfg(test)]
+mod unrewindable_fence_block_tests {
+    use super::*;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+    const FILTER: [u8; 32] = [0x02; 32];
+
+    /// Named when first found and when its reason changes; the same one, on
+    /// every 10 s retry, only every repeat interval, with its whole duration.
+    #[test]
+    fn an_unrewindable_fence_is_named_once_then_repeated_at_the_interval() {
+        let start = std::time::Instant::now();
+        let at = |minutes: u32| start + MINUTE * minutes;
+        let mut block = UnrewindableFenceBlock::default();
+        let missing = "no local frame at the fence";
+        assert_eq!(block.observe(at(0), &FILTER, missing), Some(Duration::ZERO));
+        for tick in 1..180u64 {
+            assert_eq!(block.observe(start + Duration::from_secs(10 * tick), &FILTER, missing), None, "tick {tick}");
+        }
+        assert_eq!(block.observe(at(30), &FILTER, missing), Some(MINUTE * 30));
+        assert_eq!(block.observe(at(31), &FILTER, missing), None);
+        let pruned = "fence state not retained locally";
+        assert_eq!(block.observe(at(32), &FILTER, pruned), Some(MINUTE * 32), "a changed reason");
+        assert_eq!(block.observe(at(33), &FILTER, pruned), None);
+        assert_eq!(block.observe(at(34), &[0x03; 32], pruned), Some(MINUTE * 34), "another filter");
+        assert_eq!(block.cleared(at(40)), Some(MINUTE * 40));
+        assert_eq!(block.cleared(at(41)), None, "named once");
+        assert_eq!(block.observe(at(50), &FILTER, pruned), Some(Duration::ZERO), "a new block");
+    }
+}
+
 #[cfg(test)]
 mod session_view_lag_tests {
     use super::*;
@@ -7950,6 +9046,60 @@ mod session_view_lag_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A successor whose start waits on its predecessor's state takes the
+    /// next recovery turn, though its recovery queued before the refusal.
+    #[tokio::test]
+    async fn a_blocked_successor_start_moves_its_queued_recovery_first() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let (events, _received) = mpsc::unbounded_channel();
+        let private = [7; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+        let deps = AppEngineDeps {
+            delivery_frame_source: None,
+            clock_store: clock, global_anchor_store: None, global_hypergraph: None,
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            local_prover_address: vec![1; 32], local_bls_pubkey: vec![],
+            bls_signer: Box::new(quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap()),
+            reward_greedy: false, min_active_provers_for_propose: 1,
+            coverage_publish: None, hypergraph: None, storage_source_hypergraph: None, topology: None,
+            execution_engine: None, inclusion_prover: None, kv_db: None,
+            app_consensus_cw: false, db_config: Default::default(), unified_cutover_hook: None,
+        };
+        let (mut engine, handle) =
+            AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
+        let turns: &'static crate::recovery_turns::RecoveryTurns =
+            Box::leak(Box::new(crate::recovery_turns::RecoveryTurns::new(1)));
+        let held = turns.acquire(Arc::new(AtomicBool::new(false))).await;
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let run = |name: &'static str, blocked: Arc<AtomicBool>| {
+            let order = order.clone();
+            tokio::spawn(async move {
+                let _turn = turns.acquire(blocked).await;
+                order.lock().unwrap().push(name);
+            })
+        };
+        let other = run("other", Arc::new(AtomicBool::new(false)));
+        tokio::task::yield_now().await;
+        let successor_flag = handle.execution_record().successor_blocked_flag();
+        let successor = run("successor", successor_flag.clone());
+        tokio::task::yield_now().await;
+        let pending = QuilError::ExecutionUnavailable("predecessor outgoing history recovery is still in progress".into());
+        engine.note_predecessor_block(Some(&pending), std::time::Instant::now());
+        assert!(successor_flag.load(Ordering::Relaxed));
+        drop(held);
+        other.await.unwrap();
+        successor.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), ["successor", "other"]);
+        engine.note_predecessor_block(None, std::time::Instant::now());
+        assert!(!successor_flag.load(Ordering::Relaxed), "a started session no longer goes first");
+    }
+
     #[test]
     fn expected_admission_wait_is_distinct_from_preparation_failure() {
         assert!(expected_admission_wait(&QuilError::ExecutionUnavailable("awaiting allocation activation".into())));
@@ -9116,6 +10266,82 @@ mod tests {
             assert!(db.get(&quil_store::encoding::clock_shard_staged_key(staged, 2)).unwrap().is_none(),
                 "no staged copy outlives the seal");
         }
+    }
+
+    /// Without a presence report frame (mainnet), the tick's presence step
+    /// returns before reading anything; once one is set, it looks.
+    #[tokio::test]
+    async fn presence_reports_read_nothing_until_their_frame_is_set() {
+        use quil_execution::global_intrinsic::handoff;
+        use quil_types::crypto::Signer as _;
+        let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+        let (events, _received) = mpsc::unbounded_channel();
+        let private = [7; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&private).unwrap();
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let global = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        global.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+        let mut members: Vec<Vec<u8>> =
+            (0..3).map(|_| quil_crypto::FalconSigner::generate().public_key().to_vec()).collect();
+        members.sort();
+        let session = quil_cw_consensus::handoff::Session {
+            chain_id: [7; 32], filter: vec![0x61; 32], generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(), base_frame: 0,
+            authorization: [0; 32], members: members.clone(),
+        };
+        let state = quil_execution::hypergraph_state::HypergraphState::new(global.clone());
+        handoff::initialize(&state, 1, &session).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        global.commit_with_global_cursor(1, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+        let deps = AppEngineDeps {
+            delivery_frame_source: None,
+            clock_store: clock.clone(), global_anchor_store: None, global_hypergraph: Some(global),
+            prover_registry: Arc::new(crate::test_support::TestProverRegistry::new()),
+            frame_prover: Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            message_collector: Arc::new(MessageCollector::new()),
+            fee_manager: Arc::new(crate::fees::InMemoryDynamicFeeManager::new(10)),
+            local_prover_address: vec![1; 32], local_bls_pubkey: members[0].clone(),
+            bls_signer: Box::new(quil_crypto::Ed448Signer::from_bytes(&private, &public).unwrap()),
+            reward_greedy: false, min_active_provers_for_propose: 1,
+            coverage_publish: Some(Arc::new(|_: Vec<u8>| {})), hypergraph: None, storage_source_hypergraph: None,
+            topology: None, execution_engine: None, inclusion_prover: None, kv_db: None,
+            app_consensus_cw: false, db_config: Default::default(), unified_cutover_hook: None,
+        };
+        let (mut engine, _handle) =
+            AppConsensusEngine::new(1, quil_execution::domains::QUIL_TOKEN.to_vec(), deps, events);
+        engine.cw_session = Some(session);
+        engine.session_liveness = Some(Arc::new(quil_cw_consensus::adapters::Liveness::default()));
+        handoff::set_presence_report_frame_for_thread(Some(u64::MAX));
+        engine.report_presence();
+        assert_eq!(engine.presence.attempts(), 0, "unset: nothing is read");
+        handoff::set_presence_report_frame_for_thread(Some(0));
+        engine.report_presence();
+        assert_eq!(engine.presence.attempts(), 1, "set: the session is looked at");
+        handoff::set_presence_report_frame_for_thread(Some(u64::MAX));
+        // A running session GLOBAL no longer has as its filter's head is
+        // retired, and its liveness (votes and the host's bodies) with it.
+        let mut stale = engine.cw_session.clone().unwrap();
+        stale.members.remove(0);
+        engine.cw_session = Some(stale);
+        engine.maintain_committee_session().await;
+        assert!(engine.cw_session.is_none(), "retired");
+        assert!(engine.session_liveness.is_none(), "its liveness is released");
+    }
+
+    /// A session host's liveness keeps vote signatures only while the
+    /// presence report frame is set.
+    #[test]
+    fn a_session_keeps_vote_signatures_only_while_presence_reports_are_set() {
+        use quil_execution::global_intrinsic::handoff;
+        handoff::set_presence_report_frame_for_thread(Some(u64::MAX));
+        assert!(!new_session_liveness().keeps_votes());
+        handoff::set_presence_report_frame_for_thread(Some(10_000));
+        assert!(new_session_liveness().keeps_votes(), "set, even ahead");
+        handoff::set_presence_report_frame_for_thread(Some(u64::MAX));
     }
 
     #[tokio::test]

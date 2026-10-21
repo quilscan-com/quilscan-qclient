@@ -212,6 +212,10 @@ pub fn proto_message_request_to_canonical_inner_bytes(
             crate::global_intrinsic::handoff::SealSubmission::from_canonical_bytes(bytes)?;
             Ok(bytes.clone())
         }
+        Inner::PresenceReport(bytes) => {
+            crate::global_intrinsic::handoff::presence::PresenceReport::from_canonical_bytes(bytes)?;
+            Ok(bytes.clone())
+        }
         Inner::Join(p) => {
             crate::global_intrinsic::conversions::prover_join_from_proto(p)
                 .to_canonical_bytes()
@@ -402,6 +406,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // the fixture sets the deprecated `filter` explicitly
     fn proto_to_canonical_confirm_matches_handcrafted() {
         use quil_types::proto::global as pb;
         use quil_types::proto::keys as keys_pb;
@@ -416,6 +421,7 @@ mod tests {
             }),
             filters: vec![vec![0x10u8; 8]],
             leaf_roots: vec![],
+            release: None,
         };
         let bundle_pb = pb::MessageBundle {
             requests: vec![pb::MessageRequest {
@@ -437,6 +443,7 @@ mod tests {
             }),
             filters: vec![vec![0x10u8; 8]],
             leaf_roots: Vec::new(),
+            release: None,
         };
         let confirm_inner = confirm_handcrafted.to_canonical_bytes().unwrap();
         let bundle_handcrafted = CanonicalMessageBundle {

@@ -73,7 +73,7 @@ fn once_snapshot_uses_official_allocation_fields_and_exact_units() {
 
     let mut model = Model::new();
     model.process_refresh_data(Some(node), Some(shards), Some(workers));
-    let json: serde_json::Value = serde_json::from_str(&format_snapshot(&model).unwrap()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&format_snapshot(&mut model).unwrap()).unwrap();
 
     assert_eq!(json["schema_version"], 1);
     assert_eq!(json["worker_info_available"], true);
@@ -135,7 +135,7 @@ fn once_snapshot_includes_the_tui_execution_detail_for_each_allocation() {
 
     let mut model = Model::new();
     model.process_refresh_data(Some(node), Some(shards), Some(workers));
-    let json: serde_json::Value = serde_json::from_str(&format_snapshot(&model).unwrap()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&format_snapshot(&mut model).unwrap()).unwrap();
     let row = &json["allocations"][0];
 
     assert_eq!(
@@ -168,10 +168,12 @@ fn once_snapshot_distinguishes_unknown_heads_and_rewards_from_zero_size() {
     let mut model = Model::new();
     model.process_refresh_data(Some(node), Some(shards), None);
 
-    let json: serde_json::Value = serde_json::from_str(&format_snapshot(&model).unwrap()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&format_snapshot(&mut model).unwrap()).unwrap();
     let row = &json["allocations"][0];
     assert_eq!(json["worker_info_available"], false);
     assert_eq!(row["size_bytes"], "0");
+    assert_eq!(row["tui"]["compact"]["cells"]["size"], "0.0");
+    assert_eq!(row["tui"]["expanded"]["cells"]["reward"], "-");
     assert_eq!(row["peer_materialized_frame"], 0);
     assert!(row["peer_head"].is_null());
     assert_eq!(row["peer_state"], "unknown");
@@ -244,7 +246,7 @@ fn telemetry_model() -> Model {
         }],
         ..Default::default()
     };
-    let shards = GetShardInfoResponse {
+    let mut shards = GetShardInfoResponse {
         frame_number: 1000,
         allocation_scoring_strategy: "reward".into(),
         shards: vec![ShardRewardInfo {
@@ -275,6 +277,10 @@ fn telemetry_model() -> Model {
         }],
         ..Default::default()
     };
+    let mut available = shards.shards[0].clone();
+    available.filter = vec![0x34; 32];
+    available.is_allocated = false;
+    shards.shards.push(available);
     let workers = WorkerInfoResponse {
         worker_info: vec![WorkerInfo {
             core_id: 3,
@@ -289,6 +295,8 @@ fn telemetry_model() -> Model {
                     planned_leaves: 456,
                     source: "192.0.2.1:8340".into(),
                     attempts: 2,
+                    failures_by_class: [("connect".into(), u32::MAX), ("archive_state".into(), 7)].into(),
+                    longest_permit_wait_ms: u64::MAX,
                     ..Default::default()
                 }),
                 seal: Some(SessionSeal {
@@ -307,14 +315,16 @@ fn telemetry_model() -> Model {
         }],
     };
     let mut model = Model::new();
-    model.process_refresh_data(Some(node), Some(shards), Some(workers));
+    super::update::apply_msg(&mut model, Msg::DataRefresh {
+        node_info: Some(node), shard_info: Some(shards), worker_info: Some(workers), err: None,
+    });
     model
 }
 
 #[test]
 fn sync_requirement_snapshot_adds_node_telemetry_without_changing_schema_or_units() {
-    let model = telemetry_model();
-    let text = format_snapshot(&model).unwrap();
+    let mut model = telemetry_model();
+    let text = format_snapshot(&mut model).unwrap();
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
     let row = &json["allocations"][0];
     assert_eq!(json["schema_version"], 1);
@@ -357,13 +367,13 @@ fn sync_requirement_snapshot_preserves_full_execution_phases_and_cache_freshness
     for state in ["waiting", "syncing", "serving", "closing", "handoff"] {
         model.allocations[0].execution.as_mut().unwrap().state = state.into();
         let json: serde_json::Value =
-            serde_json::from_str(&format_snapshot(&model).unwrap()).unwrap();
+            serde_json::from_str(&format_snapshot(&mut model).unwrap()).unwrap();
         assert_eq!(json["allocations"][0]["local_execution_state"], state);
     }
     let execution = model.allocations[0].execution.as_mut().unwrap();
     execution.state = "blocked".into();
     execution.blocker = "awaiting successor".into();
-    let json: serde_json::Value = serde_json::from_str(&format_snapshot(&model).unwrap()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&format_snapshot(&mut model).unwrap()).unwrap();
     assert_eq!(json["allocations"][0]["local_execution_state"], "handoff");
     assert_eq!(json["allocations"][0]["execution_severity"], "normal");
     assert!(json["allocations"][0]["execution_detail"]
@@ -371,7 +381,7 @@ fn sync_requirement_snapshot_preserves_full_execution_phases_and_cache_freshness
         .unwrap()
         .contains("Reason: awaiting successor"));
     model.worker_snapshot_received.as_mut().unwrap().0 -= std::time::Duration::from_secs(500);
-    let json: serde_json::Value = serde_json::from_str(&format_snapshot(&model).unwrap()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&format_snapshot(&mut model).unwrap()).unwrap();
     assert_eq!(json["allocations"][0]["local_execution_state"], "cached");
     assert_eq!(json["allocations"][0]["execution_severity"], "normal");
 }
@@ -388,27 +398,29 @@ fn sync_requirement_observed_rewards_distinguish_missing_stale_and_zero() {
         .as_mut()
         .unwrap()
         .advanced_frames = 0;
-    let snapshot = |model: &Model| {
+    let snapshot = |model: &mut Model| {
         serde_json::from_str::<serde_json::Value>(&format_snapshot(model).unwrap()).unwrap()
     };
     assert_eq!(
-        snapshot(&model)["allocations"][0]["observed_reward_windows"]["60m"]["units_per_day"],
+        snapshot(&mut model)["allocations"][0]["observed_reward_windows"]["60m"]["units_per_day"],
         "0"
     );
+    assert_eq!(snapshot(&mut model)["allocations"][0]["tui"]["compact"]["cells"]["reward"], "0.0/1000.0/8640.0");
     model
         .node_app_cadence
         .get_mut(&filter)
         .unwrap()
         .last_observed_unix_seconds -= 91;
-    assert!(snapshot(&model)["allocations"][0]["observed_reward_windows"]["60m"].is_null());
+    assert!(snapshot(&mut model)["allocations"][0]["observed_reward_windows"]["60m"].is_null());
+    assert_eq!(snapshot(&mut model)["allocations"][0]["tui"]["expanded"]["cells"]["reward"], "-/-/8640.0");
     model.node_app_cadence.clear();
-    assert!(snapshot(&model)["allocations"][0]["observed_reward_windows"]["60m"].is_null());
+    assert!(snapshot(&mut model)["allocations"][0]["observed_reward_windows"]["60m"].is_null());
     assert_eq!(
-        snapshot(&model)["allocations"][0]["reward_quil_per_day"],
+        snapshot(&mut model)["allocations"][0]["reward_quil_per_day"],
         "8640.0"
     );
     model.allocations[0].ring = super::model::UNKNOWN_REWARD_RING;
-    assert!(snapshot(&model)["allocations"][0]["reward_quil_per_day"].is_null());
+    assert!(snapshot(&mut model)["allocations"][0]["reward_quil_per_day"].is_null());
 }
 
 #[test]
@@ -419,4 +431,58 @@ fn sync_requirement_empty_listener_is_local() {
         listen_grpc_multiaddr: String::new(),
     };
     assert!(!opts.is_light_node());
+}
+
+#[test]
+fn once_presentation_restores_caller_display_options() {
+    let mut model = telemetry_model();
+    model.compact_actions = false;
+    model.color_coding = false;
+    model.reward_windows = 4;
+    model.interval_windows = 1;
+    model.global_interval_windows = 2;
+    model.global_fields = 2;
+    model.hidden_header_kpis.insert("Peer ID".into());
+    let options = (model.compact_actions, model.compact_units, model.color_coding,
+        model.reward_windows, model.interval_windows, model.global_interval_windows, model.global_fields);
+    let hidden = model.hidden_header_kpis.clone();
+    let output: serde_json::Value = serde_json::from_str(&format_snapshot(&mut model).unwrap()).unwrap();
+    assert_eq!(options, (model.compact_actions, model.compact_units, model.color_coding,
+        model.reward_windows, model.interval_windows, model.global_interval_windows, model.global_fields));
+    assert_eq!(model.hidden_header_kpis, hidden);
+    for mode in ["compact", "expanded"] {
+        let heading = output["tui"][mode]["allocations"]["heading"].as_array().unwrap();
+        assert!(!heading.iter().any(|text| text.as_str().unwrap().contains("Claimable")));
+        assert!(output["tui"][mode]["header"].as_array().unwrap().iter().any(|text| text.as_str().unwrap().starts_with("Peer")));
+    }
+}
+
+#[test]
+fn once_from_refresh_exports_successful_rpc_header_instead_of_connecting() {
+    let node = NodeInfoResponse { peer_id: "fresh-peer".into(), last_received_frame: 1000,
+        current_epoch: 1, epoch_length_frames: 720, ..Default::default() };
+    let json: serde_json::Value = serde_json::from_str(&from_refresh(Msg::DataRefresh {
+        node_info: Some(node), shard_info: None, worker_info: None, err: None,
+    }, Msg::ShardRefresh(Ok(GetShardInfoResponse::default()))).unwrap()).unwrap();
+    assert_eq!(json["tui"]["compact"]["header"].as_array().unwrap().len(), 7);
+    for (mode, rpc) in [("compact", "RPC: ✓"), ("expanded", "RPC: connected")] {
+        let header = json["tui"][mode]["header"].as_array().unwrap();
+        assert!(header.iter().any(|text| text == rpc), "{header:?}");
+        assert!(!header.iter().any(|text| text.as_str().unwrap().contains("Connecting")));
+    }
+}
+
+#[test]
+fn sync_requirement_snapshot_exports_recovery_failure_classes() {
+    let mut model = telemetry_model();
+    let value: serde_json::Value = serde_json::from_str(&format_snapshot(&mut model).unwrap()).unwrap();
+    let recovery = &value["allocations"][0]["execution"]["recovery"];
+    assert_eq!(recovery["failures_by_class"], serde_json::json!({"connect": u32::MAX, "archive_state": 7}));
+}
+
+#[test]
+fn sync_requirement_snapshot_exports_longest_permit_wait_without_precision_loss() {
+    let mut model = telemetry_model();
+    let value: serde_json::Value = serde_json::from_str(&format_snapshot(&mut model).unwrap()).unwrap();
+    assert_eq!(value["allocations"][0]["execution"]["recovery"]["longest_permit_wait_ms"].as_u64(), Some(u64::MAX));
 }

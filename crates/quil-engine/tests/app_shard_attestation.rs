@@ -33,7 +33,6 @@
 //!     verified). Catches multi-proof packing + per-signer challenge
 //!     derivation regressions.
 
-use std::sync::Arc;
 
 use quil_crypto::{FalconKeyConstructor, WesolowskiFrameProver};
 use quil_execution::global_intrinsic::frame_header::FrameHeader;
@@ -139,6 +138,7 @@ fn build_committee(
                 leave_confirm_frame_number: 0,
                 leave_reject_frame_number: 0,
                 last_active_frame_number: 0,
+                last_signed_frame_number: 0,
                 epoch: 0,
                 ring: 0,
                 vertex_address: Vec::new(),

@@ -11,7 +11,7 @@ use tonic::transport::Channel;
 
 use quil_keys::FileKeyManager;
 use quil_types::proto::global::{
-    message_request::Request, MessageRequest, ProverConfirm, ProverLeave, ProverPause,
+    message_request::Request, MessageRequest, ProverLeave, ProverPause,
     ProverReject, ProverResume,
 };
 use quil_types::proto::node::{
@@ -27,7 +27,8 @@ use super::util::{filters_label, trunc_hex};
 type Client = NodeServiceClient<Channel>;
 
 /// Per-call deadline for every NodeService RPC (mirrors `rpcTimeout`).
-const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const SHARD_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longer ceiling for RequestJoin (VDF on the node side).
 const JOIN_RPC_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -112,9 +113,17 @@ async fn fetch_rpc_data(
 }
 
 /// Fetch fast node/worker status independently of archive-backed shard sizes.
-pub async fn fetch_data(mut client: Client) -> Msg {
+pub async fn fetch_data(client: Client) -> Msg {
+    fetch_data_with_timeouts(client, RPC_TIMEOUT, RPC_TIMEOUT).await
+}
+
+pub(super) async fn fetch_data_with_timeouts(
+    mut client: Client,
+    node_timeout: Duration,
+    worker_timeout: Duration,
+) -> Msg {
     let node_info = match tokio::time::timeout(
-        RPC_TIMEOUT,
+        node_timeout,
         client.get_node_info(tonic::Request::new(GetNodeInfoRequest::default())),
     )
     .await
@@ -133,7 +142,7 @@ pub async fn fetch_data(mut client: Client) -> Msg {
         }
     };
     let worker_info = match tokio::time::timeout(
-        RPC_TIMEOUT,
+        worker_timeout,
         client.get_worker_info(tonic::Request::new(GetWorkerInfoRequest::default())),
     )
     .await
@@ -151,19 +160,45 @@ pub async fn fetch_data(mut client: Client) -> Msg {
 
 /// Archive fallback can exceed the fast status deadline. Keep it bounded,
 /// report failure explicitly, and allow node status to refresh meanwhile.
-pub async fn fetch_shards(mut client: Client) -> Msg {
+pub async fn fetch_shards(client: Client) -> Msg {
+    let result = fetch_shard_info(client, SHARD_RPC_TIMEOUT).await;
+    Msg::ShardRefresh(match result {
+        Ok(shards) => Ok(shards),
+        Err(ShardReadError::Rpc(e)) => Err(format!("Shard data unavailable: {e}")),
+        Err(ShardReadError::Timeout) => Err("Shard data timed out after 60s; retrying".into()),
+    })
+}
+
+pub(super) async fn fetch_shards_with_timeout(client: Client, timeout: Duration) -> Msg {
+    let result = fetch_shard_info(client, timeout).await;
+    Msg::ShardRefresh(match result {
+        Ok(shards) => Ok(shards),
+        Err(ShardReadError::Rpc(e)) => Err(format!("Shard data unavailable: {e}")),
+        Err(ShardReadError::Timeout) => Err(format!("GetShardInfo: timed out after {timeout:?}")),
+    })
+}
+
+enum ShardReadError {
+    Rpc(tonic::Status),
+    Timeout,
+}
+
+async fn fetch_shard_info(
+    mut client: Client,
+    timeout: Duration,
+) -> Result<quil_types::proto::node::GetShardInfoResponse, ShardReadError> {
     let result = tokio::time::timeout(
-        Duration::from_secs(60),
+        timeout,
         client.get_shard_info(tonic::Request::new(GetShardInfoRequest {
             include_all: true,
         })),
     )
     .await;
-    Msg::ShardRefresh(match result {
+    match result {
         Ok(Ok(r)) => Ok(r.into_inner()),
-        Ok(Err(e)) => Err(format!("Shard data unavailable: {e}")),
-        Err(_) => Err("Shard data timed out after 60s; retrying".into()),
-    })
+        Ok(Err(e)) => Err(ShardReadError::Rpc(e)),
+        Err(_) => Err(ShardReadError::Timeout),
+    }
 }
 
 /// `getFrameNumber` — current frame from GetShardInfo (the sign frame).
@@ -210,7 +245,7 @@ pub async fn do_join(mut client: Client, filters: Vec<Vec<u8>>) -> Msg {
 // ── Signed lifecycle ops (Leave / Confirm / Reject / Pause / Resume) ─────
 
 /// Build the signed `MessageRequest` for a lifecycle action.
-#[allow(deprecated)] // ProverConfirm/ProverReject.filter is a deprecated wire field.
+#[allow(deprecated)] // ProverReject.filter is a deprecated wire field.
 fn build_request(
     km: &FileKeyManager,
     action: &str,
@@ -226,16 +261,7 @@ fn build_request(
                 public_key_signature_bls48581: Some(sig),
             })
         }
-        "Confirm" => {
-            let sig = sign::confirm_sig(km, filters, frame)?;
-            Request::Confirm(ProverConfirm {
-                filter: Vec::new(),
-                frame_number: frame,
-                public_key_signature_bls48581: Some(sig),
-                filters: filters.to_vec(),
-                leaf_roots: Vec::new(),
-            })
-        }
+        "Confirm" => Request::Confirm(sign::confirm_op(km, filters, frame)?),
         "Reject" => {
             let sig = sign::reject_sig(km, filters, frame)?;
             Request::Reject(ProverReject {

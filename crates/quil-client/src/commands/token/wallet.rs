@@ -176,7 +176,7 @@ impl RecipientWallet {
     /// Check the complete framing/context before choosing a transport domain.
     /// This is not proof verification; receiving execution verifies the proof.
     fn prepare_submission(&self, bytes: Vec<u8>) -> anyhow::Result<(Vec<u8>, quil_types::proto::global::MessageRequest)> {
-        use quil_lattice_ct::confidential::{custom_mint::{self, CustomMint}, mint::Mint, mint_claim::MintClaim, pending_create::PendingCreate, pending_claim::PendingClaim, shield::Shield, transfer::Transfer};
+        use quil_lattice_ct::confidential::{custom_mint::{self, CustomMint}, mint::Mint, mint_claim::MintClaim, pending_create::PendingCreate, pending_claim::PendingClaim, transfer::Transfer};
         use quil_execution::token_engine::{TYPE_LATTICE_MINT, TYPE_LATTICE_MINT_CLAIM, TYPE_LATTICE_PENDING, TYPE_LATTICE_PENDING_CLAIM, TYPE_LATTICE_SHIELD, TYPE_LATTICE_TRANSACTION};
         let domain = quil_execution::token_intrinsic::wire::domain(&bytes)?;
         anyhow::ensure!(domain == self.application, "operation belongs to another application");
@@ -3685,7 +3685,7 @@ mod tests {
 
     #[test]
     fn coin_scan_validates_contents_and_preserves_state_on_bad_pages() {
-        use quil_lattice_ct::confidential::coin_tree::{CoinRecord, CoinTree};
+        use quil_lattice_ct::confidential::coin_tree::CoinRecord;
         use quil_types::proto::node::{ListCoinsResponse, ConfidentialCoin};
         let keys = sntrup761::Sntrup761KeyPair::generate();
         let wallet = RecipientWallet::from_keys(

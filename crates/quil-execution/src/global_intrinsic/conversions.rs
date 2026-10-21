@@ -350,6 +350,11 @@ pub fn prover_resume_to_proto(r: &ProverResume) -> pb::ProverResume {
 // ProverConfirm/Reject ↔ proto
 // =====================================================================
 
+// `filter` is deprecated in global.proto in favour of the repeated `filters`,
+// but it is still on the wire: peers that predate the change send it, and
+// dropping it here would change the encoded bytes. Carried through verbatim
+// until the field is retired from the proto.
+#[allow(deprecated)]
 pub fn prover_confirm_from_proto(pb: &pb::ProverConfirm) -> ProverConfirm {
     ProverConfirm {
         filter: pb.filter.clone(),
@@ -360,9 +365,34 @@ pub fn prover_confirm_from_proto(pb: &pb::ProverConfirm) -> ProverConfirm {
             .map(addressed_sig_from_proto),
         filters: pb.filters.clone(),
         leaf_roots: pb.leaf_roots.iter().map(confirm_leaf_roots_from_proto).collect(),
+        // As in the canonical decoder: ignored before the release frame.
+        release: pb
+            .release
+            .as_ref()
+            .filter(|_| pb.frame_number >= super::prover_release::confirm_release_frame())
+            .and_then(release_from_proto),
     }
 }
 
+/// A release outside the canonical ranges (a version other than three
+/// bytes, a patch above `u8`, a subpatch above `u16`) is none.
+pub fn release_from_proto(pb: &pb::ReleaseInfo) -> Option<super::prover_release::Release> {
+    Some(super::prover_release::Release {
+        version: <[u8; 3]>::try_from(pb.version.as_slice()).ok()?,
+        patch: u8::try_from(pb.patch_number).ok()?,
+        subpatch: u16::try_from(pb.subpatch).ok()?,
+    })
+}
+
+pub fn release_to_proto(release: &super::prover_release::Release) -> pb::ReleaseInfo {
+    pb::ReleaseInfo {
+        version: release.version.to_vec(),
+        patch_number: u32::from(release.patch),
+        subpatch: u32::from(release.subpatch),
+    }
+}
+
+#[allow(deprecated)] // see `prover_confirm_from_proto`
 pub fn prover_confirm_to_proto(c: &ProverConfirm) -> pb::ProverConfirm {
     pb::ProverConfirm {
         filter: c.filter.clone(),
@@ -373,6 +403,7 @@ pub fn prover_confirm_to_proto(c: &ProverConfirm) -> pb::ProverConfirm {
             .map(addressed_sig_to_proto),
         filters: c.filters.clone(),
         leaf_roots: c.leaf_roots.iter().map(confirm_leaf_roots_to_proto).collect(),
+        release: c.release.as_ref().map(release_to_proto),
     }
 }
 
@@ -410,6 +441,7 @@ pub fn confirm_leaf_roots_to_proto(
     }
 }
 
+#[allow(deprecated)] // see `prover_confirm_from_proto`
 pub fn prover_reject_from_proto(pb: &pb::ProverReject) -> ProverReject {
     ProverReject {
         filter: pb.filter.clone(),
@@ -422,6 +454,7 @@ pub fn prover_reject_from_proto(pb: &pb::ProverReject) -> ProverReject {
     }
 }
 
+#[allow(deprecated)] // see `prover_confirm_from_proto`
 pub fn prover_reject_to_proto(r: &ProverReject) -> pb::ProverReject {
     pb::ProverReject {
         filter: r.filter.clone(),
@@ -465,13 +498,6 @@ pub fn prover_update_to_proto(u: &ProverUpdate) -> pb::ProverUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample_addr_sig() -> AddressedSignature {
-        AddressedSignature {
-            signature: vec![0xAAu8; 666],
-            address: vec![0xBBu8; 32],
-        }
-    }
 
     fn sample_pb_addr_sig() -> keys_pb::Bls48581AddressedSignature {
         keys_pb::Bls48581AddressedSignature {
@@ -552,6 +578,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // deprecated `filter` is part of what round-trips
     fn prover_confirm_round_trip() {
         let pb = pb::ProverConfirm {
             filter: vec![0x44u8; 32],
@@ -559,6 +586,7 @@ mod tests {
             public_key_signature_bls48581: Some(sample_pb_addr_sig()),
             filters: vec![vec![0x55u8; 16], vec![0x66u8; 24]],
             leaf_roots: vec![],
+            release: None,
         };
         let c = prover_confirm_from_proto(&pb);
         let back = prover_confirm_to_proto(&c);
@@ -566,6 +594,38 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // deprecated `filter` is part of what round-trips
+    fn prover_confirm_release_round_trips_and_an_invalid_one_is_none() {
+        use super::super::prover_release::set_confirm_release_frame_for_thread;
+        let release = pb::ReleaseInfo { version: vec![2, 1, 0], patch_number: 25, subpatch: 92 };
+        let pb = pb::ProverConfirm {
+            filter: vec![],
+            frame_number: 50,
+            public_key_signature_bls48581: Some(sample_pb_addr_sig()),
+            filters: vec![vec![0x55u8; 16]],
+            leaf_roots: vec![],
+            release: Some(release.clone()),
+        };
+        for frame in [None, Some(51)] {
+            set_confirm_release_frame_for_thread(frame);
+            assert_eq!(prover_confirm_from_proto(&pb).release, None, "ignored before the release frame");
+        }
+        set_confirm_release_frame_for_thread(Some(50));
+        let c = prover_confirm_from_proto(&pb);
+        set_confirm_release_frame_for_thread(None);
+        assert_eq!(c.release, Some(super::super::prover_release::Release { version: [2, 1, 0], patch: 25, subpatch: 92 }));
+        assert_eq!(prover_confirm_to_proto(&c), pb);
+        for invalid in [
+            pb::ReleaseInfo { version: vec![2, 1], ..release.clone() },
+            pb::ReleaseInfo { patch_number: 256, ..release.clone() },
+            pb::ReleaseInfo { subpatch: 65_536, ..release.clone() },
+        ] {
+            assert_eq!(release_from_proto(&invalid), None);
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // deprecated `filter` is part of what round-trips
     fn prover_reject_round_trip() {
         let pb = pb::ProverReject {
             filter: vec![],

@@ -42,6 +42,8 @@ fn recovery_json(r: &quil_types::proto::node::ShardRecovery) -> Value {
         "source": r.source, "attempts": r.attempts, "consecutive_failures": r.consecutive_failures,
         "attempt_started_unix_ms": r.attempt_started_unix_ms, "permit_wait_ms": r.permit_wait_ms,
         "attempt_ms": r.attempt_ms, "attempt_installed_leaves": r.attempt_installed_leaves,
+        "failures_by_class": r.failures_by_class,
+        "longest_permit_wait_ms": r.longest_permit_wait_ms,
     })
 }
 
@@ -156,19 +158,23 @@ fn available_json(row: &ShardRow, model: &Model) -> Value {
     })
 }
 
-pub(super) fn format_snapshot(model: &Model) -> serde_json::Result<String> {
-    let allocations: Vec<Value> = model
-        .sorted_allocations()
-        .iter()
-        .map(|row| allocation_json(row, model))
-        .collect();
-    let available_shards: Vec<Value> = model
-        .sorted_available()
-        .iter()
-        .map(|row| available_json(row, model))
-        .collect();
+pub(super) fn format_snapshot(model: &mut Model) -> serde_json::Result<String> {
+    let allocation_rows = model.sorted_allocations();
+    let available_rows = model.sorted_available();
+    let (tui, allocation_tui, available_tui) = super::view::snapshot_presentation(model, &allocation_rows, &available_rows);
+    let allocations: Vec<Value> = allocation_rows.iter().zip(allocation_tui).map(|(row, tui)| {
+        let mut value = allocation_json(row, model);
+        value["tui"] = tui;
+        value
+    }).collect();
+    let available_shards: Vec<Value> = available_rows.iter().zip(available_tui).map(|(row, tui)| {
+        let mut value = available_json(row, model);
+        value["tui"] = tui;
+        value
+    }).collect();
     serde_json::to_string_pretty(&json!({
         "schema_version": 1,
+        "tui": tui,
         "peer_id": model.peer_id,
         "frame_number": model.frame_number,
         "last_received_frame": model.last_received_frame,
@@ -207,6 +213,10 @@ pub(super) fn from_refresh(node_refresh: Msg, shard_refresh: Msg) -> anyhow::Res
     let shard_info = shard_result.map_err(|err| anyhow::anyhow!("fetch shard data: {err}"))?;
 
     let mut model = Model::new();
-    model.process_refresh_data(Some(node_info), Some(shard_info), worker_info);
-    Ok(format_snapshot(&model)?)
+    // Enter through the same successful-refresh lifecycle as the interactive
+    // screen: freshness and first observations belong to update, not formatting.
+    super::update::apply_msg(&mut model, Msg::DataRefresh {
+        node_info: Some(node_info), shard_info: Some(shard_info), worker_info, err: None,
+    });
+    Ok(format_snapshot(&mut model)?)
 }

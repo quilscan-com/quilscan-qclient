@@ -1,9 +1,9 @@
 use base64::prelude::*;
-use std::{collections::HashMap, io::Read};
+use std::collections::HashMap;
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use ed448_goldilocks_plus::{elliptic_curve::{group::GroupEncoding, Field, Group}, subtle::ConstantTimeEq, EdwardsPoint, Scalar};
+use ed448_goldilocks_plus::{elliptic_curve::{group::GroupEncoding, Group}, subtle::ConstantTimeEq, EdwardsPoint, Scalar};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -13,6 +13,9 @@ pub enum FeldmanError {
     #[error("Invalid data: {0}")]
     InvalidData(String),
     #[error("Crypto error: {0}")]
+    // Reserved for crypto-layer failures; every current failure path maps to
+    // `InvalidData` or `WrongRound`.
+    #[allow(dead_code)]
     CryptoError(String),
 }
 
@@ -364,6 +367,8 @@ impl Feldman {
         lhs.ct_eq(&expected).into()
     }
     
+    // Accessor for embedders that drive Feldman VSS directly.
+    #[allow(dead_code)]
     pub fn scalar(&self) -> Option<&Scalar> {
         self.scalar.as_ref()
     }

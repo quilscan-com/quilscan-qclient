@@ -684,7 +684,7 @@ pub fn new_triple_ratchet(peers: &Vec<Vec<u8>>, peer_key: &Vec<u8>, identity_key
     };
 }
 
-fn metadata_to_json(ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChannelEnvelope>) -> Result<HashMap<String, String>, TripleRatchetStateAndMetadata> {
+fn metadata_to_json(_ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChannelEnvelope>) -> Result<HashMap<String, String>, TripleRatchetStateAndMetadata> {
     let mut metadata_json = HashMap::<String, String>::new();
     for (k,v) in metadata {
         let env = v.to_json();
@@ -700,7 +700,10 @@ fn metadata_to_json(ratchet_state: &String, metadata: HashMap<Vec<u8>, P2PChanne
     Ok(metadata_json)
 }
 
-fn json_to_metadata(ratchet_state_and_metadata: TripleRatchetStateAndMetadata, ratchet_state: &String) -> Result<HashMap<Vec<u8>, P2PChannelEnvelope>, TripleRatchetStateAndMetadata> {
+// Inverse of `metadata_to_json`, kept so the JSON state format stays
+// round-trippable; only the serializing half has a caller today.
+#[allow(dead_code)]
+fn json_to_metadata(ratchet_state_and_metadata: TripleRatchetStateAndMetadata, _ratchet_state: &String) -> Result<HashMap<Vec<u8>, P2PChannelEnvelope>, TripleRatchetStateAndMetadata> {
   let mut metadata = HashMap::<Vec<u8>, P2PChannelEnvelope>::new();
   for (k,v) in ratchet_state_and_metadata.metadata {
       let env = P2PChannelEnvelope::from_json(v);

@@ -19,6 +19,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub const TYPE_COMMITTEE_HANDOFF: u32 = 0x0321;
+/// A session's notarize votes as evidence of its members' presence
+/// ([`presence::PresenceReport`]).
+pub const TYPE_PRESENCE_REPORT: u32 = 0x0322;
 pub const MAX_TRANSITION_SHARDS: usize = 512;
 
 /// Second leaf of every authorization vertex. The records share the global
@@ -589,6 +592,106 @@ pub fn set_fenced_successor_eligibility_frame_for_thread(frame: Option<u64>) {
     FENCED_SUCCESSOR_ELIGIBILITY_OVERRIDE.with(|cell| cell.set(frame));
 }
 
+/// From this GLOBAL frame GLOBAL validates presence reports
+/// ([`presence::PresenceReport`]); before it every report is refused, as an
+/// older build refuses it. An accepted report changes no state yet, but the
+/// operation is consensus-affecting all the same: an older build decodes it
+/// as an empty request, so it computes another requests root for any GLOBAL
+/// frame that carries one, and every archive and GLOBAL prover must run a
+/// build with it before the frame. From the same frame GLOBAL records the
+/// frame of each session's tip advance ([`session_tip_frame`]), which an
+/// older build does not write either. Not scheduled on mainnet;
+/// `QUIL_PRESENCE_REPORT_FRAME` elsewhere, never by default.
+pub const MAINNET_PRESENCE_REPORT_FRAME: Option<u64> = None;
+
+static PRESENCE_REPORT_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static PRESENCE_REPORT_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn presence_report_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_PRESENCE_REPORT_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's presence report frame from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_presence_report_frame(network: u8) -> u64 {
+    *PRESENCE_REPORT_FRAME.get_or_init(|| {
+        presence_report_frame_for(network, std::env::var("QUIL_PRESENCE_REPORT_FRAME").ok().as_deref())
+    })
+}
+
+pub fn presence_report_frame() -> u64 {
+    if let Some(frame) = PRESENCE_REPORT_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *PRESENCE_REPORT_FRAME.get_or_init(|| {
+        std::env::var("QUIL_PRESENCE_REPORT_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the presence report frame for the calling thread only (tests).
+pub fn set_presence_report_frame_for_thread(frame: Option<u64>) {
+    PRESENCE_REPORT_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// From this GLOBAL frame GLOBAL fences a closing session that has not
+/// sealed one epoch after its closing request, instead of
+/// [`schedule::FENCE_AFTER_EPOCHS`] epochs ([`schedule::fence_due_frame`]).
+/// The request's frame selects the rule, so a request's fence is due at the
+/// same frame whenever and wherever it is evaluated, and a request made
+/// before this frame keeps the longer timeout. At GLOBAL frame 907,920
+/// members on an older build refused every closing seal, and six app
+/// committees sat closing one to three votes short for the full four epochs
+/// before their fences. Not shorter than an epoch: stale seats stay eligible
+/// until the next epoch boundary, so a successor seated sooner would take
+/// them again and be fenced again. Consensus-affecting for GLOBAL: every
+/// archive and GLOBAL prover must run a build with it before the frame. App
+/// provers date fences by the same rule when they rewind past one
+/// (`fence_rewind` in the engine), so they should too. Not scheduled on
+/// mainnet; `QUIL_EARLY_FENCE_FRAME` elsewhere, never by default.
+pub const MAINNET_EARLY_FENCE_FRAME: Option<u64> = None;
+
+static EARLY_FENCE_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static EARLY_FENCE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn early_fence_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_EARLY_FENCE_FRAME.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Fix this process's early fence frame from its network, and return it.
+/// Called at startup before any frame is processed; the first call decides.
+pub fn init_early_fence_frame(network: u8) -> u64 {
+    *EARLY_FENCE_FRAME.get_or_init(|| {
+        early_fence_frame_for(network, std::env::var("QUIL_EARLY_FENCE_FRAME").ok().as_deref())
+    })
+}
+
+pub fn early_fence_frame() -> u64 {
+    if let Some(frame) = EARLY_FENCE_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *EARLY_FENCE_FRAME.get_or_init(|| {
+        std::env::var("QUIL_EARLY_FENCE_FRAME").ok().and_then(|value| value.parse().ok()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the early fence frame for the calling thread only (tests).
+pub fn set_early_fence_frame_for_thread(frame: Option<u64>) {
+    EARLY_FENCE_OVERRIDE.with(|cell| cell.set(frame));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Active,
@@ -784,6 +887,8 @@ fn create_session(state: &HypergraphState, frame: u64, value: &Session) -> Resul
     // Once an application enters the protocol, an unregistered child/alias
     // cannot regain legacy authorization by choosing a different full filter.
     write(state, frame, b"managed-app", &value.filter[..32], &[1])?;
+    // A session that never advances its tip is timed from its creation.
+    record_tip_frame(state, frame, &id)?;
     Ok(id)
 }
 
@@ -1267,6 +1372,15 @@ pub(crate) fn activate_with(
 
 /// Authenticated source checkpoints for a successor's bootstrap. Returning
 /// records is not a local materialization/readiness verdict.
+/// The GLOBAL frame the request that authorized session `id` was scheduled
+/// at, where its committee was chosen; `None` for a session no request
+/// authorized (a first session) or without an origin record.
+pub fn scheduled_frame(state: &impl Records, id: &[u8; 32]) -> Result<Option<u64>> {
+    let Some(bytes) = read(state, b"origin", id)? else { return Ok(None) };
+    let Ok(request_id) = <[u8; 32]>::try_from(bytes.as_slice()) else { return Ok(None) };
+    Ok(request(state, &request_id)?.map(|request| request.frame))
+}
+
 pub fn origins(state: &impl Records, id: &[u8; 32]) -> Result<Vec<(Session, Checkpoint)>> {
     session(state, id)?.ok_or_else(|| invalid("bootstrap session absent"))?;
     let bytes = read(state, b"origin", id)?
@@ -1304,14 +1418,51 @@ pub fn session_tip(state: &impl Records, id: &[u8; 32]) -> Result<Option<Checkpo
         .transpose()
 }
 
-/// Advance [`session_tip`] to `tip` if it is higher.
+/// Advance [`session_tip`] to `tip` if it is higher. `frame` is the GLOBAL
+/// frame executing it, which an advance records as [`session_tip_frame`].
 pub fn record_session_tip(state: &HypergraphState, frame: u64, id: &[u8; 32], tip: &Checkpoint) -> Result<()> {
     if session_tip(state, id)?.is_some_and(|current| current.frame >= tip.frame) {
         return Ok(());
     }
     let mut bytes = Vec::new();
     tip.write(&mut bytes);
-    write(state, frame, b"tip", id, &bytes)
+    write(state, frame, b"tip", id, &bytes)?;
+    record_tip_frame(state, frame, id)
+}
+
+/// Record GLOBAL frame `frame` as [`session_tip_frame`] of `id`. Before the
+/// [`presence_report_frame`] this writes nothing, so GLOBAL's records and
+/// roots stay those of a build without it.
+fn record_tip_frame(state: &HypergraphState, frame: u64, id: &[u8; 32]) -> Result<()> {
+    if frame < presence_report_frame() {
+        return Ok(());
+    }
+    write(state, frame, b"tip-frame", id, &frame.to_be_bytes())
+}
+
+/// The GLOBAL frame that last advanced [`session_tip`] of `id`, or that
+/// created the session if its tip has not advanced since. Recorded only from
+/// the [`presence_report_frame`] on: `None` for a session neither created
+/// nor advanced since then.
+pub fn session_tip_frame(state: &impl Records, id: &[u8; 32]) -> Result<Option<u64>> {
+    read(state, b"tip-frame", id)?
+        .map(|bytes| {
+            <[u8; 8]>::try_from(bytes)
+                .map(u64::from_be_bytes)
+                .map_err(|_| QuilError::Store("corrupt session tip frame".into()))
+        })
+        .transpose()
+}
+
+/// How many GLOBAL frames before `frame` [`session_tip`] of `id` last
+/// advanced ([`session_tip_frame`]); zero for a `frame` not after it. Without
+/// a record, the frames since the [`presence_report_frame`]: a lower bound,
+/// since the session has not advanced from it on. `None` before that frame.
+pub fn frames_since_tip_advance(state: &impl Records, id: &[u8; 32], frame: u64) -> Result<Option<u64>> {
+    if let Some(recorded) = session_tip_frame(state, id)? {
+        return Ok(Some(frame.saturating_sub(recorded)));
+    }
+    Ok(frame.checked_sub(presence_report_frame()))
 }
 
 /// The reward ring of each of a session's members, in member order, fixed at
@@ -1457,6 +1608,9 @@ pub mod schedule;
 
 #[path = "handoff_legacy.rs"]
 pub mod legacy;
+
+#[path = "handoff_presence.rs"]
+pub mod presence;
 
 #[cfg(test)]
 #[path = "handoff_tests.rs"]
