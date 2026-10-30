@@ -37,33 +37,40 @@ mod forest;
 mod membership_proof;
 mod overlay;
 mod scope;
+pub mod storage_health;
 mod store;
 // Efficient JMT Merkle-diff sync — enabled via the vendored jmt visibility patch
 // (crates/jmt: gen_child_node_key + NibblePath::new made pub).
+pub mod subtree_proof;
 mod sync;
 
+pub use forest::tree_generation;
 pub use forest::{
-    node_size_sum, rollup_phase_roots, subtree_leaf_count, subtree_size, Forest, Phase,
-    ShardRoots, PHASES,
+    node_size_sum, rollup_phase_roots, subtree_leaf_count, subtree_size, Forest, Phase, ShardRoots,
+    PHASES,
 };
 pub use scope::ScopeDeletion;
-pub use sync::{diff_leaves, diff_leaves_under_prefix, key_range_under, BatchTreeReader, SubtreeSyncAnchor};
-pub use forest::tree_generation;
+pub use storage_health::{DiskThresholds, StoreRole};
+pub use sync::{
+    diff_leaves, diff_leaves_under_prefix, key_range_under, BatchTreeReader, SubtreeSyncAnchor,
+};
 // Re-export so sync callers can name the diff's key type + the reader bound
 // without depending on jmt directly.
+pub use database::{
+    CoordinatedDb, DatabaseCommitError, DatabaseWriteGuard, DisjointBatch, KeyPrefixSet,
+    WeakCoordinatedDb,
+};
 pub use jmt::storage::TreeReader;
 pub use jmt::KeyHash;
 pub use membership_proof::{
-    verify_vertex_membership, MembershipProof, ShardAggregation, VertexMembershipProof,
-};
-pub use store::{ForestStore, MemTreeStore, RocksTreeStore, SizeIndex};
-pub use database::{
-    CoordinatedDb, DatabaseCommitError, DatabaseWriteGuard, DisjointBatch, KeyPrefixSet, WeakCoordinatedDb,
+    verify_vertex_membership, verify_vertex_membership_with, MembershipProof, ShardAggregation,
+    VertexMembershipProof,
 };
 pub use overlay::{
-    ExecutionOverlay, ExecutionViewAdmission, OverlayCursor, OverlayLimits, OverlayMutation, OverlayReadView,
-    OverlayStats, PreparedOverlayCommit, DEFAULT_EXECUTION_VIEW_MAX_AGE,
+    ExecutionOverlay, ExecutionViewAdmission, OverlayCursor, OverlayLimits, OverlayMutation,
+    OverlayReadView, OverlayStats, PreparedOverlayCommit, DEFAULT_EXECUTION_VIEW_MAX_AGE,
 };
+pub use store::{ForestStore, MemTreeStore, RocksTreeStore, SizeIndex};
 
 /// Namespaces a single tree within the shared RocksDB. The `level` (1/2/3)
 /// plus an `id` (app address, shard id, …) uniquely identifies a tree; its
@@ -76,15 +83,24 @@ pub struct TreeId {
 
 impl TreeId {
     pub fn global(index: u8) -> Self {
-        TreeId { level: 1, id: vec![index] }
+        TreeId {
+            level: 1,
+            id: vec![index],
+        }
     }
     pub fn app(app_address: &[u8]) -> Self {
-        TreeId { level: 2, id: app_address.to_vec() }
+        TreeId {
+            level: 2,
+            id: app_address.to_vec(),
+        }
     }
     /// A shard's single-tree id (used when a shard has one undivided state
     /// tree). For the CRDT's four phase trees use [`TreeId::shard_phase`].
     pub fn shard(shard_id: &[u8]) -> Self {
-        TreeId { level: 3, id: shard_id.to_vec() }
+        TreeId {
+            level: 3,
+            id: shard_id.to_vec(),
+        }
     }
     /// A shard's per-[`Phase`] state tree. The phase byte prefixes the shard
     /// id so the four phase trees are distinct JMT instances that never
@@ -171,7 +187,12 @@ impl AppEntry {
         let app_root: [u8; 32] = b[..32].try_into().ok()?;
         let num_leaves = u64::from_be_bytes(b[32..40].try_into().ok()?);
         let total_size = u128::from_be_bytes(b[40..56].try_into().ok()?);
-        Some(AppEntry { app_root, num_leaves, total_size, metadata: b[56..].to_vec() })
+        Some(AppEntry {
+            app_root,
+            num_leaves,
+            total_size,
+            metadata: b[56..].to_vec(),
+        })
     }
 }
 
@@ -200,7 +221,11 @@ impl ShardEntry {
         let shard_commitment: [u8; 32] = b[..32].try_into().ok()?;
         let num_leaves = u64::from_be_bytes(b[32..40].try_into().ok()?);
         let total_size = u128::from_be_bytes(b[40..56].try_into().ok()?);
-        Some(ShardEntry { shard_commitment, num_leaves, total_size })
+        Some(ShardEntry {
+            shard_commitment,
+            num_leaves,
+            total_size,
+        })
     }
 }
 
@@ -253,7 +278,9 @@ pub fn commit_update_raw<S: TreeReader>(
     leaves: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
 ) -> Result<(RootHash, TreeUpdateBatch)> {
     let tree = Sha256Jmt::new(store);
-    let value_set = leaves.into_iter().map(|(k, v)| (shard_path_key_hash(&k), Some(v)));
+    let value_set = leaves
+        .into_iter()
+        .map(|(k, v)| (shard_path_key_hash(&k), Some(v)));
     let (root, batch) = tree.put_value_set(value_set, version)?;
     Ok((root, batch))
 }
@@ -283,7 +310,10 @@ pub fn shard_index(address: &[u8], shard_depth: u32) -> u32 {
     for i in 0..shard_depth {
         let byte = (i / 8) as usize;
         let bit = 7 - (i % 8);
-        let set = address.get(byte).map(|b| (b >> bit) & 1 == 1).unwrap_or(false);
+        let set = address
+            .get(byte)
+            .map(|b| (b >> bit) & 1 == 1)
+            .unwrap_or(false);
         idx = (idx << 1) | (set as u32);
     }
     idx
@@ -302,8 +332,9 @@ pub fn app_root_from_shards(
 ) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let n = 1u32 << shard_depth;
-    let mut level: Vec<[u8; 32]> =
-        (0..n).map(|i| shard_roots.get(&i).copied().unwrap_or([0u8; 32])).collect();
+    let mut level: Vec<[u8; 32]> = (0..n)
+        .map(|i| shard_roots.get(&i).copied().unwrap_or([0u8; 32]))
+        .collect();
     while level.len() > 1 {
         level = level
             .chunks(2)
@@ -382,7 +413,11 @@ pub fn decode_shard_bit_path(filter: &[u8], app_len: usize) -> Option<(Vec<u8>, 
         return None;
     }
     let app = filter[..app_len].to_vec();
-    let n = u16::from_be_bytes(filter[app_len..app_len + SHARD_BIT_LEN_BYTES].try_into().ok()?) as usize;
+    let n = u16::from_be_bytes(
+        filter[app_len..app_len + SHARD_BIT_LEN_BYTES]
+            .try_into()
+            .ok()?,
+    ) as usize;
     let n_bytes = n.div_ceil(8);
     if filter.len() != app_len + SHARD_BIT_LEN_BYTES + n_bytes {
         return None;
@@ -621,8 +656,11 @@ fn canonical_bit_paths_rec(
 ) {
     // Shards whose prefix extends past `depth` split further here; those whose
     // prefix ends at `depth` terminate (their bit-path is already complete).
-    let continuing: Vec<usize> =
-        active.iter().copied().filter(|&i| prefixes[i].len() > depth).collect();
+    let continuing: Vec<usize> = active
+        .iter()
+        .copied()
+        .filter(|&i| prefixes[i].len() > depth)
+        .collect();
     if continuing.is_empty() {
         return;
     }
@@ -660,7 +698,10 @@ fn addr_has_bit_prefix(data: &[u8], path: &[bool]) -> bool {
 /// a single-shard app routes to index 0). Mirrors `assign_child_index` (the top
 /// address bits select the shard). Falls back to 0 if nothing matches.
 pub fn address_shard_index(data_addr: &[u8], bit_paths: &[Vec<bool>]) -> usize {
-    bit_paths.iter().position(|p| addr_has_bit_prefix(data_addr, p)).unwrap_or(0)
+    bit_paths
+        .iter()
+        .position(|p| addr_has_bit_prefix(data_addr, p))
+        .unwrap_or(0)
 }
 
 /// Aggregate shards at ARBITRARY (variable) depths into the app root — a sparse
@@ -749,7 +790,11 @@ pub fn app_root_from_shard_path(
     // that won't match the trusted app root and is rejected — no panic).
     let depth = target.len().min(siblings.len());
     for d in (0..depth).rev() {
-        h = if target[d] { hash_pair(&siblings[d], &h) } else { hash_pair(&h, &siblings[d]) };
+        h = if target[d] {
+            hash_pair(&siblings[d], &h)
+        } else {
+            hash_pair(&h, &siblings[d])
+        };
     }
     h
 }
@@ -765,8 +810,9 @@ pub fn app_membership_path(
     shard_roots: &std::collections::BTreeMap<u32, [u8; 32]>,
 ) -> Vec<[u8; 32]> {
     let n = 1u32 << shard_depth;
-    let mut level: Vec<[u8; 32]> =
-        (0..n).map(|i| shard_roots.get(&i).copied().unwrap_or([0u8; 32])).collect();
+    let mut level: Vec<[u8; 32]> = (0..n)
+        .map(|i| shard_roots.get(&i).copied().unwrap_or([0u8; 32]))
+        .collect();
     let mut idx = shard_index as usize;
     let mut siblings = Vec::with_capacity(shard_depth as usize);
     while level.len() > 1 {
@@ -790,7 +836,11 @@ pub fn app_root_from_shard(
     let mut h = shard_root;
     let mut idx = shard_index as usize;
     for sib in siblings {
-        h = if idx & 1 == 0 { hash_pair(&h, sib) } else { hash_pair(sib, &h) };
+        h = if idx & 1 == 0 {
+            hash_pair(&h, sib)
+        } else {
+            hash_pair(sib, &h)
+        };
         idx >>= 1;
     }
     h
@@ -861,7 +911,13 @@ mod tests {
         // Cover: empty, 1 bit, sub-byte (6, the QUIL width), byte boundary (8),
         // multi-byte (13), and a deep skewed-style path.
         for p in [
-            "", "0", "1", "000000", "000001", "10101010", "1010101011010",
+            "",
+            "0",
+            "1",
+            "000000",
+            "000001",
+            "10101010",
+            "1010101011010",
             "0000000000001", // the "descend K uniform bits then branch" shape
         ] {
             let bp = bits(p);
@@ -893,7 +949,10 @@ mod tests {
         let mut noncanon = app.to_vec();
         noncanon.extend_from_slice(&3u16.to_be_bytes());
         noncanon.push(0b010_00001); // bits[0..3]=010, bit at position 7 (padding) set
-        assert!(decode_shard_bit_path(&noncanon, 32).is_none(), "padding bit must be zero");
+        assert!(
+            decode_shard_bit_path(&noncanon, 32).is_none(),
+            "padding bit must be zero"
+        );
     }
 
     #[test]
@@ -902,15 +961,22 @@ mod tests {
             let bp = bits(p);
             let prefix = bit_path_to_prefix(&bp);
             assert_eq!(prefix[0], BIT_PATH_PREFIX_SENTINEL);
-            assert_eq!(shard_bit_path_from_prefix(&prefix), Some(bp.clone()), "round-trip {p:?}");
+            assert_eq!(
+                shard_bit_path_from_prefix(&prefix),
+                Some(bp.clone()),
+                "round-trip {p:?}"
+            );
         }
         // Legacy prefixes are NOT sentinel-tagged → None (resolve via canonical).
         assert_eq!(shard_bit_path_from_prefix(&[]), None);
         assert_eq!(shard_bit_path_from_prefix(&[0]), None); // QUIL shard 0 / binary child 0
         assert_eq!(shard_bit_path_from_prefix(&[63]), None); // QUIL shard 63
         assert_eq!(shard_bit_path_from_prefix(&[128]), None); // binary split marker
-        // Malformed tagged prefix (a level after the sentinel isn't a bit).
-        assert_eq!(shard_bit_path_from_prefix(&[BIT_PATH_PREFIX_SENTINEL, 0, 2]), None);
+                                                              // Malformed tagged prefix (a level after the sentinel isn't a bit).
+        assert_eq!(
+            shard_bit_path_from_prefix(&[BIT_PATH_PREFIX_SENTINEL, 0, 2]),
+            None
+        );
     }
 
     #[test]
@@ -930,20 +996,38 @@ mod tests {
         let non_ext = encode_shard_bit_path(&app, &bits("001"));
         assert!(shard_filter_extends(&child, &parent, 32));
         assert!(shard_filter_extends(&sibling, &parent, 32));
-        assert!(!shard_filter_extends(&wrong_app, &parent, 32), "different app");
-        assert!(!shard_filter_extends(&non_ext, &parent, 32), "not a bit-prefix");
-        assert!(!shard_filter_extends(&parent, &child, 32), "parent does not extend child");
+        assert!(
+            !shard_filter_extends(&wrong_app, &parent, 32),
+            "different app"
+        );
+        assert!(
+            !shard_filter_extends(&non_ext, &parent, 32),
+            "not a bit-prefix"
+        );
+        assert!(
+            !shard_filter_extends(&parent, &child, 32),
+            "parent does not extend child"
+        );
 
         // ROOT split: the parent is the BARE 32-byte app address (empty bit-path),
         // NOT an encoded filter — a bit-path child must still be accepted.
         let root_parent = app.to_vec(); // bare app, len == app_len
         let root_child0 = encode_shard_bit_path(&app, &bits("000000"));
         let root_child1 = encode_shard_bit_path(&app, &bits("000001"));
-        assert_eq!(decode_shard_filter_or_root(&root_parent, 32), Some((app.to_vec(), vec![])));
-        assert!(shard_filter_extends(&root_child0, &root_parent, 32), "deep child extends bare-app root");
+        assert_eq!(
+            decode_shard_filter_or_root(&root_parent, 32),
+            Some((app.to_vec(), vec![]))
+        );
+        assert!(
+            shard_filter_extends(&root_child0, &root_parent, 32),
+            "deep child extends bare-app root"
+        );
         assert!(shard_filter_extends(&root_child1, &root_parent, 32));
         // A child under a DIFFERENT bare-app root is rejected.
-        assert!(!shard_filter_extends(&root_child0, &other.to_vec(), 32), "wrong app root");
+        assert!(
+            !shard_filter_extends(&root_child0, &other.to_vec(), 32),
+            "wrong app root"
+        );
     }
 
     #[test]
@@ -956,9 +1040,12 @@ mod tests {
             f
         });
         assert_eq!(shard_prefix_to_filter(&app, &[]), app.to_vec()); // unsplit = bare app
-        // Sentinel bit-path → the ENCODED filter (NOT l2 ‖ 0xFF ‖ bits).
+                                                                     // Sentinel bit-path → the ENCODED filter (NOT l2 ‖ 0xFF ‖ bits).
         let sentinel = bit_path_to_prefix(&bits("000001"));
-        assert_eq!(shard_prefix_to_filter(&app, &sentinel), encode_shard_bit_path(&app, &bits("000001")));
+        assert_eq!(
+            shard_prefix_to_filter(&app, &sentinel),
+            encode_shard_bit_path(&app, &bits("000001"))
+        );
         // Round-trips: the produced filter decodes back to the same bit-path.
         let (dec_app, dec_bits) =
             decode_shard_bit_path(&shard_prefix_to_filter(&app, &sentinel), 32).unwrap();
@@ -980,9 +1067,15 @@ mod tests {
         shards.push(bits("001"));
         for a in 0u16..256 {
             let byte = [a as u8];
-            let matches: Vec<&Vec<bool>> =
-                shards.iter().filter(|p| addr_has_bit_prefix(&byte, p)).collect();
-            assert_eq!(matches.len(), 1, "addr {a:08b} must match exactly one shard, got {matches:?}");
+            let matches: Vec<&Vec<bool>> = shards
+                .iter()
+                .filter(|p| addr_has_bit_prefix(&byte, p))
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "addr {a:08b} must match exactly one shard, got {matches:?}"
+            );
         }
 
         // Immediate (1-bit) split: branch == parent → no spine.
@@ -997,7 +1090,10 @@ mod tests {
     #[test]
     fn canonical_unsplit_app_is_root() {
         // A single unsplit shard (empty prefix) = the whole app at the root.
-        assert_eq!(canonical_shard_bit_paths(&[vec![]]), vec![Vec::<bool>::new()]);
+        assert_eq!(
+            canonical_shard_bit_paths(&[vec![]]),
+            vec![Vec::<bool>::new()]
+        );
     }
 
     #[test]
@@ -1091,9 +1187,11 @@ mod tests {
     #[test]
     fn heterogeneous_fleet_grids_diverge_but_unified_seeders_agree() {
         let l2 = [0x11u8; 32]; // stand-in QUIL app address (l2)
-        // Build a node's valid-shard address set the way the archive does.
+                               // Build a node's valid-shard address set the way the archive does.
         let valid_set = |grid: &[Vec<u32>]| -> std::collections::HashSet<Vec<u8>> {
-            grid.iter().map(|p| shard_prefix_to_filter(&l2, p)).collect()
+            grid.iter()
+                .map(|p| shard_prefix_to_filter(&l2, p))
+                .collect()
         };
         // The coverage/join address a prover on shard `k` submits, derived from
         // ITS OWN local grid (same call the lifecycle join path makes).
@@ -1145,7 +1243,10 @@ mod tests {
 
         // And a HOMOGENEOUS old fleet is internally consistent (why it silently
         // "worked" until one archive updated and flipped to sentinel).
-        assert!(valid_set(&grid_old).contains(&addr_old), "old fleet self-consistent");
+        assert!(
+            valid_set(&grid_old).contains(&addr_old),
+            "old fleet self-consistent"
+        );
     }
 
     #[test]
@@ -1180,8 +1281,10 @@ mod tests {
     #[test]
     fn canonical_octal_split_padding_byte_adds_no_bits() {
         // Octal: leading byte 0x20-step + a 0x00 padding byte → prefix [hi, 0].
-        let prefixes: Vec<Vec<u32>> =
-            [0u32, 32, 64, 96, 128, 160, 192, 224].iter().map(|&hi| vec![hi, 0]).collect();
+        let prefixes: Vec<Vec<u32>> = [0u32, 32, 64, 96, 128, 160, 192, 224]
+            .iter()
+            .map(|&hi| vec![hi, 0])
+            .collect();
         let paths = canonical_shard_bit_paths(&prefixes);
         for (i, p) in paths.iter().enumerate() {
             // 3 bits from the leading byte, 0 from the padding byte.
@@ -1232,14 +1335,20 @@ mod tests {
         // A child under a DIFFERENT genesis shard (shard 4 = 000100) must NOT
         // extend parent [3] — the fix stays a bit-prefix check, not a byte one.
         let foreign = encode_shard_bit_path(&app, &bits("0001000"));
-        assert!(!shard_filter_extends(&foreign, &parent, 32), "shard-4 child ⊄ shard-3");
+        assert!(
+            !shard_filter_extends(&foreign, &parent, 32),
+            "shard-4 child ⊄ shard-3"
+        );
     }
 
     #[test]
     fn canonical_child_zero_width_inferred_from_siblings() {
         // The child-0 marker [0] is ambiguous alone; its width comes from siblings.
         // Binary sibling {0,128} → [0] is 1 bit "0".
-        assert_eq!(canonical_shard_bit_paths(&[vec![0], vec![128]])[0], bits("0"));
+        assert_eq!(
+            canonical_shard_bit_paths(&[vec![0], vec![128]])[0],
+            bits("0")
+        );
         // Quaternary sibling set → [0] is 2 bits "00".
         assert_eq!(
             canonical_shard_bit_paths(&[vec![0], vec![64], vec![128], vec![192]])[0],
@@ -1270,19 +1379,22 @@ mod tests {
         let prefixes = vec![vec![0u32], vec![64], vec![128], vec![192]];
         let paths = canonical_shard_bit_paths(&prefixes);
         let roots: [[u8; 32]; 4] = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
-        let shard_paths: Vec<(Vec<bool>, [u8; 32])> =
-            paths.iter().cloned().zip(roots).collect();
+        let shard_paths: Vec<(Vec<bool>, [u8; 32])> = paths.iter().cloned().zip(roots).collect();
         let via_paths = app_root_from_shard_paths(&shard_paths);
         let uniform: std::collections::BTreeMap<u32, [u8; 32]> =
             (0..4u32).map(|i| (i, roots[i as usize])).collect();
         let via_uniform = app_root_from_shards(2, &uniform);
-        assert_eq!(via_paths, via_uniform, "canonical quaternary == uniform depth-2");
+        assert_eq!(
+            via_paths, via_uniform,
+            "canonical quaternary == uniform depth-2"
+        );
     }
 
     #[test]
     fn mem_commit_is_deterministic_and_readable() {
-        let leaves: Vec<(Vec<u8>, Vec<u8>)> =
-            (0u32..50).map(|i| (i.to_be_bytes().to_vec(), vec![i as u8; 40])).collect();
+        let leaves: Vec<(Vec<u8>, Vec<u8>)> = (0u32..50)
+            .map(|i| (i.to_be_bytes().to_vec(), vec![i as u8; 40]))
+            .collect();
 
         let s1 = MemTreeStore::default();
         let r1 = commit(&s1, 0, leaves.clone()).unwrap();
@@ -1316,7 +1428,11 @@ mod tests {
         // path equal its address, so `assign_child_index`-style top-bit sharding
         // (binary@0x80, … 64 shards = top 6 bits) maps 1:1 onto the tree.
         let addr = [0xABu8; 32];
-        assert_eq!(shard_path_key_hash(&addr).0, addr, "KeyHash == address bytes");
+        assert_eq!(
+            shard_path_key_hash(&addr).0,
+            addr,
+            "KeyHash == address bytes"
+        );
 
         // Two addresses in the SAME shard (top 6 bits equal: 0xAB = 1010_1011,
         // top-6 = 101010) vs a DIFFERENT shard (top byte 0x2B: 001010_11).
@@ -1332,8 +1448,16 @@ mod tests {
         };
         // top-6-bit shard selector (mirrors assign_child_index for n=64).
         let shard6 = |a: &[u8; 32]| a[0] >> 2;
-        assert_eq!(shard6(&addr), shard6(&same_shard), "same top-6-bits ⇒ same shard");
-        assert_ne!(shard6(&addr), shard6(&diff_shard), "differing top-6-bits ⇒ different shard");
+        assert_eq!(
+            shard6(&addr),
+            shard6(&same_shard),
+            "same top-6-bits ⇒ same shard"
+        );
+        assert_ne!(
+            shard6(&addr),
+            shard6(&diff_shard),
+            "differing top-6-bits ⇒ different shard"
+        );
 
         // Raw-key commit round-trips (values readable at their raw path) and
         // produces a DIFFERENT root than SHA-256 keying (proves the path changed).
@@ -1352,7 +1476,10 @@ mod tests {
             "value readable at its raw address path"
         );
         let hashed_root = commit(&MemTreeStore::default(), 0, leaves).unwrap();
-        assert_ne!(raw_root.0, hashed_root.0, "raw-key path differs from SHA-256 keying");
+        assert_ne!(
+            raw_root.0, hashed_root.0,
+            "raw-key path differs from SHA-256 keying"
+        );
     }
 
     #[test]
@@ -1382,11 +1509,18 @@ mod tests {
         // A different shard root ⇒ a different app root (binding).
         let mut roots2 = roots.clone();
         roots2.insert(42u32, [9u8; 32]);
-        assert_ne!(app_root_from_shards(6, &roots2), r1, "app root binds each shard");
+        assert_ne!(
+            app_root_from_shards(6, &roots2),
+            r1,
+            "app root binds each shard"
+        );
 
         // All-empty app ⇒ a fixed all-zero-leaves root, not itself zero.
         let empty = app_root_from_shards(6, &BTreeMap::new());
-        assert_ne!(empty, [0u8; 32], "aggregated empty root is a hash, not zero");
+        assert_ne!(
+            empty, [0u8; 32],
+            "aggregated empty root is a hash, not zero"
+        );
         // Depth-0 app (single shard) = that shard's root verbatim.
         let mut one = BTreeMap::new();
         one.insert(0u32, [7u8; 32]);
@@ -1417,8 +1551,10 @@ mod tests {
             roots.insert(i, [i as u8 + 1; 32]);
         }
         let uniform = app_root_from_shards(2, &roots);
-        let paths: Vec<(Vec<bool>, [u8; 32])> =
-            roots.iter().map(|(&i, &r)| (prefix_to_bits(&[i], 2), r)).collect();
+        let paths: Vec<(Vec<bool>, [u8; 32])> = roots
+            .iter()
+            .map(|(&i, &r)| (prefix_to_bits(&[i], 2), r))
+            .collect();
         assert_eq!(
             app_root_from_shard_paths(&paths),
             uniform,
@@ -1444,12 +1580,7 @@ mod tests {
         // A COMPLETE, non-uniform shard set: [0] and [1] at depth 6, while [2]
         // split further into [2,10] and [2,40] at depth 12. (Prefix-free.)
         let mk = |p: &[u32], b: u8| (prefix_to_bits(p, 6), [b; 32]);
-        let shards = vec![
-            mk(&[0], 1),
-            mk(&[1], 2),
-            mk(&[2, 10], 3),
-            mk(&[2, 40], 4),
-        ];
+        let shards = vec![mk(&[0], 1), mk(&[1], 2), mk(&[2, 10], 3), mk(&[2, 40], 4)];
         let app_root = app_root_from_shard_paths(&shards);
 
         // Every shard's co-path reconstructs the app root from its own root...
@@ -1503,7 +1634,11 @@ mod tests {
             metadata: b"QUIL:token".to_vec(),
         };
         assert_eq!(AppEntry::from_bytes(&ae.to_bytes()).unwrap(), ae);
-        let se = ShardEntry { shard_commitment: [9u8; 32], num_leaves: 3, total_size: 999 };
+        let se = ShardEntry {
+            shard_commitment: [9u8; 32],
+            num_leaves: 3,
+            total_size: 999,
+        };
         assert_eq!(ShardEntry::from_bytes(&se.to_bytes()).unwrap(), se);
         // Short buffers reject.
         assert!(AppEntry::from_bytes(&[0u8; 10]).is_none());

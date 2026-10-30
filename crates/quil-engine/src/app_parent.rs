@@ -16,9 +16,24 @@ use quil_types::proto::global::AppShardFrame;
 /// cover.
 const MAX_PRIVATE_CHAIN: usize = 8;
 
+/// [`AppParentExecutor::extendable`] verdicts kept, by view, parent and
+/// materialized height. A leader asks about a few views per turn.
+const EXTENDABLE_VERDICTS: usize = 32;
+
+/// A selected parent whose stored ancestry does not reach the materialized
+/// tip within [`MAX_PRIVATE_CHAIN`] frames, so no member can build on it, or
+/// (judged as a nullified parent) reaches it only at that limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Refused {
+    /// The parent's height above the materialized tip.
+    depth: u64,
+}
+
+/// One validated unfinalized frame: `(digest, frame number, exact bytes)`.
+pub(crate) type ChainBody = (Digest, u64, Vec<u8>);
+
 /// Proposal validation (output, committee, storage attestation, structure).
-pub(crate) type ProposalValidation =
-    Arc<dyn Fn(&AppShardFrame) -> Result<bool> + Send + Sync>;
+pub(crate) type ProposalValidation = Arc<dyn Fn(&AppShardFrame) -> Result<bool> + Send + Sync>;
 
 /// Pending-message copy bounds for a private leader (as for GLOBAL proposals).
 pub(super) const PRIVATE_PARENT_MESSAGE_BYTES: usize = 8 << 20;
@@ -66,6 +81,10 @@ pub struct PrivateAppParent {
     /// Whether each unfinalized frame between the base and the parent (oldest
     /// first) carried no requests: they count toward a session's drain.
     pub(crate) request_free_below: Vec<bool>,
+    /// The bodies of the unfinalized frames above the base, the parent last,
+    /// each validated as part of the chain: a leader building on them may
+    /// re-send them (`AppSeamProposer::resend_parent_bodies`).
+    pub(crate) chain_bodies: Vec<ChainBody>,
     pub(crate) clock: Arc<dyn ClockStore>,
     pub(crate) crdt: Arc<quil_hypergraph::HypergraphCrdt>,
     pub(crate) manager: Arc<quil_execution::ExecutionEngineManager>,
@@ -76,6 +95,7 @@ pub struct PrivateAppParent {
 }
 
 /// The materialized tip a parent must extend.
+#[derive(Clone)]
 struct Tip {
     cursor: u64,
     digest: [u8; 32],
@@ -102,6 +122,14 @@ pub struct AppParentExecutor {
     blocks: std::sync::OnceLock<BlockStore>,
     // One execution at a time; the result serves the leader and every vote.
     prepared: std::sync::Mutex<Option<Arc<PrivateAppParent>>>,
+    /// See [`Self::extendable`].
+    verdicts: std::sync::Mutex<std::collections::VecDeque<((u64, Digest, u64), Option<Refused>)>>,
+    /// The tip as last read by a proposal or vote; [`Self::extendable`] runs
+    /// in the consensus loop and must not wait for the store's commit lock.
+    tip_hint: std::sync::Mutex<Option<Tip>>,
+    /// The worker this executor serves, for its log lines: they run outside
+    /// the worker's span.
+    core_id: u32,
 }
 
 impl AppParentExecutor {
@@ -137,7 +165,16 @@ impl AppParentExecutor {
             session_base,
             blocks: std::sync::OnceLock::new(),
             prepared: std::sync::Mutex::new(None),
+            verdicts: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            tip_hint: std::sync::Mutex::new(None),
+            core_id: 0,
         }
+    }
+
+    /// Name the worker in this executor's lines ([`Self::core_id`]).
+    pub(super) fn for_core(mut self, core_id: u32) -> Self {
+        self.core_id = core_id;
+        self
     }
 
     /// The consensus host's body store, where selected parents' bytes arrive.
@@ -162,22 +199,39 @@ impl AppParentExecutor {
     }
 
     fn tip(&self) -> Result<Tip> {
+        let tip = self.read_tip()?;
+        *self.tip_hint.lock().unwrap_or_else(|e| e.into_inner()) = Some(tip.clone());
+        Ok(tip)
+    }
+
+    fn read_tip(&self) -> Result<Tip> {
         let shard = self.hypergraph.capture_committed_shard(&self.filter)?;
         let recorded = shard
             .records
-            .read_record(&quil_store::encoding::consensus_materialized_cursor_key(&self.filter))?
+            .read_record(&quil_store::encoding::consensus_materialized_cursor_key(
+                &self.filter,
+            ))?
             .map(|bytes| {
-                bytes.as_slice().try_into().map(u64::from_be_bytes)
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map(u64::from_be_bytes)
                     .map_err(|_| unavailable("malformed materialized cursor"))
             })
             .transpose()?;
         let cursor = recorded.unwrap_or(0);
         if let Some((base, genesis)) = self.session_base {
             if cursor < base {
-                return Err(unavailable("materialized state precedes the session genesis"));
+                return Err(unavailable(
+                    "materialized state precedes the session genesis",
+                ));
             }
             if cursor == base {
-                return Ok(Tip { cursor, digest: genesis, view: 0 });
+                return Ok(Tip {
+                    cursor,
+                    digest: genesis,
+                    view: 0,
+                });
             }
         }
         if cursor == 0 {
@@ -209,27 +263,80 @@ impl AppParentExecutor {
         Ok(self.tip()?.digest == parent.0)
     }
 
+    /// Whether a leader can build on `parent`, certified at `view` and also
+    /// nullified, leaving room for the next leader: false when its stored
+    /// ancestry does not reach the materialized tip within [`MAX_PRIVATE_CHAIN`]
+    /// frames ([`Self::unfinalized_chain`]), or reaches it only at that limit,
+    /// where a child would be the last frame anyone could extend. Judged from
+    /// the bodies alone, without execution. Consensus asks this in its loop,
+    /// so it reads the tip a proposal or vote last read rather than the store,
+    /// and caches definitive verdicts by materialized height. Anything it
+    /// cannot judge (no current tip, a missing, undecodable or seal body)
+    /// answers true, leaving the leader's choice as it was.
+    pub(crate) fn extendable(&self, parent: Digest, view: u64) -> bool {
+        self.refusal(parent, view).is_none()
+    }
+
+    fn refusal(&self, parent: Digest, view: u64) -> Option<Refused> {
+        let height = self.materialized.load(std::sync::atomic::Ordering::SeqCst);
+        let key = (view, parent, height);
+        let mut verdicts = self.verdicts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, verdict)) = verdicts.iter().find(|(cached, _)| *cached == key) {
+            return *verdict;
+        }
+        let hint = self
+            .tip_hint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // A tip read at another height than the engine's is stale or ahead.
+        let tip = hint.filter(|tip| tip.cursor == height)?;
+        let verdict = if tip.digest == parent.0 {
+            None
+        } else {
+            match self.walk_chain(&tip, parent, view) {
+                Ok(Ok((chain, _))) if chain.len() >= MAX_PRIVATE_CHAIN => Some(Refused {
+                    depth: chain.len() as u64,
+                }),
+                Ok(Ok(_)) => None,
+                Ok(Err(refused)) => Some(refused),
+                // A body may still arrive: judge again next time.
+                Err(_) => return None,
+            }
+        };
+        if verdicts.len() >= EXTENDABLE_VERDICTS {
+            verdicts.pop_front();
+        }
+        verdicts.push_back((key, verdict));
+        verdict
+    }
+
     /// Execute the selected parent privately, or return the prepared result.
     /// The parent and its unfinalized ancestors down to the materialized tip
     /// ([`Self::unfinalized_chain`], at most [`MAX_PRIVATE_CHAIN`] frames)
     /// must link by parent selector, rise in view and pass the proposal
     /// checks: the first against canonical state, each later one against the
     /// private branch its predecessors built.
-    pub(crate) fn prepare(&self, parent: Digest, parent_view: u64) -> Result<Arc<PrivateAppParent>> {
+    pub(crate) fn prepare(
+        &self,
+        parent: Digest,
+        parent_view: u64,
+    ) -> Result<Arc<PrivateAppParent>> {
         let mut prepared = self
             .prepared
             .lock()
             .map_err(|_| unavailable("private parent cache poisoned"))?;
+        let started = std::time::Instant::now();
         let tip = self.tip()?;
         if let Some(existing) = prepared.as_ref() {
-            if existing.digest == parent && existing.view == parent_view && existing.base == tip.cursor
+            if existing.digest == parent
+                && existing.view == parent_view
+                && existing.base == tip.cursor
                 && existing._branch.overlay().ensure_readable().is_ok()
             {
                 return Ok(existing.clone());
             }
         }
-        // Drop any stale branch before capturing another.
-        *prepared = None;
         if tip.digest == parent.0 {
             return Err(unavailable("selected parent is the materialized tip"));
         }
@@ -246,7 +353,9 @@ impl AppParentExecutor {
             .and_then(|f| f.header)
             .is_some_and(|h| h.frame_number > tip.cursor)
         {
-            return Err(unavailable("canonical execution of the next frame is in progress"));
+            return Err(unavailable(
+                "canonical execution of the next frame is in progress",
+            ));
         }
         if self.materialized.load(std::sync::atomic::Ordering::SeqCst) != tip.cursor {
             return Err(unavailable("canonical materialization is changing"));
@@ -256,7 +365,7 @@ impl AppParentExecutor {
         // notarized but not finalized; executing only a child of the tip, every
         // member abstained from a parent two frames up and the shard stopped
         // (e.g. frames 5403 and 5404 above tip 5402).
-        let chain = self.unfinalized_chain(&tip, parent, parent_view)?;
+        let (chain, chain_bodies) = self.unfinalized_chain(&tip, parent, parent_view)?;
         // Each frame's own checks; its requests root is checked against the
         // state it extends, which for all but the first is the branch below.
         for frame in &chain {
@@ -265,22 +374,30 @@ impl AppParentExecutor {
             }
         }
         if let Err((reason, detail)) = (self.canonical_check)(&chain[0]) {
-            return Err(unavailable(format!("selected parent fails proposal validation: {reason} ({detail})")));
+            return Err(unavailable(format!(
+                "selected parent fails proposal validation: {reason} ({detail})"
+            )));
         }
-        let frame = chain.last().expect("a chain holds the selected parent").clone();
+        let frame = chain
+            .last()
+            .expect("a chain holds the selected parent")
+            .clone();
         let header = frame
             .header
             .clone()
             .ok_or_else(|| unavailable("selected parent has no header"))?;
         let number = header.frame_number;
 
+        // Drop any stale branch before capturing another, but only now: a
+        // proposal on a parent that cannot be executed keeps the one in use.
+        *prepared = None;
         let branch = match (
             self.global_anchor_store.backing_store_identity(),
             self.exec.crdt().backing_store_identity(),
         ) {
-            (Some(anchor), Some(own)) if anchor == own => {
-                self.exec.capture_execution_branch(private_branch_limits())?
-            }
+            (Some(anchor), Some(own)) if anchor == own => self
+                .exec
+                .capture_execution_branch(private_branch_limits())?,
             _ => self.exec.capture_anchored_execution_branch(
                 private_branch_limits(),
                 self.global_anchor_store.clone(),
@@ -313,7 +430,9 @@ impl AppParentExecutor {
                     None,
                 );
                 if let Err((reason, detail)) = check(frame) {
-                    return Err(unavailable(format!("selected parent fails proposal validation: {reason} ({detail})")));
+                    return Err(unavailable(format!(
+                        "selected parent fails proposal validation: {reason} ({detail})"
+                    )));
                 }
             }
             let selector = quil_crypto::poseidon::hash_bytes_to_32(&header.output)?.to_vec();
@@ -323,7 +442,10 @@ impl AppParentExecutor {
             let txn = clock.new_transaction(false)?;
             clock.commit_shard_clock_frame(&self.filter, at, &selector, txn.as_ref(), false)?;
             txn.commit()?;
-            let world_size = certified_world_size(self.global_anchor_store.as_ref(), header.global_frame_number)?;
+            let world_size = certified_world_size(
+                self.global_anchor_store.as_ref(),
+                header.global_frame_number,
+            )?;
             let materialized = materialize_app_shard_requests(
                 manager.as_ref(),
                 &frame.requests,
@@ -335,7 +457,9 @@ impl AppParentExecutor {
                 header.global_frame_number,
             )?;
             processed += materialized.processed;
-            let digest = quil_execution::token_intrinsic::accumulator_header::report_digest(&materialized.accumulator_report);
+            let digest = quil_execution::token_intrinsic::accumulator_header::report_digest(
+                &materialized.accumulator_report,
+            );
             update_outflow(&outflows, at, |outflow| {
                 outflow.fee_total = Some(materialized.fee_total);
                 outflow.settlements = Some(materialized.settlements);
@@ -357,11 +481,14 @@ impl AppParentExecutor {
             None,
         );
         info!(
-            filter = %hex::encode(&self.filter[..self.filter.len().min(8)]),
+            core_id = self.core_id,
+            filter = %hex::encode(&self.filter),
             frame = number,
             view = parent_view,
+            base = tip.cursor,
             frames = chain.len(),
             processed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
             "executed unfinalized selected app parent privately"
         );
         let result = Arc::new(PrivateAppParent {
@@ -370,7 +497,11 @@ impl AppParentExecutor {
             view: parent_view,
             base: tip.cursor,
             frame_number: number,
-            request_free_below: chain[..chain.len() - 1].iter().map(|frame| frame.requests.is_empty()).collect(),
+            request_free_below: chain[..chain.len() - 1]
+                .iter()
+                .map(|frame| frame.requests.is_empty())
+                .collect(),
+            chain_bodies,
             clock,
             crdt,
             manager,
@@ -391,15 +522,26 @@ impl AppParentExecutor {
         checkpoint: &quil_cw_consensus::handoff::Checkpoint,
     ) -> Result<Arc<PrivateAppParent>> {
         let digest = digest_from_identity(checkpoint.digest);
-        let blocks = self.blocks.get().ok_or_else(|| unavailable("seal checkpoint body is not available"))?;
-        let bytes = blocks.get(&digest).ok_or_else(|| unavailable("seal checkpoint body is not available"))?;
+        let blocks = self
+            .blocks
+            .get()
+            .ok_or_else(|| unavailable("seal checkpoint body is not available"))?;
+        let bytes = blocks
+            .get(&digest)
+            .ok_or_else(|| unavailable("seal checkpoint body is not available"))?;
         if quil_cw_consensus::handoff::Seal::is_encoding(&bytes) {
             return Err(unavailable("seal checkpoint body is a terminal seal"));
         }
-        let frame = decode_app_frame(&bytes).ok_or_else(|| unavailable("seal checkpoint body is not a data frame"))?;
-        let header = frame.header.as_ref().ok_or_else(|| unavailable("seal checkpoint has no header"))?;
+        let frame = decode_app_frame(&bytes)
+            .ok_or_else(|| unavailable("seal checkpoint body is not a data frame"))?;
+        let header = frame
+            .header
+            .as_ref()
+            .ok_or_else(|| unavailable("seal checkpoint has no header"))?;
         if header.frame_number != checkpoint.frame || app_frame_digest(&frame) != Some(digest) {
-            return Err(unavailable("seal checkpoint body differs from its frame or digest"));
+            return Err(unavailable(
+                "seal checkpoint body differs from its frame or digest",
+            ));
         }
         self.prepare(digest, header.rank)
     }
@@ -408,43 +550,88 @@ impl AppParentExecutor {
     /// the materialized tip, oldest first, from the stored bodies. Each frame
     /// names the one below as its parent, numbers rise by one from the tip,
     /// views rise strictly above the tip's, and the selected parent carries the
-    /// selected view. At most [`MAX_PRIVATE_CHAIN`] frames.
-    fn unfinalized_chain(&self, tip: &Tip, parent: Digest, parent_view: u64) -> Result<Vec<AppShardFrame>> {
-        let blocks = self.blocks.get().ok_or_else(|| unavailable("selected parent body is not available"))?;
-        let refused = || unavailable("selected parent does not extend the materialized tip");
+    /// selected view. At most [`MAX_PRIVATE_CHAIN`] frames, with the bytes
+    /// each was decoded from.
+    fn unfinalized_chain(
+        &self,
+        tip: &Tip,
+        parent: Digest,
+        parent_view: u64,
+    ) -> Result<(Vec<AppShardFrame>, Vec<ChainBody>)> {
+        self.walk_chain(tip, parent, parent_view)?
+            .map_err(|_| unavailable("selected parent does not extend the materialized tip"))
+    }
+
+    /// [`Self::unfinalized_chain`], telling the bodies' definitive refusal
+    /// apart from what this member cannot read (a missing, undecodable or
+    /// seal body).
+    fn walk_chain(
+        &self,
+        tip: &Tip,
+        parent: Digest,
+        parent_view: u64,
+    ) -> Result<std::result::Result<(Vec<AppShardFrame>, Vec<ChainBody>), Refused>> {
+        let blocks = self
+            .blocks
+            .get()
+            .ok_or_else(|| unavailable("selected parent body is not available"))?;
         let mut chain: Vec<AppShardFrame> = Vec::new();
+        let mut bodies = Vec::new();
         let mut next = parent;
+        let mut depth = None;
         loop {
-            let bytes = blocks.get(&next).ok_or_else(|| unavailable("selected parent body is not available"))?;
-            let frame = decode_app_frame(&bytes).ok_or_else(|| unavailable("undecodable selected parent"))?;
-            let header = frame.header.as_ref().ok_or_else(|| unavailable("selected parent has no header"))?;
-            if app_frame_digest(&frame) != Some(next) || header.address != self.filter || header.rank <= tip.view {
-                return Err(refused());
+            let bytes = blocks
+                .get(&next)
+                .ok_or_else(|| unavailable("selected parent body is not available"))?;
+            if quil_cw_consensus::handoff::Seal::is_encoding(&bytes) {
+                return Err(unavailable("selected parent body is a terminal seal"));
+            }
+            let frame = decode_app_frame(&bytes)
+                .ok_or_else(|| unavailable("undecodable selected parent"))?;
+            let header = frame
+                .header
+                .as_ref()
+                .ok_or_else(|| unavailable("selected parent has no header"))?;
+            let refused = Refused {
+                depth: *depth.get_or_insert(header.frame_number.saturating_sub(tip.cursor)),
+            };
+            if app_frame_digest(&frame) != Some(next)
+                || header.address != self.filter
+                || header.rank <= tip.view
+            {
+                return Ok(Err(refused));
             }
             match chain.last().and_then(|above| above.header.as_ref()) {
-                Some(above) if above.frame_number != header.frame_number + 1 || above.rank <= header.rank => {
-                    return Err(refused());
+                Some(above)
+                    if above.frame_number != header.frame_number + 1
+                        || above.rank <= header.rank =>
+                {
+                    return Ok(Err(refused));
                 }
-                None if header.rank != parent_view => return Err(refused()),
+                None if header.rank != parent_view => return Ok(Err(refused)),
                 _ => {}
             }
             let reaches_tip = header.parent_selector == digest_from_identity(tip.digest).as_ref();
             let (number, selector) = (header.frame_number, header.parent_selector.clone());
             chain.push(frame);
+            bodies.push((next, number, bytes));
             if reaches_tip {
                 if number != tip.cursor + 1 {
-                    return Err(refused());
+                    return Ok(Err(refused));
                 }
                 break;
             }
             if chain.len() >= MAX_PRIVATE_CHAIN || number <= tip.cursor + 1 {
-                return Err(refused());
+                return Ok(Err(refused));
             }
-            let identity: [u8; 32] = selector.as_slice().try_into().map_err(|_| refused())?;
+            let Ok(identity) = <[u8; 32]>::try_from(selector.as_slice()) else {
+                return Ok(Err(refused));
+            };
             next = digest_from_identity(identity);
         }
         chain.reverse();
-        Ok(chain)
+        bodies.reverse();
+        Ok(Ok((chain, bodies)))
     }
 
     /// The canonical leader rebound to a prepared parent for `rank`.
@@ -454,6 +641,40 @@ impl AppParentExecutor {
         rank: u64,
     ) -> Result<Arc<dyn quil_consensus::leader_provider::LeaderProvider<AppShardState>>> {
         Ok(Arc::new(self.leader.for_parent(parent, rank)?))
+    }
+}
+
+/// A leader skips notarized parents that were nullified (they can never
+/// finalize) and that no member can extend, for an older certified parent.
+impl quil_cw_consensus::engine_host::ParentFallback for AppParentExecutor {
+    fn extendable(&self, view: u64, payload: Digest) -> bool {
+        AppParentExecutor::extendable(self, payload, view)
+    }
+
+    fn fell_back(&self, view: u64, parent: u64, skipped: &[u64]) {
+        // The newest skipped parent's height above the tip, as last judged.
+        let depth = skipped.first().and_then(|newest| {
+            let verdicts = self.verdicts.lock().unwrap_or_else(|e| e.into_inner());
+            verdicts
+                .iter()
+                .rev()
+                .find(|((cached, _, _), _)| cached == newest)
+                .and_then(|(_, verdict)| verdict.map(|refused| refused.depth))
+        });
+        info!(
+            core_id = self.core_id,
+            filter = %hex::encode(&self.filter),
+            view,
+            parent_view = parent,
+            skipped = ?skipped,
+            // Views from the parent through the newest skipped one, whose
+            // nullifications simplex forwards (a bounded number per turn).
+            nullification_gap = skipped.first().map_or(0, |newest| newest.saturating_sub(parent)),
+            depth = ?depth,
+            max_depth = MAX_PRIVATE_CHAIN,
+            materialized = self.materialized.load(std::sync::atomic::Ordering::SeqCst),
+            "app leader builds on an older certified parent: newer notarized parents were nullified and lie max_depth or more frames above the materialized tip"
+        );
     }
 }
 

@@ -15,9 +15,11 @@ use crate::context::{Context, GlobalArgs};
 use crate::rpc::ConnectOpts;
 
 mod account;
-mod legacy;
 #[cfg(feature = "confidential-tokens")]
 pub(crate) mod balance;
+#[cfg(feature = "confidential-tokens")]
+mod claimable_rewards;
+mod legacy;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
 
@@ -28,16 +30,196 @@ pub struct TokenCommonArgs {
     /// Use public RPC for token operations.
     #[arg(long = "public-rpc", global = true, default_value_t = false)]
     pub public_rpc: bool,
-    /// Path to the node config directory.
-    #[arg(long = "config", global = true, default_value = "")]
-    pub config: String,
-    /// Read wallet state (coins, escrows, witnesses, fee quotes) from this
-    /// node's gRPC multiaddr instead of the configured node. Submissions still
-    /// go to the configured node, whose peer key authenticates them. Use when
-    /// the configured node does not hold the application's state (a regular
-    /// node's master process does not serve its workers' shard state).
+    /// Path to the node config directory, the one holding config.yml
+    /// (default: the default node config). A directory without config.yml is
+    /// refused. `token legacy` takes it more than once, after `legacy`.
+    #[arg(long = "config", global = true, value_name = "DIR", action = clap::ArgAction::Append)]
+    pub config: Vec<String>,
+    /// Read wallet state (coins, escrows, witnesses) and other applications'
+    /// fee quotes from this node's gRPC multiaddr instead of the configured
+    /// node. QUIL fee quotes and submissions still go to the configured node,
+    /// whose peer key authenticates them. Use when the configured node does
+    /// not hold the application's state (a regular node's master process does
+    /// not serve its workers' shard state). The connection is plaintext: a
+    /// host other than this one also needs --insecure-read-rpc.
     #[arg(long = "read-rpc", global = true)]
     pub read_rpc: Option<String>,
+    /// Allow --read-rpc to name another host over plaintext gRPC, which
+    /// anyone on the network path can read and alter.
+    #[arg(long = "insecure-read-rpc", global = true, default_value_t = false)]
+    pub insecure_read_rpc: bool,
+    /// Largest fee in base units paid from a node's quote, and largest QUIL
+    /// settlement paid for another application's bundle (default: 0.1 QUIL).
+    /// A larger quote is refused; an explicit --fee is not limited.
+    #[arg(
+        long = "max-fee",
+        global = true,
+        env = "QUILIBRIUM_MAX_FEE",
+        default_value_t = DEFAULT_MAX_AUTOMATIC_FEE
+    )]
+    pub max_fee: u128,
+}
+
+/// Default limit on an automatic fee or bundle settlement: 0.1 QUIL. A QUIL
+/// operation's quoted fee is orders of magnitude lower; a settlement reaches it
+/// only for a bundle near the 1 MiB quote bound at several times the default
+/// application fee vote.
+pub const DEFAULT_MAX_AUTOMATIC_FEE: u128 = 800_000_000;
+
+/// Environment variable behind `--max-fee`, also read by paid deploy and
+/// hypergraph writes, which have no fee flags of their own.
+#[cfg(feature = "native-proof")]
+const MAX_FEE_ENV: &str = "QUILIBRIUM_MAX_FEE";
+
+/// The automatic fee limit for a paid write outside `qclient token`.
+#[cfg(feature = "native-proof")]
+fn max_fee_from_env() -> anyhow::Result<u128> {
+    match std::env::var(MAX_FEE_ENV) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{MAX_FEE_ENV} {value:?}: {e}")),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_MAX_AUTOMATIC_FEE),
+        Err(e) => Err(anyhow::anyhow!("{MAX_FEE_ENV}: {e}")),
+    }
+}
+
+impl TokenCommonArgs {
+    /// The one `--config` of a command other than `token legacy` (empty: the
+    /// default node config).
+    fn single_config(&self) -> anyhow::Result<&str> {
+        match self.config.as_slice() {
+            [] => Ok(""),
+            [one] => Ok(one.as_str()),
+            several => anyhow::bail!(
+                "--config is given {} times; only `token legacy` reads several node configs",
+                several.len()
+            ),
+        }
+    }
+}
+
+/// Where the node a command reads from was named, for errors that say so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeSource {
+    /// `--read-rpc`.
+    ReadRpc,
+    /// `listenGrpcMultiaddr` of the node config in this directory.
+    Config(PathBuf),
+    /// No node config names one: the node's default listener.
+    Default,
+}
+
+/// A node to read from, and where it was named.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadNode {
+    pub opts: ConnectOpts,
+    pub source: NodeSource,
+}
+
+impl ReadNode {
+    /// The node as an operator would look it up: its address, then where
+    /// that address came from.
+    pub(crate) fn describe(&self) -> String {
+        if self.opts.is_light_node() {
+            return if self.opts.custom_rpc.is_empty() {
+                format!(
+                    "the public RPC {} (--public-rpc, or publicRpc in the qclient config)",
+                    crate::rpc::PUBLIC_RPC_ADDR
+                )
+            } else {
+                format!("{} (customRpc in the qclient config)", self.opts.custom_rpc)
+            };
+        }
+        let multiaddr = self.multiaddr();
+        match &self.source {
+            NodeSource::ReadRpc => format!("{multiaddr} (--read-rpc)"),
+            NodeSource::Config(dir) if self.opts.listen_grpc_multiaddr.is_empty() => format!(
+                "{multiaddr} (the node default: {} sets no listenGrpcMultiaddr)",
+                dir.join("config.yml").display()
+            ),
+            NodeSource::Config(dir) => format!(
+                "{multiaddr} (listenGrpcMultiaddr in {})",
+                dir.join("config.yml").display()
+            ),
+            NodeSource::Default => format!("{multiaddr} (the node default; no node config found)"),
+        }
+    }
+
+    /// The gRPC multiaddr dialed, for a node that is not a public RPC.
+    pub(crate) fn multiaddr(&self) -> &str {
+        if self.opts.listen_grpc_multiaddr.is_empty() {
+            quil_config::DEFAULT_LISTEN_GRPC_MULTIADDR
+        } else {
+            &self.opts.listen_grpc_multiaddr
+        }
+    }
+
+    /// One key per distinct endpoint, so a command dials each node once.
+    pub(crate) fn endpoint_key(&self) -> String {
+        if self.opts.is_light_node() {
+            format!("rpc:{}", self.opts.custom_rpc)
+        } else {
+            format!("grpc:{}", self.multiaddr())
+        }
+    }
+
+    /// What the operator can do when this node does not answer. `default`
+    /// is the default node config's listener, suggested when it differs.
+    fn remedy(&self, default: Option<&str>) -> String {
+        if self.opts.is_light_node() {
+            return "Check this host's network access, or read through a running node with \
+                    --read-rpc <its listenGrpcMultiaddr>"
+                .into();
+        }
+        let mut remedy = match self.source {
+            NodeSource::ReadRpc => "Check that a node runs and listens there: a node's address is \
+                 listenGrpcMultiaddr in its own config.yml"
+                .to_string(),
+            _ => "Is that node running? Pass --read-rpc <multiaddr of a running node>: a \
+                  node's address is listenGrpcMultiaddr in its own config.yml"
+                .to_string(),
+        };
+        if let Some(default) = default.filter(|default| *default != self.multiaddr()) {
+            remedy.push_str(&format!(" (the default node config has {default})"));
+        }
+        remedy
+    }
+
+    /// Connect, or say which node did not answer, where it was named and
+    /// what to do about it.
+    pub(crate) async fn connect(
+        &self,
+        default: Option<&str>,
+    ) -> anyhow::Result<
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+    > {
+        crate::rpc::connect_node_service(&self.opts)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot reach the node at {}: {error:#}. {}",
+                    self.describe(),
+                    self.remedy(default)
+                )
+            })
+    }
+}
+
+/// Connection options for `--read-rpc`. The read connection is plaintext h2,
+/// so a host other than this one is dialed only with `--insecure-read-rpc`.
+fn read_rpc_opts(multiaddr: &str, insecure: bool) -> anyhow::Result<ConnectOpts> {
+    anyhow::ensure!(
+        insecure || crate::rpc::is_local_multiaddr(multiaddr)?,
+        "--read-rpc {multiaddr} is not on this host, and its gRPC connection is plaintext: \
+         anyone on the network path can read and alter the wallet state it returns; \
+         read through a node on this host, or pass --insecure-read-rpc to accept that"
+    );
+    Ok(ConnectOpts {
+        public_rpc: false,
+        custom_rpc: String::new(),
+        listen_grpc_multiaddr: multiaddr.to_string(),
+    })
 }
 
 #[derive(Debug, Args)]
@@ -47,8 +229,10 @@ pub struct TokenArgs {
     /// Application identifier in hexadecimal (default: QUIL).
     #[arg(long, global = true)]
     pub application: Option<String>,
-    /// Maximum discovery pages; exhaustion fails rather than returning a partial balance.
-    #[arg(long, global = true, default_value_t = 128)]
+    /// Maximum discovery pages (up to 64 confidential coins or escrows each,
+    /// 8 from older nodes); exhaustion fails rather than returning a partial
+    /// balance.
+    #[arg(long, global = true, default_value_t = 2048)]
     pub max_pages: usize,
     /// Maximum recovered unspent coins retained during discovery.
     #[arg(long, global = true, default_value_t = 1024)]
@@ -63,13 +247,23 @@ pub enum TokenCommand {
     Account,
     /// Lists the total balance of tokens in the managing account.
     Balance,
-    /// Reads only the authenticated prover reward witness without scanning wallet coins.
+    /// Reads QUIL rewards, unshielded legacy coins and confidential balance independently.
     #[cfg(feature = "confidential-tokens")]
     ClaimableRewards,
     /// Lists all coins under control of the managing account.
     Coins,
-    /// Lists this identity's legacy (pre-2.1) coins and their unshielded total.
-    Legacy,
+    /// Lists legacy (pre-2.1) coins, their unshielded total and shield readiness.
+    ///
+    /// Identities: the node config (--config, repeatable after `legacy`;
+    /// default: the default node config), every node under --configs-under,
+    /// and Ed448 public keys, peer IDs or owner addresses given without any
+    /// config. Only config.yml's Ed448 public key is read, never keys.yml.
+    /// Coins are read from --read-rpc, else the public RPC (--public-rpc),
+    /// else each config's listenGrpcMultiaddr; identities given without a
+    /// config ask the default node config's node, else the node default
+    /// /ip4/127.0.0.1/tcp/8337.
+    #[command(after_long_help = legacy::AFTER_HELP)]
+    Legacy(legacy::LegacyArgs),
     /// Transfer a confidential amount to a recipient address (`confidential-address`).
     Transfer {
         /// Recipient QCT3 address.
@@ -100,7 +294,14 @@ pub enum TokenCommand {
         fee: Option<u128>,
     },
     /// Shield every unshielded legacy coin of this identity, in batches of up
-    /// to 96 legacy coins from one shard each (active from GLOBAL frame 864,000).
+    /// to 96 legacy coins from one shard each.
+    ///
+    /// On mainnet, where every legacy coin came from the migration, shields
+    /// are admitted from GLOBAL frame 943,920 (the first frame of epoch 1311),
+    /// when admission starts matching owners in their migrated form; earlier
+    /// shields are refused ("source owner mismatch"), so this command refuses
+    /// to start before the node's GLOBAL head reaches it. Batches themselves
+    /// are admitted from frame 864,000. `token legacy` shows the plan.
     #[cfg(feature = "native-proof")]
     ShieldAll {
         /// Legacy coins per batch (1 to 96).
@@ -267,7 +468,6 @@ pub enum TokenCommand {
 /// Resolved per-invocation token context (Go `TokenCmd.PersistentPreRun`).
 pub struct TokenCtx {
     pub node_config: Config,
-    #[allow(dead_code)]
     pub config_dir: PathBuf,
     pub key_manager: Arc<FileKeyManager>,
     pub connect_opts: ConnectOpts,
@@ -277,6 +477,9 @@ pub struct TokenCtx {
     /// `config.p2p.peer_priv_key`. EMPTY on a Falcon-only node, which carries
     /// no pre-migration Ed448 key.
     pub peer_id_bytes: Vec<u8>,
+    /// Largest automatic fee or bundle settlement, in base units, paid from a
+    /// node's quote (`--max-fee`).
+    pub max_fee: u128,
 }
 
 impl TokenCtx {
@@ -296,28 +499,42 @@ impl TokenCtx {
     pub async fn connect(
         &self,
     ) -> anyhow::Result<
-        quil_types::proto::node::node_service_client::NodeServiceClient<
-            tonic::transport::Channel,
-        >,
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
     > {
-        crate::rpc::connect_node_service(&self.connect_opts).await
+        // Read options differ from the submission's only by --read-rpc.
+        let read_rpc = self.connect_opts.listen_grpc_multiaddr
+            != self.submit_opts.listen_grpc_multiaddr
+            || self.connect_opts.is_light_node() != self.submit_opts.is_light_node();
+        ReadNode {
+            opts: self.connect_opts.clone(),
+            source: if read_rpc {
+                NodeSource::ReadRpc
+            } else {
+                NodeSource::Config(self.config_dir.clone())
+            },
+        }
+        .connect(None)
+        .await
     }
 
     /// Connect to the configured node for an authenticated submission.
     pub async fn connect_submit(
         &self,
     ) -> anyhow::Result<
-        quil_types::proto::node::node_service_client::NodeServiceClient<
-            tonic::transport::Channel,
-        >,
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
     > {
-        crate::rpc::connect_node_service(&self.submit_opts).await
+        ReadNode {
+            opts: self.submit_opts.clone(),
+            source: NodeSource::Config(self.config_dir.clone()),
+        }
+        .connect(None)
+        .await
     }
 
     fn load(global: GlobalArgs, common: &TokenCommonArgs) -> anyhow::Result<Self> {
         let ctx = Context::load(global)?;
         println!("Loading node config...");
-        let (node_config, config_dir) = ctx.load_node_config(&common.config)?;
+        let (node_config, config_dir) = ctx.load_node_config(common.single_config()?)?;
 
         // The Ed448 identity is kept ONLY for the legacy coin address
         // (`poseidon(ed448 peerId)`, `legacy_address()` below). The peer id we
@@ -332,7 +549,10 @@ impl TokenCtx {
         let key_manager = ctx.key_manager(&node_config, &config_dir)?;
         match key_manager.get_public_key_bytes_by_id("q-prover-key") {
             Ok(falcon_pub) => {
-                println!("{}", quil_p2p::peer_id_base58_from_falcon_pubkey(&falcon_pub));
+                println!(
+                    "{}",
+                    quil_p2p::peer_id_base58_from_falcon_pubkey(&falcon_pub)
+                );
             }
             // Fall back to the legacy Ed448 peer id only if the Falcon network key
             // is absent (a pre-migration keystore).
@@ -343,9 +563,7 @@ impl TokenCtx {
         }
         let submit_opts = ctx.connect_opts(&node_config, common.public_rpc);
         let connect_opts = match &common.read_rpc {
-            Some(multiaddr) => ConnectOpts {
-                public_rpc: false, custom_rpc: String::new(), listen_grpc_multiaddr: multiaddr.clone(),
-            },
+            Some(multiaddr) => read_rpc_opts(multiaddr, common.insecure_read_rpc)?,
             None => submit_opts.clone(),
         };
 
@@ -355,7 +573,10 @@ impl TokenCtx {
             key_manager,
             connect_opts,
             submit_opts,
-            peer_id_bytes: identity.map(|identity| identity.peer_id_bytes).unwrap_or_default(),
+            peer_id_bytes: identity
+                .map(|identity| identity.peer_id_bytes)
+                .unwrap_or_default(),
+            max_fee: common.max_fee,
         })
     }
 }
@@ -365,7 +586,9 @@ impl TokenCtx {
 /// because coin selection follows the fee; outputs are counted exactly.
 #[cfg(feature = "native-proof")]
 async fn operation_fee(
-    tc: &TokenCtx, application: &str, explicit: Option<u128>,
+    tc: &TokenCtx,
+    application: &str,
+    explicit: Option<u128>,
     shape: quil_execution::token_intrinsic::cost::Shape,
 ) -> anyhow::Result<u128> {
     let decoded = hex::decode(application)?;
@@ -376,7 +599,10 @@ async fn operation_fee(
         let fee = explicit.unwrap_or(0);
         // Custom-token outflow carries no token fee; the operation's QUIL fee
         // is paid by a settlement claim submitted with it.
-        anyhow::ensure!(fee == 0, "custom-token operations carry no token fee; their QUIL fee is paid by a settlement");
+        anyhow::ensure!(
+            fee == 0,
+            "custom-token operations carry no token fee; their QUIL fee is paid by a settlement"
+        );
         Ok(fee)
     }
 }
@@ -396,103 +622,354 @@ pub(crate) async fn pay_for_bundle(
     rest: &quil_execution::message_envelope::CanonicalMessageBundle,
     wait: std::time::Duration,
 ) -> anyhow::Result<(Vec<u8>, bool)> {
-    let common = TokenCommonArgs { public_rpc: false, config: String::new(), read_rpc: None };
+    let common = TokenCommonArgs {
+        public_rpc: false,
+        config: Vec::new(),
+        read_rpc: None,
+        insecure_read_rpc: false,
+        max_fee: max_fee_from_env()?,
+    };
     let tc = TokenCtx::load(global, &common)?;
     wallet::pay_for_bundle(&tc, destination, rest, None, wait).await
 }
 
 pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
+    // Legacy coins are listed by public key alone: no keystore, and possibly
+    // several identities.
+    if let TokenCommand::Legacy(listing) = &args.command {
+        return legacy::run(global, &args.common, &application(args)?, listing).await;
+    }
     let tc = TokenCtx::load(global, &args.common)?;
     run_with_context(&tc, args).await
 }
 
+/// The `--application` identifier (default: QUIL).
+fn application(args: &TokenArgs) -> anyhow::Result<[u8; 32]> {
+    match &args.application {
+        None => Ok(quil_execution::domains::QUIL_TOKEN),
+        Some(application) => hex::decode(application)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("application must be exactly 32 bytes")),
+    }
+}
+
 /// Shared command dispatch after configuration and keys have been loaded.
 async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()> {
-    let application = args.application.clone().unwrap_or_else(|| hex::encode(quil_execution::domains::QUIL_TOKEN));
+    let application = args
+        .application
+        .clone()
+        .unwrap_or_else(|| hex::encode(quil_execution::domains::QUIL_TOKEN));
     let decoded = hex::decode(&application)?;
     anyhow::ensure!(decoded.len() == 32, "application must be exactly 32 bytes");
     #[cfg(feature = "confidential-tokens")]
     match &args.command {
         TokenCommand::ClaimableRewards => {
-            println!("{}", balance::claimable_rewards(&tc).await);
-            return Ok(());
+            return claimable_rewards::run(tc, args.max_pages, args.max_coins).await;
         }
-        TokenCommand::Balance => return wallet::run_balance(&tc, &application, args.max_pages, args.max_coins).await,
-        TokenCommand::Coins => return wallet::run_coins(&tc, &application, args.max_pages, args.max_coins).await,
+        TokenCommand::Balance => {
+            return wallet::run_balance(&tc, &application, args.max_pages, args.max_coins).await
+        }
+        TokenCommand::Coins => {
+            return wallet::run_coins(&tc, &application, args.max_pages, args.max_coins).await
+        }
         TokenCommand::ConfidentialAddress => {
             wallet::run(&tc, &application, false)?;
             return wallet::run(&tc, &application, true);
         }
-        TokenCommand::Escrows { max_escrows } =>
-            return wallet::run_escrows(&tc, &application, args.max_pages, *max_escrows).await,
+        TokenCommand::Escrows { max_escrows } => {
+            return wallet::run_escrows(&tc, &application, args.max_pages, *max_escrows).await
+        }
         _ => {}
     }
     #[cfg(feature = "native-proof")]
     {
-        let parse_amount = |value: &str| value.parse::<u128>().map_err(|e| anyhow::anyhow!("amount {value:?}: {e}"));
+        let parse_amount = |value: &str| {
+            value
+                .parse::<u128>()
+                .map_err(|e| anyhow::anyhow!("amount {value:?}: {e}"))
+        };
         let parse_id = |value: &str| -> anyhow::Result<[u8; 32]> {
-            hex::decode(value.trim_start_matches("0x"))?.try_into()
+            hex::decode(value.trim_start_matches("0x"))?
+                .try_into()
                 .map_err(|_| anyhow::anyhow!("{value:?} must be exactly 32 bytes of hex"))
         };
         use quil_execution::token_intrinsic::cost::Shape;
-        let max_inputs = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(tc.node_config.p2p.network).limits.max_inputs;
-        let spend = |coins: usize| Shape { coins, markers: max_inputs, escrow: false };
+        let max_inputs = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
+            tc.node_config.p2p.network,
+        )
+        .limits
+        .max_inputs;
+        let spend = |coins: usize| Shape {
+            coins,
+            markers: max_inputs,
+            escrow: false,
+        };
         match &args.command {
-            TokenCommand::Transfer { recipient, amount, fee } =>
-                return wallet::run_transfer(&tc, &application, recipient, parse_amount(amount)?, *fee, args.max_pages, args.max_coins).await,
-            TokenCommand::Merge { coins, fee } =>
-                return wallet::run_merge(&tc, &application, coins, operation_fee(&tc, &application, *fee, spend(1)).await?, args.max_pages, args.max_coins).await,
-            TokenCommand::Split { coin, amounts, parts, part_amount, fee } => {
+            TokenCommand::Transfer {
+                recipient,
+                amount,
+                fee,
+            } => {
+                return wallet::run_transfer(
+                    &tc,
+                    &application,
+                    recipient,
+                    parse_amount(amount)?,
+                    *fee,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await
+            }
+            TokenCommand::Merge { coins, fee } => {
+                return wallet::run_merge(
+                    &tc,
+                    &application,
+                    coins,
+                    operation_fee(&tc, &application, *fee, spend(1)).await?,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await
+            }
+            TokenCommand::Split {
+                coin,
+                amounts,
+                parts,
+                part_amount,
+                fee,
+            } => {
                 let pieces: Vec<u128> = match (parts, part_amount) {
                     (Some(parts), Some(part_amount)) => {
                         anyhow::ensure!(*parts <= 2, "split supports at most two outputs");
                         vec![parse_amount(part_amount)?; *parts as usize]
                     }
                     (Some(_), None) => anyhow::bail!("--parts requires --part-amount"),
-                    (None, _) => amounts.iter().map(|amount| parse_amount(amount)).collect::<anyhow::Result<_>>()?,
+                    (None, _) => amounts
+                        .iter()
+                        .map(|amount| parse_amount(amount))
+                        .collect::<anyhow::Result<_>>()?,
                 };
-                return wallet::run_split(&tc, &application, coin, &pieces, operation_fee(&tc, &application, *fee, Shape { coins: pieces.len().max(1), markers: 1, escrow: false }).await?, args.max_pages, args.max_coins).await;
+                return wallet::run_split(
+                    &tc,
+                    &application,
+                    coin,
+                    &pieces,
+                    operation_fee(
+                        &tc,
+                        &application,
+                        *fee,
+                        Shape {
+                            coins: pieces.len().max(1),
+                            markers: 1,
+                            escrow: false,
+                        },
+                    )
+                    .await?,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await;
             }
-            TokenCommand::PendingTransfer { recipient, amount, expiration, fee } =>
-                return wallet::run_pending_create(&tc, &application, recipient, parse_amount(amount)?, operation_fee(&tc, &application, *fee, Shape { coins: 1, markers: max_inputs, escrow: true }).await?, *expiration, args.max_pages, args.max_coins).await,
-            TokenCommand::Accept { escrow, fee } =>
-                return wallet::run_claim(&tc, &application, escrow, operation_fee(&tc, &application, *fee, Shape { coins: 1, markers: 1, escrow: false }).await?, false).await,
-            TokenCommand::Reject { escrow, fee } =>
-                return wallet::run_claim(&tc, &application, escrow, operation_fee(&tc, &application, *fee, Shape { coins: 1, markers: 1, escrow: false }).await?, true).await,
-            TokenCommand::Mint { recipient, fee, claim } => {
-                anyhow::ensure!(decoded == quil_execution::domains::QUIL_TOKEN, "reward mint requires the QUIL application; use custom-mint for custom tokens");
+            TokenCommand::PendingTransfer {
+                recipient,
+                amount,
+                expiration,
+                fee,
+            } => {
+                return wallet::run_pending_create(
+                    &tc,
+                    &application,
+                    recipient,
+                    parse_amount(amount)?,
+                    operation_fee(
+                        &tc,
+                        &application,
+                        *fee,
+                        Shape {
+                            coins: 1,
+                            markers: max_inputs,
+                            escrow: true,
+                        },
+                    )
+                    .await?,
+                    *expiration,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await
+            }
+            TokenCommand::Accept { escrow, fee } => {
+                return wallet::run_claim(
+                    &tc,
+                    &application,
+                    escrow,
+                    operation_fee(
+                        &tc,
+                        &application,
+                        *fee,
+                        Shape {
+                            coins: 1,
+                            markers: 1,
+                            escrow: false,
+                        },
+                    )
+                    .await?,
+                    false,
+                )
+                .await
+            }
+            TokenCommand::Reject { escrow, fee } => {
+                return wallet::run_claim(
+                    &tc,
+                    &application,
+                    escrow,
+                    operation_fee(
+                        &tc,
+                        &application,
+                        *fee,
+                        Shape {
+                            coins: 1,
+                            markers: 1,
+                            escrow: false,
+                        },
+                    )
+                    .await?,
+                    true,
+                )
+                .await
+            }
+            TokenCommand::Mint {
+                recipient,
+                fee,
+                claim,
+            } => {
+                anyhow::ensure!(
+                    decoded == quil_execution::domains::QUIL_TOKEN,
+                    "reward mint requires the QUIL application; use custom-mint for custom tokens"
+                );
                 // The mint pays its own state-growth charge (one coin and the
                 // receipt marker) out of the minted amount.
-                let mint_fee = if claim.is_some() { 0 } else {
+                let mint_fee = if claim.is_some() {
+                    0
+                } else {
                     // Reward mints execute in the global venue: quote its pricing.
-                    wallet::quoted_quil_fee(&tc, *fee, Shape { coins: 1, markers: 1, escrow: false }, true).await?
+                    wallet::quoted_quil_fee(
+                        &tc,
+                        *fee,
+                        Shape {
+                            coins: 1,
+                            markers: 1,
+                            escrow: false,
+                        },
+                        true,
+                    )
+                    .await?
                 };
-                return wallet::run_mint(&tc, recipient.as_deref(), mint_fee, claim.as_deref()).await;
+                return wallet::run_mint(&tc, recipient.as_deref(), mint_fee, claim.as_deref())
+                    .await;
             }
-            TokenCommand::ShieldAll { max_per_batch } =>
-                return wallet::run_shield_all(&tc, &application, *max_per_batch).await,
-            TokenCommand::Shield { source, amount, fee } =>
-                return wallet::run_shield(&tc, &application, source, *amount, operation_fee(&tc, &application, *fee, Shape { coins: 1, markers: 1, escrow: false }).await?).await,
-            TokenCommand::Pay { destination, amount, context, fee } => {
-                wallet::run_pay(&tc, parse_id(destination)?, parse_amount(amount)?,
-                    wallet::SettlementBinding::Bundle(parse_id(context)?), *fee, None,
-                    args.max_pages, args.max_coins).await?;
+            TokenCommand::ShieldAll { max_per_batch } => {
+                return wallet::run_shield_all(&tc, &application, *max_per_batch).await
+            }
+            TokenCommand::Shield {
+                source,
+                amount,
+                fee,
+            } => {
+                return wallet::run_shield(
+                    &tc,
+                    &application,
+                    source,
+                    *amount,
+                    operation_fee(
+                        &tc,
+                        &application,
+                        *fee,
+                        Shape {
+                            coins: 1,
+                            markers: 1,
+                            escrow: false,
+                        },
+                    )
+                    .await?,
+                )
+                .await
+            }
+            TokenCommand::Pay {
+                destination,
+                amount,
+                context,
+                fee,
+            } => {
+                wallet::run_pay(
+                    &tc,
+                    parse_id(destination)?,
+                    parse_amount(amount)?,
+                    wallet::SettlementBinding::Bundle(parse_id(context)?),
+                    *fee,
+                    None,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await?;
                 return Ok(());
             }
-            TokenCommand::Prefund { destination, amount, fee, claimant_key } =>
-                return wallet::run_prefund(&tc, parse_id(destination)?, parse_amount(amount)?, *fee, claimant_key,
-                    args.max_pages, args.max_coins).await,
+            TokenCommand::Prefund {
+                destination,
+                amount,
+                fee,
+                claimant_key,
+            } => {
+                return wallet::run_prefund(
+                    &tc,
+                    parse_id(destination)?,
+                    parse_amount(amount)?,
+                    *fee,
+                    claimant_key,
+                    args.max_pages,
+                    args.max_coins,
+                )
+                .await
+            }
             TokenCommand::Prefunded => return wallet::run_prefunded(&tc).await,
-            TokenCommand::SettlementClaim { destination, receipt, amount, context, wait } => {
-                let claim = wallet::settlement_claim(&tc, parse_id(destination)?, parse_id(receipt)?, parse_amount(amount)?,
-                    &wallet::ClaimBinding::Bundle(parse_id(context)?), None, std::time::Duration::from_secs(*wait)).await?;
+            TokenCommand::SettlementClaim {
+                destination,
+                receipt,
+                amount,
+                context,
+                wait,
+            } => {
+                let claim = wallet::settlement_claim(
+                    &tc,
+                    parse_id(destination)?,
+                    parse_id(receipt)?,
+                    parse_amount(amount)?,
+                    &wallet::ClaimBinding::Bundle(parse_id(context)?),
+                    None,
+                    std::time::Duration::from_secs(*wait),
+                )
+                .await?;
                 println!("{}", hex::encode(claim));
                 return Ok(());
             }
             TokenCommand::Entitlements { file } => return wallet::run_entitlements(&tc, file),
-            TokenCommand::CustomMint { amount, recipient, authority_key, permissionless, payee, price, pay_wait, entitlement } => {
+            TokenCommand::CustomMint {
+                amount,
+                recipient,
+                authority_key,
+                permissionless,
+                payee,
+                price,
+                pay_wait,
+                entitlement,
+            } => {
                 let paid = match (payee, price) {
-                    (Some(payee), Some(price)) => Some((payee.as_str(), *price, std::time::Duration::from_secs(*pay_wait))),
+                    (Some(payee), Some(price)) => Some((
+                        payee.as_str(),
+                        *price,
+                        std::time::Duration::from_secs(*pay_wait),
+                    )),
                     (None, None) => None,
                     _ => anyhow::bail!("a paid mint needs both --payee and --price"),
                 };
@@ -500,7 +977,17 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     Some(hex) => hex::decode(hex.strip_prefix("0x").unwrap_or(hex))?,
                     None => Vec::new(),
                 };
-                return wallet::run_custom_mint(&tc, &application, *amount, recipient.as_deref(), authority_key, *permissionless, paid, entitlement).await;
+                return wallet::run_custom_mint(
+                    &tc,
+                    &application,
+                    *amount,
+                    recipient.as_deref(),
+                    authority_key,
+                    *permissionless,
+                    paid,
+                    entitlement,
+                )
+                .await;
             }
             TokenCommand::PaymentAddress => return wallet::run_payment_address(&tc),
             _ => {}
@@ -508,11 +995,13 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
     }
     match &args.command {
         TokenCommand::Account => account::run(&tc),
-        TokenCommand::Legacy => {
+        TokenCommand::Legacy(listing) => {
             let application: [u8; 32] = decoded.as_slice().try_into().expect("checked above");
-            legacy::run(tc, &application).await
+            legacy::run_loaded(tc, &application, listing).await
         }
-        _ => anyhow::bail!("this build does not include support for this confidential token operation"),
+        _ => anyhow::bail!(
+            "this build does not include support for this confidential token operation"
+        ),
     }
 }
 
@@ -530,37 +1019,309 @@ mod tests {
     #[test]
     fn token_cli_uses_one_command_family_for_all_applications() {
         let app = hex::encode([7; 32]);
-        let parsed = TokenCli::try_parse_from(["token", "transfer", "recipient", "9", "--application", &app,
-            "--fee", "0", "--max-pages", "4", "--max-coins", "8"]).unwrap();
+        let parsed = TokenCli::try_parse_from([
+            "token",
+            "transfer",
+            "recipient",
+            "9",
+            "--application",
+            &app,
+            "--fee",
+            "0",
+            "--max-pages",
+            "4",
+            "--max-coins",
+            "8",
+        ])
+        .unwrap();
         assert_eq!(parsed.token.application.as_deref(), Some(app.as_str()));
         assert_eq!((parsed.token.max_pages, parsed.token.max_coins), (4, 8));
-        assert!(matches!(parsed.token.command, TokenCommand::Transfer { fee: Some(0), .. }));
+        assert!(matches!(
+            parsed.token.command,
+            TokenCommand::Transfer { fee: Some(0), .. }
+        ));
         #[cfg(feature = "native-proof")]
         {
             assert!(TokenCli::try_parse_from(["token", "shield", "coin", "9"]).is_ok());
-            assert!(TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app]).is_ok());
+            assert!(
+                TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app])
+                    .is_ok()
+            );
             // Paid and proof-basis mints, and the entitlement tree builder.
-            assert!(TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app,
-                "--payee", "00", "--price", "5"]).is_ok());
-            assert!(matches!(TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app,
-                "--entitlement", "00"]).unwrap().token.command, TokenCommand::CustomMint { entitlement: Some(_), .. }));
-            assert!(matches!(TokenCli::try_parse_from(["token", "entitlements", "list.txt"]).unwrap().token.command,
-                TokenCommand::Entitlements { .. }));
+            assert!(TokenCli::try_parse_from([
+                "token",
+                "custom-mint",
+                "9",
+                "--application",
+                &app,
+                "--payee",
+                "00",
+                "--price",
+                "5"
+            ])
+            .is_ok());
+            assert!(matches!(
+                TokenCli::try_parse_from([
+                    "token",
+                    "custom-mint",
+                    "9",
+                    "--application",
+                    &app,
+                    "--entitlement",
+                    "00"
+                ])
+                .unwrap()
+                .token
+                .command,
+                TokenCommand::CustomMint {
+                    entitlement: Some(_),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                TokenCli::try_parse_from(["token", "entitlements", "list.txt"])
+                    .unwrap()
+                    .token
+                    .command,
+                TokenCommand::Entitlements { .. }
+            ));
             assert!(TokenCli::try_parse_from(["token", "payment-address"]).is_ok());
             // Pre-funding: a settlement paid before its bundle exists.
-            assert!(matches!(TokenCli::try_parse_from(["token", "prefund", &app, "500"]).unwrap().token.command,
-                TokenCommand::Prefund { claimant_key, .. } if claimant_key == "q-prover-key"));
+            assert!(
+                matches!(TokenCli::try_parse_from(["token", "prefund", &app, "500"]).unwrap().token.command,
+                TokenCommand::Prefund { claimant_key, .. } if claimant_key == "q-prover-key")
+            );
             assert!(TokenCli::try_parse_from(["token", "prefunded"]).is_ok());
-            assert!(TokenCli::try_parse_from(["token", "mint", "--claim", "authorization.bin"]).is_ok());
+            assert!(
+                TokenCli::try_parse_from(["token", "mint", "--claim", "authorization.bin"]).is_ok()
+            );
         }
+    }
+
+    #[test]
+    fn token_cli_takes_the_fee_limit_and_the_insecure_read_switch() {
+        let parsed = TokenCli::try_parse_from(["token", "balance"]).unwrap();
+        assert!(!parsed.token.common.insecure_read_rpc);
+        let parsed = TokenCli::try_parse_from([
+            "token",
+            "--read-rpc",
+            "/ip4/192.0.2.7/tcp/8337",
+            "balance",
+            "--insecure-read-rpc",
+            "--max-fee",
+            "5000",
+        ])
+        .unwrap();
+        assert!(parsed.token.common.insecure_read_rpc);
+        assert_eq!(parsed.token.common.max_fee, 5000);
+    }
+
+    #[test]
+    fn read_rpc_to_another_host_needs_the_insecure_switch() {
+        for local in [
+            "/ip4/127.0.0.1/tcp/8337",
+            "/ip4/0.0.0.0/tcp/8337",
+            "/ip6/::1/tcp/8337",
+            "/dns/localhost/tcp/8337",
+        ] {
+            let opts = read_rpc_opts(local, false).unwrap();
+            assert_eq!(opts.listen_grpc_multiaddr, local);
+            assert!(!opts.is_light_node());
+        }
+        for remote in [
+            "/ip4/192.0.2.7/tcp/8337",
+            "/ip6/2001:db8::7/tcp/8337",
+            "/dns4/rpc.example.com/tcp/8337",
+        ] {
+            let error = read_rpc_opts(remote, false).unwrap_err().to_string();
+            assert!(error.contains("--insecure-read-rpc"), "{error}");
+            assert_eq!(
+                read_rpc_opts(remote, true).unwrap().listen_grpc_multiaddr,
+                remote
+            );
+        }
+        assert!(read_rpc_opts("not-a-multiaddr", false).is_err());
+    }
+
+    /// `token legacy` takes several identities and output switches; every
+    /// other command still reads exactly one config.
+    #[test]
+    fn token_legacy_takes_identities_and_other_commands_one_config() {
+        let owner = format!("0x{}", hex::encode([3; 32]));
+        let parsed = TokenCli::try_parse_from([
+            "token",
+            "legacy",
+            "--config",
+            "one/.config",
+            "--config",
+            "two/.config",
+            "--configs-under",
+            "nodes",
+            "--ed448-pub",
+            "00",
+            "--peer-id",
+            "QmPeer",
+            "--owner",
+            &owner,
+            "--summary",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(parsed.token.common.config, ["one/.config", "two/.config"]);
+        let TokenCommand::Legacy(listing) = &parsed.token.command else {
+            panic!("not the legacy command");
+        };
+        assert_eq!(listing.configs_under, [PathBuf::from("nodes")]);
+        assert_eq!(
+            (
+                &listing.ed448_pub[..],
+                &listing.peer_id[..],
+                &listing.owner[..]
+            ),
+            (
+                &["00".to_string()][..],
+                &["QmPeer".to_string()][..],
+                &[owner][..]
+            )
+        );
+        assert!(listing.summary && listing.json);
+        // Nothing given: the default config, per-coin text.
+        let TokenCommand::Legacy(plain) = TokenCli::try_parse_from(["token", "legacy"])
+            .unwrap()
+            .token
+            .command
+        else {
+            panic!("not the legacy command");
+        };
+        assert!(!plain.summary && !plain.json && plain.ed448_pub.is_empty());
+
+        // The output switches belong to `legacy` alone.
+        assert!(TokenCli::try_parse_from(["token", "balance", "--summary"]).is_err());
+        assert!(TokenCli::try_parse_from(["token", "balance", "--json"]).is_err());
+        let once = TokenCli::try_parse_from(["token", "--config", "one", "balance"]).unwrap();
+        assert_eq!(once.token.common.single_config().unwrap(), "one");
+        let none = TokenCli::try_parse_from(["token", "balance"]).unwrap();
+        assert_eq!(none.token.common.single_config().unwrap(), "");
+        let twice =
+            TokenCli::try_parse_from(["token", "balance", "--config", "a", "--config", "b"])
+                .unwrap();
+        let error = twice.token.common.single_config().unwrap_err().to_string();
+        assert!(error.contains("only `token legacy`"), "{error}");
+    }
+
+    /// `token legacy --help` documents its JSON schema, and `shield-all`'s
+    /// help names the frame mainnet admits shields of migrated coins from.
+    #[test]
+    fn token_help_documents_the_legacy_schema_and_the_shield_frame() {
+        use clap::CommandFactory;
+        let mut command = TokenCli::command();
+        let legacy = command
+            .find_subcommand_mut("legacy")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(legacy.contains(legacy::JSON_SCHEMA), "{legacy}");
+        assert!(legacy.contains("--configs-under"), "{legacy}");
+        #[cfg(feature = "native-proof")]
+        {
+            let shield_all = command
+                .find_subcommand_mut("shield-all")
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            use quil_execution::token_intrinsic::legacy_migration::MAINNET_MIGRATED_OWNER_FRAME;
+            assert_eq!(
+                MAINNET_MIGRATED_OWNER_FRAME, 943_920,
+                "update the shield-all help"
+            );
+            assert!(shield_all.contains("943,920"), "{shield_all}");
+        }
+    }
+
+    /// An unreachable node is named with where its address came from and
+    /// what to do, not only as a transport error.
+    #[tokio::test]
+    async fn an_unreachable_node_is_named_with_its_source_and_the_fix() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        );
+        drop(listener);
+        let config_dir = PathBuf::from("old-node").join(".config");
+        let node = ReadNode {
+            opts: ConnectOpts {
+                public_rpc: false,
+                custom_rpc: String::new(),
+                listen_grpc_multiaddr: dead.clone(),
+            },
+            source: NodeSource::Config(config_dir.clone()),
+        };
+        let error = node
+            .connect(Some("/ip4/127.0.0.1/tcp/8888"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(&format!("cannot reach the node at {dead}")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "(listenGrpcMultiaddr in {})",
+                config_dir.join("config.yml").display()
+            )),
+            "{error}"
+        );
+        assert!(error.contains("Pass --read-rpc"), "{error}");
+        assert!(
+            error.contains("(the default node config has /ip4/127.0.0.1/tcp/8888)"),
+            "{error}"
+        );
+        // The default node config's own listener is not suggested back.
+        let error = node
+            .connect(Some(dead.as_str()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("the default node config has"), "{error}");
+
+        let read = ReadNode {
+            source: NodeSource::ReadRpc,
+            ..node.clone()
+        };
+        assert_eq!(read.describe(), format!("{dead} (--read-rpc)"));
+        let default = ReadNode {
+            opts: ConnectOpts::default(),
+            source: NodeSource::Default,
+        };
+        assert_eq!(
+            default.describe(),
+            "/ip4/127.0.0.1/tcp/8337 (the node default; no node config found)"
+        );
+        let public = ReadNode {
+            opts: ConnectOpts {
+                public_rpc: true,
+                ..ConnectOpts::default()
+            },
+            source: NodeSource::Default,
+        };
+        assert!(public.describe().starts_with("the public RPC"));
+        assert_ne!(public.endpoint_key(), default.endpoint_key());
     }
 
     #[test]
     fn token_cli_has_no_retired_suite_switch() {
         let parsed = TokenCli::try_parse_from(["token", "balance"]).unwrap();
         assert!(matches!(parsed.token.command, TokenCommand::Balance));
-        let rewards = TokenCli::try_parse_from(["token", "claimable-rewards"]).unwrap();
-        assert!(matches!(rewards.token.command, TokenCommand::ClaimableRewards));
+        #[cfg(feature = "confidential-tokens")]
+        {
+            let rewards = TokenCli::try_parse_from(["token", "claimable-rewards"]).unwrap();
+            assert!(matches!(
+                rewards.token.command,
+                TokenCommand::ClaimableRewards
+            ));
+        }
         assert!(TokenCli::try_parse_from(["token", "--legacy", "balance"]).is_err());
         assert!(TokenCli::try_parse_from(["token", "balance", "--legacy"]).is_err());
     }

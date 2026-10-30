@@ -40,11 +40,16 @@ pub struct SdrParams {
 impl Default for SdrParams {
     fn default() -> Self {
         // Finalized: DRSample degree 6, expander 8, L = 11, 32-byte nodes.
-        Self { drg_degree: 6, expander_degree: 8, layers: 11, node_bytes: 32 }
+        Self {
+            drg_degree: 6,
+            expander_degree: 8,
+            layers: 11,
+            node_bytes: 32,
+        }
     }
 }
 
-const DST_LABEL: &[u8] = b"quil/porep/sdr-label/v1";
+pub(crate) const DST_LABEL: &[u8] = b"quil/porep/sdr-label/v1";
 const DST_GRAPH: &[u8] = b"quil/porep/sdr-graph/v1";
 
 /// Two 64-bit values deterministically derived for a graph edge. `kind` = 0 for
@@ -69,7 +74,7 @@ fn graph_rng(v: u64, kind: u8, edge_idx: u32) -> (u64, u64) {
 ///
 /// AUDIT: this is the distribution to validate against the reference. The bucket
 /// `j ∈ [1, ⌊log2 v⌋+1]`, then a node uniformly in `[2^(j-1), min(v, 2^j))`.
-fn drg_parents(v: u64, drg_degree: usize, out: &mut Vec<u64>) {
+pub(crate) fn drg_parents(v: u64, drg_degree: usize, out: &mut Vec<u64>) {
     out.clear();
     if v == 0 {
         return;
@@ -89,7 +94,7 @@ fn drg_parents(v: u64, drg_degree: usize, out: &mut Vec<u64>) {
 
 /// Expander parents of node `v` in the PRIOR layer: `expander_degree` uniformly
 /// random nodes in `[0, n)`.
-fn expander_parents(v: u64, expander_degree: usize, n: u64, out: &mut Vec<u64>) {
+pub(crate) fn expander_parents(v: u64, expander_degree: usize, n: u64, out: &mut Vec<u64>) {
     out.clear();
     if n == 0 {
         return;
@@ -111,7 +116,7 @@ fn node<'a>(buf: &'a [u8], idx: u64, nb: usize) -> &'a [u8] {
 /// parents). The graph is key-independent and the same in every layer, so it
 /// is derived once per leaf, in parallel, rather than once per layer; it costs
 /// `4·width` bytes per node. `None` when node indices do not fit in `u32`.
-fn graph_parents(n: usize, params: &SdrParams) -> Option<(Vec<u32>, usize, usize)> {
+pub(crate) fn graph_parents(n: usize, params: &SdrParams) -> Option<(Vec<u32>, usize, usize)> {
     use rayon::prelude::*;
     if u32::try_from(n).is_err() {
         return None;
@@ -120,7 +125,12 @@ fn graph_parents(n: usize, params: &SdrParams) -> Option<(Vec<u32>, usize, usize
     let width = drg + params.expander_degree;
     let mut table = vec![0u32; n * width];
     table.par_chunks_mut(width).enumerate().for_each_init(
-        || (Vec::with_capacity(drg), Vec::with_capacity(params.expander_degree)),
+        || {
+            (
+                Vec::with_capacity(drg),
+                Vec::with_capacity(params.expander_degree),
+            )
+        },
         |(dpar, epar), (v, row)| {
             drg_parents(v as u64, params.drg_degree, dpar);
             expander_parents(v as u64, params.expander_degree, n as u64, epar);
@@ -140,8 +150,21 @@ fn graph_parents(n: usize, params: &SdrParams) -> Option<(Vec<u32>, usize, usize
 /// Two layers resident at a time, plus the parent table of [`graph_parents`].
 /// Labelling stays sequential: every label depends on its predecessor.
 fn final_layer_labels(n: usize, key: &[u8], params: &SdrParams) -> Vec<u8> {
+    label_layers(n, key, params, &mut |_, _| {})
+}
+
+/// [`final_layer_labels`], handing every finished layer to `on_layer` (its
+/// index and labels) before the next one is computed. The hash-based storage
+/// proofs fold each layer into the column commitment and keep the labels of
+/// the nodes a seal proof opens; the labels themselves are unchanged.
+pub(crate) fn label_layers(
+    n: usize,
+    key: &[u8],
+    params: &SdrParams,
+    on_layer: &mut dyn FnMut(usize, &[u8]),
+) -> Vec<u8> {
     let Some((parents, drg, width)) = graph_parents(n, params) else {
-        return final_layer_labels_uncached(n, key, params);
+        return label_layers_uncached(n, key, params, on_layer);
     };
     let nb = params.node_bytes;
     let mut prev = vec![0u8; n * nb]; // layer -1: no expander parents on layer 0
@@ -169,6 +192,7 @@ fn final_layer_labels(n: usize, key: &[u8], params: &SdrParams) -> Vec<u8> {
             let lbl = h.finalize();
             cur[v * nb..v * nb + nb].copy_from_slice(&lbl[..nb]);
         }
+        on_layer(layer, &cur);
         std::mem::swap(&mut prev, &mut cur);
     }
     prev // after the final swap, `prev` holds layer L-1
@@ -176,7 +200,18 @@ fn final_layer_labels(n: usize, key: &[u8], params: &SdrParams) -> Vec<u8> {
 
 /// [`final_layer_labels`] deriving parents on every layer, for leaves whose
 /// node indices exceed `u32` and as the reference the cached path must match.
+#[cfg(test)]
 fn final_layer_labels_uncached(n: usize, key: &[u8], params: &SdrParams) -> Vec<u8> {
+    label_layers_uncached(n, key, params, &mut |_, _| {})
+}
+
+/// [`label_layers`] deriving parents on every layer.
+fn label_layers_uncached(
+    n: usize,
+    key: &[u8],
+    params: &SdrParams,
+    on_layer: &mut dyn FnMut(usize, &[u8]),
+) -> Vec<u8> {
     let nb = params.node_bytes;
     let mut prev = vec![0u8; n * nb]; // layer -1: no expander parents on layer 0
     let mut cur = vec![0u8; n * nb];
@@ -206,6 +241,7 @@ fn final_layer_labels_uncached(n: usize, key: &[u8], params: &SdrParams) -> Vec<
             let lbl = h.finalize();
             cur[v as usize * nb..v as usize * nb + nb].copy_from_slice(&lbl[..nb]);
         }
+        on_layer(layer, &cur);
         std::mem::swap(&mut prev, &mut cur);
     }
     prev // after the final swap, `prev` holds layer L-1
@@ -239,7 +275,11 @@ pub fn sdr_decode(replica: &[u8], key: &[u8], params: &SdrParams) -> Vec<u8> {
     let nb = params.node_bytes;
     let n = replica.len() / nb;
     let labels = final_layer_labels(n, key, params);
-    replica.iter().zip(labels.iter()).map(|(r, l)| r ^ l).collect()
+    replica
+        .iter()
+        .zip(labels.iter())
+        .map(|(r, l)| r ^ l)
+        .collect()
 }
 
 // ── Leaf commitment: a KZG vector-commitment tree over ≤256-element blocks ───
@@ -348,7 +388,10 @@ pub fn commit_leaf(replica: &[u8], poly_size: u64) -> LeafCommitment {
         .map(|block| bls48581::commit_raw_full(&pack_block(block, poly_size), poly_size))
         .collect();
     if blocks.is_empty() {
-        blocks.push(bls48581::commit_raw_full(&pack_block(&[], poly_size), poly_size));
+        blocks.push(bls48581::commit_raw_full(
+            &pack_block(&[], poly_size),
+            poly_size,
+        ));
     }
 
     // Internal levels: each node commits the field-reduced child commitments.
@@ -363,7 +406,11 @@ pub fn commit_leaf(replica: &[u8], poly_size: u64) -> LeafCommitment {
     }
 
     let root = levels.last().unwrap()[0].clone();
-    LeafCommitment { root, levels, poly_size }
+    LeafCommitment {
+        root,
+        levels,
+        poly_size,
+    }
 }
 
 /// A leaf authentication path for one block: bottom→top, each level's parent
@@ -391,11 +438,18 @@ pub fn leaf_path(leaf: &LeafCommitment, block_index: u64) -> LeafPath {
         let group_start = parent_idx * poly;
         let group_end = (group_start + poly).min(cur.len());
         let full = node_poly(&cur[group_start..group_end], leaf.poly_size);
-        proofs.push(bls48581::prove_raw_full(&full, child_idx as u64, leaf.poly_size));
+        proofs.push(bls48581::prove_raw_full(
+            &full,
+            child_idx as u64,
+            leaf.poly_size,
+        ));
         node_commits.push(leaf.levels[lvl + 1][parent_idx].clone());
         idx = parent_idx;
     }
-    LeafPath { node_commits, proofs }
+    LeafPath {
+        node_commits,
+        proofs,
+    }
 }
 
 /// Producer helper: SDR-encode a leaf's data into the member's unique replica
@@ -435,11 +489,18 @@ mod tests {
 
     fn small_params() -> SdrParams {
         // Small leaf so tests run fast; structure identical to production.
-        SdrParams { drg_degree: 6, expander_degree: 8, layers: 11, node_bytes: 32 }
+        SdrParams {
+            drg_degree: 6,
+            expander_degree: 8,
+            layers: 11,
+            node_bytes: 32,
+        }
     }
 
     fn data(n_nodes: usize) -> Vec<u8> {
-        (0..n_nodes * 32).map(|i| (i as u8).wrapping_mul(37).wrapping_add(11)).collect()
+        (0..n_nodes * 32)
+            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+            .collect()
     }
 
     #[test]
@@ -449,7 +510,11 @@ mod tests {
         let d = data(64);
         let r = sdr_encode(&d, &key, &p);
         let back = sdr_decode(&r, &key, &p);
-        assert_eq!(&back[..d.len()], &d[..], "decode(encode(data)) must equal data");
+        assert_eq!(
+            &back[..d.len()],
+            &d[..],
+            "decode(encode(data)) must equal data"
+        );
     }
 
     #[test]
@@ -457,7 +522,11 @@ mod tests {
         let p = small_params();
         let key = replica_key(b"member0", b"shardA", 7);
         let d = data(64);
-        assert_eq!(sdr_encode(&d, &key, &p), sdr_encode(&d, &key, &p), "encode must be deterministic");
+        assert_eq!(
+            sdr_encode(&d, &key, &p),
+            sdr_encode(&d, &key, &p),
+            "encode must be deterministic"
+        );
     }
 
     #[test]
@@ -468,12 +537,21 @@ mod tests {
         let r1 = sdr_encode(&d, &replica_key(b"member1", b"shardA", 7), &p); // different member
         let r2 = sdr_encode(&d, &replica_key(b"member0", b"shardB", 7), &p); // different shard
         let r3 = sdr_encode(&d, &replica_key(b"member0", b"shardA", 8), &p); // different epoch
-        // Each distinct key yields a replica that differs in (essentially) every
-        // node — no two members can share storage.
+                                                                             // Each distinct key yields a replica that differs in (essentially) every
+                                                                             // node — no two members can share storage.
         let diff = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
-        assert!(diff(&r0, &r1) > r0.len() * 9 / 10, "different member ⇒ replica differs everywhere");
-        assert!(diff(&r0, &r2) > r0.len() * 9 / 10, "different shard ⇒ replica differs everywhere");
-        assert!(diff(&r0, &r3) > r0.len() * 9 / 10, "different epoch ⇒ replica differs everywhere");
+        assert!(
+            diff(&r0, &r1) > r0.len() * 9 / 10,
+            "different member ⇒ replica differs everywhere"
+        );
+        assert!(
+            diff(&r0, &r2) > r0.len() * 9 / 10,
+            "different shard ⇒ replica differs everywhere"
+        );
+        assert!(
+            diff(&r0, &r3) > r0.len() * 9 / 10,
+            "different epoch ⇒ replica differs everywhere"
+        );
     }
 
     /// End-to-end: the encoder's replica is committed via KZG and a possession
@@ -504,7 +582,8 @@ mod tests {
         let bitmask = [0x01u8];
         let block = crate::porep::derive_block_index(&rho_n, b"shardA", 7, b"member0", 0, 1);
         assert_eq!(block, 0, "single-block leaf must challenge block 0");
-        let idx = crate::porep::derive_challenge_index(&rho_n, b"shardA", 7, b"member0", 0, poly_size);
+        let idx =
+            crate::porep::derive_challenge_index(&rho_n, b"shardA", 7, b"member0", 0, poly_size);
         let proof = bls48581::prove_raw_full(&full, idx, poly_size);
         let value = full[idx as usize * MB..idx as usize * MB + MB].to_vec();
         let path = leaf_path(&leaf, block);
@@ -531,9 +610,24 @@ mod tests {
     fn cached_parents_label_exactly_like_per_layer_derivation() {
         let variants = [
             small_params(),
-            SdrParams { drg_degree: 0, expander_degree: 8, layers: 3, node_bytes: 32 },
-            SdrParams { drg_degree: 1, expander_degree: 0, layers: 2, node_bytes: 32 },
-            SdrParams { drg_degree: 6, expander_degree: 8, layers: 1, node_bytes: 16 },
+            SdrParams {
+                drg_degree: 0,
+                expander_degree: 8,
+                layers: 3,
+                node_bytes: 32,
+            },
+            SdrParams {
+                drg_degree: 1,
+                expander_degree: 0,
+                layers: 2,
+                node_bytes: 32,
+            },
+            SdrParams {
+                drg_degree: 6,
+                expander_degree: 8,
+                layers: 1,
+                node_bytes: 16,
+            },
         ];
         let key = replica_key(b"member0", b"shardA", 7);
         for p in &variants {
@@ -557,15 +651,24 @@ mod tests {
             let mut off = 0;
             while off < replica.len() {
                 let end = (off + block_bytes).min(replica.len());
-                blocks.push(bls48581::commit_raw_full(&pack_block(&replica[off..end], poly_size), poly_size));
+                blocks.push(bls48581::commit_raw_full(
+                    &pack_block(&replica[off..end], poly_size),
+                    poly_size,
+                ));
                 off = end;
             }
             if blocks.is_empty() {
-                blocks.push(bls48581::commit_raw_full(&pack_block(&[], poly_size), poly_size));
+                blocks.push(bls48581::commit_raw_full(
+                    &pack_block(&[], poly_size),
+                    poly_size,
+                ));
             }
             let mut levels = vec![blocks];
             while levels.last().unwrap().len() > 1 {
-                let next = levels.last().unwrap().chunks(poly_size as usize)
+                let next = levels
+                    .last()
+                    .unwrap()
+                    .chunks(poly_size as usize)
                     .map(|group| bls48581::commit_raw_full(&node_poly(group, poly_size), poly_size))
                     .collect();
                 levels.push(next);

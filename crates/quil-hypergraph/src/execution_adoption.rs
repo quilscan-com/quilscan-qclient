@@ -13,6 +13,7 @@ struct Metadata {
     sizes: HashMap<Vec<u8>, (u64, i128)>,
     covered: Vec<i32>,
     unified: bool,
+    exact: bool,
 }
 
 /// Constructed under a retained execution capture. All fallible locks and
@@ -39,8 +40,12 @@ fn unavailable(message: &str) -> QuilError {
 
 /// Readers hold these briefly; waiting them out keeps an executed frame
 /// from being discarded. One deadline covers every lock an adoption takes.
-fn write<'a, T>(patience: &quil_types::lock_patience::Patience, lock: &'a RwLock<T>) -> Result<RwLockWriteGuard<'a, T>> {
-    patience.write(lock)
+fn write<'a, T>(
+    patience: &quil_types::lock_patience::Patience,
+    lock: &'a RwLock<T>,
+) -> Result<RwLockWriteGuard<'a, T>> {
+    patience
+        .write(lock)
         .ok_or_else(|| unavailable("execution adoption metadata is busy or poisoned"))
 }
 
@@ -87,6 +92,7 @@ impl ExecutionCapture<'_> {
         let state = Metadata {
             forest_version: state.forest_version.load(Ordering::Acquire),
             unified: state.unified_tree.load(Ordering::Acquire),
+            exact: state.exact_sizes.load(Ordering::Acquire),
             roots: take(state.prover_root_by_frame)?,
             world_sizes: take(state.world_size_by_frame)?,
             phase_versions: take(state.phase_versions)?,
@@ -165,6 +171,9 @@ impl PreparedCrdtAdoption<'_> {
         self.source
             .unified_tree
             .store(state.unified, Ordering::Release);
+        self.source
+            .exact_sizes
+            .store(state.exact, Ordering::Release);
         self.source.sizes_warmed.store(true, Ordering::Release);
     }
 }

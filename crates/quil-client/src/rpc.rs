@@ -94,8 +94,24 @@ async fn build_channel(addr: &str, tls: bool) -> anyhow::Result<Channel> {
     let channel = endpoint(addr, tls)?
         .connect()
         .await
-        .map_err(|e| anyhow::anyhow!("connect {addr}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("connect {addr}: {}", with_causes(&e)))?;
     Ok(channel)
+}
+
+/// An error with its causes: tonic's own message is only "transport error",
+/// and the cause says what failed (e.g. "Connection refused").
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        let text = next.to_string();
+        if !message.ends_with(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        cause = next.source();
+    }
+    message
 }
 
 /// Connect and return a `NodeServiceClient` with 100 MiB limits.
@@ -183,9 +199,62 @@ pub fn grpc_multiaddr_to_host_port(ma: &str) -> anyhow::Result<String> {
     }
 }
 
+/// Whether a gRPC multiaddr dials this host: a loopback or unspecified IP
+/// address, or `localhost`. Plaintext h2 stays on the machine only then.
+pub fn is_local_multiaddr(ma: &str) -> anyhow::Result<bool> {
+    let host_port = grpc_multiaddr_to_host_port(ma)?;
+    let (host, _) = host_port
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("could not extract host from multiaddr: {ma}"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Ok(match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_multiaddrs_are_loopback_unspecified_or_localhost() {
+        for (ma, local) in [
+            ("/ip4/127.0.0.1/tcp/8337", true),
+            ("/ip4/127.8.9.10/tcp/8337", true),
+            ("/ip4/0.0.0.0/tcp/8337", true),
+            ("/ip6/::1/tcp/8337", true),
+            ("/ip6/::/tcp/8337", true),
+            ("/dns/localhost/tcp/8337", true),
+            ("/ip4/10.0.0.2/tcp/8337", false),
+            ("/ip4/192.0.2.7/tcp/8337", false),
+            ("/ip6/2001:db8::7/tcp/8337", false),
+            ("/dns4/rpc.quilibrium.com/tcp/8337", false),
+            ("/dns4/localhost.example.com/tcp/8337", false),
+        ] {
+            assert_eq!(is_local_multiaddr(ma).unwrap(), local, "{ma}");
+        }
+        assert!(is_local_multiaddr("127.0.0.1:8337").is_err());
+    }
+
+    /// A refused connection names its cause, not only "transport error".
+    #[tokio::test]
+    async fn a_failed_connection_names_its_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let opts = ConnectOpts {
+            public_rpc: false,
+            custom_rpc: String::new(),
+            listen_grpc_multiaddr: format!("/ip4/127.0.0.1/tcp/{port}"),
+        };
+        let error = connect_channel(&opts).await.unwrap_err().to_string();
+        assert!(
+            error.starts_with(&format!("connect 127.0.0.1:{port}: transport error: ")),
+            "{error}"
+        );
+        assert!(error.len() > format!("connect 127.0.0.1:{port}: transport error: ").len());
+    }
 
     #[test]
     fn parses_ip4_tcp_multiaddr() {
@@ -224,7 +293,10 @@ mod tests {
             listen_grpc_multiaddr: String::new(),
         };
         assert!(!opts.is_light_node());
-        assert_eq!(opts.target().unwrap(), ("127.0.0.1:8337".to_string(), false));
+        assert_eq!(
+            opts.target().unwrap(),
+            ("127.0.0.1:8337".to_string(), false)
+        );
     }
 
     #[test]
@@ -246,7 +318,10 @@ mod tests {
             listen_grpc_multiaddr: String::new(),
         };
         assert!(opts.is_light_node());
-        assert_eq!(opts.target().unwrap(), ("example.com:9000".to_string(), true));
+        assert_eq!(
+            opts.target().unwrap(),
+            ("example.com:9000".to_string(), true)
+        );
     }
 
     #[test]
@@ -257,7 +332,10 @@ mod tests {
             listen_grpc_multiaddr: "/ip4/127.0.0.1/tcp/8337".into(),
         };
         assert!(opts.is_light_node());
-        assert_eq!(opts.target().unwrap(), ("example.com:9000".to_string(), true));
+        assert_eq!(
+            opts.target().unwrap(),
+            ("example.com:9000".to_string(), true)
+        );
     }
 
     #[test]
@@ -268,6 +346,9 @@ mod tests {
             listen_grpc_multiaddr: "/ip4/127.0.0.1/tcp/8337".into(),
         };
         assert!(!opts.is_light_node());
-        assert_eq!(opts.target().unwrap(), ("127.0.0.1:8337".to_string(), false));
+        assert_eq!(
+            opts.target().unwrap(),
+            ("127.0.0.1:8337".to_string(), false)
+        );
     }
 }

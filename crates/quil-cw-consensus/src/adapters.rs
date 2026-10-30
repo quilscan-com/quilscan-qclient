@@ -52,6 +52,9 @@ pub struct ProposalContext {
     pub view: u64,
     pub parent_view: u64,
     pub parent: Digest,
+    /// The view's leader as a prover address (Poseidon of its Falcon key);
+    /// `None` for a context not made by Simplex.
+    pub leader: Option<[u8; 32]>,
 }
 
 impl From<Context<Digest, FalconPublicKey>> for ProposalContext {
@@ -61,8 +64,33 @@ impl From<Context<Digest, FalconPublicKey>> for ProposalContext {
             view: context.view().get(),
             parent_view: context.parent.0.get(),
             parent: context.parent.1,
+            leader: prover_address(&context.leader),
         }
     }
+}
+
+/// A committee member's prover address, `poseidon(public key)`, remembered:
+/// every proposal and vote asks for its leader's.
+fn prover_address(key: &FalconPublicKey) -> Option<[u8; 32]> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    static REMEMBERED: LazyLock<Mutex<HashMap<FalconPublicKey, [u8; 32]>>> =
+        LazyLock::new(Default::default);
+    if let Some(address) = REMEMBERED
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(key).copied())
+    {
+        return Some(address);
+    }
+    let address = quil_crypto::poseidon::hash_bytes_to_32(key.as_ref()).ok()?;
+    if let Ok(mut cache) = REMEMBERED.lock() {
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(key.clone(), address);
+    }
+    Some(address)
 }
 
 /// Re-exported so seam implementors (quil-engine) needn't depend on commonware-p2p.
@@ -85,16 +113,29 @@ pub fn digest_to_identity(digest: &Digest) -> [u8; 32] {
 /// application validation succeeds — so a re-proposed/unverified block at a
 /// finalized digest can no longer overwrite the finalized frame (the
 /// "preserve finalized app shard frames" fix).
+///
+/// The store is bounded by [`BlockStoreLimits`]. Each block carries a view:
+/// the latest certificate's view when it arrived, raised when a notarization
+/// or finalization names it. Once a view finalizes, blocks more than
+/// `keep_views` below it are dropped: consensus no longer builds on or votes
+/// for them, and the window leaves the slower readers of finalized bodies
+/// (materialization, recovery) time to take them. A reader that takes them
+/// later than that holds the window at the lowest view it still has to take
+/// ([`BlockStore::hold_from`]). Over a cap, the store evicts first the
+/// candidates (blocks no certificate names and this node never verified),
+/// then the blocks of the oldest views, but never a verified or certified
+/// block of the latest `protected_views` views or of the held window. A
+/// body that arrives after a certificate named it is stored as certified.
 #[derive(Clone, Default)]
 pub struct BlockStore {
-    inner: Arc<Mutex<HashMap<Digest, StoredBlock>>>,
+    inner: Arc<Mutex<Blocks>>,
 }
 
 /// A [`BlockStore`] handle that does not keep the blocks alive: once the
 /// host that owns the store stops, its bodies are freed.
 #[derive(Clone)]
 pub struct WeakBlockStore {
-    inner: std::sync::Weak<Mutex<HashMap<Digest, StoredBlock>>>,
+    inner: std::sync::Weak<Mutex<Blocks>>,
 }
 
 impl WeakBlockStore {
@@ -103,47 +144,410 @@ impl WeakBlockStore {
     }
 }
 
+/// How long a [`BlockStore`] keeps blocks, and how many it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockStoreLimits {
+    /// Views below the latest finalized view whose blocks are kept.
+    pub keep_views: u64,
+    /// Views below the latest certified view whose verified or certified
+    /// blocks are never evicted over a cap.
+    pub protected_views: u64,
+    /// Blocks held at most, unless protected.
+    pub max_blocks: usize,
+    /// Bytes held at most, unless protected.
+    pub max_bytes: usize,
+    /// Candidates (blocks no certificate names and this node never
+    /// verified) held at most.
+    pub max_candidate_blocks: usize,
+    /// Candidate bytes held at most.
+    pub max_candidate_bytes: usize,
+}
+
+impl Default for BlockStoreLimits {
+    /// Sized for an application shard, whose finalizer may hold finalized
+    /// bodies here until its engine materializes them. The candidate caps
+    /// hold eight GLOBAL frames of the 16 MiB maximum, or 1024 smaller
+    /// blocks; honest members deliver about one proposal per view.
+    fn default() -> Self {
+        Self {
+            keep_views: 1024,
+            protected_views: 32,
+            max_blocks: 4096,
+            max_bytes: 512 << 20,
+            max_candidate_blocks: 1024,
+            max_candidate_bytes: 128 << 20,
+        }
+    }
+}
+
+impl BlockStoreLimits {
+    /// GLOBAL: its finalizer takes each finalized body when the finalization
+    /// is reported, and proposals and ancestors are also kept in the clock
+    /// store, so a shorter window suffices.
+    pub fn global() -> Self {
+        Self {
+            keep_views: 128,
+            ..Self::default()
+        }
+    }
+}
+
+/// Reports the lowest view whose finalized bodies a reader of a
+/// [`BlockStore`] still has to take, if any.
+pub type BlockHold = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+/// Minimum interval between two eviction log lines of one store.
+const EVICTION_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Clone)]
 struct StoredBlock {
     bytes: Vec<u8>,
     verified: bool,
+    /// A notarization or finalization names this digest.
+    certified: bool,
+    /// The view consensus last placed this block at (see [`BlockStore`]).
+    view: u64,
+    /// Arrival order of the digest.
+    seq: u64,
+}
+
+impl StoredBlock {
+    /// This node verified or built the block, or a certificate names it.
+    fn vouched(&self) -> bool {
+        self.verified || self.certified
+    }
+}
+
+struct Blocks {
+    map: HashMap<Digest, StoredBlock>,
+    limits: BlockStoreLimits,
+    /// Names the store in its log lines.
+    scope: String,
+    bytes: usize,
+    candidates: usize,
+    candidate_bytes: usize,
+    /// The highest view a certificate named.
+    certified_view: u64,
+    /// The highest finalized view.
+    finalized_view: u64,
+    /// Digests certificates named, with the highest such view, so that a
+    /// body arriving after its certificate is stored as certified. Pruned
+    /// with the window, and at most `max_blocks` of them.
+    certified_digests: HashMap<Digest, u64>,
+    /// What [`BlockStore::hold_from`] reported at the latest finalization.
+    held_view: Option<u64>,
+    hold: Option<BlockHold>,
+    next_seq: u64,
+    evicted: Evicted,
+}
+
+/// Blocks evicted over a cap since the last eviction log line.
+#[derive(Default)]
+struct Evicted {
+    candidates: u64,
+    vouched: u64,
+    bytes: u64,
+    last_report: Option<std::time::Instant>,
+}
+
+/// One eviction log line.
+struct EvictionReport {
+    scope: String,
+    candidates: u64,
+    vouched: u64,
+    bytes: u64,
+    held_blocks: usize,
+    held_bytes: usize,
+    since_previous: Option<std::time::Duration>,
+}
+
+impl EvictionReport {
+    fn log(&self) {
+        let window = match self.since_previous {
+            Some(elapsed) => format!("the last {}s", elapsed.as_secs()),
+            None => "the store started".to_string(),
+        };
+        if self.vouched > 0 {
+            tracing::warn!(
+                scope = %self.scope,
+                candidates = self.candidates,
+                vouched = self.vouched,
+                bytes = self.bytes,
+                held_blocks = self.held_blocks,
+                held_bytes = self.held_bytes,
+                "consensus block store over its limits since {window}: evicted verified or \
+                 certified blocks of old views; a body still needed is read from storage or \
+                 fetched again; report this line if it repeats"
+            );
+        } else {
+            tracing::info!(
+                scope = %self.scope,
+                candidates = self.candidates,
+                bytes = self.bytes,
+                held_blocks = self.held_blocks,
+                held_bytes = self.held_bytes,
+                "consensus block store over its limits since {window}: evicted candidate blocks \
+                 no certificate names (peer deliveries or proposals that did not notarize)"
+            );
+        }
+    }
+}
+
+impl Default for Blocks {
+    fn default() -> Self {
+        Self::new(BlockStoreLimits::default(), "consensus".to_string())
+    }
+}
+
+impl Blocks {
+    fn new(limits: BlockStoreLimits, scope: String) -> Self {
+        Self {
+            map: HashMap::new(),
+            limits,
+            scope,
+            bytes: 0,
+            candidates: 0,
+            candidate_bytes: 0,
+            certified_view: 0,
+            finalized_view: 0,
+            certified_digests: HashMap::new(),
+            held_view: None,
+            hold: None,
+            next_seq: 0,
+            evicted: Evicted::default(),
+        }
+    }
+
+    /// Store `bytes` under `digest`, replacing what is held there.
+    fn insert(&mut self, digest: Digest, bytes: Vec<u8>, verified: bool) -> Option<EvictionReport> {
+        let (view, seq, certified) = match self.take(&digest) {
+            Some(old) => (old.view.max(self.certified_view), old.seq, old.certified),
+            None => {
+                self.next_seq += 1;
+                match self.certified_digests.get(&digest) {
+                    Some(view) => (self.certified_view.max(*view), self.next_seq, true),
+                    None => (self.certified_view, self.next_seq, false),
+                }
+            }
+        };
+        self.add(
+            digest,
+            StoredBlock {
+                bytes,
+                verified,
+                certified,
+                view,
+                seq,
+            },
+        );
+        self.enforce_caps()
+    }
+
+    fn add(&mut self, digest: Digest, block: StoredBlock) {
+        let len = block.bytes.len();
+        self.bytes += len;
+        if !block.vouched() {
+            self.candidates += 1;
+            self.candidate_bytes += len;
+        }
+        self.map.insert(digest, block);
+    }
+
+    fn take(&mut self, digest: &Digest) -> Option<StoredBlock> {
+        let block = self.map.remove(digest)?;
+        let len = block.bytes.len();
+        self.bytes -= len;
+        if !block.vouched() {
+            self.candidates -= 1;
+            self.candidate_bytes -= len;
+        }
+        Some(block)
+    }
+
+    fn note_certificate(&mut self, view: u64) {
+        if self.certified_view == 0 && view > 0 {
+            // Blocks restored before any certificate take the first view one
+            // names, so the window does not drop them at the first
+            // finalization.
+            for block in self.map.values_mut() {
+                block.view = block.view.max(view);
+            }
+        }
+        self.certified_view = self.certified_view.max(view);
+    }
+
+    /// A certificate names `digest`; `view` is its view, when it is one of
+    /// this store's.
+    fn certify(&mut self, digest: &Digest, view: Option<u64>) {
+        if let Some(view) = view {
+            self.note_certificate(view);
+        }
+        let view = view.unwrap_or(self.certified_view);
+        let known = self.certified_digests.entry(*digest).or_insert(view);
+        *known = (*known).max(view);
+        while self.certified_digests.len() > self.limits.max_blocks {
+            let Some(oldest) = self
+                .certified_digests
+                .iter()
+                .min_by_key(|(_, view)| **view)
+                .map(|(digest, _)| *digest)
+            else {
+                break;
+            };
+            self.certified_digests.remove(&oldest);
+        }
+        if let Some(mut block) = self.take(digest) {
+            block.certified = true;
+            block.view = block.view.max(view);
+            self.add(*digest, block);
+        }
+    }
+
+    /// `view` finalized, and a reader still has to take the finalized bodies
+    /// from `held` on.
+    fn finalize(&mut self, view: u64, held: Option<u64>) {
+        self.note_certificate(view);
+        self.held_view = held;
+        if view <= self.finalized_view {
+            return;
+        }
+        self.finalized_view = view;
+        let anchor = held.map_or(view, |held| held.min(view));
+        let below = anchor.saturating_sub(self.limits.keep_views);
+        let stale: Vec<Digest> = self
+            .map
+            .iter()
+            .filter(|(_, block)| block.view < below)
+            .map(|(digest, _)| *digest)
+            .collect();
+        for digest in stale {
+            self.take(&digest);
+        }
+        self.certified_digests
+            .retain(|_, certified| *certified >= below);
+    }
+
+    fn enforce_caps(&mut self) -> Option<EvictionReport> {
+        let limits = self.limits;
+        while self.candidates > limits.max_candidate_blocks
+            || self.candidate_bytes > limits.max_candidate_bytes
+        {
+            let Some(victim) = self.eviction_victim(|block| !block.vouched()) else {
+                break;
+            };
+            self.evict(&victim);
+        }
+        let mut floor = self.certified_view.saturating_sub(limits.protected_views);
+        if let Some(held) = self.held_view {
+            floor = floor.min(held.saturating_sub(limits.keep_views));
+        }
+        while self.map.len() > limits.max_blocks || self.bytes > limits.max_bytes {
+            let Some(victim) = self.eviction_victim(|block| !block.vouched() || block.view < floor)
+            else {
+                break;
+            };
+            self.evict(&victim);
+        }
+        self.eviction_report(std::time::Instant::now())
+    }
+
+    /// The block to evict first among the `eligible`: candidates before
+    /// vouched blocks, then the lowest view, then the earliest arrival.
+    fn eviction_victim(&self, eligible: impl Fn(&StoredBlock) -> bool) -> Option<Digest> {
+        self.map
+            .iter()
+            .filter(|(_, block)| eligible(*block))
+            .min_by_key(|(_, block)| (block.vouched(), block.view, block.seq))
+            .map(|(digest, _)| *digest)
+    }
+
+    fn evict(&mut self, digest: &Digest) {
+        if let Some(block) = self.take(digest) {
+            if block.vouched() {
+                self.evicted.vouched += 1;
+            } else {
+                self.evicted.candidates += 1;
+            }
+            self.evicted.bytes += block.bytes.len() as u64;
+        }
+    }
+
+    /// At most one report per [`EVICTION_REPORT_INTERVAL`]; the first
+    /// eviction after a quiet interval is reported at once.
+    fn eviction_report(&mut self, now: std::time::Instant) -> Option<EvictionReport> {
+        if self.evicted.candidates == 0 && self.evicted.vouched == 0 {
+            return None;
+        }
+        let since_previous = self
+            .evicted
+            .last_report
+            .map(|last| now.saturating_duration_since(last));
+        if since_previous.is_some_and(|elapsed| elapsed < EVICTION_REPORT_INTERVAL) {
+            return None;
+        }
+        self.evicted.last_report = Some(now);
+        Some(EvictionReport {
+            scope: self.scope.clone(),
+            candidates: std::mem::take(&mut self.evicted.candidates),
+            vouched: std::mem::take(&mut self.evicted.vouched),
+            bytes: std::mem::take(&mut self.evicted.bytes),
+            held_blocks: self.map.len(),
+            held_bytes: self.bytes,
+            since_previous,
+        })
+    }
 }
 
 impl BlockStore {
     pub fn downgrade(&self) -> WeakBlockStore {
-        WeakBlockStore { inner: Arc::downgrade(&self.inner) }
+        WeakBlockStore {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// A store bounded by `limits`, named `scope` in its log lines.
+    pub fn with_limits(limits: BlockStoreLimits, scope: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Blocks::new(limits, scope.into()))),
+        }
+    }
+
     /// Insert an unverified block candidate. Candidates may be replaced until
     /// one exact byte sequence passes application validation and is sealed.
     /// Once sealed, peer ingress cannot substitute different bytes for the
     /// consensus digest that was actually verified.
     pub fn put(&self, digest: Digest, bytes: Vec<u8>) {
-        let mut inner = self.inner.lock();
-        match inner.get_mut(&digest) {
-            Some(stored) if stored.verified => {}
-            Some(stored) => stored.bytes = bytes,
-            None => {
-                inner.insert(
-                    digest,
-                    StoredBlock {
-                        bytes,
-                        verified: false,
-                    },
-                );
+        let report = {
+            let mut inner = self.inner.lock();
+            let sealed = inner.map.get(&digest).is_some_and(|stored| stored.verified);
+            if sealed {
+                None
+            } else {
+                inner.insert(digest, bytes, false)
             }
+        };
+        if let Some(report) = report {
+            report.log();
         }
     }
     pub fn get(&self, digest: &Digest) -> Option<Vec<u8>> {
-        self.inner.lock().get(digest).map(|stored| stored.bytes.clone())
+        self.inner
+            .lock()
+            .map
+            .get(digest)
+            .map(|stored| stored.bytes.clone())
     }
 
     /// Refuse oversized recovery input before copying peer-controlled bytes.
     pub fn get_bounded(&self, digest: &Digest, max_bytes: usize) -> Option<Vec<u8>> {
-        self.inner.lock().get(digest)
+        self.inner
+            .lock()
+            .map
+            .get(digest)
             .filter(|stored| stored.bytes.len() <= max_bytes)
             .map(|stored| stored.bytes.clone())
     }
@@ -152,17 +556,18 @@ impl BlockStore {
     /// locally). Idempotent: once a digest is sealed, a later `seal`/`put`
     /// cannot substitute different bytes for it.
     pub fn seal(&self, digest: Digest, bytes: Vec<u8>) {
-        let mut inner = self.inner.lock();
-        if inner.get(&digest).map(|stored| stored.verified).unwrap_or(false) {
-            return;
+        let report = {
+            let mut inner = self.inner.lock();
+            let sealed = inner.map.get(&digest).is_some_and(|stored| stored.verified);
+            if sealed {
+                None
+            } else {
+                inner.insert(digest, bytes, true)
+            }
+        };
+        if let Some(report) = report {
+            report.log();
         }
-        inner.insert(
-            digest,
-            StoredBlock {
-                bytes,
-                verified: true,
-            },
-        );
     }
 
     /// Return the current bytes together with whether this node's application
@@ -172,8 +577,52 @@ impl BlockStore {
     pub fn get_with_verification(&self, digest: &Digest) -> Option<(Vec<u8>, bool)> {
         self.inner
             .lock()
+            .map
             .get(digest)
             .map(|stored| (stored.bytes.clone(), stored.verified))
+    }
+
+    /// A certificate of `view` names `digest`: its block, if held, is one
+    /// consensus or its finalizer may still need, at least until `view`
+    /// leaves the window.
+    pub fn certified(&self, digest: &Digest, view: u64) {
+        self.inner.lock().certify(digest, Some(view));
+    }
+
+    /// A finalization this node recorded earlier names `digest`, at a view
+    /// that may belong to another consensus instance: keep its block as a
+    /// certified one without moving this store's views.
+    pub fn recorded_final(&self, digest: &Digest) {
+        self.inner.lock().certify(digest, None);
+    }
+
+    /// A certificate of `view` that names no block (a nullification).
+    pub fn observe_certificate(&self, view: u64) {
+        self.inner.lock().note_certificate(view);
+    }
+
+    /// `view` finalized: drop the blocks more than `keep_views` below it, or
+    /// below the view the hold reports if that is lower.
+    pub fn finalized(&self, view: u64) {
+        // Asked outside the store's lock: the reader takes its own lock, and
+        // holds it while it reads the store.
+        let hold = self.inner.lock().hold.clone();
+        let held = hold.and_then(|hold| hold());
+        self.inner.lock().finalize(view, held);
+    }
+
+    /// Let a reader that takes finalized bodies later than their
+    /// finalization (the application finalizer delivers them in order) hold
+    /// the window: `hold` reports the lowest view it still has to take. Asked
+    /// at each finalization, outside the store's lock.
+    pub fn hold_from(&self, hold: BlockHold) {
+        self.inner.lock().hold = Some(hold);
+    }
+
+    /// The blocks and bytes held.
+    pub fn usage(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        (inner.map.len(), inner.bytes)
     }
 }
 
@@ -205,7 +654,13 @@ pub trait GlobalProposer: Send + Sync + 'static {
     /// `bytes` is the frame body
     /// if already delivered (via `FrameSink`), else `None` (not yet arrived →
     /// return `false` so the view nullifies rather than votes blind).
-    fn verify(&self, view: u64, parent_digest: Digest, digest: Digest, bytes: Option<Vec<u8>>) -> bool;
+    fn verify(
+        &self,
+        view: u64,
+        parent_digest: Digest,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> bool;
 
     /// After `propose` declined: how long until asking again for the same view
     /// can succeed, or `None` to give the view up. A leader that is only pacing
@@ -244,7 +699,11 @@ pub trait GlobalProposer: Send + Sync + 'static {
     /// it needs is on its way to this node (its GLOBAL anchor, just ahead of
     /// this node's latest); `None` checks it now. Wrapping proposers forward
     /// it to the one that knows.
-    fn verify_delay(&self, _context: ProposalContext, _bytes: &[u8]) -> Option<std::time::Duration> {
+    fn verify_delay(
+        &self,
+        _context: ProposalContext,
+        _bytes: &[u8],
+    ) -> Option<std::time::Duration> {
         None
     }
 
@@ -259,7 +718,10 @@ pub trait GlobalProposer: Send + Sync + 'static {
         digest: Digest,
         bytes: Option<Vec<u8>>,
     ) -> Result<bool, std::time::Duration> {
-        if let Some(delay) = bytes.as_deref().and_then(|bytes| self.verify_delay(context, bytes)) {
+        if let Some(delay) = bytes
+            .as_deref()
+            .and_then(|bytes| self.verify_delay(context, bytes))
+        {
             return Err(delay);
         }
         Ok(self.verify_with_context(context, digest, bytes))
@@ -331,7 +793,12 @@ impl<E: Spawner + Clock, Pr: GlobalProposer> Clone for FalconAutomaton<E, Pr> {
 
 impl<E: Spawner + Clock, Pr: GlobalProposer> FalconAutomaton<E, Pr> {
     pub fn new(context: E, proposer: Arc<Pr>, store: BlockStore) -> Self {
-        Self { context, proposer, store, liveness: None }
+        Self {
+            context,
+            proposer,
+            store,
+            liveness: None,
+        }
     }
 
     /// Also count, in `liveness`, how each proposal and vote of this member
@@ -342,9 +809,7 @@ impl<E: Spawner + Clock, Pr: GlobalProposer> FalconAutomaton<E, Pr> {
     }
 }
 
-impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
-    for FalconAutomaton<E, Pr>
-{
+impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton for FalconAutomaton<E, Pr> {
     type Digest = Digest;
     type Context = Context<Digest, FalconPublicKey>;
 
@@ -354,8 +819,10 @@ impl<E: Spawner + Clock + Send + 'static, Pr: GlobalProposer> Automaton
         let proposer = self.proposer.clone();
         let store = self.store.clone();
         let liveness = self.liveness.clone();
-        let settle = move |proposed: bool| if let Some(liveness) = liveness.as_ref() {
-            liveness.settle(Step::Propose, proposal_context.view, proposed);
+        let settle = move |proposed: bool| {
+            if let Some(liveness) = liveness.as_ref() {
+                liveness.settle(Step::Propose, proposal_context.view, proposed);
+            }
         };
         self.context.child("propose").spawn(move |ctx| async move {
             if let Some(pacing) = proposer.proposal_pacing(proposal_context) {
@@ -470,7 +937,10 @@ pub struct FalconRelay<Sk: FrameSink> {
 
 impl<Sk: FrameSink> Clone for FalconRelay<Sk> {
     fn clone(&self) -> Self {
-        Self { sink: self.sink.clone(), store: self.store.clone() }
+        Self {
+            sink: self.sink.clone(),
+            store: self.store.clone(),
+        }
     }
 }
 
@@ -526,6 +996,8 @@ pub struct Liveness {
     /// ([`Liveness::notarized`]); bound by the host's reporter, and not kept
     /// alive by it.
     blocks: std::sync::OnceLock<WeakBlockStore>,
+    /// Set once [`Liveness::notarized`] has warned that no store is bound.
+    unbound_warned: std::sync::atomic::AtomicBool,
     /// Whether notarize votes keep their signatures ([`Liveness::keep_votes`]).
     keep_votes: std::sync::atomic::AtomicBool,
 }
@@ -549,6 +1021,9 @@ struct ViewVotes {
     finalize: std::collections::BTreeSet<u32>,
     /// The notarize votes themselves, per proposal (parent view, digest).
     evidence: std::collections::BTreeMap<(u64, [u8; 32]), Evidence>,
+    /// The nullify votes themselves: round epoch and signature bytes per
+    /// signer; a signer's first vote stays.
+    nullify_evidence: std::collections::BTreeMap<u32, (u64, Vec<u8>)>,
 }
 
 struct Evidence {
@@ -572,6 +1047,15 @@ pub struct NotarizedProposal {
     pub body: Vec<u8>,
 }
 
+/// One nullify vote of a recent view ([`Liveness::nullify_votes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NullifyKey {
+    /// The round epoch (a session's generation).
+    pub epoch: u64,
+    pub view: u64,
+    pub signer: u32,
+}
+
 /// One notarize vote of a recent view ([`Liveness::notarize_votes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NotarizeKey {
@@ -587,7 +1071,12 @@ impl ViewVotes {
     fn tally(&self, view: u64) -> ViewTally {
         ViewTally {
             view,
-            notarize: self.notarize.values().map(|signers| signers.len()).max().unwrap_or(0),
+            notarize: self
+                .notarize
+                .values()
+                .map(|signers| signers.len())
+                .max()
+                .unwrap_or(0),
             proposals: self.notarize.len(),
             nullify: self.nullify.len(),
             finalize: self.finalize.len(),
@@ -595,7 +1084,12 @@ impl ViewVotes {
     }
 
     fn signers(&self) -> impl Iterator<Item = u32> + '_ {
-        self.notarize.values().flatten().chain(&self.nullify).chain(&self.finalize).copied()
+        self.notarize
+            .values()
+            .flatten()
+            .chain(&self.nullify)
+            .chain(&self.finalize)
+            .copied()
     }
 }
 
@@ -612,6 +1106,18 @@ pub struct ViewTally {
     pub proposals: usize,
     pub nullify: usize,
     pub finalize: usize,
+}
+
+/// Who voted in one recent view ([`Liveness::view_signers`]), by signer
+/// (member) index.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ViewSigners {
+    pub view: u64,
+    /// The signers behind the view's best-supported proposal, as counted by
+    /// [`ViewTally::notarize`].
+    pub notarize: std::collections::BTreeSet<u32>,
+    pub nullify: std::collections::BTreeSet<u32>,
+    pub finalize: std::collections::BTreeSet<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -631,6 +1137,9 @@ pub struct LivenessSnapshot {
     /// Of the last [`LIVENESS_VIEWS`] views, the one whose best proposal had
     /// the most notarize votes.
     pub best: ViewTally,
+    /// Of the last [`LIVENESS_VIEWS`] views, the one with the most nullify
+    /// votes.
+    pub most_nullified: ViewTally,
     /// Messages consensus discarded as invalid, and from how many peers.
     pub blocked: u64,
     pub blocked_peers: usize,
@@ -668,12 +1177,18 @@ pub struct Decisions {
 
 impl Liveness {
     fn vote(&self, view: u64, count: impl FnOnce(&mut LivenessSnapshot, &mut ViewVotes)) {
-        let Ok(mut state) = self.inner.lock() else { return };
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
         let state = &mut *state;
         state.snapshot.view = state.snapshot.view.max(view);
         let floor = state.snapshot.view.saturating_sub(LIVENESS_VIEWS);
         let mut ignored = ViewVotes::default();
-        let votes = if view > floor { state.views.entry(view).or_default() } else { &mut ignored };
+        let votes = if view > floor {
+            state.views.entry(view).or_default()
+        } else {
+            &mut ignored
+        };
         count(&mut state.snapshot, votes);
         state.views.retain(|recent, _| *recent > floor);
     }
@@ -685,7 +1200,13 @@ impl Liveness {
 
     /// Count a notarize vote and, with `evidence` (round epoch, parent view
     /// and signature), keep it; a signer's first vote of a proposal stays.
-    fn notarize_vote(&self, view: u64, signer: u32, payload: [u8; 32], evidence: Option<(u64, u64, Vec<u8>)>) {
+    fn notarize_vote(
+        &self,
+        view: u64,
+        signer: u32,
+        payload: [u8; 32],
+        evidence: Option<(u64, u64, Vec<u8>)>,
+    ) {
         self.vote(view, |s, votes| {
             s.notarize_votes += 1;
             votes.notarize.entry(payload).or_default().insert(signer);
@@ -693,7 +1214,10 @@ impl Liveness {
                 votes
                     .evidence
                     .entry((parent, payload))
-                    .or_insert_with(|| Evidence { epoch, signatures: Default::default() })
+                    .or_insert_with(|| Evidence {
+                        epoch,
+                        signatures: Default::default(),
+                    })
                     .signatures
                     .entry(signer)
                     .or_insert(signature);
@@ -702,14 +1226,32 @@ impl Liveness {
     }
 
     #[cfg(test)]
-    fn evidence(&self, view: u64, epoch: u64, parent: u64, payload: [u8; 32], signer: u32, signature: Vec<u8>) {
+    fn evidence(
+        &self,
+        view: u64,
+        epoch: u64,
+        parent: u64,
+        payload: [u8; 32],
+        signer: u32,
+        signature: Vec<u8>,
+    ) {
         self.notarize_vote(view, signer, payload, Some((epoch, parent, signature)))
     }
 
+    #[cfg(test)]
     fn nullify(&self, view: u64, signer: u32) {
+        self.nullify_vote(view, signer, None)
+    }
+
+    /// Count a nullify vote and, with `evidence` (round epoch and
+    /// signature), keep it; a signer's first nullify of a view stays.
+    fn nullify_vote(&self, view: u64, signer: u32, evidence: Option<(u64, Vec<u8>)>) {
         self.vote(view, |s, votes| {
             s.nullify_votes += 1;
             votes.nullify.insert(signer);
+            if let Some(evidence) = evidence {
+                votes.nullify_evidence.entry(signer).or_insert(evidence);
+            }
         })
     }
 
@@ -721,21 +1263,54 @@ impl Liveness {
     }
 
     fn certificate(&self, view: u64, record: impl FnOnce(&mut LivenessSnapshot)) {
-        let Ok(mut state) = self.inner.lock() else { return };
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
         record(&mut state.snapshot);
         state.snapshot.view = state.snapshot.view.max(view);
     }
 
     pub fn snapshot(&self) -> LivenessSnapshot {
-        let Ok(state) = self.inner.lock() else { return LivenessSnapshot::default() };
+        let Ok(state) = self.inner.lock() else {
+            return LivenessSnapshot::default();
+        };
         let mut snapshot = state.snapshot;
-        snapshot.voters = state.views.values().flat_map(ViewVotes::signers)
-            .collect::<std::collections::BTreeSet<_>>().len();
+        snapshot.voters = state
+            .views
+            .values()
+            .flat_map(ViewVotes::signers)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
         let tallies = || state.views.iter().map(|(view, votes)| votes.tally(*view));
         snapshot.current = tallies().last().unwrap_or_default();
-        snapshot.best = tallies().max_by_key(|tally| (tally.notarize, tally.view)).unwrap_or_default();
+        snapshot.best = tallies()
+            .max_by_key(|tally| (tally.notarize, tally.view))
+            .unwrap_or_default();
+        snapshot.most_nullified = tallies()
+            .max_by_key(|tally| (tally.nullify, tally.view))
+            .unwrap_or_default();
         snapshot.blocked_peers = state.blocked.len();
         snapshot
+    }
+
+    /// Who voted in `view` while it is one of the last [`LIVENESS_VIEWS`]
+    /// views; `None` for a view without votes or one that left them.
+    pub fn view_signers(&self, view: u64) -> Option<ViewSigners> {
+        let Ok(state) = self.inner.lock() else {
+            return None;
+        };
+        let votes = state.views.get(&view)?;
+        Some(ViewSigners {
+            view,
+            notarize: votes
+                .notarize
+                .values()
+                .max_by_key(|signers| signers.len())
+                .cloned()
+                .unwrap_or_default(),
+            nullify: votes.nullify.clone(),
+            finalize: votes.finalize.clone(),
+        })
     }
 
     /// Let [`Self::notarized`] read the bodies `store` holds while its host
@@ -744,11 +1319,13 @@ impl Liveness {
         let _ = self.blocks.set(store.downgrade());
     }
 
-    /// Keep the signatures of the notarize votes this consensus reports, for
-    /// [`Self::notarize_votes`] and [`Self::notarized`] (presence reports).
+    /// Keep the signatures of the notarize and nullify votes this consensus
+    /// reports, for [`Self::notarize_votes`], [`Self::notarized`] and
+    /// [`Self::nullify_votes`] (presence reports).
     /// Off by default: then no signature is decoded, copied or stored.
     pub fn keep_votes(&self, keep: bool) {
-        self.keep_votes.store(keep, std::sync::atomic::Ordering::Relaxed);
+        self.keep_votes
+            .store(keep, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether notarize votes keep their signatures ([`Self::keep_votes`]).
@@ -760,35 +1337,72 @@ impl Liveness {
     /// ascending view order, each with its votes and the body this node
     /// built or verified; a proposal without such a body is left out.
     pub fn notarized(&self) -> Vec<NotarizedProposal> {
-        let Some(blocks) = self.blocks.get().and_then(WeakBlockStore::upgrade) else { return Vec::new() };
-        let recent: Vec<NotarizedProposal> = {
-            let Ok(state) = self.inner.lock() else { return Vec::new() };
-            state.views.iter().flat_map(|(view, votes)| {
-                votes.evidence.iter().map(move |((parent, payload), evidence)| NotarizedProposal {
-                    epoch: evidence.epoch,
-                    view: *view,
-                    parent: *parent,
-                    payload: *payload,
-                    votes: evidence.signatures.iter().map(|(signer, signature)| (*signer, signature.clone())).collect(),
-                    body: Vec::new(),
-                })
-            }).collect()
+        let Some(blocks) = self.blocks.get().and_then(WeakBlockStore::upgrade) else {
+            // A host that failed part-way through activation never bound its
+            // store; a bound store that is gone is an ordinary shutdown.
+            if self.blocks.get().is_none()
+                && !self
+                    .unbound_warned
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    "consensus liveness has no block store bound, so notarized proposals are reported without \
+                     bodies; this node's consensus activation did not finish (defect to report with the \
+                     preceding activation errors)",
+                );
+            }
+            return Vec::new();
         };
-        recent.into_iter().filter_map(|mut proposal| {
-            let (body, verified) = blocks.get_with_verification(&digest_from_identity(proposal.payload))?;
-            verified.then(|| {
-                proposal.body = body;
-                proposal
+        let recent: Vec<NotarizedProposal> = {
+            let Ok(state) = self.inner.lock() else {
+                return Vec::new();
+            };
+            state
+                .views
+                .iter()
+                .flat_map(|(view, votes)| {
+                    votes
+                        .evidence
+                        .iter()
+                        .map(move |((parent, payload), evidence)| NotarizedProposal {
+                            epoch: evidence.epoch,
+                            view: *view,
+                            parent: *parent,
+                            payload: *payload,
+                            votes: evidence
+                                .signatures
+                                .iter()
+                                .map(|(signer, signature)| (*signer, signature.clone()))
+                                .collect(),
+                            body: Vec::new(),
+                        })
+                })
+                .collect()
+        };
+        recent
+            .into_iter()
+            .filter_map(|mut proposal| {
+                let (body, verified) =
+                    blocks.get_with_verification(&digest_from_identity(proposal.payload))?;
+                verified.then(|| {
+                    proposal.body = body;
+                    proposal
+                })
             })
-        }).collect()
+            .collect()
     }
 
     /// Every notarize vote of the recent views, in ascending view order,
     /// with its signature bytes where `wanted` asks for them and `None`
     /// elsewhere, so a caller that keeps the result of checking a vote
     /// copies only the votes it has not checked yet. No body is read.
-    pub fn notarize_votes(&self, wanted: impl Fn(&NotarizeKey) -> bool) -> Vec<(NotarizeKey, Option<Vec<u8>>)> {
-        let Ok(state) = self.inner.lock() else { return Vec::new() };
+    pub fn notarize_votes(
+        &self,
+        wanted: impl Fn(&NotarizeKey) -> bool,
+    ) -> Vec<(NotarizeKey, Option<Vec<u8>>)> {
+        let Ok(state) = self.inner.lock() else {
+            return Vec::new();
+        };
         let mut votes = Vec::new();
         for (view, recent) in &state.views {
             for ((parent, payload), evidence) in &recent.evidence {
@@ -808,14 +1422,44 @@ impl Liveness {
         votes
     }
 
+    /// Every kept nullify vote of the recent views, in ascending view and
+    /// signer order, with its signature bytes where `wanted` asks for them
+    /// and `None` elsewhere ([`Self::notarize_votes`]).
+    pub fn nullify_votes(
+        &self,
+        wanted: impl Fn(&NullifyKey) -> bool,
+    ) -> Vec<(NullifyKey, Option<Vec<u8>>)> {
+        let Ok(state) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut votes = Vec::new();
+        for (view, recent) in &state.views {
+            for (signer, (epoch, signature)) in &recent.nullify_evidence {
+                let key = NullifyKey {
+                    epoch: *epoch,
+                    view: *view,
+                    signer: *signer,
+                };
+                let signature = wanted(&key).then(|| signature.clone());
+                votes.push((key, signature));
+            }
+        }
+        votes
+    }
+
     pub fn decisions(&self) -> Decisions {
-        self.inner.lock().map(|state| state.decisions.clone()).unwrap_or_default()
+        self.inner
+            .lock()
+            .map(|state| state.decisions.clone())
+            .unwrap_or_default()
     }
 
     /// Why `step` of `view` has not succeeded (so far): the reason its outcome
     /// is counted under if it ends without success. A later note replaces it.
     pub fn note(&self, step: Step, view: u64, reason: &'static str, detail: impl Into<String>) {
-        let Ok(mut state) = self.inner.lock() else { return };
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
         let floor = state.snapshot.view.saturating_sub(NOTE_VIEWS);
         state.notes.retain(|(_, noted), _| *noted > floor);
         state.notes.insert((step, view), (reason, detail.into()));
@@ -823,23 +1467,42 @@ impl Liveness {
 
     /// `step` of `view` ended, successfully or under its last note.
     pub fn settle(&self, step: Step, view: u64, succeeded: bool) {
-        let Ok(mut state) = self.inner.lock() else { return };
-        let (reason, detail) = state.notes.remove(&(step, view)).unwrap_or(("unexplained", String::new()));
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
+        let (reason, detail) = state
+            .notes
+            .remove(&(step, view))
+            .unwrap_or(("unexplained", String::new()));
         let decisions = &mut state.decisions;
         let (done, failed, last) = match step {
-            Step::Propose => (&mut decisions.proposed, &mut decisions.declined, &mut decisions.last_declined),
-            Step::Verify => (&mut decisions.accepted, &mut decisions.refused, &mut decisions.last_refused),
+            Step::Propose => (
+                &mut decisions.proposed,
+                &mut decisions.declined,
+                &mut decisions.last_declined,
+            ),
+            Step::Verify => (
+                &mut decisions.accepted,
+                &mut decisions.refused,
+                &mut decisions.last_refused,
+            ),
         };
         if succeeded {
             *done += 1;
         } else {
             *failed.entry(reason).or_default() += 1;
-            *last = Some(Outcome { view, reason, detail });
+            *last = Some(Outcome {
+                view,
+                reason,
+                detail,
+            });
         }
     }
 
     fn blocked(&self, peer: FalconPublicKey) {
-        let Ok(mut state) = self.inner.lock() else { return };
+        let Ok(mut state) = self.inner.lock() else {
+            return;
+        };
         state.snapshot.blocked += 1;
         if state.blocked.len() < BLOCKED_PEERS {
             state.blocked.insert(peer);
@@ -854,14 +1517,33 @@ impl Liveness {
             Activity::Notarize(vote) => {
                 let evidence = if self.keep_votes.load(std::sync::atomic::Ordering::Relaxed) {
                     vote.attestation.signature.get().map(|signature| {
-                        (vote.proposal.round.epoch().get(), vote.proposal.parent.get(), signature.to_vec())
+                        (
+                            vote.proposal.round.epoch().get(),
+                            vote.proposal.parent.get(),
+                            signature.to_vec(),
+                        )
                     })
                 } else {
                     None
                 };
-                self.notarize_vote(vote.view().get(), signer(vote.signer()), vote.proposal.payload.0, evidence);
+                self.notarize_vote(
+                    vote.view().get(),
+                    signer(vote.signer()),
+                    vote.proposal.payload.0,
+                    evidence,
+                );
             }
-            Activity::Nullify(vote) => self.nullify(vote.view().get(), signer(vote.signer())),
+            Activity::Nullify(vote) => {
+                let evidence = if self.keep_votes.load(std::sync::atomic::Ordering::Relaxed) {
+                    vote.attestation
+                        .signature
+                        .get()
+                        .map(|signature| (vote.round.epoch().get(), signature.to_vec()))
+                } else {
+                    None
+                };
+                self.nullify_vote(vote.view().get(), signer(vote.signer()), evidence);
+            }
             Activity::Finalize(vote) => self.finalize(vote.view().get(), signer(vote.signer())),
             Activity::Notarization(cert) => {
                 let view = cert.view().get();
@@ -895,7 +1577,9 @@ impl CountingBlocker {
 
 impl Clone for CountingBlocker {
     fn clone(&self) -> Self {
-        Self { liveness: self.liveness.clone() }
+        Self {
+            liveness: self.liveness.clone(),
+        }
     }
 }
 
@@ -919,13 +1603,21 @@ pub struct FalconReporter<Fin: FrameFinalizer> {
 
 impl<Fin: FrameFinalizer> Clone for FalconReporter<Fin> {
     fn clone(&self) -> Self {
-        Self { finalizer: self.finalizer.clone(), store: self.store.clone(), liveness: self.liveness.clone() }
+        Self {
+            finalizer: self.finalizer.clone(),
+            store: self.store.clone(),
+            liveness: self.liveness.clone(),
+        }
     }
 }
 
 impl<Fin: FrameFinalizer> FalconReporter<Fin> {
     pub fn new(finalizer: Arc<Fin>, store: BlockStore) -> Self {
-        Self { finalizer, store, liveness: None }
+        Self {
+            finalizer,
+            store,
+            liveness: None,
+        }
     }
 
     /// Also record every vote and certificate in `liveness`, which reads the
@@ -950,12 +1642,21 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
             Activity::Notarization(n) => {
                 let digest = n.proposal.payload;
                 let view: u64 = n.proposal.round.view().get();
+                self.store.certified(&digest, view);
                 let bytes = self.store.get(&digest);
                 self.finalizer.on_notarized(view, digest, bytes);
+            }
+            Activity::Certification(n) => {
+                self.store
+                    .certified(&n.proposal.payload, n.proposal.round.view().get());
+            }
+            Activity::Nullification(n) => {
+                self.store.observe_certificate(n.round.view().get());
             }
             Activity::Finalization(f) => {
                 let digest = f.proposal.payload;
                 let view: u64 = f.proposal.round.view().get();
+                self.store.certified(&digest, view);
                 // Distinguish "we sealed the exact validated/built bytes" from
                 // "we only learned the finalization cert" (bytes present but
                 // never locally verified) — the finalizer needs it to decide
@@ -970,14 +1671,17 @@ impl<Fin: FrameFinalizer> Reporter for FalconReporter<Fin> {
                 let cert = Some(crate::app_cert::encode_finalization(&f));
                 self.finalizer
                     .on_finalized(view, digest, bytes, cert, locally_verified);
+                // Views far below this one, and below what a finalizer still
+                // holds (`BlockStore::hold_from`), leave the store's window.
+                self.store.finalized(view);
             }
             Activity::ConflictingNotarize(_)
             | Activity::ConflictingFinalize(_)
             | Activity::NullifyFinalize(_) => {
                 self.finalizer.on_equivocation(0);
             }
-            // Individual votes / nullifies / certifications are not surfaced to
-            // the Quilibrium layer (simplex handles quorum internally).
+            // Individual votes and nullifies are not surfaced to the
+            // Quilibrium layer (simplex handles quorum internally).
             _ => {}
         }
         Feedback::Ok
@@ -1033,6 +1737,164 @@ mod block_store_seal_tests {
 }
 
 #[cfg(test)]
+mod block_store_bound_tests {
+    use super::*;
+
+    fn digest_n(n: u32) -> Digest {
+        let mut identity = [0u8; 32];
+        identity[..4].copy_from_slice(&n.to_be_bytes());
+        identity[31] = 0xb5;
+        digest_from_identity(identity)
+    }
+
+    fn held(store: &BlockStore, digests: impl IntoIterator<Item = u32>) -> usize {
+        digests
+            .into_iter()
+            .filter(|n| store.get(&digest_n(*n)).is_some())
+            .count()
+    }
+
+    /// Candidate bytes are capped as well as their count.
+    #[test]
+    fn candidate_bytes_are_capped() {
+        let limits = BlockStoreLimits {
+            max_candidate_bytes: 64 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        for n in 1..=100 {
+            store.put(digest_n(n), vec![3; 4 << 10]);
+        }
+        assert_eq!(store.usage(), (16, 64 << 10));
+        assert_eq!(held(&store, 85..=100), 16);
+    }
+
+    /// A finalization drops the blocks more than `keep_views` below it and
+    /// keeps the rest, certified or not.
+    #[test]
+    fn finalization_drops_only_blocks_below_the_window() {
+        let limits = BlockStoreLimits {
+            keep_views: 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        for view in 1..=30u32 {
+            store.observe_certificate(view.into());
+            store.put(digest_n(view), vec![view as u8; 8]);
+            if view % 2 == 0 {
+                store.certified(&digest_n(view), view.into());
+            }
+        }
+        store.finalized(30);
+        assert_eq!(held(&store, 1..=19), 0);
+        assert_eq!(held(&store, 20..=30), 11);
+        assert_eq!(store.usage(), (11, 88));
+        // An older finalization reported late prunes nothing more.
+        store.finalized(25);
+        assert_eq!(store.usage().0, 11);
+    }
+
+    /// A block restored at startup, before any certificate, takes the view
+    /// of the first one, so that finalization does not drop it.
+    #[test]
+    fn blocks_restored_before_any_certificate_survive_the_first_finalization() {
+        let limits = BlockStoreLimits {
+            keep_views: 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        store.put(digest_n(1), vec![1; 8]);
+        store.seal(digest_n(2), vec![2; 8]);
+        store.finalized(500);
+        assert_eq!(held(&store, 1..=2), 2);
+        store.finalized(600);
+        assert_eq!(held(&store, 1..=2), 0);
+    }
+
+    /// Over the byte cap, candidates go first, then vouched blocks of old
+    /// views; verified or certified blocks of the latest views stay even
+    /// when they alone exceed the cap.
+    #[test]
+    fn over_the_byte_cap_recent_vouched_blocks_stay() {
+        let limits = BlockStoreLimits {
+            keep_views: 1000,
+            protected_views: 2,
+            max_bytes: 10 << 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        store.observe_certificate(1);
+        store.seal(digest_n(1), vec![1; 3 << 10]);
+        store.observe_certificate(10);
+        store.seal(digest_n(2), vec![2; 3 << 10]);
+        store.put(digest_n(3), vec![3; 2 << 10]);
+        store.put(digest_n(4), vec![4; 2 << 10]);
+        assert_eq!(held(&store, 1..=4), 4);
+        // A certified candidate is vouched for: the plain candidate goes.
+        store.certified(&digest_n(4), 10);
+        store.put(digest_n(5), vec![5; 2 << 10]);
+        assert!(store.get(&digest_n(3)).is_none());
+        assert_eq!(held(&store, [1, 2, 4, 5]), 4);
+        // Room for a recent verified block: the last candidate, then the
+        // verified block of view 1 (below the protected views) go.
+        store.seal(digest_n(6), vec![6; 4 << 10]);
+        assert_eq!(held(&store, [1, 3, 5]), 0);
+        assert_eq!(held(&store, [2, 4, 6]), 3);
+        // Protected blocks alone may exceed the cap.
+        store.seal(digest_n(7), vec![7; 4 << 10]);
+        assert_eq!(held(&store, [2, 4, 6, 7]), 4);
+        assert_eq!(store.usage(), (4, 13 << 10));
+    }
+
+    /// A reader still taking finalized bodies holds the window at the lowest
+    /// view it has to take; once it lets go, the next finalization prunes.
+    #[test]
+    fn a_hold_keeps_bodies_a_reader_has_not_taken() {
+        let limits = BlockStoreLimits {
+            keep_views: 10,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        let pending = Arc::new(std::sync::Mutex::new(Some(5u64)));
+        let hold = pending.clone();
+        store.hold_from(Arc::new(move || *hold.lock().unwrap()));
+        for view in 1..=30u32 {
+            store.observe_certificate(view.into());
+            store.put(digest_n(view), vec![view as u8; 8]);
+            store.certified(&digest_n(view), view.into());
+        }
+        store.finalized(30);
+        assert_eq!(held(&store, 1..=30), 30);
+        *pending.lock().unwrap() = None;
+        store.finalized(31);
+        assert_eq!(held(&store, 1..=20), 0);
+        assert_eq!(held(&store, 21..=30), 10);
+    }
+
+    /// A body that arrives after a certificate named it is stored as a
+    /// certified block, not as an evictable candidate.
+    #[test]
+    fn a_body_arriving_after_its_certificate_is_kept_as_certified() {
+        let limits = BlockStoreLimits {
+            max_candidate_blocks: 4,
+            ..BlockStoreLimits::default()
+        };
+        let store = BlockStore::with_limits(limits, "test");
+        store.observe_certificate(10);
+        store.certified(&digest_n(1), 10);
+        store.put(digest_n(1), vec![1; 8]);
+        for n in 2..=20 {
+            store.put(digest_n(n), vec![2; 8]);
+        }
+        assert_eq!(
+            store.get_with_verification(&digest_n(1)),
+            Some((vec![1; 8], false))
+        );
+        assert_eq!(held(&store, 2..=20), 4);
+    }
+}
+
+#[cfg(test)]
 mod liveness_tests {
     use super::*;
 
@@ -1054,8 +1916,27 @@ mod liveness_tests {
         }
         liveness.finalize(7, 1);
         let seen = liveness.snapshot();
-        assert_eq!(seen.best, ViewTally { view: 7, notarize: 5, proposals: 2, nullify: 0, finalize: 1 });
-        assert_eq!(seen.current, ViewTally { view: 8, notarize: 0, proposals: 0, nullify: 3, finalize: 0 });
+        assert_eq!(
+            seen.best,
+            ViewTally {
+                view: 7,
+                notarize: 5,
+                proposals: 2,
+                nullify: 0,
+                finalize: 1
+            }
+        );
+        assert_eq!(
+            seen.current,
+            ViewTally {
+                view: 8,
+                notarize: 0,
+                proposals: 0,
+                nullify: 3,
+                finalize: 0
+            }
+        );
+        assert_eq!(seen.most_nullified, seen.current);
         assert_eq!(seen.voters, 8);
         assert_eq!(seen.notarize_votes, 9);
         // Views older than the window leave the tallies and the voter count:
@@ -1066,24 +1947,72 @@ mod liveness_tests {
         assert_eq!(seen.voters, 4);
     }
 
+    /// A view's signers name the members behind its best-supported proposal
+    /// and its other votes, while the view is recent.
+    #[test]
+    fn view_signers_name_the_members_behind_the_best_proposal() {
+        let liveness = Liveness::default();
+        assert_eq!(liveness.view_signers(7), None, "no votes");
+        for signer in [0, 2, 3] {
+            liveness.notarize(7, signer, [1; 32]);
+        }
+        liveness.notarize(7, 4, [2; 32]);
+        liveness.nullify(7, 4);
+        liveness.nullify(7, 5);
+        liveness.finalize(7, 0);
+        let set = |signers: &[u32]| {
+            signers
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            liveness.view_signers(7),
+            Some(ViewSigners {
+                view: 7,
+                notarize: set(&[0, 2, 3]),
+                nullify: set(&[4, 5]),
+                finalize: set(&[0])
+            }),
+        );
+        liveness.nullify(7 + LIVENESS_VIEWS, 1);
+        assert_eq!(liveness.view_signers(7), None, "left the recent views");
+    }
+
     /// Each step ends once per view under the last reason noted for it, and
     /// a success forgets the reasons noted before it.
     #[test]
     fn outcomes_are_counted_once_per_view_under_their_last_reason() {
         let liveness = Liveness::default();
         liveness.note(Step::Propose, 3, "parent unavailable", "not yet");
-        liveness.note(Step::Propose, 3, "leader not ready to build on the parent", "frame 0");
+        liveness.note(
+            Step::Propose,
+            3,
+            "leader not ready to build on the parent",
+            "frame 0",
+        );
         liveness.settle(Step::Propose, 3, false);
         liveness.note(Step::Propose, 4, "parent unavailable", "not yet");
         liveness.settle(Step::Propose, 4, true);
-        liveness.note(Step::Verify, 4, "pre-state root differs", "phase vertex adds");
+        liveness.note(
+            Step::Verify,
+            4,
+            "pre-state root differs",
+            "phase vertex adds",
+        );
         liveness.settle(Step::Verify, 4, false);
         liveness.settle(Step::Verify, 5, false);
         liveness.settle(Step::Verify, 6, true);
         let decided = liveness.decisions();
         assert_eq!(decided.proposed, 1);
-        assert_eq!(decided.declined.into_iter().collect::<Vec<_>>(), vec![("leader not ready to build on the parent", 1)]);
-        assert_eq!(decided.last_declined.map(|o| (o.view, o.detail)), Some((3, "frame 0".to_string())));
+        assert_eq!(
+            decided.declined.into_iter().collect::<Vec<_>>(),
+            vec![("leader not ready to build on the parent", 1)]
+        );
+        assert_eq!(
+            decided.last_declined.map(|o| (o.view, o.detail)),
+            Some((3, "frame 0".to_string()))
+        );
         assert_eq!(decided.accepted, 1);
         assert_eq!(
             decided.refused.into_iter().collect::<Vec<_>>(),
@@ -1099,6 +2028,12 @@ mod liveness_tests {
         let liveness = Liveness::default();
         liveness.evidence(7, 3, 6, [1; 32], 2, vec![0xa2]);
         assert!(liveness.notarized().is_empty(), "no block store bound");
+        assert!(
+            liveness
+                .unbound_warned
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "an unbound store warns once"
+        );
         let store = BlockStore::new();
         liveness.bind_blocks(&store);
         liveness.evidence(7, 3, 6, [1; 32], 0, vec![0xa0]);
@@ -1110,12 +2045,22 @@ mod liveness_tests {
         assert_eq!(
             liveness.notarized(),
             vec![NotarizedProposal {
-                epoch: 3, view: 7, parent: 6, payload: [1; 32],
-                votes: vec![(0, vec![0xa0]), (2, vec![0xa2])], body: b"body".to_vec(),
+                epoch: 3,
+                view: 7,
+                parent: 6,
+                payload: [1; 32],
+                votes: vec![(0, vec![0xa0]), (2, vec![0xa2])],
+                body: b"body".to_vec(),
             }],
             "a signer's first vote stays",
         );
-        let key = |view, parent, payload, signer| NotarizeKey { epoch: 3, view, parent, payload, signer };
+        let key = |view, parent, payload, signer| NotarizeKey {
+            epoch: 3,
+            view,
+            parent,
+            payload,
+            signer,
+        };
         assert_eq!(
             liveness.notarize_votes(|key| key.signer == 2),
             vec![
@@ -1145,13 +2090,26 @@ mod liveness_tests {
         let mut keys: Vec<_> = (0..2)
             .map(|_| {
                 let key = quil_crypto::FalconSigner::generate();
-                crate::falcon_base::FalconPrivateKey::from_bytes(key.private_key(), key.public_key()).unwrap()
+                crate::falcon_base::FalconPrivateKey::from_bytes(
+                    key.private_key(),
+                    key.public_key(),
+                )
+                .unwrap()
             })
             .collect();
         keys.sort_by_key(|key| key.public_key().as_ref().to_vec());
-        let participants: Set<_> = keys.iter().map(|key| key.public_key()).collect::<Vec<_>>().try_into().unwrap();
+        let participants: Set<_> = keys
+            .iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
         let scheme = SimplexFalconScheme::signer(b"test", participants, keys[1].clone()).unwrap();
-        let proposal = Proposal::new(Round::new(Epoch::new(3), View::new(9)), View::new(5), digest_from_identity([4; 32]));
+        let proposal = Proposal::new(
+            Round::new(Epoch::new(3), View::new(9)),
+            View::new(5),
+            digest_from_identity([4; 32]),
+        );
         let vote = Notarize::sign(&scheme, proposal).unwrap();
         (scheme, vote)
     }
@@ -1168,14 +2126,65 @@ mod liveness_tests {
         liveness.keep_votes(true);
         liveness.observe(&Activity::Notarize(vote.clone()));
         let votes = liveness.notarize_votes(|_| true);
-        let key = NotarizeKey { epoch: 3, view: 9, parent: 5, payload: [4; 32], signer: 1 };
-        assert_eq!(votes, vec![(key, Some(vote.attestation.signature.get().unwrap().to_vec()))]);
+        let key = NotarizeKey {
+            epoch: 3,
+            view: 9,
+            parent: 5,
+            payload: [4; 32],
+            signer: 1,
+        };
+        assert_eq!(
+            votes,
+            vec![(
+                key,
+                Some(vote.attestation.signature.get().unwrap().to_vec())
+            )]
+        );
         let listed = Proposal::new(
             Round::new(Epoch::new(key.epoch), View::new(key.view)),
             View::new(key.parent),
             digest_from_identity(key.payload),
         );
-        assert!(scheme.verify_notarize(&listed, &vote.attestation), "the listed vote verifies as consensus checks it");
+        assert!(
+            scheme.verify_notarize(&listed, &vote.attestation),
+            "the listed vote verifies as consensus checks it"
+        );
+    }
+
+    /// A nullify vote consensus reports keeps its round and signature when
+    /// presence reports ask for votes, so it verifies again from what
+    /// [`Liveness`] returns; otherwise it is only counted.
+    #[test]
+    fn a_reported_nullify_keeps_its_round_and_signature_when_asked() {
+        use commonware_consensus::simplex::types::Nullify;
+        use commonware_consensus::types::{Epoch, Round, View};
+        let (scheme, _) = signed_notarize();
+        let vote =
+            Nullify::sign::<Digest>(&scheme, Round::new(Epoch::new(3), View::new(11))).unwrap();
+        let liveness = Liveness::default();
+        liveness.observe(&Activity::Nullify(vote.clone()));
+        assert_eq!(liveness.snapshot().nullify_votes, 1, "the vote is counted");
+        assert!(
+            liveness.nullify_votes(|_| true).is_empty(),
+            "and its signature not kept"
+        );
+        liveness.keep_votes(true);
+        liveness.observe(&Activity::Nullify(vote.clone()));
+        let key = NullifyKey {
+            epoch: 3,
+            view: 11,
+            signer: 1,
+        };
+        let signature = vote.attestation.signature.get().unwrap().to_vec();
+        assert_eq!(
+            liveness.nullify_votes(|_| true),
+            vec![(key, Some(signature))]
+        );
+        assert_eq!(liveness.nullify_votes(|_| false), vec![(key, None)]);
+        assert!(
+            scheme.verify_nullify(&vote),
+            "the listed vote verifies as consensus checks it"
+        );
     }
 
     /// Unless presence reports ask for them, notarize votes are only
@@ -1186,8 +2195,17 @@ mod liveness_tests {
         let liveness = Liveness::default();
         liveness.observe(&Activity::Notarize(vote.clone()));
         assert_eq!(liveness.snapshot().notarize_votes, 1, "the vote is counted");
-        assert!(liveness.notarize_votes(|_| true).is_empty(), "and its signature not kept");
-        assert!(liveness.inner.lock().unwrap().views.values().all(|votes| votes.evidence.is_empty()));
+        assert!(
+            liveness.notarize_votes(|_| true).is_empty(),
+            "and its signature not kept"
+        );
+        assert!(liveness
+            .inner
+            .lock()
+            .unwrap()
+            .views
+            .values()
+            .all(|votes| votes.evidence.is_empty()));
         liveness.keep_votes(true);
         liveness.observe(&Activity::Notarize(vote));
         assert_eq!(liveness.notarize_votes(|_| true).len(), 1);
@@ -1204,7 +2222,10 @@ mod liveness_tests {
         store.seal(digest_from_identity([1; 32]), b"body".to_vec());
         assert_eq!(liveness.notarized().len(), 1);
         drop(store);
-        assert!(liveness.notarized().is_empty(), "the bodies went with their store");
+        assert!(
+            liveness.notarized().is_empty(),
+            "the bodies went with their store"
+        );
     }
 
     #[test]
@@ -1215,12 +2236,59 @@ mod liveness_tests {
         let liveness = Arc::new(Liveness::default());
         let mut blocker = CountingBlocker::new(Some(liveness.clone()));
         let peers: Vec<_> = (0..2)
-            .map(|_| crate::falcon_base::FalconPrivateKey::random(commonware_utils::test_rng()).public_key())
+            .map(|_| {
+                crate::falcon_base::FalconPrivateKey::random(commonware_utils::test_rng())
+                    .public_key()
+            })
             .collect();
         for peer in [&peers[0], &peers[0], &peers[1]] {
             blocker.block((*peer).clone());
         }
         let seen = liveness.snapshot();
         assert_eq!((seen.blocked, seen.blocked_peers), (3, 2));
+    }
+}
+
+#[cfg(test)]
+mod block_store_flood_reproducer {
+    use super::*;
+
+    fn candidate(n: u32) -> Digest {
+        let mut identity = [0u8; 32];
+        identity[..4].copy_from_slice(&n.to_be_bytes());
+        identity[31] = 0xf1;
+        digest_from_identity(identity)
+    }
+
+    /// A peer that sends GLOBAL blocks under distinct digests (any decodable
+    /// frame with a fresh `output`) has each stored as a candidate. The store
+    /// must stay bounded (at most 1024 candidates by default) and keep the
+    /// verified block consensus still needs.
+    #[test]
+    fn reproduces_unbounded_candidate_flood() {
+        let store = BlockStore::new();
+        let verified = candidate(0);
+        store.seal(verified, vec![1; 1024]);
+        let flood: u32 = 4096;
+        for n in 1..=flood {
+            store.put(candidate(n), vec![2; 64]);
+        }
+        let held = (1..=flood)
+            .filter(|n| store.get(&candidate(*n)).is_some())
+            .count();
+        assert!(
+            held <= 1024,
+            "block store grows without bound: it holds all {held} of {flood} flooded peer \
+             candidates"
+        );
+        assert!(
+            store.get(&candidate(flood)).is_some(),
+            "the newest candidate was evicted before older flood candidates"
+        );
+        assert_eq!(
+            store.get_with_verification(&verified),
+            Some((vec![1; 1024], true)),
+            "the flood displaced the verified block"
+        );
     }
 }

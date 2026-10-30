@@ -59,6 +59,17 @@ pub const CONSENSUS_GLOBAL_EXECUTION_PENDING: u8 = 0x06;
 /// `[CONSENSUS, 0x07]` → 8-byte BE GLOBAL frame: this store discarded its
 /// application-shard frame history at the committee-handoff flag day.
 pub const CONSENSUS_APP_HISTORY_DISCARDED: u8 = 0x07;
+/// `[CONSENSUS, 0x08] ‖ filter` → a shard re-anchor at its session fence
+/// whose rebase has not committed: generation, fence and the materialized
+/// cursor it began at, each an 8-byte BE `u64`, then the 32-byte digest of
+/// the local frame at that cursor (zero for none): 56 bytes. A 24-byte
+/// value is the same without the digest.
+pub const CONSENSUS_APP_REANCHOR: u8 = 0x08;
+/// `[CONSENSUS, 0x09] ‖ filter` → 8-byte BE materialized cursor: a payload
+/// eviction dropped this shard's subtree from the store while its frames and
+/// cursor stayed, at that cursor. The state those frames claim is gone, so a
+/// later binding re-anchors the shard rather than replay onto nothing.
+pub const CONSENSUS_APP_LINEAGE_DROPPED: u8 = 0x09;
 pub const MIGRATION: u8 = 0xF0;
 pub const WORKER: u8 = 0xFF;
 
@@ -332,6 +343,18 @@ pub fn clock_global_frame_candidate_latest_index() -> Vec<u8> {
 /// them; no execution plan does, so their cleanup is declared disjoint.
 pub const CLOCK_SHARD_STAGED_PREFIXES: &[[u8; 2]] = &[[CLOCK_FRAME, CLOCK_SHARD_STAGED]];
 
+/// Committed application-shard frames and their latest index. An archive
+/// stores each frame it admits for serving as a write confined to these
+/// prefixes, which makes stale only an execution plan that touched them
+/// (`CoordinatedDb::commit_execution`); an ordinary write made every
+/// concurrent atomic GLOBAL execution stale. Safety rests on that check, not
+/// on what execution reads: GLOBAL execution is not expected to touch them,
+/// and one that does still conflicts.
+pub const CLOCK_SHARD_SERVING_PREFIXES: &[[u8; 2]] = &[
+    [CLOCK_FRAME, CLOCK_SHARD_FRAME],
+    [CLOCK_FRAME, INDEX_LATEST | CLOCK_SHARD_FRAME],
+];
+
 /// Committed GLOBAL request bodies and their retention index. Only frame
 /// reads touch them; a regular node does not execute GLOBAL requests.
 pub const GLOBAL_REQUEST_PREFIXES: &[[u8; 2]] = &[
@@ -433,11 +456,7 @@ pub fn clock_timeout_certificate_earliest_index(filter: &[u8]) -> Vec<u8> {
 /// Go's `clockShardParentIndexKey`:
 /// `[0x00, 0x31, frame_number(8 BE), filter..., right_align(selector, 32)]`
 /// (`CLOCK_SHARD_FRAME_INDEX_PARENT` = `0x30 | CLOCK_SHARD_FRAME` = `0x31`)
-pub fn clock_shard_parent_index_key(
-    filter: &[u8],
-    frame_number: u64,
-    selector: &[u8],
-) -> Vec<u8> {
+pub fn clock_shard_parent_index_key(filter: &[u8], frame_number: u64, selector: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + 8 + filter.len() + 32);
     k.push(CLOCK_FRAME);
     k.push(INDEX_PARENT | CLOCK_SHARD_FRAME);
@@ -461,11 +480,7 @@ pub fn clock_prover_trie_key(filter: &[u8], ring: u16, frame_number: u64) -> Vec
 
 /// Go's `clockDataTotalDistanceKey`:
 /// `[0x00, 0x04, frame_number(8 BE), filter..., right_align(selector, 32)]`
-pub fn clock_data_total_distance_key(
-    filter: &[u8],
-    frame_number: u64,
-    selector: &[u8],
-) -> Vec<u8> {
+pub fn clock_data_total_distance_key(filter: &[u8], frame_number: u64, selector: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + 8 + filter.len() + 32);
     k.push(CLOCK_FRAME);
     k.push(CLOCK_TOTAL_DISTANCE);
@@ -608,10 +623,7 @@ pub fn hypergraph_shard_commit_frame_prefix(frame_number: u64) -> Vec<u8> {
 
 /// Alt shard commit key: `[0x09, 0xE4, frame_number(8 BE), shard_address...]`.
 /// Matches Go's `hypergraphAltShardCommitKey`.
-pub fn hypergraph_alt_shard_commit_key(
-    frame_number: u64,
-    shard_address: &[u8],
-) -> Vec<u8> {
+pub fn hypergraph_alt_shard_commit_key(frame_number: u64, shard_address: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(2 + 8 + shard_address.len());
     k.push(HYPERGRAPH_SHARD);
     k.push(HG_ALT_SHARD_COMMIT);
@@ -787,14 +799,20 @@ pub fn hypergraph_vertex_data_v2_vk_prefix(
 
 /// The shard holding every prover, allocation and leaf-root registration.
 pub fn prover_registry_shard() -> quil_types::store::ShardKey {
-    quil_types::store::ShardKey { l1: [0; 3], l2: [0xff; 32] }
+    quil_types::store::ShardKey {
+        l1: [0; 3],
+        l2: [0xff; 32],
+    }
 }
 
 /// Every key prefix a prover registry scan reads: the fixed vertex rows of
 /// the prover shard's add and remove phases, legacy and versioned. Stores
 /// watch these so a registry scan can be reused while none was written.
 pub fn prover_registry_key_prefixes() -> Vec<Vec<u8>> {
-    prover_registry_row_prefixes().into_iter().map(|(_, prefix)| prefix).collect()
+    prover_registry_row_prefixes()
+        .into_iter()
+        .map(|(_, prefix)| prefix)
+        .collect()
 }
 
 /// [`prover_registry_key_prefixes`] with each prefix's phase. A row's
@@ -972,6 +990,22 @@ pub fn app_history_discarded_key() -> Vec<u8> {
     vec![CONSENSUS, CONSENSUS_APP_HISTORY_DISCARDED]
 }
 
+/// Key of `filter`'s pending re-anchor at its session fence. See
+/// [`CONSENSUS_APP_REANCHOR`].
+pub fn app_reanchor_key(filter: &[u8]) -> Vec<u8> {
+    let mut key = vec![CONSENSUS, CONSENSUS_APP_REANCHOR];
+    key.extend_from_slice(filter);
+    key
+}
+
+/// Key of `filter`'s dropped-lineage record. See
+/// [`CONSENSUS_APP_LINEAGE_DROPPED`].
+pub fn app_lineage_dropped_key(filter: &[u8]) -> Vec<u8> {
+    let mut key = vec![CONSENSUS, CONSENSUS_APP_LINEAGE_DROPPED];
+    key.extend_from_slice(filter);
+    key
+}
+
 /// The key ranges that hold application-shard frame chains (as opposed to
 /// application state and GLOBAL frames), each `[start, end)`:
 /// - clock: shard frames, staged shard frames, prover-trie and total-distance
@@ -981,8 +1015,8 @@ pub fn app_history_discarded_key() -> Vec<u8> {
 ///   settlements and fee totals (`0xF3..0xF8`; GLOBAL outcomes are `0xF2`,
 ///   GLOBAL request candidates `0xF8`);
 /// - consensus: per-filter legacy state and liveness (a GLOBAL row has no
-///   filter and is kept), application materialized cursors and history
-///   recovery progress.
+///   filter and is kept), application materialized cursors, history
+///   recovery progress, pending re-anchors and dropped-lineage records.
 pub fn app_frame_history_ranges() -> Vec<(Vec<u8>, Vec<u8>)> {
     let clock = |from: u8, to: u8| (vec![CLOCK_FRAME, from], vec![CLOCK_FRAME, to]);
     vec![
@@ -992,15 +1026,50 @@ pub fn app_frame_history_ranges() -> Vec<(Vec<u8>, Vec<u8>)> {
         clock(CLOCK_TOTAL_DISTANCE, CLOCK_TOTAL_DISTANCE + 1),
         clock(CLOCK_APP_CERTIFIED_STATE, CLOCK_APP_CERTIFIED_STATE + 1),
         clock(CLOCK_SHARD_CERTIFIED_STATE, CLOCK_SHARD_CERTIFIED_STATE + 1),
-        clock(INDEX_EARLIEST | CLOCK_SHARD_FRAME, (INDEX_EARLIEST | CLOCK_SHARD_FRAME) + 1),
-        clock(INDEX_LATEST | CLOCK_SHARD_FRAME, (INDEX_LATEST | CLOCK_SHARD_FRAME) + 1),
-        clock(INDEX_LATEST | CLOCK_APP_CERTIFIED_STATE, (INDEX_LATEST | CLOCK_APP_CERTIFIED_STATE) + 1),
-        clock(INDEX_PARENT | CLOCK_SHARD_FRAME, (INDEX_PARENT | CLOCK_SHARD_FRAME) + 1),
-        clock(CLOCK_SHARD_FRAME_SPENDS, CLOCK_GLOBAL_FRAME_REQUEST_CANDIDATE),
-        (vec![CONSENSUS, CONSENSUS_STATE, 0x00], vec![CONSENSUS, CONSENSUS_LIVENESS]),
-        (vec![CONSENSUS, CONSENSUS_LIVENESS, 0x00], vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR]),
-        (vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR], vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR + 1]),
-        (vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY], vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY + 1]),
+        clock(
+            INDEX_EARLIEST | CLOCK_SHARD_FRAME,
+            (INDEX_EARLIEST | CLOCK_SHARD_FRAME) + 1,
+        ),
+        clock(
+            INDEX_LATEST | CLOCK_SHARD_FRAME,
+            (INDEX_LATEST | CLOCK_SHARD_FRAME) + 1,
+        ),
+        clock(
+            INDEX_LATEST | CLOCK_APP_CERTIFIED_STATE,
+            (INDEX_LATEST | CLOCK_APP_CERTIFIED_STATE) + 1,
+        ),
+        clock(
+            INDEX_PARENT | CLOCK_SHARD_FRAME,
+            (INDEX_PARENT | CLOCK_SHARD_FRAME) + 1,
+        ),
+        clock(
+            CLOCK_SHARD_FRAME_SPENDS,
+            CLOCK_GLOBAL_FRAME_REQUEST_CANDIDATE,
+        ),
+        (
+            vec![CONSENSUS, CONSENSUS_STATE, 0x00],
+            vec![CONSENSUS, CONSENSUS_LIVENESS],
+        ),
+        (
+            vec![CONSENSUS, CONSENSUS_LIVENESS, 0x00],
+            vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR],
+        ),
+        (
+            vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR],
+            vec![CONSENSUS, CONSENSUS_MATERIALIZED_CURSOR + 1],
+        ),
+        (
+            vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY],
+            vec![CONSENSUS, CONSENSUS_HISTORY_RECOVERY + 1],
+        ),
+        (
+            vec![CONSENSUS, CONSENSUS_APP_REANCHOR],
+            vec![CONSENSUS, CONSENSUS_APP_REANCHOR + 1],
+        ),
+        (
+            vec![CONSENSUS, CONSENSUS_APP_LINEAGE_DROPPED],
+            vec![CONSENSUS, CONSENSUS_APP_LINEAGE_DROPPED + 1],
+        ),
     ]
 }
 
@@ -1119,7 +1188,7 @@ mod tests {
     fn global_frame_key_matches_go() {
         let key = clock_global_frame_key(42);
         assert_eq!(key.len(), 10);
-        assert_eq!(key[0], CLOCK_FRAME);    // 0x00
+        assert_eq!(key[0], CLOCK_FRAME); // 0x00
         assert_eq!(key[1], CLOCK_GLOBAL_FRAME); // 0x00
         assert_eq!(&key[2..], &42u64.to_be_bytes());
     }

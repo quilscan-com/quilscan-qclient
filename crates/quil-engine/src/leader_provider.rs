@@ -24,7 +24,9 @@ const VDF_OUTPUT_LEN: usize = 516;
 
 /// The global op kinds a collected bundle carries, for timing logs.
 pub(crate) fn message_kinds(raw: &[u8]) -> String {
-    let Ok(bundle) = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(raw) else {
+    let Ok(bundle) =
+        quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(raw)
+    else {
         return "undecodable".into();
     };
     let kinds: Vec<String> = bundle
@@ -37,7 +39,11 @@ pub(crate) fn message_kinds(raw: &[u8]) -> String {
                 .unwrap_or_else(|_| format!("0x{:08x}", request.inner_type_prefix))
         })
         .collect();
-    if kinds.is_empty() { "empty".into() } else { kinds.join("+") }
+    if kinds.is_empty() {
+        "empty".into()
+    } else {
+        kinds.join("+")
+    }
 }
 
 /// How long a leader waits at `now_ms` before producing on a parent recorded
@@ -93,7 +99,10 @@ impl RejectedMessages {
     }
 
     fn remember(&mut self, context: &Option<ValidationContext>, hash: [u8; 32], reason: String) {
-        if context.is_some() && self.context == *context && self.reasons.len() < REJECTED_MESSAGES_KEPT {
+        if context.is_some()
+            && self.context == *context
+            && self.reasons.len() < REJECTED_MESSAGES_KEPT
+        {
             self.reasons.insert(hash, reason);
         }
     }
@@ -103,6 +112,157 @@ impl RejectedMessages {
 /// proof and execution must still fit the selected-parent deadline (60 s) and
 /// the frame cadence; the rest wait for a later frame.
 const MESSAGE_VALIDATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A shard header a GLOBAL proposal would carry, as the application frame
+/// bodies executing it needs: archives materialize the shard through
+/// `frame_number` before they execute the GLOBAL frame. `empty`: the header
+/// proves that frame carried no requests, so it stands in for its own body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardBodyNeed {
+    pub address: Vec<u8>,
+    pub frame_number: u64,
+    pub empty: bool,
+}
+
+/// Whether this GLOBAL prover holds the application frame bodies each need
+/// requires, one answer per need
+/// ([`GlobalLeaderProvider::with_body_availability`]): `Some` with the
+/// application frames archives materialize executing the header (those above
+/// the shard's cursor through it), `None` when a body is not held.
+pub type ShardBodyAvailability = Arc<dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>> + Send + Sync>;
+
+/// Application frames the shard headers one GLOBAL proposal carries make
+/// archives materialize, at most, beyond the one smallest header that does
+/// not fit ([`hold_back_unavailable_shard_proofs`]).
+///
+/// Every archive materializes them, holding its application frame ingest,
+/// before it publishes the GLOBAL frame, and GLOBAL waits for the slowest.
+/// Before 2026-10-27 archives materialized about 4,000–6,000 application
+/// frames per 10 minutes while GLOBAL made about 38 frames, so about 130 per
+/// GLOBAL frame, executed within the frame cadence. Twice that keeps a frame
+/// that catches shards up within about three times a routine frame's
+/// materialization, while about 100 shards 300–600 frames behind are carried
+/// again within about 100 GLOBAL frames. `QUIL_PROPOSAL_APP_FRAME_BUDGET`
+/// overrides it. Leader policy only: which headers a proposal carries is the
+/// leader's choice, and verification and execution are unchanged.
+const PROPOSAL_APP_FRAME_BUDGET: u64 = 256;
+
+fn proposal_app_frame_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("QUIL_PROPOSAL_APP_FRAME_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(PROPOSAL_APP_FRAME_BUDGET)
+    })
+}
+
+/// The bodies the shard headers a proof bundle carries need.
+pub(crate) fn shard_body_needs(raw: &[u8]) -> Vec<ShardBodyNeed> {
+    use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+    use quil_execution::message_envelope::CanonicalMessageBundle;
+    let Ok(bundle) = CanonicalMessageBundle::from_canonical_bytes(raw) else {
+        return Vec::new();
+    };
+    bundle
+        .requests
+        .into_iter()
+        .flatten()
+        .filter(|request| request.inner_type_prefix == TYPE_FRAME_HEADER)
+        .filter_map(|request| FrameHeader::from_canonical_bytes(&request.inner_bytes).ok())
+        .filter(|header| !header.address.is_empty())
+        .map(|header| ShardBodyNeed {
+            empty: crate::archive_ingest::requests_root_is_empty(&header.requests_root),
+            address: header.address,
+            frame_number: header.frame_number,
+        })
+        .collect()
+}
+
+/// The shard proofs a GLOBAL proposal carries
+/// ([`hold_back_unavailable_shard_proofs`]).
+#[derive(Debug, Default)]
+pub(crate) struct ShardProofSelection {
+    /// The proofs that ride, in the order given.
+    pub ready: Vec<Vec<u8>>,
+    /// The needs whose bodies are not held.
+    pub missing: Vec<ShardBodyNeed>,
+    /// Application frames the proofs that ride make archives materialize.
+    pub frames: u64,
+    /// Proofs whose bodies are held, left for a later proposal by the budget.
+    pub deferred: usize,
+    /// Application frames those would have added, and the most one would.
+    pub deferred_frames: u64,
+    pub largest_deferred: u64,
+}
+
+/// Split shard proofs into those whose headers' bodies `available` reports
+/// held, which may ride this proposal, and the needs it does not report
+/// held. A proof with any such need stays in the mempool, for a later
+/// proposal within its anchor window once the bodies arrive.
+///
+/// Of the proofs whose bodies are held, those making archives materialize
+/// the fewest application frames ride first, within `budget` frames, and the
+/// smallest one that does not fit rides too, so a shard further behind than
+/// the budget is still carried. The rest stay in the mempool and ride a
+/// later proposal, with the shard's newer header. Carried all at once after
+/// headers were held back for long, about 100 shards 300–600 frames behind
+/// would make every archive materialize some 45,000 frames before executing
+/// one GLOBAL frame.
+pub(crate) fn hold_back_unavailable_shard_proofs(
+    proofs: Vec<Vec<u8>>,
+    available: &dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>>,
+    budget: u64,
+) -> ShardProofSelection {
+    let needs: Vec<Vec<ShardBodyNeed>> = proofs.iter().map(|raw| shard_body_needs(raw)).collect();
+    let all: Vec<ShardBodyNeed> = needs.iter().flatten().cloned().collect();
+    let mut answers = available(all.as_slice()).into_iter();
+    let mut selection = ShardProofSelection::default();
+    // (proof, the frames it makes archives materialize)
+    let mut held: Vec<(Vec<u8>, u64)> = Vec::with_capacity(proofs.len());
+    for (raw, needs) in proofs.into_iter().zip(needs) {
+        let before = selection.missing.len();
+        // A shard materializes once, through its highest header.
+        let mut frames: std::collections::HashMap<Vec<u8>, u64> = std::collections::HashMap::new();
+        for need in needs {
+            match answers.next().flatten() {
+                Some(count) => {
+                    let shard = frames.entry(need.address).or_insert(0);
+                    *shard = (*shard).max(count);
+                }
+                None => selection.missing.push(need),
+            }
+        }
+        if selection.missing.len() == before {
+            held.push((
+                raw,
+                frames.values().fold(0, |sum, &n| sum.saturating_add(n)),
+            ));
+        }
+    }
+    let mut order: Vec<usize> = (0..held.len()).collect();
+    order.sort_by_key(|&index| (held[index].1, index));
+    let mut rides = vec![false; held.len()];
+    let mut overflowed = false;
+    for index in order {
+        let frames = held[index].1;
+        if selection.frames.saturating_add(frames) <= budget || !overflowed {
+            overflowed |= selection.frames.saturating_add(frames) > budget;
+            selection.frames = selection.frames.saturating_add(frames);
+            rides[index] = true;
+        } else {
+            selection.deferred += 1;
+            selection.deferred_frames = selection.deferred_frames.saturating_add(frames);
+            selection.largest_deferred = selection.largest_deferred.max(frames);
+        }
+    }
+    selection.ready = held
+        .into_iter()
+        .zip(rides)
+        .filter_map(|((raw, _), rides)| rides.then_some(raw))
+        .collect();
+    selection
+}
 
 /// Global chain leader provider. Selects leaders based on the prover
 /// registry's ordered prover list, seeded by the parent frame's
@@ -152,14 +312,24 @@ pub struct GlobalLeaderProvider {
     /// state-jump sync anchoring. `None` (unit tests without a store)
     /// leaves the commitment empty, which those consumers tolerate.
     hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    /// Whether this node holds the application frame bodies a shard proof's
+    /// headers need ([`ShardBodyAvailability`]). `None` proposes every
+    /// verified proof, as a node without an archive ingest does.
+    body_availability: Option<ShardBodyAvailability>,
 }
 
 impl GlobalLeaderProvider {
     pub(crate) fn matches_execution_source(
-        &self, manager: &Arc<quil_execution::ExecutionEngineManager>,
+        &self,
+        manager: &Arc<quil_execution::ExecutionEngineManager>,
     ) -> bool {
-        self.message_validator.as_ref().is_some_and(|m| Arc::ptr_eq(m, manager))
-            && self.hypergraph.as_ref().is_some_and(|h| Arc::ptr_eq(h, &manager.crdt()))
+        self.message_validator
+            .as_ref()
+            .is_some_and(|m| Arc::ptr_eq(m, manager))
+            && self
+                .hypergraph
+                .as_ref()
+                .is_some_and(|h| Arc::ptr_eq(h, &manager.crdt()))
             && self.clock_store.backing_store_identity().is_some()
             && self.clock_store.backing_store_identity() == manager.crdt().backing_store_identity()
     }
@@ -167,7 +337,12 @@ impl GlobalLeaderProvider {
     /// Why the current validation context refused `raw`, if it did.
     #[cfg(test)]
     pub(crate) fn refused_message(&self, raw: &[u8]) -> Option<String> {
-        self.rejected.lock().unwrap().reasons.get(&<[u8; 32]>::from(Sha256::digest(raw))).cloned()
+        self.rejected
+            .lock()
+            .unwrap()
+            .reasons
+            .get(&<[u8; 32]>::from(Sha256::digest(raw)))
+            .cloned()
     }
 
     /// How many messages were dropped on a remembered refusal.
@@ -181,12 +356,21 @@ impl GlobalLeaderProvider {
     /// ([`MessageCollector::snapshot_for_proposal`]); what `consumed`, the
     /// executed ancestors, carried is left out.
     pub(crate) fn for_execution_branch(
-        &self, branch: &quil_execution::ExecutionBranch, rank: u64, frame_number: u64,
-        max_bytes: usize, max_items: usize, consumed: &[Vec<u8>],
+        &self,
+        branch: &quil_execution::ExecutionBranch,
+        rank: u64,
+        frame_number: u64,
+        max_bytes: usize,
+        max_items: usize,
+        consumed: &[Vec<u8>],
     ) -> Result<Self> {
         let collector = Arc::new(MessageCollector::new());
         let messages = self.message_collector.snapshot_for_proposal(
-            rank, max_bytes, max_items, Some(frame_number), consumed,
+            rank,
+            max_bytes,
+            max_items,
+            Some(frame_number),
+            consumed,
         )?;
         for (bytes, verified) in messages {
             if verified {
@@ -197,13 +381,20 @@ impl GlobalLeaderProvider {
         }
         collector.mark_finalized(consumed);
         let mut leader = Self::new(
-            Arc::new(branch.registry().clone()), self.frame_prover.clone(),
-            self.difficulty_adjuster.clone(), branch.clock_store().clone(), collector,
-            self.local_prover_address.clone(), self.local_public_key.clone(),
-            self.signer.clone(), self.inclusion_prover.clone(),
-            Some(branch.manager().clone()), Some(branch.manager().crdt()),
+            Arc::new(branch.registry().clone()),
+            self.frame_prover.clone(),
+            self.difficulty_adjuster.clone(),
+            branch.clock_store().clone(),
+            collector,
+            self.local_prover_address.clone(),
+            self.local_public_key.clone(),
+            self.signer.clone(),
+            self.inclusion_prover.clone(),
+            Some(branch.manager().clone()),
+            Some(branch.manager().crdt()),
         );
         leader.rejected = self.rejected.clone();
+        leader.body_availability = self.body_availability.clone();
         Ok(leader)
     }
 
@@ -233,7 +424,18 @@ impl GlobalLeaderProvider {
             message_validator,
             rejected: Default::default(),
             hypergraph,
+            body_availability: None,
         }
+    }
+
+    /// Propose a shard's certified header only while `available` reports
+    /// every application frame body executing it needs held: an archive's
+    /// execution waits for those bodies, so a header whose body its
+    /// committee withholds would otherwise halt GLOBAL on every archive.
+    /// `None` proposes every verified proof.
+    pub fn with_body_availability(mut self, available: Option<ShardBodyAvailability>) -> Self {
+        self.body_availability = available;
+        self
     }
 
     /// Compute the `prover_tree_commitment` for the frame being proved:
@@ -427,9 +629,7 @@ impl GlobalLeaderProvider {
     // Mirror kept alongside `frame_identity`; call sites use the selector
     // bytes directly.
     #[allow(dead_code)]
-    fn qc_identity(
-        qc: &quil_types::proto::global::QuorumCertificate,
-    ) -> Identity {
+    fn qc_identity(qc: &quil_types::proto::global::QuorumCertificate) -> Identity {
         qc.selector.clone()
     }
 
@@ -578,7 +778,10 @@ pub(crate) fn select_shard_tips(
         }
     };
     let shards: Vec<_> = shards.into_values().collect();
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(shards.len() / 16).max(1);
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(shards.len() / 16)
+        .max(1);
     if threads == 1 {
         for candidates in shards {
             select(candidates, &mut out);
@@ -601,7 +804,10 @@ pub(crate) fn select_shard_tips(
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("shard tip selection panicked")).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("shard tip selection panicked"))
+            .collect()
     });
     for part in parts {
         out.kept.extend(part.kept);
@@ -632,9 +838,8 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
     fn get_next_leaders(&self, prior: Option<&State<GlobalState>>) -> Result<Vec<Identity>> {
         // The prior state must have a valid VDF output to seed the
         // ordering. Without it we cannot determine leader order.
-        let prior = prior.ok_or_else(|| {
-            QuilError::Consensus("no prior frame for leader selection".into())
-        })?;
+        let prior = prior
+            .ok_or_else(|| QuilError::Consensus("no prior frame for leader selection".into()))?;
 
         if prior.state.output.len() != VDF_OUTPUT_LEN {
             return Err(QuilError::Consensus(format!(
@@ -658,9 +863,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         )?;
 
         if ordered_addresses.is_empty() {
-            return Err(QuilError::Consensus(
-                "no active provers in registry".into(),
-            ));
+            return Err(QuilError::Consensus("no active provers in registry".into()));
         }
 
         let leaders: Vec<Identity> = ordered_addresses
@@ -734,9 +937,10 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 .or_else(|_| self.clock_store.get_global_clock_frame(prior_frame_number))?
         };
 
-        let prior_header = prior.header.as_ref().ok_or_else(|| {
-            QuilError::Consensus("prior frame has no header".into())
-        })?;
+        let prior_header = prior
+            .header
+            .as_ref()
+            .ok_or_else(|| QuilError::Consensus("prior frame has no header".into()))?;
 
         // ------------------------------------------------------------------
         // 2. Validate the resolved frame's identity matches what consensus
@@ -829,14 +1033,31 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // hashing those and dropping them during the later decode makes our
         // own proposal fail its request-root check.
         let mut malformed = Vec::new();
-        let collected: Vec<_> = collected.into_iter().filter(|raw| {
-            let round_trip = crate::consensus_wire::decode_message_bundle(raw)
-                .and_then(|bundle| crate::consensus_wire::proto_message_bundle_to_canonical_bytes(&bundle));
-            if round_trip.as_ref().is_ok_and(|canonical| canonical == raw) { true }
-            else { malformed.push(raw.clone()); false }
-        }).collect();
+        let collected: Vec<_> = collected
+            .into_iter()
+            .filter(|raw| {
+                let round_trip =
+                    crate::consensus_wire::decode_message_bundle_at(raw, Some(frame_number))
+                        .and_then(|bundle| {
+                            crate::consensus_wire::proto_message_bundle_to_canonical_bytes_at(
+                                &bundle,
+                                Some(frame_number),
+                            )
+                        });
+                if round_trip.as_ref().is_ok_and(|canonical| canonical == raw) {
+                    true
+                } else {
+                    malformed.push(raw.clone());
+                    false
+                }
+            })
+            .collect();
         if !malformed.is_empty() {
-            tracing::warn!(frame = frame_number, rejected = malformed.len(), "discarding non-canonical GLOBAL proposal inputs");
+            tracing::warn!(
+                frame = frame_number,
+                rejected = malformed.len(),
+                "discarding non-canonical GLOBAL proposal inputs"
+            );
             self.message_collector.remove(&malformed);
         }
         // Committee-handoff seals: every member of a closing committee submits
@@ -846,12 +1067,16 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // change nothing).
         let collected = {
             let view = self.message_validator.as_ref().and_then(|validator| {
-                quil_execution::global_intrinsic::handoff::CommittedView::capture(&validator.crdt()).ok()
+                quil_execution::global_intrinsic::handoff::CommittedView::capture(&validator.crdt())
+                    .ok()
             });
             let (kept, settled) = reduce_handoff_bundles(collected, view.as_ref());
             if !settled.is_empty() {
-                tracing::debug!(frame = frame_number, settled = settled.len(),
-                    "dropping committee-handoff seals GLOBAL already recorded");
+                tracing::debug!(
+                    frame = frame_number,
+                    settled = settled.len(),
+                    "dropping committee-handoff seals GLOBAL already recorded"
+                );
                 self.message_collector.remove(&settled);
             }
             kept
@@ -872,7 +1097,10 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     std::collections::HashMap::new();
                 let msg_type = |raw: &[u8]| -> String {
                     if raw.len() >= 4 {
-                        format!("0x{:08x}", u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+                        format!(
+                            "0x{:08x}",
+                            u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
+                        )
                     } else {
                         "short".to_string()
                     }
@@ -936,7 +1164,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     let started = std::time::Instant::now();
                     let outcome = validator.validate_message(frame_number, &global_addr, &raw);
                     let ms = started.elapsed().as_millis() as u64;
-                    let entry = validation_ms.entry(message_kinds(&raw)).or_insert((0, 0, 0));
+                    let entry = validation_ms
+                        .entry(message_kinds(&raw))
+                        .or_insert((0, 0, 0));
                     *entry = (entry.0 + 1, entry.1 + ms, entry.2.max(ms));
                     match outcome {
                         Ok(()) => valid.push(raw),
@@ -952,7 +1182,10 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                             *drop_reasons
                                 .entry(format!("{} :: {}", msg_type(&raw), reason))
                                 .or_insert(0) += 1;
-                            self.rejected.lock().unwrap().remember(&context, hash, reason);
+                            self.rejected
+                                .lock()
+                                .unwrap()
+                                .remember(&context, hash, reason);
                             tracing::debug!(
                                 frame = frame_number,
                                 error = %e,
@@ -996,7 +1229,7 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // Each shard's tip must be verified: held verified by the
                 // collector (an archive verifies on admission) or checked here,
                 // with refusals remembered under this validation context.
-                let tips = {
+                let mut tips = {
                     let (collector, rejected) = (&self.message_collector, &self.rejected);
                     let (context, global_addr) = (&context, &global_addr);
                     select_shard_tips(
@@ -1017,13 +1250,58 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                                         .map(|c| if c.is_ascii_digit() { '#' } else { c })
                                         .take(90)
                                         .collect();
-                                    rejected.lock().unwrap().remember(context, hash, reason.clone());
+                                    rejected.lock().unwrap().remember(
+                                        context,
+                                        hash,
+                                        reason.clone(),
+                                    );
                                     TipCheck::Invalid(reason)
                                 }
                             }
                         },
                     )
                 };
+                // A verified tip rides only while this node holds every
+                // application frame body executing it needs. Archives wait
+                // for those bodies before they execute the GLOBAL frame, so
+                // one a committee certified but never released would halt
+                // GLOBAL on all of them. The rest stay in the mempool, for a
+                // later frame within their anchor window.
+                if let Some(available) = self.body_availability.as_ref() {
+                    let kept = std::mem::take(&mut tips.kept);
+                    let offered = kept.len();
+                    let budget = proposal_app_frame_budget();
+                    let selection = hold_back_unavailable_shard_proofs(kept, &**available, budget);
+                    tips.kept = selection.ready;
+                    let held_back = offered - tips.kept.len() - selection.deferred;
+                    let first = selection.missing.first();
+                    // Counted into one summary line per interval
+                    // ([`crate::inclusion_summary`]), not logged per proposal.
+                    crate::inclusion_summary::note_proposal(
+                        frame_number,
+                        offered,
+                        tips.kept.len(),
+                        held_back,
+                        first.map(|need| (need.address.as_slice(), need.frame_number)),
+                        selection.deferred,
+                        selection.largest_deferred,
+                    );
+                    tracing::debug!(
+                        frame = frame_number,
+                        offered,
+                        carried = tips.kept.len(),
+                        carried_app_frames = selection.frames,
+                        held_back,
+                        first_held_back_shard = %first.map_or(String::new(), |need| hex::encode(&need.address)),
+                        first_held_back_frame = first.map_or(0, |need| need.frame_number),
+                        deferred = selection.deferred,
+                        deferred_app_frames = selection.deferred_frames,
+                        largest_deferred_gap = selection.largest_deferred,
+                        budget,
+                        "shard tips selected for this GLOBAL proposal: those whose application frame bodies this \
+                         archive holds, smallest gap first within the application frame budget"
+                    );
+                }
                 let coalesced = tips.superseded.len();
                 valid.extend(tips.kept);
                 for s in &tips.superseded {
@@ -1114,7 +1392,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
             .unwrap_or_default()
             .as_millis() as i64;
         let timestamp = now_ms + 10_000; // +10s, matching Go
-        let difficulty = self.difficulty_adjuster.get_next_difficulty(rank, timestamp);
+        let difficulty = self
+            .difficulty_adjuster
+            .get_next_difficulty(rank, timestamp);
 
         tracing::debug!(
             difficulty,
@@ -1179,10 +1459,12 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // Certified pricing input: the network size recorded with the parent's
         // prover root (the prover-root gate above already waited for it).
         let world_state_size: u64 = if self.hypergraph.is_some() {
-            self.world_state_size_read(frame_number).ok_or_else(|| QuilError::Consensus(format!(
-                "cannot produce frame {frame_number}: parent {} world-state size not recorded",
-                frame_number.saturating_sub(1)
-            )))?
+            self.world_state_size_read(frame_number).ok_or_else(|| {
+                QuilError::Consensus(format!(
+                    "cannot produce frame {frame_number}: parent {} world-state size not recorded",
+                    frame_number.saturating_sub(1)
+                ))
+            })?
         } else {
             0
         };
@@ -1224,7 +1506,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // bundle would also fail downstream.
         let proto_messages: Vec<quil_types::proto::global::MessageBundle> = messages
             .iter()
-            .filter_map(|raw| crate::consensus_wire::decode_message_bundle(raw).ok())
+            .filter_map(|raw| {
+                crate::consensus_wire::decode_message_bundle_at(raw, Some(frame_number)).ok()
+            })
             .collect();
         let state = GlobalState::new(
             frame_number,
@@ -1289,7 +1573,8 @@ fn handoff_only_submissions(
     raw: &[u8],
 ) -> Option<Vec<quil_execution::global_intrinsic::handoff::SealSubmission>> {
     use quil_execution::global_intrinsic::handoff::{SealSubmission, TYPE_COMMITTEE_HANDOFF};
-    let bundle = quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(raw).ok()?;
+    let bundle =
+        quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(raw).ok()?;
     if bundle.requests.is_empty() {
         return None;
     }
@@ -1324,14 +1609,22 @@ pub(crate) fn reduce_handoff_bundles(
     // headers it carries.
     type Reach = (u64, usize);
     let reach = |sealed: &quil_execution::global_intrinsic::handoff::SealSubmission| -> Reach {
-        let last = sealed.drain.last()
-            .and_then(|bytes| quil_execution::global_intrinsic::frame_header::FrameHeader::from_canonical_bytes(bytes).ok())
+        let last = sealed
+            .drain
+            .last()
+            .and_then(|bytes| {
+                quil_execution::global_intrinsic::frame_header::FrameHeader::from_canonical_bytes(
+                    bytes,
+                )
+                .ok()
+            })
             .map_or(0, |header| header.frame_number);
         (last, sealed.drain.len())
     };
     let mut settled = Vec::new();
     // (bundle, its seals and their drains' reach), unsettled handoff-only ones.
-    let mut candidates: Vec<(Vec<u8>, Option<Vec<(Key, Reach)>>)> = Vec::with_capacity(collected.len());
+    let mut candidates: Vec<(Vec<u8>, Option<Vec<(Key, Reach)>>)> =
+        Vec::with_capacity(collected.len());
     for raw in collected {
         let Some(submissions) = handoff_only_submissions(&raw) else {
             candidates.push((raw, None));
@@ -1339,15 +1632,28 @@ pub(crate) fn reduce_handoff_bundles(
         };
         let done = view.is_some_and(|view| {
             submissions.iter().all(|sealed| {
-                quil_execution::global_intrinsic::handoff::submission_settled(view, &sealed.submission).unwrap_or(false)
+                quil_execution::global_intrinsic::handoff::submission_settled(
+                    view,
+                    &sealed.submission,
+                )
+                .unwrap_or(false)
             })
         });
         if done {
             settled.push(raw);
             continue;
         }
-        let keys = submissions.iter()
-            .map(|sealed| ((sealed.submission.seal.request, sealed.submission.seal.session), reach(sealed)))
+        let keys = submissions
+            .iter()
+            .map(|sealed| {
+                (
+                    (
+                        sealed.submission.seal.request,
+                        sealed.submission.seal.session,
+                    ),
+                    reach(sealed),
+                )
+            })
             .collect();
         candidates.push((raw, Some(keys)));
     }
@@ -1368,7 +1674,9 @@ pub(crate) fn reduce_handoff_bundles(
             kept.push(raw);
             continue;
         };
-        let rides = keys.iter().any(|(key, _)| best.get(key).is_some_and(|(chosen, _)| *chosen == index));
+        let rides = keys
+            .iter()
+            .any(|(key, _)| best.get(key).is_some_and(|(chosen, _)| *chosen == index));
         if !rides || keys.iter().all(|(key, _)| seen.contains(key)) {
             continue;
         }
@@ -1385,7 +1693,9 @@ mod tests {
     #[test]
     fn a_proposal_carries_one_copy_of_each_committee_handoff_seal() {
         use quil_cw_consensus::handoff::{Checkpoint, Seal};
-        use quil_execution::global_intrinsic::handoff::{CertificateSubmission, TYPE_COMMITTEE_HANDOFF};
+        use quil_execution::global_intrinsic::handoff::{
+            CertificateSubmission, TYPE_COMMITTEE_HANDOFF,
+        };
         use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
         let bundle = |request: u8, timestamp: i64| {
             let submission = CertificateSubmission {
@@ -1393,7 +1703,13 @@ mod tests {
                     request: [request; 32],
                     session: [7; 32],
                     view: 1,
-                    checkpoint: Checkpoint { frame: 0, view: 0, digest: [0; 32], state_roots: [[0; 32]; 4], history_root: [0; 32] },
+                    checkpoint: Checkpoint {
+                        frame: 0,
+                        view: 0,
+                        digest: [0; 32],
+                        state_roots: [[0; 32]; 4],
+                        history_root: [0; 32],
+                    },
                 },
                 certificate: vec![request; 40],
             };
@@ -1408,7 +1724,14 @@ mod tests {
             .unwrap()
         };
         let other = b"not a bundle".to_vec();
-        let collected = vec![bundle(1, 10), bundle(1, 11), other.clone(), bundle(2, 12), bundle(1, 13), bundle(2, 14)];
+        let collected = vec![
+            bundle(1, 10),
+            bundle(1, 11),
+            other.clone(),
+            bundle(2, 12),
+            bundle(1, 13),
+            bundle(2, 14),
+        ];
         let (kept, settled) = reduce_handoff_bundles(collected, None);
         assert_eq!(kept, vec![bundle(1, 10), other.clone(), bundle(2, 12)]);
         assert!(settled.is_empty(), "nothing is settled without a view");
@@ -1419,15 +1742,30 @@ mod tests {
             let raw = bundle(request, timestamp);
             let mut decoded = CanonicalMessageBundle::from_canonical_bytes(&raw).unwrap();
             let request = decoded.requests[0].as_mut().unwrap();
-            let submission = CertificateSubmission::from_canonical_bytes(&request.inner_bytes).unwrap();
+            let submission =
+                CertificateSubmission::from_canonical_bytes(&request.inner_bytes).unwrap();
             request.inner_bytes = quil_execution::global_intrinsic::handoff::SealSubmission {
-                submission, drain: vec![vec![9; 16]; headers],
-            }.to_canonical_bytes().unwrap();
+                submission,
+                drain: vec![vec![9; 16]; headers],
+            }
+            .to_canonical_bytes()
+            .unwrap();
             decoded.to_canonical_bytes().unwrap()
         };
-        let collected = vec![bundle(1, 10), drained(1, 11, 1), other.clone(), drained(1, 12, 2), bundle(2, 13), drained(1, 14, 2)];
+        let collected = vec![
+            bundle(1, 10),
+            drained(1, 11, 1),
+            other.clone(),
+            drained(1, 12, 2),
+            bundle(2, 13),
+            drained(1, 14, 2),
+        ];
         let (kept, _) = reduce_handoff_bundles(collected, None);
-        assert_eq!(kept, vec![other.clone(), drained(1, 12, 2), bundle(2, 13)], "the longest drain, the earliest of equals");
+        assert_eq!(
+            kept,
+            vec![other.clone(), drained(1, 12, 2), bundle(2, 13)],
+            "the longest drain, the earliest of equals"
+        );
 
         // Partial drains, each eight headers from the tip its sender saw: the
         // one reaching furthest rides, a copy from an older view stays back.
@@ -1435,16 +1773,34 @@ mod tests {
             let raw = bundle(1, timestamp);
             let mut decoded = CanonicalMessageBundle::from_canonical_bytes(&raw).unwrap();
             let request = decoded.requests[0].as_mut().unwrap();
-            let submission = CertificateSubmission::from_canonical_bytes(&request.inner_bytes).unwrap();
-            let drain = (from..from + 8).map(|frame_number| quil_execution::global_intrinsic::frame_header::FrameHeader {
-                frame_number, ..Default::default()
-            }.to_canonical_bytes().unwrap()).collect();
-            request.inner_bytes = quil_execution::global_intrinsic::handoff::SealSubmission { submission, drain }
-                .to_canonical_bytes().unwrap();
+            let submission =
+                CertificateSubmission::from_canonical_bytes(&request.inner_bytes).unwrap();
+            let drain = (from..from + 8)
+                .map(|frame_number| {
+                    quil_execution::global_intrinsic::frame_header::FrameHeader {
+                        frame_number,
+                        ..Default::default()
+                    }
+                    .to_canonical_bytes()
+                    .unwrap()
+                })
+                .collect();
+            request.inner_bytes =
+                quil_execution::global_intrinsic::handoff::SealSubmission { submission, drain }
+                    .to_canonical_bytes()
+                    .unwrap();
             decoded.to_canonical_bytes().unwrap()
         };
-        let collected = vec![partial(20, 2), partial(21, 4), drained(1, 22, 2), partial(23, 3)];
-        assert_eq!(reduce_handoff_bundles(collected, None).0, vec![partial(21, 4)]);
+        let collected = vec![
+            partial(20, 2),
+            partial(21, 4),
+            drained(1, 22, 2),
+            partial(23, 3),
+        ];
+        assert_eq!(
+            reduce_handoff_bundles(collected, None).0,
+            vec![partial(21, 4)]
+        );
     }
 
     use super::*;
@@ -1459,23 +1815,55 @@ mod tests {
     struct StubFrameProver;
     impl FrameProver for StubFrameProver {
         fn prove_frame_header(
-            &self, _: &[u8], _: &[u8], _: &[u8], _: &[Vec<u8>], _: &[u8], _: i64, _: u32, _: u64, _: u64, _: &[u8], _: u64,
+            &self,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[Vec<u8>],
+            _: &[u8],
+            _: i64,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: &[u8],
+            _: u64,
         ) -> Result<quil_types::proto::global::FrameHeader> {
             Err(QuilError::Internal("stub".into()))
         }
         fn prove_global_frame_header(
-            &self, _: &GlobalFrameHeader, _: &[Vec<u8>], _: &[u8], _: &[Vec<u8>], _: &[u8], _: u64,
-            _: &dyn Signer, _: i64, _: u32, _: u8,
+            &self,
+            _: &GlobalFrameHeader,
+            _: &[Vec<u8>],
+            _: &[u8],
+            _: &[Vec<u8>],
+            _: &[u8],
+            _: u64,
+            _: &dyn Signer,
+            _: i64,
+            _: u32,
+            _: u8,
         ) -> Result<GlobalFrameHeader> {
             Err(QuilError::Internal("stub".into()))
         }
         fn verify_global_frame_header(&self, _: &GlobalFrameHeader) -> Result<Vec<u8>> {
             Ok(Vec::new())
         }
-        fn calculate_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: u32) -> Result<Vec<u8>> {
+        fn calculate_multi_proof(
+            &self,
+            _: &[u8; 32],
+            _: u32,
+            _: &[&[u8]],
+            _: u32,
+        ) -> Result<Vec<u8>> {
             Ok(Vec::new())
         }
-        fn verify_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: &[&[u8]]) -> Result<bool> {
+        fn verify_multi_proof(
+            &self,
+            _: &[u8; 32],
+            _: u32,
+            _: &[&[u8]],
+            _: &[&[u8]],
+        ) -> Result<bool> {
             Ok(true)
         }
     }
@@ -1584,13 +1972,13 @@ mod tests {
 
     fn prior_state(output_len: usize) -> State<GlobalState> {
         let gs = GlobalState::new(
-            5,                          // frame_number
-            5,                          // rank
-            0,                          // timestamp
-            100,                        // difficulty
-            vec![0x11u8; output_len],   // output
-            vec![0x03u8; 32],           // parent_selector
-            vec![0x02u8; 32],           // prover
+            5,                        // frame_number
+            5,                        // rank
+            0,                        // timestamp
+            100,                      // difficulty
+            vec![0x11u8; output_len], // output
+            vec![0x03u8; 32],         // parent_selector
+            vec![0x02u8; 32],         // prover
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1616,7 +2004,9 @@ mod tests {
 
     #[test]
     fn get_next_leaders_errors_on_wrong_output_length() {
-        let p = provider_with(Arc::new(TestProverRegistry::with_provers(vec![make_prover(1)])));
+        let p = provider_with(Arc::new(TestProverRegistry::with_provers(vec![
+            make_prover(1),
+        ])));
         let prior = prior_state(100); // != VDF_OUTPUT_LEN
         let err = p.get_next_leaders(Some(&prior)).unwrap_err();
         assert!(err.to_string().contains("output length"));
@@ -1759,16 +2149,25 @@ mod tests {
             Arc::new(MemStore::new()),
             Arc::new(StubProver),
         ));
-        let global_shard = ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+        let global_shard = ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
         // Seed real state into the global prover shard (app == global
         // address) plus a distractor app shard, then commit to the forest.
         crdt.add_vertex(
-            &Location { app_address: [0xff; 32], data_address: [0x01; 32] },
+            &Location {
+                app_address: [0xff; 32],
+                data_address: [0x01; 32],
+            },
             b"prover-state",
         )
         .unwrap();
         crdt.add_vertex(
-            &Location { app_address: [0x2a; 32], data_address: [0x07; 32] },
+            &Location {
+                app_address: [0x2a; 32],
+                data_address: [0x07; 32],
+            },
             b"distractor",
         )
         .unwrap();
@@ -1778,7 +2177,10 @@ mod tests {
         let distractor = crdt.compute_shard_root(
             "vertex",
             "adds",
-            &ShardKey { l1: [0u8; 3], l2: [0x2a; 32] },
+            &ShardKey {
+                l1: [0u8; 3],
+                l2: [0x2a; 32],
+            },
         );
 
         let provider = provider_with_crdt(Some(crdt.clone()));
@@ -1789,8 +2191,14 @@ mod tests {
             "compute_prover_root must return the live global-shard vertex-adds root",
         );
         assert_eq!(got.len(), 32, "a real forest root is 32 bytes");
-        assert!(got.iter().any(|&b| b != 0), "global shard has data → non-zero root");
-        assert_ne!(got, distractor, "must target the global shard, not another app shard");
+        assert!(
+            got.iter().any(|&b| b != 0),
+            "global shard has data → non-zero root"
+        );
+        assert_ne!(
+            got, distractor,
+            "must target the global shard, not another app shard"
+        );
         // Deterministic across re-proves of the same committed state.
         assert_eq!(got, provider.compute_prover_root(0));
     }
@@ -1807,7 +2215,11 @@ mod tests {
     /// `FrameHeader` for `addr` at LOCAL frame `local_frame`.
     /// Tip selection over proofs the collector holds verified.
     fn coalesce_verified(msgs: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-        let tips = select_shard_tips(msgs, |_| true, |_: &[u8]| -> TipCheck { unreachable!("every candidate is verified") });
+        let tips = select_shard_tips(
+            msgs,
+            |_| true,
+            |_: &[u8]| -> TipCheck { unreachable!("every candidate is verified") },
+        );
         assert!(tips.invalid.is_empty() && tips.deferred == 0);
         (tips.kept, tips.superseded)
     }
@@ -1825,7 +2237,13 @@ mod tests {
         let tips = select_shard_tips(
             vec![lower.clone(), forged.clone(), real.clone(), other.clone()],
             |raw| raw != forged.as_slice(),
-            |raw| if raw == forged.as_slice() { TipCheck::Invalid("certificate".into()) } else { TipCheck::Valid },
+            |raw| {
+                if raw == forged.as_slice() {
+                    TipCheck::Invalid("certificate".into())
+                } else {
+                    TipCheck::Valid
+                }
+            },
         );
         let mut kept = tips.kept.clone();
         kept.sort();
@@ -1843,12 +2261,19 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let checks = AtomicUsize::new(0);
         let msgs: Vec<_> = (1..=5).map(|n| make_shard_frame(0x11, n)).collect();
-        let tips = select_shard_tips(msgs, |_| false, |_| {
-            checks.fetch_add(1, Ordering::SeqCst);
-            TipCheck::Valid
-        });
+        let tips = select_shard_tips(
+            msgs,
+            |_| false,
+            |_| {
+                checks.fetch_add(1, Ordering::SeqCst);
+                TipCheck::Valid
+            },
+        );
         assert_eq!(checks.load(Ordering::SeqCst), 1, "only the tip is checked");
-        assert_eq!(tips.kept.iter().map(|m| frame_of(m)).collect::<Vec<_>>(), vec![5]);
+        assert_eq!(
+            tips.kept.iter().map(|m| frame_of(m)).collect::<Vec<_>>(),
+            vec![5]
+        );
         assert_eq!(tips.superseded.len(), 4);
 
         // Forged headers above an unverified real one: the work is bounded and
@@ -1856,10 +2281,18 @@ mod tests {
         let checks = AtomicUsize::new(0);
         let mut msgs: Vec<_> = (100..110).map(|n| make_shard_frame(0x11, n)).collect();
         msgs.push(make_shard_frame(0x11, 7));
-        let tips = select_shard_tips(msgs, |_| false, |raw| {
-            checks.fetch_add(1, Ordering::SeqCst);
-            if frame_of(raw) >= 100 { TipCheck::Invalid("certificate".into()) } else { TipCheck::Valid }
-        });
+        let tips = select_shard_tips(
+            msgs,
+            |_| false,
+            |raw| {
+                checks.fetch_add(1, Ordering::SeqCst);
+                if frame_of(raw) >= 100 {
+                    TipCheck::Invalid("certificate".into())
+                } else {
+                    TipCheck::Valid
+                }
+            },
+        );
         assert_eq!(checks.load(Ordering::SeqCst), MAX_TIP_VERIFICATIONS);
         assert!(tips.kept.is_empty());
         assert_eq!(tips.invalid.len(), MAX_TIP_VERIFICATIONS);
@@ -1870,7 +2303,11 @@ mod tests {
     fn an_unjudged_tip_leaves_the_next_verified_proof_in_its_place() {
         let high = make_shard_frame(0x11, 9);
         let low = make_shard_frame(0x11, 8);
-        let tips = select_shard_tips(vec![high, low.clone()], |raw| raw == low.as_slice(), |_| TipCheck::Unavailable);
+        let tips = select_shard_tips(
+            vec![high, low.clone()],
+            |raw| raw == low.as_slice(),
+            |_| TipCheck::Unavailable,
+        );
         assert_eq!(tips.kept, vec![low]);
         assert_eq!(tips.deferred, 1, "the higher proof stays for a later frame");
         assert!(tips.superseded.is_empty() && tips.invalid.is_empty());
@@ -1878,11 +2315,161 @@ mod tests {
 
     #[test]
     fn many_shards_select_in_parallel_with_the_same_result() {
-        let msgs: Vec<_> = (0..64u8).flat_map(|a| (1..=3).map(move |n| make_shard_frame(a, n))).collect();
+        let msgs: Vec<_> = (0..64u8)
+            .flat_map(|a| (1..=3).map(move |n| make_shard_frame(a, n)))
+            .collect();
         let (kept, superseded) = coalesce_verified(msgs);
         assert_eq!(kept.len(), 64);
         assert!(kept.iter().all(|m| frame_of(m) == 3));
         assert_eq!(superseded.len(), 128);
+    }
+
+    /// A verified tip rides only while the bodies its headers need are held:
+    /// a tip whose body was withheld stays back, a bundle stays back whole
+    /// when any of its headers does, and a header with an empty requests
+    /// root says so.
+    #[test]
+    fn shard_tips_whose_bodies_are_not_held_stay_back() {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let bundle = |headers: Vec<FrameHeader>| {
+            CanonicalMessageBundle {
+                requests: headers
+                    .into_iter()
+                    .map(|header| {
+                        Some(CanonicalMessageRequest {
+                            inner_type_prefix: TYPE_FRAME_HEADER,
+                            inner_bytes: header.to_canonical_bytes().unwrap(),
+                        })
+                    })
+                    .collect(),
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let header = |addr: u8, frame_number: u64| FrameHeader {
+            address: vec![addr; 32],
+            frame_number,
+            global_frame_number: 99,
+            ..Default::default()
+        };
+        let need = |addr: u8, frame_number: u64| ShardBodyNeed {
+            address: vec![addr; 32],
+            frame_number,
+            empty: false,
+        };
+        // Shard 0x22's frame 9 body was never released.
+        let available = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
+            needs
+                .iter()
+                .map(|n| (n.address != vec![0x22u8; 32] || n.frame_number < 9).then_some(1))
+                .collect()
+        };
+        let held = make_shard_frame(0x11, 7);
+        let withheld = make_shard_frame(0x22, 9);
+        let both = bundle(vec![header(0x33, 4), header(0x22, 9)]);
+        let junk = b"not a bundle".to_vec();
+        let (kept, superseded) = coalesce_verified(vec![
+            held.clone(),
+            make_shard_frame(0x22, 8),
+            withheld.clone(),
+            both,
+            junk.clone(),
+        ]);
+        assert_eq!(superseded.len(), 1);
+        let ShardProofSelection {
+            mut ready, missing, ..
+        } = hold_back_unavailable_shard_proofs(kept, &available, u64::MAX);
+        ready.sort();
+        let mut want = vec![held, junk];
+        want.sort();
+        assert_eq!(
+            ready, want,
+            "the withheld tip and the bundle carrying it stay back"
+        );
+        assert_eq!(missing, vec![need(0x22, 9), need(0x22, 9)]);
+
+        let mut empty = header(0x11, 3);
+        empty.requests_root = vec![0; 32];
+        assert_eq!(
+            shard_body_needs(&bundle(vec![empty, header(0x11, 4)])),
+            vec![
+                ShardBodyNeed {
+                    empty: true,
+                    ..need(0x11, 3)
+                },
+                need(0x11, 4)
+            ]
+        );
+        // Nothing held: every proof with a shard header stays back.
+        let none_held = |needs: &[ShardBodyNeed]| vec![None; needs.len()];
+        let ShardProofSelection { ready, missing, .. } =
+            hold_back_unavailable_shard_proofs(vec![withheld], &none_held, u64::MAX);
+        assert!(ready.is_empty());
+        assert_eq!(missing, vec![need(0x22, 9)]);
+    }
+
+    /// Shard headers whose bodies are held ride smallest gap first within the
+    /// application frame budget, plus the smallest that does not fit, so a
+    /// shard further behind than the budget is still carried; the rest wait
+    /// for a later proposal, and a header whose body is not held never rides,
+    /// however small.
+    #[test]
+    fn shard_tips_ride_smallest_gap_first_within_the_app_frame_budget() {
+        // Shard `addr` is `addr` frames behind; 0x05's bodies are not held.
+        let available = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
+            needs
+                .iter()
+                .map(|n| (n.address[0] != 0x05).then_some(n.address[0] as u64 * 10))
+                .collect()
+        };
+        let gaps = [0x30u8, 0x01, 0x14, 0x05, 0x02, 0x40, 0x03];
+        let proofs: Vec<Vec<u8>> = gaps.iter().map(|&a| make_shard_frame(a, 7)).collect();
+        let junk = b"not a bundle".to_vec();
+        let mut with_junk = proofs.clone();
+        with_junk.push(junk.clone());
+
+        // Budget 100: 10 + 20 + 30 = 60 fit, 200 does not and rides as the
+        // smallest overflow; 480 and 640 wait. 0x05 is held back for its body.
+        let selection = hold_back_unavailable_shard_proofs(with_junk, &available, 100);
+        assert_eq!(
+            selection.ready,
+            vec![
+                proofs[1].clone(),
+                proofs[2].clone(),
+                proofs[4].clone(),
+                proofs[6].clone(),
+                junk.clone(),
+            ],
+            "the smallest gaps, the first overflow and the proof without headers ride, in the order given"
+        );
+        assert_eq!(selection.frames, 260);
+        assert_eq!(selection.deferred, 2);
+        assert_eq!(selection.deferred_frames, 480 + 640);
+        assert_eq!(selection.largest_deferred, 640);
+        assert_eq!(
+            selection.missing,
+            vec![ShardBodyNeed {
+                address: vec![0x05; 32],
+                frame_number: 7,
+                empty: false,
+            }]
+        );
+
+        // A shard further behind than the whole budget still rides alone.
+        let selection = hold_back_unavailable_shard_proofs(
+            vec![proofs[5].clone(), proofs[0].clone()],
+            &available,
+            100,
+        );
+        assert_eq!(selection.ready, vec![proofs[0].clone()]);
+        assert_eq!((selection.deferred, selection.largest_deferred), (1, 640));
+
+        // Within the budget everything rides and nothing is deferred.
+        let selection = hold_back_unavailable_shard_proofs(proofs.clone(), &available, u64::MAX);
+        assert_eq!(selection.ready.len(), proofs.len() - 1);
+        assert_eq!(selection.deferred, 0);
     }
 
     fn make_shard_frame(addr: u8, local_frame: u64) -> Vec<u8> {
@@ -1898,9 +2485,12 @@ mod tests {
             inner_type_prefix: TYPE_FRAME_HEADER,
             inner_bytes: fh.to_canonical_bytes().unwrap(),
         };
-        CanonicalMessageBundle { requests: vec![Some(req)], timestamp: 0 }
-            .to_canonical_bytes()
-            .unwrap()
+        CanonicalMessageBundle {
+            requests: vec![Some(req)],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
     }
 
     // Post-split, every proposal at one height validated the same 36 refused
@@ -1909,18 +2499,31 @@ mod tests {
     fn a_refusal_stands_until_the_height_parent_or_committed_frame_moves() {
         let mut rejected = RejectedMessages::default();
         let (bad, other) = ([1u8; 32], [2u8; 32]);
-        let at = |frame: u64, parent: u8, committed: u64| Some((frame, vec![parent; 32], committed));
+        let at =
+            |frame: u64, parent: u8, committed: u64| Some((frame, vec![parent; 32], committed));
         rejected.enter(at(837364, 7, 837363));
-        rejected.remember(&at(837364, 7, 837363), bad, "invalid allocation status".into());
+        rejected.remember(
+            &at(837364, 7, 837363),
+            bad,
+            "invalid allocation status".into(),
+        );
         rejected.enter(at(837364, 7, 837363));
-        assert_eq!(rejected.refused(&bad).as_deref(), Some("invalid allocation status"));
+        assert_eq!(
+            rejected.refused(&bad).as_deref(),
+            Some("invalid allocation status")
+        );
         assert_eq!(rejected.refused(&other), None);
 
         // A refusal made under a context that has since changed is not kept.
         rejected.remember(&at(837364, 7, 837362), other, "stale".into());
         assert_eq!(rejected.refused(&other), None);
 
-        for moved in [at(837365, 7, 837363), at(837364, 8, 837363), at(837364, 7, 837364), None] {
+        for moved in [
+            at(837365, 7, 837363),
+            at(837364, 8, 837363),
+            at(837364, 7, 837364),
+            None,
+        ] {
             rejected.enter(at(837364, 7, 837363));
             rejected.remember(&at(837364, 7, 837363), bad, "refused".into());
             rejected.enter(moved.clone());
@@ -1957,7 +2560,11 @@ mod tests {
 
         // One tip per shard → 2 kept; the other 3 (876, 877, dup 877) superseded.
         assert_eq!(kept.len(), 2, "one tip per shard address (A + B)");
-        assert_eq!(superseded.len(), 3, "876, 877 and the duplicate 877 dropped");
+        assert_eq!(
+            superseded.len(),
+            3,
+            "876, 877 and the duplicate 877 dropped"
+        );
 
         // The kept tips are exactly A@878 and B@500 (order-independent).
         let mut kept_keys: Vec<(Vec<u8>, u64)> = kept
@@ -1975,7 +2582,11 @@ mod tests {
         for m in &superseded {
             let keys = crate::message_collector::extract_shard_frame_keys(m);
             assert_eq!(keys.len(), 1);
-            assert_eq!(keys[0].0, vec![0x11u8; 32], "only shard A frames superseded");
+            assert_eq!(
+                keys[0].0,
+                vec![0x11u8; 32],
+                "only shard A frames superseded"
+            );
             assert!(keys[0].1 < 878, "superseded frame is below the tip");
         }
     }
@@ -1988,7 +2599,11 @@ mod tests {
         assert_eq!(kept.len(), 1, "backlog bounded to the single tip");
         assert_eq!(superseded.len(), 999);
         let keys = crate::message_collector::extract_shard_frame_keys(&kept[0]);
-        assert_eq!(keys, vec![(vec![0x11u8; 32], 1000)], "tip is the highest frame");
+        assert_eq!(
+            keys,
+            vec![(vec![0x11u8; 32], 1000)],
+            "tip is the highest frame"
+        );
     }
 
     #[test]

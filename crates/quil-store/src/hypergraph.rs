@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::overlay::{OverlayDb, OverlayDbSnapshot, OverlayTxn, PageCursor, PageSnapshot};
+use crate::overlay::{
+    newest_version_within, BoundedCursorSource, OverlayDb, OverlayDbSnapshot, OverlayTxn,
+    PageCursor, PageSnapshot,
+};
 
 use quil_types::error::{QuilError, Result};
 use quil_types::store::ShardKey;
@@ -8,16 +11,17 @@ use quil_types::store::ShardKey;
 use crate::encoding::{
     hypergraph_alt_shard_address_index_key, hypergraph_alt_shard_address_prefix,
     hypergraph_alt_shard_commit_key, hypergraph_alt_shard_commit_latest_key,
-    hypergraph_shard_commit_frame_prefix, hypergraph_shard_commit_key,
-    hypergraph_tree_blob_key, hypergraph_tree_node_by_key,
-    hypergraph_tree_node_by_path, hypergraph_tree_node_by_path_prefix,
-    hypergraph_vertex_data_key, hypergraph_vertex_data_prefix,
-    HG_VERTEX_ADDS_SHARD_COMMIT,
+    hypergraph_shard_commit_frame_prefix, hypergraph_shard_commit_key, hypergraph_tree_blob_key,
+    hypergraph_tree_node_by_key, hypergraph_tree_node_by_path, hypergraph_tree_node_by_path_prefix,
+    hypergraph_vertex_data_key, hypergraph_vertex_data_prefix, HG_VERTEX_ADDS_SHARD_COMMIT,
 };
 
 /// RocksDB-backed hypergraph tree storage.
 pub struct RocksHypergraphStore {
     db: quil_forest::CoordinatedDb,
+    /// The store opened without rows or a large-vertex index state: its
+    /// writes mark the index complete until that mark is stored.
+    index_opened_empty: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "test-utils"))]
     fail_commit: std::sync::atomic::AtomicBool,
 }
@@ -36,6 +40,10 @@ impl OverlayHypergraphSnapshot {
     fn scan_point_backend(&self) -> Option<quil_types::store::ScanPoint> {
         self.snapshot.scan_point()
     }
+
+    fn store_name_backend(&self) -> Option<String> {
+        None
+    }
 }
 
 impl OverlayHypergraphStore {
@@ -44,7 +52,9 @@ impl OverlayHypergraphStore {
     }
 
     pub fn new(overlay: Arc<quil_forest::ExecutionOverlay>) -> Self {
-        Self { db: OverlayDb(overlay) }
+        Self {
+            db: OverlayDb(overlay),
+        }
     }
 
     pub fn forest(&self) -> quil_forest::Forest {
@@ -65,7 +75,14 @@ impl OverlayHypergraphStore {
     }
 
     fn apply_snapshot_backend(&self, _db_path: &str) -> Result<()> {
-        Err(QuilError::Store("external database import is unavailable during tentative execution".into()))
+        Err(QuilError::Store(
+            "external database import is unavailable during tentative execution".into(),
+        ))
+    }
+
+    /// Execution branches never mark the index: their base store does.
+    fn index_complete_mark_backend(&self) -> Option<([u8; 2], Vec<u8>)> {
+        None
     }
 }
 
@@ -114,19 +131,39 @@ fn prefix_range_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Read options of a sweep over a whole shard's vertex keyspace
+/// (`for_each_vertex_underlying`): the blocks it reads are not added to the
+/// block cache, where blocks already cached are still read. A sweep reads
+/// each block once (every epoch's storage confirmation, a prover scan, a
+/// worker seed), so caching them evicts the point-read working set and
+/// leaves each store's cache full of blocks no read uses again.
+fn sweep_read_options() -> rocksdb::ReadOptions {
+    let mut options = rocksdb::ReadOptions::default();
+    options.fill_cache(false);
+    options
+}
+
 impl RocksHypergraphStore {
     fn backing_store_identity_backend(&self) -> quil_types::store::BackingStoreIdentity {
         self.db.backing_store_identity()
     }
 
     pub fn new(db: quil_forest::CoordinatedDb) -> Self {
-        Self { db, #[cfg(any(test, feature = "test-utils"))] fail_commit: std::sync::atomic::AtomicBool::new(false) }
+        Self {
+            index_opened_empty: std::sync::atomic::AtomicBool::new(
+                crate::large_vertex_index::opens_empty(&db),
+            ),
+            db,
+            #[cfg(any(test, feature = "test-utils"))]
+            fail_commit: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     /// Fail the final batch write without publishing any staged records.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn fail_commit_for_test(&self, fail: bool) {
-        self.fail_commit.store(fail, std::sync::atomic::Ordering::Relaxed);
+        self.fail_commit
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The coordinated RocksDB handle backing this store. Exposed so startup can build
@@ -148,7 +185,11 @@ impl RocksHypergraphStore {
     pub fn has_forest_data(&self) -> bool {
         let mut it = self.db.raw_iterator();
         it.seek(FOREST_NAMESPACE);
-        it.valid() && it.key().map(|k| k.starts_with(FOREST_NAMESPACE)).unwrap_or(false)
+        it.valid()
+            && it
+                .key()
+                .map(|k| k.starts_with(FOREST_NAMESPACE))
+                .unwrap_or(false)
     }
 
     /// Delete the entire JMT forest (every key under [`FOREST_NAMESPACE`]) so it
@@ -163,7 +204,9 @@ impl RocksHypergraphStore {
         *upper.last_mut().unwrap() += 1; // 0xF7 -> 0xF8
         let mut batch = rocksdb::WriteBatch::default();
         batch.delete_range(&lower, &upper);
-        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+        self.db
+            .write(batch)
+            .map_err(|e| QuilError::Store(e.to_string()))
     }
 
     /// Delete a single shard's UNDERLYING vertex-blob keyspace — both the V1
@@ -184,7 +227,11 @@ impl RocksHypergraphStore {
         let prefix = [crate::encoding::HG_ROOT_VERSION];
         let mut it = self.db.raw_iterator();
         it.seek(&prefix);
-        it.valid() && it.key().map(|k| k.first() == Some(&crate::encoding::HG_ROOT_VERSION)).unwrap_or(false)
+        it.valid()
+            && it
+                .key()
+                .map(|k| k.first() == Some(&crate::encoding::HG_ROOT_VERSION))
+                .unwrap_or(false)
     }
 
     /// Capture a point-in-time snapshot of all tree blobs. The returned
@@ -233,10 +280,13 @@ impl RocksHypergraphStore {
         bytes: &[u8],
     ) -> Result<()> {
         let key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
-        RocksTxn::for_store(txn, &self.db)?.batch.lock().unwrap().put(&key, bytes);
+        RocksTxn::for_store(txn, &self.db)?
+            .batch
+            .lock()
+            .unwrap()
+            .put(&key, bytes);
         Ok(())
     }
-
 
     /// Persist one vertex's `underlying_data` sub-tree blob directly,
     /// outside any transaction. See `quil_tries::deserialize_go_tree` for
@@ -258,11 +308,17 @@ impl RocksHypergraphStore {
         bytes: &[u8],
     ) -> Result<()> {
         let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(&key, bytes);
+        if let Some(entry) =
+            crate::large_vertex_index::live_entry(set_type, phase_type, vertex_key, bytes.len())
+        {
+            batch.put(&entry, b"");
+        }
         self.db
-            .put(&key, bytes)
+            .write(batch)
             .map_err(|e| QuilError::Store(e.to_string()))
     }
-
 
     /// Like [`stream_migrate_vertex_adds`](Self::stream_migrate_vertex_adds) but
     /// scoped to the SUB-RANGE of a shard's vertex-adds keyspace whose key
@@ -292,15 +348,17 @@ impl RocksHypergraphStore {
         full_prefix.extend_from_slice(sub_prefix);
         let chunk_size = chunk_size.max(1);
         let snapshot = self.db.snapshot();
-        let iter = snapshot
-            .iterator(rocksdb::IteratorMode::From(&full_prefix, rocksdb::Direction::Forward));
+        let iter = snapshot.iterator(rocksdb::IteratorMode::From(
+            &full_prefix,
+            rocksdb::Direction::Forward,
+        ));
         let mut chunk: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(chunk_size);
         let mut scanned = 0usize;
         let mut migrated = 0usize;
 
         let flush = |chunk: &[(Vec<u8>, Vec<u8>)],
-                         migrated: &mut usize,
-                         process_chunk: &mut F|
+                     migrated: &mut usize,
+                     process_chunk: &mut F|
          -> Result<()> {
             let (m, writes) = process_chunk(chunk)?;
             *migrated += m;
@@ -308,17 +366,36 @@ impl RocksHypergraphStore {
                 let mut batch = rocksdb::WriteBatch::default();
                 for w in &writes {
                     match w {
-                        VertexWrite::Put { set, phase, vertex_key, blob } => {
+                        VertexWrite::Put {
+                            set,
+                            phase,
+                            vertex_key,
+                            blob,
+                        } => {
                             let key = hypergraph_vertex_data_key(set, phase, shard, vertex_key);
                             batch.put(&key, blob);
+                            if let Some(entry) = crate::large_vertex_index::live_entry(
+                                set,
+                                phase,
+                                vertex_key,
+                                blob.len(),
+                            ) {
+                                batch.put(&entry, b"");
+                            }
                         }
-                        VertexWrite::Delete { set, phase, vertex_key } => {
+                        VertexWrite::Delete {
+                            set,
+                            phase,
+                            vertex_key,
+                        } => {
                             let key = hypergraph_vertex_data_key(set, phase, shard, vertex_key);
                             batch.delete(&key);
                         }
                     }
                 }
-                self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
+                self.db
+                    .write(batch)
+                    .map_err(|e| QuilError::Store(e.to_string()))?;
             }
             Ok(())
         };
@@ -362,11 +439,17 @@ impl RocksHypergraphStore {
         bytes: &[u8],
     ) -> Result<()> {
         let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(&key, bytes);
+        if let Some(entry) =
+            crate::large_vertex_index::live_entry(set_type, phase_type, vertex_key, bytes.len())
+        {
+            batch.put(&entry, b"");
+        }
         self.db
-            .put(&key, bytes)
+            .write(batch)
             .map_err(|e| QuilError::Store(e.to_string()))
     }
-
 
     /// Iterate every `(vertex_key, latest_underlying_data)` pair persisted for
     /// the given `(set, phase, shard)`. The callback receives owned bytes so it
@@ -406,10 +489,10 @@ impl RocksHypergraphStore {
         // Legacy (unversioned) fills any vertex not yet re-written v2.
         let prefix = hypergraph_vertex_data_prefix(set_type, phase_type, shard_key);
         let prefix_len = prefix.len();
-        for entry in self
-            .db
-            .iterator(rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward))
-        {
+        for entry in self.db.iterator_opt(
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+            sweep_read_options(),
+        ) {
             let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
             if !k.starts_with(&prefix) {
                 break;
@@ -427,7 +510,6 @@ impl RocksHypergraphStore {
         Ok(count)
     }
 
-
     /// Greatest MVCC version of any blob in the **v2** keyspace of one
     /// `(set, phase, shard)`, or `None` when it holds none. Reads are of the
     /// greatest version, so a tree committing below this would have its writes
@@ -442,21 +524,22 @@ impl RocksHypergraphStore {
             set_type, phase_type, shard_key,
         );
         let mut max = None;
-        for entry in self
-            .db
-            .iterator(rocksdb::IteratorMode::From(&v2_prefix, rocksdb::Direction::Forward))
-        {
+        for entry in self.db.iterator(rocksdb::IteratorMode::From(
+            &v2_prefix,
+            rocksdb::Direction::Forward,
+        )) {
             let (k, _) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
             if !k.starts_with(&v2_prefix) {
                 break;
             }
             if k.len() >= v2_prefix.len() + 8 {
-                max = max.max(Some(u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap())));
+                max = max.max(Some(u64::from_be_bytes(
+                    k[k.len() - 8..].try_into().unwrap(),
+                )));
             }
         }
         Ok(max)
     }
-
 
     /// Emit the max-version blob per vertex from the MVCC **v2** keyspace of one
     /// `(set, phase, shard)`, via a fallible callback. Peak memory is O(number of
@@ -483,10 +566,10 @@ impl RocksHypergraphStore {
             set_type, phase_type, shard_key,
         );
         let mut latest: HashMap<Vec<u8>, (u64, Vec<u8>)> = HashMap::new();
-        for entry in self
-            .db
-            .iterator(rocksdb::IteratorMode::From(&v2_prefix, rocksdb::Direction::Forward))
-        {
+        for entry in self.db.iterator(rocksdb::IteratorMode::From(
+            &v2_prefix,
+            rocksdb::Direction::Forward,
+        )) {
             let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
             if !k.starts_with(&v2_prefix) {
                 break;
@@ -540,11 +623,14 @@ impl RocksHypergraphStore {
     where
         F: FnMut(&[u8], &[u8]) -> Result<()>,
     {
-        let prefix = crate::encoding::hypergraph_vertex_data_prefix(set_type, phase_type, shard_key);
+        let prefix =
+            crate::encoding::hypergraph_vertex_data_prefix(set_type, phase_type, shard_key);
         let prefix_len = prefix.len();
         let snapshot = self.db.snapshot();
-        let iter = snapshot
-            .iterator(rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward));
+        let iter = snapshot.iterator(rocksdb::IteratorMode::From(
+            &prefix,
+            rocksdb::Direction::Forward,
+        ));
         let mut count = 0usize;
         for entry in iter {
             let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
@@ -559,7 +645,6 @@ impl RocksHypergraphStore {
         }
         Ok(count)
     }
-
 
     /// Streaming, bounded-memory migration over a domain's committed
     /// `("vertex","adds", shard)` keyspace. Reads a point-in-time snapshot in
@@ -605,8 +690,8 @@ impl RocksHypergraphStore {
         // Apply one chunk: run the (possibly parallel) transform, then commit its
         // writes in a single batch. Kept as a closure so the tail chunk reuses it.
         let flush = |chunk: &[(Vec<u8>, Vec<u8>)],
-                         migrated: &mut usize,
-                         process_chunk: &mut F|
+                     migrated: &mut usize,
+                     process_chunk: &mut F|
          -> Result<()> {
             let (m, writes) = process_chunk(chunk)?;
             *migrated += m;
@@ -614,17 +699,36 @@ impl RocksHypergraphStore {
                 let mut batch = rocksdb::WriteBatch::default();
                 for w in &writes {
                     match w {
-                        VertexWrite::Put { set, phase, vertex_key, blob } => {
+                        VertexWrite::Put {
+                            set,
+                            phase,
+                            vertex_key,
+                            blob,
+                        } => {
                             let key = hypergraph_vertex_data_key(set, phase, shard, vertex_key);
                             batch.put(&key, blob);
+                            if let Some(entry) = crate::large_vertex_index::live_entry(
+                                set,
+                                phase,
+                                vertex_key,
+                                blob.len(),
+                            ) {
+                                batch.put(&entry, b"");
+                            }
                         }
-                        VertexWrite::Delete { set, phase, vertex_key } => {
+                        VertexWrite::Delete {
+                            set,
+                            phase,
+                            vertex_key,
+                        } => {
                             let key = hypergraph_vertex_data_key(set, phase, shard, vertex_key);
                             batch.delete(&key);
                         }
                     }
                 }
-                self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))?;
+                self.db
+                    .write(batch)
+                    .map_err(|e| QuilError::Store(e.to_string()))?;
             }
             Ok(())
         };
@@ -660,14 +764,23 @@ impl RocksHypergraphStore {
 /// `app‖data` id.
 pub enum VertexWrite {
     /// Write `blob` at `(set, phase, vertex_key)`.
-    Put { set: &'static str, phase: &'static str, vertex_key: Vec<u8>, blob: Vec<u8> },
+    Put {
+        set: &'static str,
+        phase: &'static str,
+        vertex_key: Vec<u8>,
+        blob: Vec<u8>,
+    },
     /// Physically remove `(set, phase, vertex_key)` from the keyspace — used to
     /// erase migrated-away originals as though they never existed (no tombstone).
-    Delete { set: &'static str, phase: &'static str, vertex_key: Vec<u8> },
+    Delete {
+        set: &'static str,
+        phase: &'static str,
+        vertex_key: Vec<u8>,
+    },
 }
 
-use std::collections::HashMap;
 use quil_types::store::{ChangeRecord, HypergraphStore, SnapshotReadable, Transaction};
+use std::collections::HashMap;
 
 /// A real RocksDB point-in-time snapshot bound to a published root.
 ///
@@ -716,11 +829,19 @@ impl RocksHypergraphSnapshot {
         // (a `&DB` plus a raw snapshot pointer), so the transmute is sound.
         let snapshot: rocksdb::SnapshotWithThreadMode<'static, rocksdb::DB> =
             unsafe { std::mem::transmute(snap) };
-        Self { snapshot, scan, _db: db }
+        Self {
+            snapshot,
+            scan,
+            _db: db,
+        }
     }
 
     fn scan_point_backend(&self) -> Option<quil_types::store::ScanPoint> {
         Some(self.scan)
+    }
+
+    fn store_name_backend(&self) -> Option<String> {
+        crate::large_vertex_index::store_name(&self._db)
     }
 }
 
@@ -789,7 +910,11 @@ fn page_fixed_vertices_at_snapshot(
             }
             let address = key[legacy_prefix.len()..].try_into().unwrap();
             // A skipped row is passed over below; its value is never copied.
-            let blob = if skip(&address) { Some(Vec::new()) } else { copy_blob(legacy.value().unwrap()) };
+            let blob = if skip(&address) {
+                Some(Vec::new())
+            } else {
+                copy_blob(legacy.value().unwrap())
+            };
             legacy.next();
             legacy
                 .status()
@@ -832,7 +957,11 @@ fn page_fixed_vertices_at_snapshot(
                     break;
                 }
                 if key.len() == entry_prefix.len() + 8 {
-                    let blob = if skip(&address) { Some(Vec::new()) } else { copy_blob(versioned.value().unwrap()) };
+                    let blob = if skip(&address) {
+                        Some(Vec::new())
+                    } else {
+                        copy_blob(versioned.value().unwrap())
+                    };
                     selected = Some((address, blob));
                     break;
                 }
@@ -889,7 +1018,10 @@ fn page_fixed_vertices_at_snapshot(
         if skip(&address) {
             if use_v2 {
                 right = next_versioned()?;
-                if left.as_ref().is_some_and(|(legacy_address, _)| *legacy_address == address) {
+                if left
+                    .as_ref()
+                    .is_some_and(|(legacy_address, _)| *legacy_address == address)
+                {
                     left = next_legacy()?;
                 }
             } else {
@@ -926,124 +1058,182 @@ fn page_fixed_vertices_at_snapshot(
 
 macro_rules! impl_hypergraph_snapshot {
     ($snapshot:ty) => {
-impl SnapshotReadable for $snapshot {
-    fn has_snapshot_vertex_reads(&self) -> bool {
-        true
-    }
+        impl SnapshotReadable for $snapshot {
+            fn has_snapshot_vertex_reads(&self) -> bool {
+                true
+            }
 
-    fn scan_point(&self) -> Option<quil_types::store::ScanPoint> {
-        self.scan_point_backend()
-    }
+            fn scan_point(&self) -> Option<quil_types::store::ScanPoint> {
+                self.scan_point_backend()
+            }
 
-    fn read_record(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.snapshot.get(key).map_err(|e| QuilError::Store(e.to_string()))
-    }
+            fn read_record(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+                self.snapshot
+                    .get(key)
+                    .map_err(|e| QuilError::Store(e.to_string()))
+            }
 
-    fn page_vertex_underlying_fixed(
-        &self, set_type: &str, phase_type: &str, shard: &ShardKey,
-        domain: &[u8; 32], after: Option<&[u8; 32]>,
-        limits: quil_types::store::VertexPageLimits,
-    ) -> Result<quil_types::store::VertexDataPage> {
-        page_fixed_vertices_at_snapshot(&self.snapshot, set_type, phase_type, shard, domain, after, limits, &|_| false)
-    }
+            fn page_vertex_underlying_fixed(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                shard: &ShardKey,
+                domain: &[u8; 32],
+                after: Option<&[u8; 32]>,
+                limits: quil_types::store::VertexPageLimits,
+            ) -> Result<quil_types::store::VertexDataPage> {
+                page_fixed_vertices_at_snapshot(
+                    &self.snapshot,
+                    set_type,
+                    phase_type,
+                    shard,
+                    domain,
+                    after,
+                    limits,
+                    &|_| false,
+                )
+            }
 
-    fn page_vertex_underlying_fixed_skipping(
-        &self, set_type: &str, phase_type: &str, shard: &ShardKey,
-        domain: &[u8; 32], after: Option<&[u8; 32]>,
-        limits: quil_types::store::VertexPageLimits, skip: &dyn Fn(&[u8; 32]) -> bool,
-    ) -> Result<quil_types::store::VertexDataPage> {
-        page_fixed_vertices_at_snapshot(&self.snapshot, set_type, phase_type, shard, domain, after, limits, skip)
-    }
+            fn page_vertex_underlying_fixed_skipping(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                shard: &ShardKey,
+                domain: &[u8; 32],
+                after: Option<&[u8; 32]>,
+                limits: quil_types::store::VertexPageLimits,
+                skip: &dyn Fn(&[u8; 32]) -> bool,
+            ) -> Result<quil_types::store::VertexDataPage> {
+                page_fixed_vertices_at_snapshot(
+                    &self.snapshot,
+                    set_type,
+                    phase_type,
+                    shard,
+                    domain,
+                    after,
+                    limits,
+                    skip,
+                )
+            }
 
-    fn load_tree_blob(
-        &self,
-        set_type: &str,
-        phase_type: &str,
-        shard_key: &quil_types::store::ShardKey,
-    ) -> Result<Option<Vec<u8>>> {
-        let key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
-        // Reads at the captured sequence — point-in-time consistent.
-        self.snapshot
-            .get(&key)
-            .map_err(|e| QuilError::Store(e.to_string()))
-    }
+            fn store_name(&self) -> Option<String> {
+                self.store_name_backend()
+            }
 
-    /// Per-node read at the captured sequence. MUST mirror
-    /// `RocksHypergraphStore::get_node_by_path` (SeekGE + prefix
-    /// compression) exactly, but bound to the snapshot so a whole-tree
-    /// walk is isolated from concurrent commits.
-    fn get_node_by_path(
-        &self,
-        set_type: &str,
-        phase_type: &str,
-        shard_key: &quil_types::store::ShardKey,
-        path: &[i32],
-    ) -> Result<Option<Vec<u8>>> {
-        let prefix = hypergraph_tree_node_by_path_prefix(set_type, phase_type, shard_key);
-        let requested = hypergraph_tree_node_by_path(set_type, phase_type, shard_key, path);
-        let mut iter = self.snapshot.raw_iterator();
-        iter.seek(&requested);
-        iter.status().map_err(|e| QuilError::Store(e.to_string()))?;
-        if !iter.valid() {
-            return Ok(None);
-        }
-        let found_key = match iter.key() {
-            Some(k) => k.to_vec(),
-            None => return Ok(None),
-        };
-        if !found_key.starts_with(&prefix) {
-            return Ok(None);
-        }
-        if !found_key.starts_with(&requested) {
-            return Ok(None);
-        }
-        let by_key = match iter.value() {
-            Some(v) => v.to_vec(),
-            None => return Ok(None),
-        };
-        self.snapshot
-            .get(&by_key)
-            .map_err(|e| QuilError::Store(e.to_string()))
-    }
+            fn large_vertex_index_state(&self) -> Result<quil_types::store::LargeVertexIndexState> {
+                let state = self
+                    .snapshot
+                    .get(crate::large_vertex_index::state_key())
+                    .map_err(|e| QuilError::Store(e.to_string()))?;
+                crate::large_vertex_index::state_at(&self.snapshot, state.as_deref())
+            }
 
-    fn load_vertex_underlying_raw(
-        &self,
-        set_type: &str,
-        phase_type: &str,
-        shard_key: &quil_types::store::ShardKey,
-        vertex_key: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
-        // MVCC "latest at capture" within the pinned snapshot: seek_for_prev to
-        // `vk_prefix ‖ u64::MAX`; the largest key still sharing `vk_prefix` (which
-        // is exactly `vk_prefix.len() + 8` bytes) is this vertex's latest version
-        // as-of the captured sequence. Mirrors the live `load_vertex_underlying_at`.
-        let vk_prefix = crate::encoding::hypergraph_vertex_data_v2_vk_prefix(
-            set_type, phase_type, shard_key, vertex_key,
-        );
-        let seek = crate::encoding::hypergraph_vertex_data_v2_key(
-            set_type, phase_type, shard_key, vertex_key, u64::MAX,
-        );
-        let mut iter = self.snapshot.raw_iterator();
-        iter.seek_for_prev(&seek);
-        // An iterator read failure must not become authenticated absence via
-        // the legacy fallback, particularly during history reconstruction.
-        iter.status().map_err(|error| QuilError::Store(error.to_string()))?;
-        if iter.valid() {
-            if let Some(k) = iter.key() {
-                if k.len() == vk_prefix.len() + 8 && k.starts_with(&vk_prefix) {
-                    return Ok(iter.value().map(|v| v.to_vec()));
+            fn page_large_vertices_skipping(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                shard: &ShardKey,
+                domain: &[u8; 32],
+                after: Option<&[u8; 32]>,
+                limits: quil_types::store::VertexPageLimits,
+                skip: &dyn Fn(&[u8; 32]) -> bool,
+            ) -> Result<quil_types::store::IndexedVertexPage> {
+                if set_type != "vertex" || phase_type != "adds" {
+                    return Err(QuilError::InvalidArgument(
+                        "the large vertex index holds vertex adds only".into(),
+                    ));
                 }
+                let legacy = |key: &[u8]| {
+                    self.snapshot
+                        .get(key)
+                        .map_err(|e| QuilError::Store(e.to_string()))
+                };
+                let load = |vertex_key: &[u8]| {
+                    crate::large_vertex_index::load_row(&self.snapshot, &legacy, shard, vertex_key)
+                };
+                crate::large_vertex_index::page(&self.snapshot, &load, domain, after, limits, skip)
+            }
+
+            fn load_tree_blob(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                shard_key: &quil_types::store::ShardKey,
+            ) -> Result<Option<Vec<u8>>> {
+                let key = hypergraph_tree_blob_key(set_type, phase_type, shard_key);
+                // Reads at the captured sequence — point-in-time consistent.
+                self.snapshot
+                    .get(&key)
+                    .map_err(|e| QuilError::Store(e.to_string()))
+            }
+
+            /// Per-node read at the captured sequence. MUST mirror
+            /// `RocksHypergraphStore::get_node_by_path` (SeekGE + prefix
+            /// compression) exactly, but bound to the snapshot so a whole-tree
+            /// walk is isolated from concurrent commits.
+            fn get_node_by_path(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                shard_key: &quil_types::store::ShardKey,
+                path: &[i32],
+            ) -> Result<Option<Vec<u8>>> {
+                let prefix = hypergraph_tree_node_by_path_prefix(set_type, phase_type, shard_key);
+                let requested = hypergraph_tree_node_by_path(set_type, phase_type, shard_key, path);
+                let mut iter = self.snapshot.raw_iterator();
+                iter.seek(&requested);
+                iter.status().map_err(|e| QuilError::Store(e.to_string()))?;
+                if !iter.valid() {
+                    return Ok(None);
+                }
+                let found_key = match iter.key() {
+                    Some(k) => k.to_vec(),
+                    None => return Ok(None),
+                };
+                if !found_key.starts_with(&prefix) {
+                    return Ok(None);
+                }
+                if !found_key.starts_with(&requested) {
+                    return Ok(None);
+                }
+                let by_key = match iter.value() {
+                    Some(v) => v.to_vec(),
+                    None => return Ok(None),
+                };
+                self.snapshot
+                    .get(&by_key)
+                    .map_err(|e| QuilError::Store(e.to_string()))
+            }
+
+            fn load_vertex_underlying_raw(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                shard_key: &quil_types::store::ShardKey,
+                vertex_key: &[u8],
+            ) -> Result<Option<Vec<u8>>> {
+                // MVCC "latest at capture" within the pinned snapshot, as the live
+                // `load_vertex_underlying_at` reads it. An iterator read failure must
+                // not become authenticated absence via the legacy fallback,
+                // particularly during history reconstruction.
+                if let Some(blob) = vertex_version_at(
+                    &self.snapshot,
+                    set_type,
+                    phase_type,
+                    shard_key,
+                    vertex_key,
+                    u64::MAX,
+                )? {
+                    return Ok(Some(blob));
+                }
+                // Legacy fallback: an un-migrated (unversioned) blob captured before the
+                // version dimension existed.
+                let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
+                self.snapshot
+                    .get(&key)
+                    .map_err(|e| QuilError::Store(e.to_string()))
             }
         }
-        // Legacy fallback: an un-migrated (unversioned) blob captured before the
-        // version dimension existed.
-        let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
-        self.snapshot
-            .get(&key)
-            .map_err(|e| QuilError::Store(e.to_string()))
-    }
-}
-
     };
 }
 impl_hypergraph_snapshot!(RocksHypergraphSnapshot);
@@ -1100,7 +1290,9 @@ pub(crate) struct RocksTxn {
 
 impl Transaction for RocksTxn {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.db.get(key).map_err(|e| QuilError::Store(e.to_string()))
+        self.db
+            .get(key)
+            .map_err(|e| QuilError::Store(e.to_string()))
     }
     fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.batch.lock().unwrap().put(key, value);
@@ -1108,9 +1300,13 @@ impl Transaction for RocksTxn {
     }
     fn commit(self: Box<Self>) -> Result<()> {
         #[cfg(any(test, feature = "test-utils"))]
-        if self.fail_commit { return Err(QuilError::Store("injected final write failure".into())); }
+        if self.fail_commit {
+            return Err(QuilError::Store("injected final write failure".into()));
+        }
         let batch = self.batch.into_inner().unwrap();
-        self.db.write(batch).map_err(|e| QuilError::Store(e.to_string()))
+        self.db
+            .write(batch)
+            .map_err(|e| QuilError::Store(e.to_string()))
     }
     fn delete(&self, key: &[u8]) -> Result<()> {
         self.batch.lock().unwrap().delete(key);
@@ -1120,8 +1316,14 @@ impl Transaction for RocksTxn {
         // Drop the batch without writing
         Ok(())
     }
-    fn new_iter(&self, _lower: &[u8], _upper: &[u8]) -> Result<Box<dyn quil_types::store::Iterator>> {
-        Err(QuilError::Internal("RocksTxn iterator not implemented".into()))
+    fn new_iter(
+        &self,
+        _lower: &[u8],
+        _upper: &[u8],
+    ) -> Result<Box<dyn quil_types::store::Iterator>> {
+        Err(QuilError::Internal(
+            "RocksTxn iterator not implemented".into(),
+        ))
     }
     fn delete_range(&self, lower: &[u8], upper: &[u8]) -> Result<()> {
         self.batch.lock().unwrap().delete_range(lower, upper);
@@ -1133,10 +1335,15 @@ impl Transaction for RocksTxn {
 }
 
 impl RocksTxn {
-    fn for_store<'a>(txn: &'a dyn Transaction, db: &quil_forest::CoordinatedDb) -> Result<&'a RocksTxn> {
+    fn for_store<'a>(
+        txn: &'a dyn Transaction,
+        db: &quil_forest::CoordinatedDb,
+    ) -> Result<&'a RocksTxn> {
         let txn = Self::from_dyn(txn)?;
         if !txn.db.same_database(db) {
-            return Err(QuilError::Store("hypergraph transaction belongs to another database".into()));
+            return Err(QuilError::Store(
+                "hypergraph transaction belongs to another database".into(),
+            ));
         }
         Ok(txn)
     }
@@ -1170,6 +1377,24 @@ impl RocksTxn {
 }
 
 impl RocksHypergraphStore {
+    /// The record that marks the large-vertex index complete, for a write of a
+    /// store that opened empty, until it is stored: its rows were all written
+    /// with their entries.
+    fn index_complete_mark_backend(&self) -> Option<([u8; 2], Vec<u8>)> {
+        use std::sync::atomic::Ordering;
+        if !self.index_opened_empty.load(Ordering::Relaxed) {
+            return None;
+        }
+        if matches!(
+            self.db.get(crate::large_vertex_index::state_key()),
+            Ok(Some(_))
+        ) {
+            self.index_opened_empty.store(false, Ordering::Relaxed);
+            return None;
+        }
+        Some(crate::large_vertex_index::complete_record())
+    }
+
     fn new_transaction_backend(&self, _indexed: bool) -> Result<Box<dyn Transaction>> {
         Ok(Box::new(RocksTxn {
             batch: std::sync::Mutex::new(rocksdb::WriteBatch::default()),
@@ -1203,11 +1428,10 @@ impl RocksHypergraphStore {
         // or stray writes against the staging area.
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(false);
-        let src = rocksdb::DB::open_for_read_only(&opts, &snap_dir, true)
-            .map_err(|e| {
-                cleanup(&snap_dir);
-                QuilError::Store(format!("apply snapshot: open src: {}", e))
-            })?;
+        let src = rocksdb::DB::open_for_read_only(&opts, &snap_dir, true).map_err(|e| {
+            cleanup(&snap_dir);
+            QuilError::Store(format!("apply snapshot: open src: {}", e))
+        })?;
 
         let mut batch = rocksdb::WriteBatch::default();
         let mut count: usize = 0;
@@ -1220,7 +1444,15 @@ impl RocksHypergraphStore {
                     return Err(QuilError::Store(format!("apply snapshot: iter: {}", e)));
                 }
             };
+            // The copied rows' index entries; another store's walk state
+            // does not describe this one's rows.
+            if crate::large_vertex_index::is_walk_record(&k) {
+                continue;
+            }
             batch.put(&k, &v);
+            if let Some(entry) = crate::large_vertex_index::live_entry_for_row(&k, v.len()) {
+                batch.put(&entry, b"");
+            }
             count += 1;
             if count % CHUNK == 0 {
                 let to_commit = std::mem::take(&mut batch);
@@ -1233,7 +1465,10 @@ impl RocksHypergraphStore {
         // Final commit for the remainder.
         if let Err(e) = self.db.write(batch) {
             cleanup(&snap_dir);
-            return Err(QuilError::Store(format!("apply snapshot: final write: {}", e)));
+            return Err(QuilError::Store(format!(
+                "apply snapshot: final write: {}",
+                e
+            )));
         }
         cleanup(&snap_dir);
         tracing::info!(keys = count, "imported snapshot via raw key/value copy");
@@ -1244,7 +1479,33 @@ impl RocksHypergraphStore {
         let snap = RocksHypergraphSnapshot::capture(self.db.clone())?;
         Ok(Some(Arc::new(snap) as Arc<dyn SnapshotReadable>))
     }
+}
 
+/// MVCC read of one vertex blob: its newest version ≤ `version`, or `None`
+/// for the caller's legacy fallback. Versions are a fixed 8-byte
+/// non-inverted suffix of `vk_prefix`, so a match is exactly
+/// `vk_prefix.len() + 8` bytes long. The read is bounded to the vertex's own
+/// keys: an unbounded reverse seek for a vertex with no version ≤ `version`,
+/// such as an absent one, stepped over every record below it that a payload
+/// eviction had range-deleted while older snapshots still pinned them,
+/// blocking a mainnet worker's sweeps for 35-52 s each.
+pub(crate) fn vertex_version_at(
+    source: &impl BoundedCursorSource,
+    set_type: &str,
+    phase_type: &str,
+    shard_key: &ShardKey,
+    vertex_key: &[u8],
+    version: u64,
+) -> Result<Option<Vec<u8>>> {
+    let vk_prefix = crate::encoding::hypergraph_vertex_data_v2_vk_prefix(
+        set_type, phase_type, shard_key, vertex_key,
+    );
+    let last = crate::encoding::hypergraph_vertex_data_v2_key(
+        set_type, phase_type, shard_key, vertex_key, version,
+    );
+    Ok(newest_version_within(source, &vk_prefix, &last)?
+        .filter(|(k, _)| k.len() == vk_prefix.len() + 8 && k.starts_with(&vk_prefix))
+        .map(|(_, blob)| blob))
 }
 
 include!("hypergraph_core.rs");
@@ -1270,10 +1531,105 @@ mod orphaned_head_tests;
 mod selective_tests;
 
 #[cfg(test)]
+#[path = "hypergraph_mvcc_seek_tests.rs"]
+mod mvcc_seek_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::rocksdb_store::RocksDb;
     use tempfile::TempDir;
+
+    /// Sweeps of whole shards read around the block cache: the vertex walk,
+    /// the general walk and the legacy keyspace add none of the blocks they
+    /// read, where a plain iterator over the same keys adds every one. Every
+    /// vertex is still yielded with its blob.
+    #[test]
+    fn shard_sweeps_do_not_fill_the_block_cache() {
+        const VERTICES: usize = 2048;
+        const BLOB: usize = 4096;
+        const MIB: u64 = 1 << 20;
+        let dir = TempDir::new().unwrap();
+        // The default 256 MiB block cache holds every block written here.
+        let db = RocksDb::open(dir.path()).unwrap();
+        let store = RocksHypergraphStore::new(db.inner());
+        // Keys of one length (the vertex walk, half of them legacy) and of
+        // two lengths (the general walk).
+        let uniform = ShardKey {
+            l1: [1, 2, 3],
+            l2: [0x11; 32],
+        };
+        let mixed = ShardKey {
+            l1: [4, 5, 6],
+            l2: [0x22; 32],
+        };
+        let vertex = |n: usize, len: usize| {
+            [(n as u64).to_be_bytes().to_vec(), vec![0xab; len - 8]].concat()
+        };
+        let blob = |vk: &[u8]| vec![vk[7]; BLOB];
+        for n in 0..VERTICES {
+            let vk = vertex(n, 64);
+            let key = if n % 2 == 0 {
+                crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &uniform, &vk, 1)
+            } else {
+                hypergraph_vertex_data_key("vertex", "adds", &uniform, &vk)
+            };
+            db.inner().put(key, blob(&vk)).unwrap();
+            let vk = vertex(n, 64 + n % 2);
+            let key =
+                crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &mixed, &vk, 1);
+            db.inner().put(key, blob(&vk)).unwrap();
+        }
+        // Reads now come from table files, through the block cache.
+        db.inner().flush().unwrap();
+        let cached = || db.memory_usage().block_cache;
+
+        let before = cached();
+        for shard in [&uniform, &mixed] {
+            let mut rows = Vec::new();
+            HypergraphStore::for_each_vertex_underlying(
+                &store,
+                "vertex",
+                "adds",
+                shard,
+                &mut |vk, data| rows.push((vk, data)),
+            )
+            .unwrap();
+            store
+                .for_each_vertex_underlying("vertex", "adds", shard, |vk, data| {
+                    rows.push((vk, data))
+                })
+                .unwrap();
+            assert_eq!(rows.len(), 2 * VERTICES);
+            assert!(rows.iter().all(|(vk, data)| *data == blob(vk)));
+        }
+        let swept = cached().saturating_sub(before);
+        assert!(
+            swept < MIB,
+            "sweeping 16 MiB of blobs added {swept} bytes to the block cache"
+        );
+
+        // The measure sees a cache that fills: plain iterators over the same
+        // keys add every block they read.
+        for shard in [&uniform, &mixed] {
+            for prefix in [
+                crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", shard),
+                hypergraph_vertex_data_prefix("vertex", "adds", shard),
+            ] {
+                let mode = rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward);
+                for entry in db.inner().iterator(mode) {
+                    if !entry.unwrap().0.starts_with(&prefix) {
+                        break;
+                    }
+                }
+            }
+        }
+        let read = cached().saturating_sub(before);
+        assert!(
+            read > 8 * MIB,
+            "plain iterators over 16 MiB of blobs added only {read} bytes to the block cache"
+        );
+    }
 
     /// The vertex walk against the general walk over a shard whose vertices
     /// carry many versions, as frequently rewritten allocations do.
@@ -1282,23 +1638,39 @@ mod tests {
     fn measure_vertex_walk_over_versions() {
         let db = RocksDb::open_in_memory().unwrap();
         let store = RocksHypergraphStore::new(db.inner());
-        let shard = ShardKey { l1: [1, 2, 3], l2: [0xff; 32] };
+        let shard = ShardKey {
+            l1: [1, 2, 3],
+            l2: [0xff; 32],
+        };
         let blob = vec![7u8; 600];
         for (vertices, versions) in [(20_000usize, 1u64), (5_000, 100)] {
-            let shard = ShardKey { l1: [versions as u8, 0, 0], ..shard };
+            let shard = ShardKey {
+                l1: [versions as u8, 0, 0],
+                ..shard
+            };
             for n in 0..vertices {
                 let vertex = [(n as u64).to_be_bytes().repeat(8)].concat();
                 for version in 0..versions {
-                    let key = crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard, &vertex, version);
+                    let key = crate::encoding::hypergraph_vertex_data_v2_key(
+                        "vertex", "adds", &shard, &vertex, version,
+                    );
                     db.inner().put(key, &blob).unwrap();
                 }
             }
-            let prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", &shard);
+            let prefix =
+                crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", &shard);
             let started = std::time::Instant::now();
-            let general = store.newest_v2_blobs_general_matching(&prefix, &|_| true).unwrap().len();
+            let general = store
+                .newest_v2_blobs_general_matching(&prefix, &|_| true)
+                .unwrap()
+                .len();
             let general_time = started.elapsed();
             let started = std::time::Instant::now();
-            let fast = store.newest_v2_blobs_matching(&prefix, &|_| true).unwrap().unwrap().len();
+            let fast = store
+                .newest_v2_blobs_matching(&prefix, &|_| true)
+                .unwrap()
+                .unwrap()
+                .len();
             eprintln!("{vertices} vertices x {versions} versions: general {general_time:?} ({general}), newest-only {:?} ({fast})",
                 started.elapsed());
         }
@@ -1311,27 +1683,51 @@ mod tests {
     fn the_vertex_walk_yields_each_vertex_newest_version() {
         let db = RocksDb::open_in_memory().unwrap();
         let store = RocksHypergraphStore::new(db.inner());
-        let shard = ShardKey { l1: [1, 2, 3], l2: [0xff; 32] };
+        let shard = ShardKey {
+            l1: [1, 2, 3],
+            l2: [0xff; 32],
+        };
         let put = |vertex: &[u8], version: u64, blob: &[u8]| {
-            let key = crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard, vertex, version);
+            let key = crate::encoding::hypergraph_vertex_data_v2_key(
+                "vertex", "adds", &shard, vertex, version,
+            );
             db.inner().put(key, blob).unwrap();
         };
         let collect = |store: &RocksHypergraphStore| {
             let mut seen = Vec::new();
-            store.for_each_vertex_underlying("vertex", "adds", &shard, |vk, blob| seen.push((vk, blob))).unwrap();
+            store
+                .for_each_vertex_underlying("vertex", "adds", &shard, |vk, blob| {
+                    seen.push((vk, blob))
+                })
+                .unwrap();
             seen.sort();
             seen
         };
         let vertex = |n: u8| [[n; 32], [n.wrapping_add(1); 32]].concat();
         for n in 0u8..40 {
-            let versions = match n % 4 { 0 => 1, 1 => 3, 2 => 4, _ => 300 };
+            let versions = match n % 4 {
+                0 => 1,
+                1 => 3,
+                2 => 4,
+                _ => 300,
+            };
             for version in 0..versions {
-                put(&vertex(n), 1000 + version * 7, format!("{n}-{version}").as_bytes());
+                put(
+                    &vertex(n),
+                    1000 + version * 7,
+                    format!("{n}-{version}").as_bytes(),
+                );
             }
         }
-        let prefix = crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", &shard);
-        let fast = store.newest_v2_blobs_matching(&prefix, &|_| true).unwrap().expect("uniform key lengths");
-        let mut general = store.newest_v2_blobs_general_matching(&prefix, &|_| true).unwrap();
+        let prefix =
+            crate::encoding::hypergraph_vertex_data_v2_shard_prefix("vertex", "adds", &shard);
+        let fast = store
+            .newest_v2_blobs_matching(&prefix, &|_| true)
+            .unwrap()
+            .expect("uniform key lengths");
+        let mut general = store
+            .newest_v2_blobs_general_matching(&prefix, &|_| true)
+            .unwrap();
         general.sort();
         let mut fast_sorted = fast.clone();
         fast_sorted.sort();
@@ -1341,13 +1737,25 @@ mod tests {
         assert_eq!(walked.len(), 40);
         for (vk, blob) in &walked {
             let n = vk[0];
-            let versions = match n % 4 { 0 => 1, 1 => 3, 2 => 4, _ => 300 };
-            assert_eq!(blob, &format!("{n}-{}", versions - 1).into_bytes(), "vertex {n}");
+            let versions = match n % 4 {
+                0 => 1,
+                1 => 3,
+                2 => 4,
+                _ => 300,
+            };
+            assert_eq!(
+                blob,
+                &format!("{n}-{}", versions - 1).into_bytes(),
+                "vertex {n}"
+            );
         }
 
         // A key of another length: the general walk, same answer.
         put(&[9u8; 40], 5, b"odd");
-        assert!(store.newest_v2_blobs_matching(&prefix, &|_| true).unwrap().is_none());
+        assert!(store
+            .newest_v2_blobs_matching(&prefix, &|_| true)
+            .unwrap()
+            .is_none());
         let walked = collect(&store);
         assert_eq!(walked.len(), 41);
         assert!(walked.contains(&(vec![9u8; 40], b"odd".to_vec())));
@@ -1363,14 +1771,26 @@ mod tests {
             let filter = [app.as_slice(), &[0]].concat();
             let cursor = crate::encoding::consensus_materialized_cursor_key(&filter);
             let history = crate::encoding::clock_shard_frame_fee_total_key(&filter, 2);
-            let first = Location { app_address: app, data_address: [1; 32] };
-            let second = Location { app_address: app, data_address: [2; 32] };
+            let first = Location {
+                app_address: app,
+                data_address: [1; 32],
+            };
+            let second = Location {
+                app_address: app,
+                data_address: [2; 32],
+            };
             let committed_roots;
             {
                 let db = RocksDb::open(dir.path()).unwrap();
                 let store = Arc::new(RocksHypergraphStore::new(db.inner()));
-                let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
-                crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
+                let crdt = HypergraphCrdt::new(
+                    store.clone(),
+                    Arc::new(quil_types::crypto::NoopInclusionProver),
+                );
+                crdt.set_forest(quil_forest::Forest::with_namespace(
+                    db.inner(),
+                    FOREST_NAMESPACE,
+                ));
                 crdt.set_app_shard_prefixes(app, (0..64).map(|n| vec![n]).collect());
                 crdt.set_unified_tree(unified);
                 let empty = crdt.capture_committed_shard(&filter).unwrap();
@@ -1380,37 +1800,68 @@ mod tests {
                 crdt.commit_with_frame_cursor(1, &cursor).unwrap();
                 let before = crdt.capture_committed_shard(&filter).unwrap();
                 assert_ne!(before.roots[0], [0; 32]);
-                assert_eq!(before.records.read_record(&cursor).unwrap(), Some(1u64.to_be_bytes().to_vec()));
+                assert_eq!(
+                    before.records.read_record(&cursor).unwrap(),
+                    Some(1u64.to_be_bytes().to_vec())
+                );
                 crdt.add_vertex(&second, b"second").unwrap();
-                assert_eq!(crdt.capture_committed_shard(&filter).unwrap().roots, before.roots);
+                assert_eq!(
+                    crdt.capture_committed_shard(&filter).unwrap().roots,
+                    before.roots
+                );
                 store.fail_commit.store(true, Ordering::Relaxed);
                 let records = vec![(history.clone(), 123u128.to_be_bytes().to_vec())];
-                assert!(crdt.commit_with_frame_cursor_and_records(2, &cursor, &records).is_err());
+                assert!(crdt
+                    .commit_with_frame_cursor_and_records(2, &cursor, &records)
+                    .is_err());
                 let failed = crdt.capture_committed_shard(&filter).unwrap();
                 assert_eq!(failed.roots, before.roots);
-                assert_eq!(failed.records.read_record(&cursor).unwrap(), Some(1u64.to_be_bytes().to_vec()));
+                assert_eq!(
+                    failed.records.read_record(&cursor).unwrap(),
+                    Some(1u64.to_be_bytes().to_vec())
+                );
                 assert!(failed.records.read_record(&history).unwrap().is_none());
                 store.fail_commit.store(false, Ordering::Relaxed);
-                crdt.commit_with_frame_cursor_and_records(2, &cursor, &records).unwrap();
+                crdt.commit_with_frame_cursor_and_records(2, &cursor, &records)
+                    .unwrap();
                 let after = crdt.capture_committed_shard(&filter).unwrap();
                 committed_roots = after.roots;
                 assert_ne!(after.roots, before.roots);
-                assert_eq!(after.records.read_record(&cursor).unwrap(), Some(2u64.to_be_bytes().to_vec()));
-                assert_eq!(after.records.read_record(&history).unwrap(), Some(123u128.to_be_bytes().to_vec()));
-                assert_eq!(before.records.read_record(&cursor).unwrap(), Some(1u64.to_be_bytes().to_vec()));
+                assert_eq!(
+                    after.records.read_record(&cursor).unwrap(),
+                    Some(2u64.to_be_bytes().to_vec())
+                );
+                assert_eq!(
+                    after.records.read_record(&history).unwrap(),
+                    Some(123u128.to_be_bytes().to_vec())
+                );
+                assert_eq!(
+                    before.records.read_record(&cursor).unwrap(),
+                    Some(1u64.to_be_bytes().to_vec())
+                );
                 assert!(before.records.read_record(&history).unwrap().is_none());
                 let sentinel = quil_forest::encode_shard_bit_path(&app, &[false; 6]);
-                assert_eq!(crdt.capture_committed_shard(&sentinel).unwrap().roots, committed_roots);
+                assert_eq!(
+                    crdt.capture_committed_shard(&sentinel).unwrap().roots,
+                    committed_roots
+                );
             }
             let db = RocksDb::open(dir.path()).unwrap();
             let store = Arc::new(RocksHypergraphStore::new(db.inner()));
-            let reopened = HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
-            reopened.set_forest(quil_forest::Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
+            let reopened =
+                HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
+            reopened.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                FOREST_NAMESPACE,
+            ));
             reopened.set_app_shard_prefixes(app, (0..64).map(|n| vec![n]).collect());
             reopened.set_unified_tree(unified);
             let checkpoint = reopened.capture_committed_shard(&filter).unwrap();
             assert_eq!(checkpoint.roots, committed_roots);
-            assert_eq!(checkpoint.records.read_record(&cursor).unwrap(), Some(2u64.to_be_bytes().to_vec()));
+            assert_eq!(
+                checkpoint.records.read_record(&cursor).unwrap(),
+                Some(2u64.to_be_bytes().to_vec())
+            );
         }
     }
 
@@ -1422,13 +1873,25 @@ mod tests {
         let cursor = crate::encoding::consensus_materialized_cursor_key(&app);
         let history = crate::encoding::clock_shard_frame_fee_total_key(&app, 1);
         let marker = crate::encoding::app_history_recovery_key(&app, &[8; 32]);
-        let first = Location { app_address: app, data_address: [1; 32] };
-        let pending = Location { app_address: app, data_address: [2; 32] };
+        let first = Location {
+            app_address: app,
+            data_address: [1; 32],
+        };
+        let pending = Location {
+            app_address: app,
+            data_address: [2; 32],
+        };
         let open = || {
             let db = RocksDb::open(dir.path()).unwrap();
             let store = Arc::new(RocksHypergraphStore::new(db.inner()));
-            let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
-            crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
+            let crdt = HypergraphCrdt::new(
+                store.clone(),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            );
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                FOREST_NAMESPACE,
+            ));
             (db, store, crdt)
         };
         {
@@ -1437,42 +1900,80 @@ mod tests {
             crdt.commit_with_frame_cursor(1, &cursor).unwrap();
             let before = crdt.capture_committed_shard(&app).unwrap();
             crdt.add_vertex(&pending, b"pending").unwrap();
-            let records = vec![(history.clone(), 17u128.to_be_bytes().to_vec()),
-                (marker.clone(), b"through frame one".to_vec())];
+            let records = vec![
+                (history.clone(), 17u128.to_be_bytes().to_vec()),
+                (marker.clone(), b"through frame one".to_vec()),
+            ];
             store.fail_commit_for_test(true);
-            assert!(crdt.checkpoint_shard_records(&app, &before.roots, &cursor, 1, &records).is_err());
+            assert!(crdt
+                .checkpoint_shard_records(&app, &before.roots, &cursor, 1, &records)
+                .is_err());
             let failed = crdt.capture_committed_shard(&app).unwrap();
             assert_eq!(failed.roots, before.roots);
             assert!(failed.records.read_record(&history).unwrap().is_none());
             assert!(failed.records.read_record(&marker).unwrap().is_none());
             store.fail_commit_for_test(false);
-            assert!(crdt.checkpoint_shard_records(&app, &before.roots, &cursor, 2, &records).is_err());
-            assert!(crdt.checkpoint_shard_records(&app, &[[0; 32]; 4], &cursor, 1, &records).is_err());
-            crdt.checkpoint_shard_records(&app, &before.roots, &cursor, 1, &records).unwrap();
+            assert!(crdt
+                .checkpoint_shard_records(&app, &before.roots, &cursor, 2, &records)
+                .is_err());
+            assert!(crdt
+                .checkpoint_shard_records(&app, &[[0; 32]; 4], &cursor, 1, &records)
+                .is_err());
+            crdt.checkpoint_shard_records(&app, &before.roots, &cursor, 1, &records)
+                .unwrap();
             let repaired = crdt.capture_committed_shard(&app).unwrap();
             assert_eq!(repaired.roots, before.roots);
-            assert_eq!(repaired.records.read_record(&cursor).unwrap(), Some(1u64.to_be_bytes().to_vec()));
+            assert_eq!(
+                repaired.records.read_record(&cursor).unwrap(),
+                Some(1u64.to_be_bytes().to_vec())
+            );
             for (key, value) in &records {
                 assert!(before.records.read_record(key).unwrap().is_none());
-                assert_eq!(repaired.records.read_record(key).unwrap().as_ref(), Some(value));
+                assert_eq!(
+                    repaired.records.read_record(key).unwrap().as_ref(),
+                    Some(value)
+                );
             }
             let shard = quil_hypergraph::shard_key_for_location(&pending);
-            assert!(repaired.records.load_vertex_underlying_raw("vertex", "adds", &shard, &pending.to_id()).unwrap().is_none());
-            assert_eq!(crdt.get_vertex_data_checked(&pending).unwrap(), Some(b"pending".to_vec()));
+            assert!(repaired
+                .records
+                .load_vertex_underlying_raw("vertex", "adds", &shard, &pending.to_id())
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                crdt.get_vertex_data_checked(&pending).unwrap(),
+                Some(b"pending".to_vec())
+            );
             // Recovery neither flushes nor discards staged execution.
             crdt.commit_with_frame_cursor(2, &cursor).unwrap();
             let advanced = crdt.capture_committed_shard(&app).unwrap();
             assert_ne!(advanced.roots, before.roots);
             let rejected = vec![(marker.clone(), b"stale".to_vec())];
-            assert!(crdt.checkpoint_shard_records(&app, &before.roots, &cursor, 2, &rejected).is_err());
-            assert!(crdt.checkpoint_shard_records(&app, &advanced.roots, &cursor, 1, &rejected).is_err());
+            assert!(crdt
+                .checkpoint_shard_records(&app, &before.roots, &cursor, 2, &rejected)
+                .is_err());
+            assert!(crdt
+                .checkpoint_shard_records(&app, &advanced.roots, &cursor, 1, &rejected)
+                .is_err());
         }
         let (_db, _store, reopened) = open();
         let recovered = reopened.capture_committed_shard(&app).unwrap();
-        assert_eq!(recovered.records.read_record(&marker).unwrap(), Some(b"through frame one".to_vec()));
-        assert_eq!(recovered.records.read_record(&history).unwrap(), Some(17u128.to_be_bytes().to_vec()));
-        assert_eq!(recovered.records.read_record(&cursor).unwrap(), Some(2u64.to_be_bytes().to_vec()));
-        assert_eq!(reopened.get_vertex_data_checked(&pending).unwrap(), Some(b"pending".to_vec()));
+        assert_eq!(
+            recovered.records.read_record(&marker).unwrap(),
+            Some(b"through frame one".to_vec())
+        );
+        assert_eq!(
+            recovered.records.read_record(&history).unwrap(),
+            Some(17u128.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            recovered.records.read_record(&cursor).unwrap(),
+            Some(2u64.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            reopened.get_vertex_data_checked(&pending).unwrap(),
+            Some(b"pending".to_vec())
+        );
     }
 
     #[test]
@@ -1482,22 +1983,41 @@ mod tests {
         let db = RocksDb::open(dir.path()).unwrap();
         let store = Arc::new(RocksHypergraphStore::new(db.inner()));
         let crdt = HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
-        assert!(crdt.capture_committed_shard(&[7; 32]).is_err(), "an unwired in-memory forest is not committed empty state");
+        assert!(
+            crdt.capture_committed_shard(&[7; 32]).is_err(),
+            "an unwired in-memory forest is not committed empty state"
+        );
         let forest = quil_forest::Forest::with_namespace(db.inner(), FOREST_NAMESPACE);
         crdt.set_forest(forest.clone());
         let app = [7; 32];
-        for invalid in [vec![], vec![7; 31], [app.as_slice(), &[64]].concat(),
-            quil_forest::encode_shard_bit_path(&app, &[false; 257])] {
+        for invalid in [
+            vec![],
+            vec![7; 31],
+            [app.as_slice(), &[64]].concat(),
+            quil_forest::encode_shard_bit_path(&app, &[false; 257]),
+        ] {
             assert!(crdt.capture_committed_shard(&invalid).is_err());
         }
-        assert!(crdt.capture_committed_shard(&[app.as_slice(), &[0]].concat()).is_err(), "unregistered legacy child");
+        assert!(
+            crdt.capture_committed_shard(&[app.as_slice(), &[0]].concat())
+                .is_err(),
+            "unregistered legacy child"
+        );
         for unified in [false, true] {
             crdt.set_unified_tree(unified);
-            let (head, value) = forest.head_version_put(&app, quil_forest::Phase::VertexAdds, 9).unwrap();
+            let (head, value) = forest
+                .head_version_put(&app, quil_forest::Phase::VertexAdds, 9)
+                .unwrap();
             db.inner().put(&head, value).unwrap();
-            assert!(crdt.capture_committed_shard(&app).is_err(), "known phase head without a root");
+            assert!(
+                crdt.capture_committed_shard(&app).is_err(),
+                "known phase head without a root"
+            );
             db.inner().put(&head, [0]).unwrap();
-            assert!(crdt.capture_committed_shard(&app).is_err(), "malformed phase head");
+            assert!(
+                crdt.capture_committed_shard(&app).is_err(),
+                "malformed phase head"
+            );
             db.inner().delete(head).unwrap();
         }
     }
@@ -1506,15 +2026,27 @@ mod tests {
     fn crdt_failed_transaction_retries_without_losing_writes_or_advancing_roots() {
         use quil_hypergraph::{HypergraphCrdt, Location};
         use std::sync::atomic::Ordering;
-        let first = Location { app_address: [7; 32], data_address: [8; 32] };
-        let second = Location { app_address: [7; 32], data_address: [9; 32] };
+        let first = Location {
+            app_address: [7; 32],
+            data_address: [8; 32],
+        };
+        let second = Location {
+            app_address: [7; 32],
+            data_address: [9; 32],
+        };
         let cursor = b"test/materialized-frame";
         for baseline in [false, true] {
             let dir = TempDir::new().unwrap();
             let db = Arc::new(RocksDb::open(dir.path()).unwrap());
             let store = Arc::new(RocksHypergraphStore::new(db.inner()));
-            let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
-            crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
+            let crdt = HypergraphCrdt::new(
+                store.clone(),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            );
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                FOREST_NAMESPACE,
+            ));
             if baseline {
                 crdt.add_vertex(&first, b"first").unwrap();
                 crdt.commit_with_global_cursor(1, cursor).unwrap();
@@ -1522,35 +2054,71 @@ mod tests {
             let old_roots = crdt.global_commitments();
             let shard = quil_hypergraph::shard_key_for_location(&second);
             let old_phase_root = crdt.compute_shard_root("vertex", "adds", &shard);
-            let metadata = |c: &HypergraphCrdt| c.shard_metadata_for_address(&second.app_address)
-                .map(|m| (m.commitment, m.leaf_count, m.size));
+            let metadata = |c: &HypergraphCrdt| {
+                c.shard_metadata_for_address(&second.app_address)
+                    .map(|m| (m.commitment, m.leaf_count, m.size))
+            };
             let old_metadata = metadata(&crdt);
             let old_cursor = db.inner().get(cursor).unwrap();
             crdt.add_vertex(&second, b"second").unwrap();
             store.fail_commit.store(true, Ordering::Relaxed);
             for _ in 0..2 {
-                assert!(crdt.commit_with_global_cursor(2, cursor).unwrap_err().is_execution_unavailable());
+                assert!(crdt
+                    .commit_with_global_cursor(2, cursor)
+                    .unwrap_err()
+                    .is_execution_unavailable());
                 assert_eq!(crdt.global_commitments(), old_roots);
-                assert_eq!(crdt.compute_shard_root("vertex", "adds", &shard), old_phase_root);
+                assert_eq!(
+                    crdt.compute_shard_root("vertex", "adds", &shard),
+                    old_phase_root
+                );
                 assert_eq!(metadata(&crdt), old_metadata);
                 assert_eq!(db.inner().get(cursor).unwrap(), old_cursor);
-                assert!(HypergraphStore::load_vertex_underlying_raw(store.as_ref(), "vertex", "adds", &shard, &second.to_id()).unwrap().is_none());
-                assert_eq!(crdt.get_vertex_data_checked(&second).unwrap(), Some(b"second".to_vec()));
+                assert!(HypergraphStore::load_vertex_underlying_raw(
+                    store.as_ref(),
+                    "vertex",
+                    "adds",
+                    &shard,
+                    &second.to_id()
+                )
+                .unwrap()
+                .is_none());
+                assert_eq!(
+                    crdt.get_vertex_data_checked(&second).unwrap(),
+                    Some(b"second".to_vec())
+                );
             }
             store.fail_commit.store(false, Ordering::Relaxed);
             // No re-staging: the failed commits must have retained both maps.
             crdt.commit_with_global_cursor(2, cursor).unwrap();
             let committed_roots = crdt.global_commitments();
             assert_ne!(committed_roots, old_roots);
-            assert_eq!(db.inner().get(cursor).unwrap(), Some(2u64.to_be_bytes().to_vec()));
-            drop(crdt); drop(store); drop(db);
+            assert_eq!(
+                db.inner().get(cursor).unwrap(),
+                Some(2u64.to_be_bytes().to_vec())
+            );
+            drop(crdt);
+            drop(store);
+            drop(db);
             let db = Arc::new(RocksDb::open(dir.path()).unwrap());
             let store = Arc::new(RocksHypergraphStore::new(db.inner()));
-            let reopened = HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
-            reopened.set_forest(quil_forest::Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
+            let reopened =
+                HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
+            reopened.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                FOREST_NAMESPACE,
+            ));
             assert_eq!(reopened.global_commitments(), committed_roots);
-            assert_eq!(reopened.get_vertex_data_checked(&second).unwrap(), Some(b"second".to_vec()));
-            if baseline { assert_eq!(reopened.get_vertex_data_checked(&first).unwrap(), Some(b"first".to_vec())); }
+            assert_eq!(
+                reopened.get_vertex_data_checked(&second).unwrap(),
+                Some(b"second".to_vec())
+            );
+            if baseline {
+                assert_eq!(
+                    reopened.get_vertex_data_checked(&first).unwrap(),
+                    Some(b"first".to_vec())
+                );
+            }
         }
     }
 
@@ -1561,12 +2129,21 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let application = [17; 32];
         let cursor = crate::encoding::consensus_materialized_cursor_key(&application);
-        let location = Location { app_address: application, data_address: [19; 32] };
+        let location = Location {
+            app_address: application,
+            data_address: [19; 32],
+        };
         {
             let db = Arc::new(RocksDb::open(directory.path()).unwrap());
             let store = Arc::new(RocksHypergraphStore::new(db.inner()));
-            let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
-            crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
+            let crdt = HypergraphCrdt::new(
+                store.clone(),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            );
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                FOREST_NAMESPACE,
+            ));
             crdt.checkpoint_frame_cursor(1, &cursor).unwrap();
             crdt.add_vertex(&location, b"pending after sync").unwrap();
             store.fail_commit.store(true, Ordering::Relaxed);
@@ -1576,17 +2153,30 @@ mod tests {
             crdt.checkpoint_frame_cursor(2, &cursor).unwrap();
             assert_eq!(crdt.read_frame_cursor(&cursor).unwrap(), 2);
             let shard = quil_hypergraph::shard_key_for_location(&location);
-            assert!(HypergraphStore::load_vertex_underlying_raw(store.as_ref(), "vertex", "adds",
-                &shard, &location.to_id()).unwrap().is_none());
+            assert!(HypergraphStore::load_vertex_underlying_raw(
+                store.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &location.to_id()
+            )
+            .unwrap()
+            .is_none());
             // The cursor-only transaction neither published nor consumed the pending write.
             crdt.commit_with_frame_cursor(3, &cursor).unwrap();
         }
         let db = Arc::new(RocksDb::open(directory.path()).unwrap());
         let store = Arc::new(RocksHypergraphStore::new(db.inner()));
         let crdt = HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
-        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            FOREST_NAMESPACE,
+        ));
         assert_eq!(crdt.read_frame_cursor(&cursor).unwrap(), 3);
-        assert_eq!(crdt.get_vertex_data_checked(&location).unwrap(), Some(b"pending after sync".to_vec()));
+        assert_eq!(
+            crdt.get_vertex_data_checked(&location).unwrap(),
+            Some(b"pending after sync".to_vec())
+        );
     }
 
     #[test]
@@ -1597,41 +2187,90 @@ mod tests {
         let application = [7; 32];
         let cursor = crate::encoding::consensus_materialized_cursor_key(&application);
         let global_cursor = crate::encoding::global_materialized_cursor_key();
-        let location = Location { app_address: application, data_address: [9; 32] };
+        let location = Location {
+            app_address: application,
+            data_address: [9; 32],
+        };
         let history = vec![
-            (crate::encoding::clock_shard_frame_fee_total_key(&application, 2), 123u128.to_be_bytes().to_vec()),
-            (crate::encoding::clock_shard_frame_settlements_key(&application, 2), vec![4; 12]),
-            (crate::encoding::clock_shard_frame_spends_key(&application, 2), vec![5; 12]),
-            (crate::encoding::clock_shard_frame_accumulator_key(&application, 2), vec![6; 32]),
-            (crate::encoding::clock_shard_accumulator_report_key(&application, &[6; 32]), vec![7; 128]),
+            (
+                crate::encoding::clock_shard_frame_fee_total_key(&application, 2),
+                123u128.to_be_bytes().to_vec(),
+            ),
+            (
+                crate::encoding::clock_shard_frame_settlements_key(&application, 2),
+                vec![4; 12],
+            ),
+            (
+                crate::encoding::clock_shard_frame_spends_key(&application, 2),
+                vec![5; 12],
+            ),
+            (
+                crate::encoding::clock_shard_frame_accumulator_key(&application, 2),
+                vec![6; 32],
+            ),
+            (
+                crate::encoding::clock_shard_accumulator_report_key(&application, &[6; 32]),
+                vec![7; 128],
+            ),
         ];
         {
             let db = Arc::new(RocksDb::open(directory.path()).unwrap());
             let store = Arc::new(RocksHypergraphStore::new(db.inner()));
-            let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
-            crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
+            let crdt = HypergraphCrdt::new(
+                store.clone(),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            );
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                FOREST_NAMESPACE,
+            ));
             assert_eq!(crdt.read_frame_cursor(&cursor).unwrap(), 0);
             db.inner().put(&global_cursor, 77u64.to_be_bytes()).unwrap();
             crdt.commit_with_frame_cursor(1, &cursor).unwrap();
-            crdt.add_vertex(&location, b"committed with cursor").unwrap();
+            crdt.add_vertex(&location, b"committed with cursor")
+                .unwrap();
             store.fail_commit.store(true, Ordering::Relaxed);
-            assert!(crdt.commit_with_frame_cursor_and_records(2, &cursor, &history).is_err());
+            assert!(crdt
+                .commit_with_frame_cursor_and_records(2, &cursor, &history)
+                .is_err());
             assert_eq!(crdt.read_frame_cursor(&cursor).unwrap(), 1);
-            for (key, _) in &history { assert!(db.inner().get(key).unwrap().is_none()); }
+            for (key, _) in &history {
+                assert!(db.inner().get(key).unwrap().is_none());
+            }
             let shard = quil_hypergraph::shard_key_for_location(&location);
-            assert!(HypergraphStore::load_vertex_underlying_raw(store.as_ref(), "vertex", "adds", &shard, &location.to_id()).unwrap().is_none());
+            assert!(HypergraphStore::load_vertex_underlying_raw(
+                store.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &location.to_id()
+            )
+            .unwrap()
+            .is_none());
             store.fail_commit.store(false, Ordering::Relaxed);
-            crdt.commit_with_frame_cursor_and_records(2, &cursor, &history).unwrap();
+            crdt.commit_with_frame_cursor_and_records(2, &cursor, &history)
+                .unwrap();
             assert_eq!(crdt.read_frame_cursor(&cursor).unwrap(), 2);
-            assert_eq!(db.inner().get(&global_cursor).unwrap(), Some(77u64.to_be_bytes().to_vec()));
+            assert_eq!(
+                db.inner().get(&global_cursor).unwrap(),
+                Some(77u64.to_be_bytes().to_vec())
+            );
         }
         let db = Arc::new(RocksDb::open(directory.path()).unwrap());
         let store = Arc::new(RocksHypergraphStore::new(db.inner()));
         let crdt = HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
-        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            FOREST_NAMESPACE,
+        ));
         assert_eq!(crdt.read_frame_cursor(&cursor).unwrap(), 2);
-        assert_eq!(crdt.get_vertex_data_checked(&location).unwrap(), Some(b"committed with cursor".to_vec()));
-        for (key, value) in &history { assert_eq!(db.inner().get(key).unwrap().as_ref(), Some(value)); }
+        assert_eq!(
+            crdt.get_vertex_data_checked(&location).unwrap(),
+            Some(b"committed with cursor".to_vec())
+        );
+        for (key, value) in &history {
+            assert_eq!(db.inner().get(key).unwrap().as_ref(), Some(value));
+        }
         for malformed in [vec![0; 7], vec![0; 9]] {
             db.inner().put(&cursor, malformed).unwrap();
             assert!(crdt.read_frame_cursor(&cursor).is_err());
@@ -1640,57 +2279,107 @@ mod tests {
 
     #[test]
     fn crdt_commit_rejects_corrupt_heads_and_retries_after_repair() {
-        use quil_hypergraph::{HypergraphCrdt, Location};
         use quil_forest::{Forest, Phase};
-        let location = Location { app_address: [7; 32], data_address: [8; 32] };
+        use quil_hypergraph::{HypergraphCrdt, Location};
+        let location = Location {
+            app_address: [7; 32],
+            data_address: [8; 32],
+        };
         for global in [false, true] {
             for bad in [vec![1], 99u64.to_be_bytes().to_vec()] {
                 let dir = TempDir::new().unwrap();
                 let db = Arc::new(RocksDb::open(dir.path()).unwrap());
                 let store = Arc::new(RocksHypergraphStore::new(db.inner()));
-                let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
+                let crdt = HypergraphCrdt::new(
+                    store.clone(),
+                    Arc::new(quil_types::crypto::NoopInclusionProver),
+                );
                 crdt.set_forest(Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
                 crdt.add_vertex(&location, b"old").unwrap();
                 crdt.commit(1).unwrap();
                 drop(crdt);
                 let forest = Forest::with_namespace(db.inner(), FOREST_NAMESPACE);
-                let (head_key, _) = if global { forest.global_head_version_put(7, 0) }
-                    else { forest.head_version_put(&location.app_address, Phase::VertexAdds, 0) }.unwrap();
+                let (head_key, _) = if global {
+                    forest.global_head_version_put(7, 0)
+                } else {
+                    forest.head_version_put(&location.app_address, Phase::VertexAdds, 0)
+                }
+                .unwrap();
                 let valid = db.inner().get(&head_key).unwrap().unwrap();
                 db.inner().put(&head_key, &bad).unwrap();
-                let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
+                let crdt = HypergraphCrdt::new(
+                    store.clone(),
+                    Arc::new(quil_types::crypto::NoopInclusionProver),
+                );
                 crdt.set_forest(forest);
                 crdt.add_vertex(&location, b"new").unwrap();
                 let cursor = b"test/corrupt-head-cursor";
-                assert!(crdt.commit_with_global_cursor(2, cursor).unwrap_err().is_execution_unavailable());
+                assert!(crdt
+                    .commit_with_global_cursor(2, cursor)
+                    .unwrap_err()
+                    .is_execution_unavailable());
                 assert!(db.inner().get(cursor).unwrap().is_none());
                 let shard = quil_hypergraph::shard_key_for_location(&location);
-                assert_eq!(HypergraphStore::load_vertex_underlying_raw(store.as_ref(), "vertex", "adds", &shard,
-                    &location.to_id()).unwrap(), Some(b"old".to_vec()));
+                assert_eq!(
+                    HypergraphStore::load_vertex_underlying_raw(
+                        store.as_ref(),
+                        "vertex",
+                        "adds",
+                        &shard,
+                        &location.to_id()
+                    )
+                    .unwrap(),
+                    Some(b"old".to_vec())
+                );
                 db.inner().put(&head_key, valid).unwrap();
                 // Failure retained the staged update; repair does not restage it.
                 crdt.commit_with_global_cursor(2, cursor).unwrap();
-                assert_eq!(HypergraphStore::load_vertex_underlying_raw(store.as_ref(), "vertex", "adds", &shard,
-                    &location.to_id()).unwrap(), Some(b"new".to_vec()));
-                assert_eq!(db.inner().get(cursor).unwrap(), Some(2u64.to_be_bytes().to_vec()));
+                assert_eq!(
+                    HypergraphStore::load_vertex_underlying_raw(
+                        store.as_ref(),
+                        "vertex",
+                        "adds",
+                        &shard,
+                        &location.to_id()
+                    )
+                    .unwrap(),
+                    Some(b"new".to_vec())
+                );
+                assert_eq!(
+                    db.inner().get(cursor).unwrap(),
+                    Some(2u64.to_be_bytes().to_vec())
+                );
             }
         }
     }
 
     #[test]
     fn crdt_append_preserves_unmarked_migration_trees_and_other_apps() {
-        use quil_hypergraph::{HypergraphCrdt, Location};
         use quil_forest::{Forest, Phase};
+        use quil_hypergraph::{HypergraphCrdt, Location};
         let app = [7; 32];
-        let mut other_app = app; other_app[31] = 9; // same L1 bucket
-        let first = Location { app_address: app, data_address: [1; 32] };
-        let next = Location { app_address: app, data_address: [2; 32] };
-        let other = Location { app_address: other_app, data_address: [3; 32] };
+        let mut other_app = app;
+        other_app[31] = 9; // same L1 bucket
+        let first = Location {
+            app_address: app,
+            data_address: [1; 32],
+        };
+        let next = Location {
+            app_address: app,
+            data_address: [2; 32],
+        };
+        let other = Location {
+            app_address: other_app,
+            data_address: [3; 32],
+        };
         let run = |unmarked: bool| {
             let dir = TempDir::new().unwrap();
             let db = Arc::new(RocksDb::open(dir.path()).unwrap());
             let store = Arc::new(RocksHypergraphStore::new(db.inner()));
-            let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
+            let crdt = HypergraphCrdt::new(
+                store.clone(),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            );
             crdt.set_forest(Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
             crdt.add_vertex(&first, b"first").unwrap();
             crdt.add_vertex(&other, b"other-app").unwrap();
@@ -1705,24 +2394,47 @@ mod tests {
                 db.inner().delete(phase_key).unwrap();
                 db.inner().delete(global_key).unwrap();
             }
-            let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
+            let crdt = HypergraphCrdt::new(
+                store.clone(),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            );
             crdt.set_forest(forest);
             crdt.add_vertex(&next, b"next").unwrap();
             crdt.commit(2).unwrap();
             let roots = crdt.global_commitments();
-            let phase = crdt.compute_shard_root("vertex", "adds", &quil_hypergraph::shard_key_for_location(&first));
-            drop(crdt); drop(store); drop(db);
+            let phase = crdt.compute_shard_root(
+                "vertex",
+                "adds",
+                &quil_hypergraph::shard_key_for_location(&first),
+            );
+            drop(crdt);
+            drop(store);
+            drop(db);
             let db = Arc::new(RocksDb::open(dir.path()).unwrap());
             let forest = Forest::with_namespace(db.inner(), FOREST_NAMESPACE);
-            assert_eq!(forest.read_head_version(&app, Phase::VertexAdds).unwrap(), Some(1));
+            assert_eq!(
+                forest.read_head_version(&app, Phase::VertexAdds).unwrap(),
+                Some(1)
+            );
             assert_eq!(forest.read_global_head_version(7).unwrap(), Some(1));
-            let reopened = HypergraphCrdt::new(Arc::new(RocksHypergraphStore::new(db.inner())),
-                Arc::new(quil_types::crypto::NoopInclusionProver));
+            let reopened = HypergraphCrdt::new(
+                Arc::new(RocksHypergraphStore::new(db.inner())),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            );
             reopened.set_forest(forest);
             assert_eq!(reopened.global_commitments(), roots);
-            assert_eq!(reopened.get_vertex_data_checked(&first).unwrap(), Some(b"first".to_vec()));
-            assert_eq!(reopened.get_vertex_data_checked(&next).unwrap(), Some(b"next".to_vec()));
-            assert_eq!(reopened.get_vertex_data_checked(&other).unwrap(), Some(b"other-app".to_vec()));
+            assert_eq!(
+                reopened.get_vertex_data_checked(&first).unwrap(),
+                Some(b"first".to_vec())
+            );
+            assert_eq!(
+                reopened.get_vertex_data_checked(&next).unwrap(),
+                Some(b"next".to_vec())
+            );
+            assert_eq!(
+                reopened.get_vertex_data_checked(&other).unwrap(),
+                Some(b"other-app".to_vec())
+            );
             (roots, phase)
         };
         // Equal commitments prove that the old leaf and untouched app are
@@ -1742,16 +2454,24 @@ mod tests {
         };
 
         // Absent key returns Ok(None).
-        assert!(store.load_tree_blob("vertex", "adds", &shard).unwrap().is_none());
+        assert!(store
+            .load_tree_blob("vertex", "adds", &shard)
+            .unwrap()
+            .is_none());
 
         // Save and read back.
         let blob = vec![1u8, 2, 3, 4, 5];
-        store.save_tree_blob("vertex", "adds", &shard, &blob).unwrap();
+        store
+            .save_tree_blob("vertex", "adds", &shard, &blob)
+            .unwrap();
         let loaded = store.load_tree_blob("vertex", "adds", &shard).unwrap();
         assert_eq!(loaded, Some(blob));
 
         // Different phase → different key → still absent.
-        assert!(store.load_tree_blob("vertex", "removes", &shard).unwrap().is_none());
+        assert!(store
+            .load_tree_blob("vertex", "removes", &shard)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1765,11 +2485,7 @@ mod tests {
             l2: [0xffu8; 32],
         };
 
-        let keys = [
-            vec![0xAA; 64],
-            vec![0xBB; 64],
-            vec![0xCC; 64],
-        ];
+        let keys = [vec![0xAA; 64], vec![0xBB; 64], vec![0xCC; 64]];
         let data = [b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()];
 
         // Empty-phase point lookup returns Ok(None).
@@ -1833,14 +2549,20 @@ mod tests {
         };
 
         // Stage some pre-capture data across multiple phases/shards.
-        store.save_tree_blob("vertex", "adds", &shard, b"v-adds-pre").unwrap();
-        store.save_tree_blob("vertex", "removes", &shard, b"v-removes-pre").unwrap();
+        store
+            .save_tree_blob("vertex", "adds", &shard, b"v-adds-pre")
+            .unwrap();
+        store
+            .save_tree_blob("vertex", "removes", &shard, b"v-removes-pre")
+            .unwrap();
 
         // Capture.
         let snap = store.capture_snapshot().unwrap();
 
         // Mutate the live store AFTER capture.
-        store.save_tree_blob("vertex", "adds", &shard, b"v-adds-POST").unwrap();
+        store
+            .save_tree_blob("vertex", "adds", &shard, b"v-adds-POST")
+            .unwrap();
         // Add a new shard entirely after capture; the snapshot must
         // not see it.
         let new_shard = ShardKey {
@@ -1878,10 +2600,12 @@ mod tests {
         // The live store DOES see the new state — confirming we
         // really did mutate the underlying DB after capture.
         assert_eq!(
-            store.load_tree_blob("vertex", "adds", &shard).unwrap().as_deref(),
+            store
+                .load_tree_blob("vertex", "adds", &shard)
+                .unwrap()
+                .as_deref(),
             Some(&b"v-adds-POST"[..])
         );
-
     }
 
     // The registry-refresh path (`for_each_vertex_underlying`) must see blobs
@@ -1892,24 +2616,142 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = RocksDb::open(tmp.path()).unwrap();
         let store = RocksHypergraphStore::new(Arc::new(db).inner());
-        let shard = ShardKey { l1: [1, 2, 3], l2: [0xffu8; 32] };
+        let shard = ShardKey {
+            l1: [1, 2, 3],
+            l2: [0xffu8; 32],
+        };
 
         // A v2 (versioned-commit) vertex and a legacy (pre-migration) vertex.
         let vk_v2 = vec![0xAAu8; 64];
         let vk_legacy = vec![0xBBu8; 64];
         let txn = store.new_transaction(false).unwrap();
-        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk_v2, b"newest", 2).unwrap();
-        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk_v2, b"OLD", 1).unwrap();
+        store
+            .save_vertex_underlying_versioned(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &vk_v2,
+                b"newest",
+                2,
+            )
+            .unwrap();
+        store
+            .save_vertex_underlying_versioned(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &vk_v2,
+                b"OLD",
+                1,
+            )
+            .unwrap();
         txn.commit().unwrap();
-        store.save_vertex_underlying("vertex", "adds", &shard, &vk_legacy, b"legacy").unwrap();
+        store
+            .save_vertex_underlying("vertex", "adds", &shard, &vk_legacy, b"legacy")
+            .unwrap();
 
-        let mut seen: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
-        store.for_each_vertex_underlying("vertex", "adds", &shard, |vk: Vec<u8>, d: Vec<u8>| {
-            seen.insert(vk, d);
-        }).unwrap();
-        assert_eq!(seen.get(&vk_v2).map(|v| v.as_slice()), Some(&b"newest"[..]), "v2 latest version");
-        assert_eq!(seen.get(&vk_legacy).map(|v| v.as_slice()), Some(&b"legacy"[..]), "legacy fallback");
+        let mut seen: std::collections::HashMap<Vec<u8>, Vec<u8>> =
+            std::collections::HashMap::new();
+        store
+            .for_each_vertex_underlying("vertex", "adds", &shard, |vk: Vec<u8>, d: Vec<u8>| {
+                seen.insert(vk, d);
+            })
+            .unwrap();
+        assert_eq!(
+            seen.get(&vk_v2).map(|v| v.as_slice()),
+            Some(&b"newest"[..]),
+            "v2 latest version"
+        );
+        assert_eq!(
+            seen.get(&vk_legacy).map(|v| v.as_slice()),
+            Some(&b"legacy"[..]),
+            "legacy fallback"
+        );
         assert_eq!(seen.len(), 2);
+    }
+
+    // A removes-phase blob of any age hides its vertex, so deleting a blob
+    // from version 0 must take the unversioned one an old store still holds.
+    #[test]
+    fn deleting_from_version_zero_takes_the_unversioned_blob() {
+        use quil_types::store::HypergraphStore;
+        let tmp = TempDir::new().unwrap();
+        let db = RocksDb::open(tmp.path()).unwrap();
+        let store = RocksHypergraphStore::new(Arc::new(db).inner());
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: [0xffu8; 32],
+        };
+        let (legacy, kept) = (vec![0xAAu8; 64], vec![0xBBu8; 64]);
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .save_vertex_underlying_versioned(
+                txn.as_ref(),
+                "vertex",
+                "removes",
+                &shard,
+                &legacy,
+                b"",
+                3,
+            )
+            .unwrap();
+        store
+            .save_vertex_underlying_versioned(
+                txn.as_ref(),
+                "vertex",
+                "removes",
+                &shard,
+                &kept,
+                b"",
+                3,
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        store
+            .save_vertex_underlying("vertex", "removes", &shard, &legacy, b"")
+            .unwrap();
+        store
+            .save_vertex_underlying("vertex", "removes", &shard, &kept, b"")
+            .unwrap();
+
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .delete_vertex_underlying_versions_from(
+                txn.as_ref(),
+                "vertex",
+                "removes",
+                &shard,
+                &legacy,
+                0,
+            )
+            .unwrap();
+        store
+            .delete_vertex_underlying_versions_from(
+                txn.as_ref(),
+                "vertex",
+                "removes",
+                &shard,
+                &kept,
+                1,
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            HypergraphStore::load_vertex_underlying_raw(
+                &store, "vertex", "removes", &shard, &legacy
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            HypergraphStore::load_vertex_underlying_raw(&store, "vertex", "removes", &shard, &kept)
+                .unwrap()
+                .as_deref(),
+            Some(&b""[..]),
+            "a deletion from a later version keeps the unversioned blob"
+        );
     }
 
     // A captured snapshot must read the versioned (v2) latest blob too, or a
@@ -1920,23 +2762,50 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = RocksDb::open(tmp.path()).unwrap();
         let store = RocksHypergraphStore::new(Arc::new(db).inner());
-        let shard = ShardKey { l1: [9, 9, 9], l2: [0x77u8; 32] };
+        let shard = ShardKey {
+            l1: [9, 9, 9],
+            l2: [0x77u8; 32],
+        };
         let vk = vec![0xCDu8; 48];
 
         let txn = store.new_transaction(false).unwrap();
-        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"gen-old", 1).unwrap();
-        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"gen-new", 2).unwrap();
+        store
+            .save_vertex_underlying_versioned(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &vk,
+                b"gen-old",
+                1,
+            )
+            .unwrap();
+        store
+            .save_vertex_underlying_versioned(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &vk,
+                b"gen-new",
+                2,
+            )
+            .unwrap();
         txn.commit().unwrap();
 
         // Live adapter (SnapshotReadable for RocksHypergraphStore) → v2 latest.
         assert_eq!(
-            SnapshotReadable::load_vertex_underlying_raw(&store, "vertex", "adds", &shard, &vk).unwrap().as_deref(),
+            SnapshotReadable::load_vertex_underlying_raw(&store, "vertex", "adds", &shard, &vk)
+                .unwrap()
+                .as_deref(),
             Some(&b"gen-new"[..])
         );
         // Captured snapshot → v2 latest at capture.
         let snap = store.capture_snapshot().unwrap();
         assert_eq!(
-            snap.load_vertex_underlying_raw("vertex", "adds", &shard, &vk).unwrap().as_deref(),
+            snap.load_vertex_underlying_raw("vertex", "adds", &shard, &vk)
+                .unwrap()
+                .as_deref(),
             Some(&b"gen-new"[..])
         );
     }
@@ -1951,39 +2820,128 @@ mod tests {
         let db = RocksDb::open(tmp.path()).unwrap();
         let store = RocksHypergraphStore::new(Arc::new(db).inner());
 
-        let shard = ShardKey { l1: [0u8; 3], l2: [0xffu8; 32] };
+        let shard = ShardKey {
+            l1: [0u8; 3],
+            l2: [0xffu8; 32],
+        };
         let vk = vec![0x11u8; 32];
 
         // Three versioned writes of the same vertex at versions 1,2,3.
         let txn = store.new_transaction(false).unwrap();
-        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"v1", 1).unwrap();
-        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"v2", 2).unwrap();
-        store.save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"v3", 3).unwrap();
+        store
+            .save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"v1", 1)
+            .unwrap();
+        store
+            .save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"v2", 2)
+            .unwrap();
+        store
+            .save_vertex_underlying_versioned(txn.as_ref(), "vertex", "adds", &shard, &vk, b"v3", 3)
+            .unwrap();
         // Root→(version,frame) index: rootA@(1,50), rootB@(2,100), rootC@(3,200).
-        store.put_root_version(txn.as_ref(), "vertex", "adds", &shard.l2, &[0xA1u8; 32], 1, 50).unwrap();
-        store.put_root_version(txn.as_ref(), "vertex", "adds", &shard.l2, &[0xB2u8; 32], 2, 100).unwrap();
-        store.put_root_version(txn.as_ref(), "vertex", "adds", &shard.l2, &[0xC3u8; 32], 3, 200).unwrap();
+        store
+            .put_root_version(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard.l2,
+                &[0xA1u8; 32],
+                1,
+                50,
+            )
+            .unwrap();
+        store
+            .put_root_version(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard.l2,
+                &[0xB2u8; 32],
+                2,
+                100,
+            )
+            .unwrap();
+        store
+            .put_root_version(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard.l2,
+                &[0xC3u8; 32],
+                3,
+                200,
+            )
+            .unwrap();
         txn.commit().unwrap();
 
         // MVCC "latest write ≤ V".
-        assert_eq!(store.load_vertex_underlying_at("vertex", "adds", &shard, &vk, 1).unwrap().as_deref(), Some(&b"v1"[..]));
-        assert_eq!(store.load_vertex_underlying_at("vertex", "adds", &shard, &vk, 2).unwrap().as_deref(), Some(&b"v2"[..]));
-        assert_eq!(store.load_vertex_underlying_at("vertex", "adds", &shard, &vk, 5).unwrap().as_deref(), Some(&b"v3"[..]));
+        assert_eq!(
+            store
+                .load_vertex_underlying_at("vertex", "adds", &shard, &vk, 1)
+                .unwrap()
+                .as_deref(),
+            Some(&b"v1"[..])
+        );
+        assert_eq!(
+            store
+                .load_vertex_underlying_at("vertex", "adds", &shard, &vk, 2)
+                .unwrap()
+                .as_deref(),
+            Some(&b"v2"[..])
+        );
+        assert_eq!(
+            store
+                .load_vertex_underlying_at("vertex", "adds", &shard, &vk, 5)
+                .unwrap()
+                .as_deref(),
+            Some(&b"v3"[..])
+        );
 
         // Root resolution.
-        assert_eq!(store.get_root_version("vertex", "adds", &shard.l2, &[0xB2u8; 32]).unwrap(), Some((2, 100)));
+        assert_eq!(
+            store
+                .get_root_version("vertex", "adds", &shard.l2, &[0xB2u8; 32])
+                .unwrap(),
+            Some((2, 100))
+        );
 
         // Prune at cull_frame=150 → tree watermark = max{ver : frame ≤ 150} = 2.
         let watermarks = store.prune_versioned(150).unwrap();
         assert_eq!(watermarks, vec![(shard.l2.to_vec(), 0usize, 2u64)]);
 
         // Blob version 1 (< watermark) is gone; 2 (the floor) and 3 remain.
-        assert_eq!(store.load_vertex_underlying_at("vertex", "adds", &shard, &vk, 2).unwrap().as_deref(), Some(&b"v2"[..]));
-        assert_eq!(store.load_vertex_underlying_at("vertex", "adds", &shard, &vk, 5).unwrap().as_deref(), Some(&b"v3"[..]));
+        assert_eq!(
+            store
+                .load_vertex_underlying_at("vertex", "adds", &shard, &vk, 2)
+                .unwrap()
+                .as_deref(),
+            Some(&b"v2"[..])
+        );
+        assert_eq!(
+            store
+                .load_vertex_underlying_at("vertex", "adds", &shard, &vk, 5)
+                .unwrap()
+                .as_deref(),
+            Some(&b"v3"[..])
+        );
         // rootA (ver 1 < watermark) is dropped from the index; rootB/rootC remain.
-        assert_eq!(store.get_root_version("vertex", "adds", &shard.l2, &[0xA1u8; 32]).unwrap(), None);
-        assert_eq!(store.get_root_version("vertex", "adds", &shard.l2, &[0xB2u8; 32]).unwrap(), Some((2, 100)));
-        assert_eq!(store.get_root_version("vertex", "adds", &shard.l2, &[0xC3u8; 32]).unwrap(), Some((3, 200)));
+        assert_eq!(
+            store
+                .get_root_version("vertex", "adds", &shard.l2, &[0xA1u8; 32])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .get_root_version("vertex", "adds", &shard.l2, &[0xB2u8; 32])
+                .unwrap(),
+            Some((2, 100))
+        );
+        assert_eq!(
+            store
+                .get_root_version("vertex", "adds", &shard.l2, &[0xC3u8; 32])
+                .unwrap(),
+            Some((3, 200))
+        );
     }
 
     #[test]
@@ -1995,7 +2953,10 @@ mod tests {
         let open = |path: &std::path::Path| {
             let db = Arc::new(RocksDb::open(path).unwrap());
             let store = Arc::new(RocksHypergraphStore::new(db.inner()));
-            let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
+            let crdt = HypergraphCrdt::new(
+                store.clone(),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            );
             crdt.set_forest(Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
             (db, store, crdt)
         };
@@ -2003,59 +2964,121 @@ mod tests {
         let target_dir = TempDir::new().unwrap();
         let (source_db, _, source) = open(source_dir.path());
         let app = [0x21; 32];
-        let location = |key| Location { app_address: app, data_address: [key; 32] };
-        for key in 1..=3 { source.add_vertex(&location(key), &vec![key; 48]).unwrap(); }
+        let location = |key| Location {
+            app_address: app,
+            data_address: [key; 32],
+        };
+        for key in 1..=3 {
+            source.add_vertex(&location(key), &vec![key; 48]).unwrap();
+        }
         source.commit(1).unwrap();
         let (version, root) = source.serve_forest_head(&app, 0).unwrap();
         let source_forest = Forest::with_namespace(source_db.inner(), FOREST_NAMESPACE);
         let reader = source_forest.shard_phase_reader(&app, PHASES[0]);
         let blobs = |plan: &quil_hypergraph::crdt::ForestSyncPlan, count| {
-            plan.remaining().iter().take(count).map(|(key, _)| vec![key[0]; 48]).collect::<Vec<_>>()
+            plan.remaining()
+                .iter()
+                .take(count)
+                .map(|(key, _)| vec![key[0]; 48])
+                .collect::<Vec<_>>()
         };
         let first;
         {
             let (_db, store, target) = open(target_dir.path());
-            let mut plan = target.prepare_phase_sync(&reader, version, &app, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+            let mut plan = target
+                .prepare_phase_sync(
+                    &reader,
+                    version,
+                    &app,
+                    0,
+                    &[],
+                    Some(SubtreeSyncAnchor::AppRoot(root)),
+                )
+                .unwrap();
             assert_eq!(plan.remaining().len(), 3);
             // Preparing, or abandoning a failed download, publishes nothing.
             assert!(target.serve_forest_head(&app, 0).is_none());
             assert!(target.finish_phase_sync(&plan).is_err());
             first = plan.remaining()[0].0[0];
-            assert!(target.apply_sync_chunk(&mut plan, &[b"wrong blob".to_vec()]).is_err());
+            assert!(target
+                .apply_sync_chunk(&mut plan, &[b"wrong blob".to_vec()])
+                .is_err());
             assert!(target.serve_forest_head(&app, 0).is_none());
-            assert!(target.get_vertex_data_checked(&location(first)).unwrap().is_none());
+            assert!(target
+                .get_vertex_data_checked(&location(first))
+                .unwrap()
+                .is_none());
             let first_blob = blobs(&plan, 1);
             target.apply_sync_chunk(&mut plan, &first_blob).unwrap();
-            assert_eq!(target.get_vertex_data_checked(&location(first)).unwrap(), Some(vec![first; 48]));
+            assert_eq!(
+                target.get_vertex_data_checked(&location(first)).unwrap(),
+                Some(vec![first; 48])
+            );
             let committed = target.serve_forest_head(&app, 0).unwrap();
             assert_ne!(committed.1, root, "one chunk is not the complete sync");
-            assert!(target.sync_incomplete(&app, &[]).unwrap(), "a partial scope is incomplete");
-            assert!(target.sync_incomplete(&app, &[true, false]).unwrap(), "and so is every range inside it");
+            assert!(
+                target.sync_incomplete(&app, &[]).unwrap(),
+                "a partial scope is incomplete"
+            );
+            assert!(
+                target.sync_incomplete(&app, &[true, false]).unwrap(),
+                "and so is every range inside it"
+            );
             assert!(!target.sync_incomplete(&[0x22; 32], &[]).unwrap());
             let next = plan.remaining()[0].0[0];
             let next_blob = blobs(&plan, 1);
             store.fail_commit.store(true, Ordering::Relaxed);
             assert!(target.apply_sync_chunk(&mut plan, &next_blob).is_err());
             assert_eq!(target.serve_forest_head(&app, 0), Some(committed));
-            assert!(target.get_vertex_data_checked(&location(next)).unwrap().is_none());
-            assert_eq!(plan.remaining().len(), 2, "failed commit must not consume the plan");
+            assert!(target
+                .get_vertex_data_checked(&location(next))
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                plan.remaining().len(),
+                2,
+                "failed commit must not consume the plan"
+            );
             // Drop the plan and process state while only the first chunk exists.
         }
         let (_target_db, _, target) = open(target_dir.path());
-        assert!(target.sync_incomplete(&app, &[false]).unwrap(), "an interrupted scope stays incomplete across restarts");
-        let mut resumed = target.prepare_phase_sync(&reader, version, &app, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+        assert!(
+            target.sync_incomplete(&app, &[false]).unwrap(),
+            "an interrupted scope stays incomplete across restarts"
+        );
+        let mut resumed = target
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &app,
+                0,
+                &[],
+                Some(SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
         for key in (1..=3).filter(|key| *key != first) {
-            assert!(resumed.remaining().iter().any(|(address, _)| address[0] == key),
-                "a restarted diff must include every missing blob");
+            assert!(
+                resumed
+                    .remaining()
+                    .iter()
+                    .any(|(address, _)| address[0] == key),
+                "a restarted diff must include every missing blob"
+            );
         }
         // A compressed singleton target can be returned again while the
         // source branches; replaying that already-complete leaf is harmless.
         let remaining = blobs(&resumed, resumed.remaining().len());
         target.apply_sync_chunk(&mut resumed, &remaining).unwrap();
         assert_eq!(target.finish_phase_sync(&resumed).unwrap(), root);
-        assert!(!target.sync_incomplete(&app, &[]).unwrap(), "the last chunk completes the scope");
+        assert!(
+            !target.sync_incomplete(&app, &[]).unwrap(),
+            "the last chunk completes the scope"
+        );
         for key in 1..=3 {
-            assert_eq!(target.get_vertex_data_checked(&location(key)).unwrap(), Some(vec![key; 48]));
+            assert_eq!(
+                target.get_vertex_data_checked(&location(key)).unwrap(),
+                Some(vec![key; 48])
+            );
         }
 
         // Upgrade recovery: the old implementation could persist the complete
@@ -2064,10 +3087,24 @@ mod tests {
         let broken_dir = TempDir::new().unwrap();
         {
             let (_db, _, broken) = open(broken_dir.path());
-            broken.sync_shard_phase_from(&reader, version, &app, 0).unwrap();
+            broken
+                .sync_shard_phase_from(&reader, version, &app, 0)
+                .unwrap();
             assert_eq!(broken.serve_forest_head(&app, 0).unwrap().1, root);
-            assert!(broken.get_vertex_data_checked(&location(1)).unwrap().is_none());
-            let mut repair = broken.prepare_phase_sync(&reader, version, &app, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+            assert!(broken
+                .get_vertex_data_checked(&location(1))
+                .unwrap()
+                .is_none());
+            let mut repair = broken
+                .prepare_phase_sync(
+                    &reader,
+                    version,
+                    &app,
+                    0,
+                    &[],
+                    Some(SubtreeSyncAnchor::AppRoot(root)),
+                )
+                .unwrap();
             assert_eq!(repair.remaining().len(), 3);
             let one = blobs(&repair, 1);
             broken.apply_sync_chunk(&mut repair, &one).unwrap();
@@ -2075,16 +3112,45 @@ mod tests {
         }
         {
             let (_db, _, broken) = open(broken_dir.path());
-            let mut repair = broken.prepare_phase_sync(&reader, version, &app, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
-            assert_eq!(repair.remaining().len(), 3, "an unfinished legacy audit must resume");
+            let mut repair = broken
+                .prepare_phase_sync(
+                    &reader,
+                    version,
+                    &app,
+                    0,
+                    &[],
+                    Some(SubtreeSyncAnchor::AppRoot(root)),
+                )
+                .unwrap();
+            assert_eq!(
+                repair.remaining().len(),
+                3,
+                "an unfinished legacy audit must resume"
+            );
             let all = blobs(&repair, 3);
             broken.apply_sync_chunk(&mut repair, &all).unwrap();
             assert_eq!(broken.finish_phase_sync(&repair).unwrap(), root);
             assert!(broken.sync_data_ready(&app, 0, &[]).unwrap());
-            assert!(broken.prepare_phase_sync(&reader, version, &app, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root)))
-                .unwrap().remaining().is_empty(), "verified data enables the cheap Merkle diff");
+            assert!(
+                broken
+                    .prepare_phase_sync(
+                        &reader,
+                        version,
+                        &app,
+                        0,
+                        &[],
+                        Some(SubtreeSyncAnchor::AppRoot(root))
+                    )
+                    .unwrap()
+                    .remaining()
+                    .is_empty(),
+                "verified data enables the cheap Merkle diff"
+            );
             for key in 1..=3 {
-                assert_eq!(broken.get_vertex_data_checked(&location(key)).unwrap(), Some(vec![key; 48]));
+                assert_eq!(
+                    broken.get_vertex_data_checked(&location(key)).unwrap(),
+                    Some(vec![key; 48])
+                );
             }
         }
 
@@ -2094,29 +3160,70 @@ mod tests {
         source.commit(2).unwrap();
         let (removed_version, removed_root) = source.serve_forest_head(&app, 1).unwrap();
         let removed_reader = source_forest.shard_phase_reader(&app, PHASES[1]);
-        let mut removal = target.prepare_phase_sync(&removed_reader, removed_version, &app, 1, &[],
-            Some(SubtreeSyncAnchor::AppRoot(removed_root))).unwrap();
+        let mut removal = target
+            .prepare_phase_sync(
+                &removed_reader,
+                removed_version,
+                &app,
+                1,
+                &[],
+                Some(SubtreeSyncAnchor::AppRoot(removed_root)),
+            )
+            .unwrap();
         assert_eq!(removal.remaining().len(), 1);
-        target.apply_sync_chunk(&mut removal, &[Vec::new()]).unwrap();
+        target
+            .apply_sync_chunk(&mut removal, &[Vec::new()])
+            .unwrap();
         assert_eq!(target.finish_phase_sync(&removal).unwrap(), removed_root);
-        assert!(target.get_vertex_data_checked(&location(first)).unwrap().is_none());
+        assert!(target
+            .get_vertex_data_checked(&location(first))
+            .unwrap()
+            .is_none());
 
         // A concurrent local commit invalidates a downloaded plan. It cannot
         // be overwritten or blended into an older certified source snapshot.
         source.add_vertex(&location(4), &[4; 48]).unwrap();
         source.commit(3).unwrap();
         let (version, root) = source.serve_forest_head(&app, 0).unwrap();
-        let mut stale = target.prepare_phase_sync(&reader, version, &app, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).unwrap();
+        let mut stale = target
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &app,
+                0,
+                &[],
+                Some(SubtreeSyncAnchor::AppRoot(root)),
+            )
+            .unwrap();
         let downloaded = blobs(&stale, 1);
         target.add_vertex(&location(5), &[5; 48]).unwrap();
         target.commit(4).unwrap();
         let before = target.serve_forest_head(&app, 0);
         assert!(target.apply_sync_chunk(&mut stale, &downloaded).is_err());
         assert_eq!(target.serve_forest_head(&app, 0), before);
-        assert!(target.get_vertex_data_checked(&location(4)).unwrap().is_none());
-        assert_eq!(target.get_vertex_data_checked(&location(5)).unwrap(), Some(vec![5; 48]));
-        assert!(target.prepare_phase_sync(&reader, version, &app, 0, &[], Some(SubtreeSyncAnchor::AppRoot(root))).is_err());
-        assert_eq!(target.serve_forest_head(&app, 0), before, "failed reconstruction must publish no chunk");
+        assert!(target
+            .get_vertex_data_checked(&location(4))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            target.get_vertex_data_checked(&location(5)).unwrap(),
+            Some(vec![5; 48])
+        );
+        assert!(target
+            .prepare_phase_sync(
+                &reader,
+                version,
+                &app,
+                0,
+                &[],
+                Some(SubtreeSyncAnchor::AppRoot(root))
+            )
+            .is_err());
+        assert_eq!(
+            target.serve_forest_head(&app, 0),
+            before,
+            "failed reconstruction must publish no chunk"
+        );
     }
 
     #[test]
@@ -2126,23 +3233,40 @@ mod tests {
 
         for phase in [0, 2] {
             let set = if phase == 0 { "vertex" } else { "hyperedge" };
-            let add = if phase == 0 { HypergraphCrdt::add_vertex } else { HypergraphCrdt::add_hyperedge };
-            let read = if phase == 0 { HypergraphCrdt::get_vertex_data_checked } else { HypergraphCrdt::get_hyperedge_data_checked };
+            let add = if phase == 0 {
+                HypergraphCrdt::add_vertex
+            } else {
+                HypergraphCrdt::add_hyperedge
+            };
+            let read = if phase == 0 {
+                HypergraphCrdt::get_vertex_data_checked
+            } else {
+                HypergraphCrdt::get_hyperedge_data_checked
+            };
             let open = |path: &std::path::Path| {
                 let db = RocksDb::open(path).unwrap();
                 let store = Arc::new(RocksHypergraphStore::new(db.inner()));
-                let crdt = HypergraphCrdt::new(store.clone(), Arc::new(quil_types::crypto::NoopInclusionProver));
+                let crdt = HypergraphCrdt::new(
+                    store.clone(),
+                    Arc::new(quil_types::crypto::NoopInclusionProver),
+                );
                 crdt.set_forest(Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
                 (db, store, crdt)
             };
             let source_dir = TempDir::new().unwrap();
             let target_dir = TempDir::new().unwrap();
             let app = [0xff; 32];
-            let location = |key| Location { app_address: app, data_address: [key; 32] };
+            let location = |key| Location {
+                app_address: app,
+                data_address: [key; 32],
+            };
             let extra = location(1);
             let common = location(2);
             let new = location(3);
-            let other = Location { app_address: [0x71; 32], data_address: [1; 32] };
+            let other = Location {
+                app_address: [0x71; 32],
+                data_address: [1; 32],
+            };
             let shard = quil_hypergraph::shard_key_for_location(&extra);
             let (source_db, _, source) = open(source_dir.path());
             add(&source, &common, b"canonical").unwrap();
@@ -2161,18 +3285,30 @@ mod tests {
                 target.commit(1).unwrap();
                 let before = target.serve_forest_head(&app, phase).unwrap();
                 old_version = before.0;
-                let mut plan = target.prepare_phase_sync(&reader, version, &app, phase, &[], anchor).unwrap();
+                let mut plan = target
+                    .prepare_phase_sync(&reader, version, &app, phase, &[], anchor)
+                    .unwrap();
                 assert_eq!(plan.remaining()[0], (extra.data_address, None));
-                assert!(target.apply_sync_chunk(&mut plan, &[b"cannot write a deletion value".to_vec()]).is_err());
+                assert!(target
+                    .apply_sync_chunk(&mut plan, &[b"cannot write a deletion value".to_vec()])
+                    .is_err());
                 store.fail_commit_for_test(true);
                 assert!(target.apply_sync_chunk(&mut plan, &[Vec::new()]).is_err());
                 assert_eq!(target.serve_forest_head(&app, phase), Some(before));
-                assert_eq!(read(&target, &extra).unwrap(), Some(b"noncanonical join".to_vec()));
+                assert_eq!(
+                    read(&target, &extra).unwrap(),
+                    Some(b"noncanonical join".to_vec())
+                );
                 assert_eq!(plan.remaining().len(), 3);
                 store.fail_commit_for_test(false);
                 target.apply_sync_chunk(&mut plan, &[Vec::new()]).unwrap();
                 assert!(read(&target, &extra).unwrap().is_none());
-                assert_eq!(store.load_vertex_underlying_at(set, "adds", &shard, &extra.to_id(), old_version).unwrap(), Some(b"noncanonical join".to_vec()));
+                assert_eq!(
+                    store
+                        .load_vertex_underlying_at(set, "adds", &shard, &extra.to_id(), old_version)
+                        .unwrap(),
+                    Some(b"noncanonical join".to_vec())
+                );
                 assert!(!target.sync_data_ready(&app, phase, &[]).unwrap());
                 assert!(target.finish_phase_sync(&plan).is_err());
                 // Reopen with the deletion committed but the two puts missing.
@@ -2181,25 +3317,48 @@ mod tests {
                 let (_db, store, target) = open(target_dir.path());
                 assert!(read(&target, &extra).unwrap().is_none());
                 assert_eq!(read(&target, &common).unwrap(), Some(b"stale".to_vec()));
-                let mut plan = target.prepare_phase_sync(&reader, version, &app, phase, &[], anchor).unwrap();
+                let mut plan = target
+                    .prepare_phase_sync(&reader, version, &app, phase, &[], anchor)
+                    .unwrap();
                 assert_eq!(plan.remaining().len(), 2);
-                let blobs = plan.remaining().iter().map(|(key, value)| {
-                    assert!(value.is_some());
-                    read(&source, &location(key[0])).unwrap().unwrap()
-                }).collect::<Vec<_>>();
+                let blobs = plan
+                    .remaining()
+                    .iter()
+                    .map(|(key, value)| {
+                        assert!(value.is_some());
+                        read(&source, &location(key[0])).unwrap().unwrap()
+                    })
+                    .collect::<Vec<_>>();
                 target.apply_sync_chunk(&mut plan, &blobs).unwrap();
                 assert_eq!(target.finish_phase_sync(&plan).unwrap(), root);
                 assert!(target.sync_data_ready(&app, phase, &[]).unwrap());
-                assert_eq!(store.load_vertex_underlying_at(set, "adds", &shard, &extra.to_id(), old_version).unwrap(), Some(b"noncanonical join".to_vec()));
+                assert_eq!(
+                    store
+                        .load_vertex_underlying_at(set, "adds", &shard, &extra.to_id(), old_version)
+                        .unwrap(),
+                    Some(b"noncanonical join".to_vec())
+                );
             }
             let (_db, store, target) = open(target_dir.path());
             assert_eq!(target.serve_forest_head(&app, phase).unwrap().1, root);
             assert!(read(&target, &extra).unwrap().is_none());
             assert_eq!(read(&target, &common).unwrap(), Some(b"canonical".to_vec()));
             assert_eq!(read(&target, &new).unwrap(), Some(b"new".to_vec()));
-            assert_eq!(read(&target, &other).unwrap(), Some(b"unrelated application".to_vec()));
-            assert_eq!(store.load_vertex_underlying_at(set, "adds", &shard, &extra.to_id(), old_version).unwrap(), Some(b"noncanonical join".to_vec()));
-            assert!(target.prepare_phase_sync(&reader, version, &app, phase, &[], anchor).unwrap().remaining().is_empty());
+            assert_eq!(
+                read(&target, &other).unwrap(),
+                Some(b"unrelated application".to_vec())
+            );
+            assert_eq!(
+                store
+                    .load_vertex_underlying_at(set, "adds", &shard, &extra.to_id(), old_version)
+                    .unwrap(),
+                Some(b"noncanonical join".to_vec())
+            );
+            assert!(target
+                .prepare_phase_sync(&reader, version, &app, phase, &[], anchor)
+                .unwrap()
+                .remaining()
+                .is_empty());
         }
     }
 
@@ -2210,35 +3369,76 @@ mod tests {
         let db = Arc::new(RocksDb::open(directory.path()).unwrap());
         let store = Arc::new(RocksHypergraphStore::new(db.inner()));
         let crdt = HypergraphCrdt::new(store, Arc::new(quil_types::crypto::NoopInclusionProver));
-        crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), FOREST_NAMESPACE));
-        let location = Location { app_address: [21; 32], data_address: [7; 32] };
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            FOREST_NAMESPACE,
+        ));
+        let location = Location {
+            app_address: [21; 32],
+            data_address: [7; 32],
+        };
         let shard = quil_hypergraph::shard_key_for_location(&location);
         let read = |generation: &quil_hypergraph::snapshot::GenerationHandle| {
-            generation.db_snapshot.as_ref().unwrap()
-                .load_vertex_underlying_raw("vertex", "adds", &shard, &location.to_id()).unwrap()
+            generation
+                .db_snapshot
+                .as_ref()
+                .unwrap()
+                .load_vertex_underlying_raw("vertex", "adds", &shard, &location.to_id())
+                .unwrap()
         };
 
         // The root generation published at boot does not track later app writes.
         assert!(crdt.publish_snapshot_capturing(vec![1; 32], 0).unwrap());
         let historical = crdt.acquire_snapshot(&[1; 32]).unwrap();
-        let before = crdt.acquire_or_capture_scan_snapshot(None).unwrap().unwrap();
+        let before = crdt
+            .acquire_or_capture_scan_snapshot(None)
+            .unwrap()
+            .unwrap();
         assert!(read(&before).is_none());
-        crdt.add_vertex(&location, b"first committed value").unwrap();
+        crdt.add_vertex(&location, b"first committed value")
+            .unwrap();
         crdt.commit(1).unwrap();
-        let first = crdt.acquire_or_capture_scan_snapshot(None).unwrap().unwrap();
+        let first = crdt
+            .acquire_or_capture_scan_snapshot(None)
+            .unwrap()
+            .unwrap();
         assert_eq!(read(&first), Some(b"first committed value".to_vec()));
         assert_ne!(before.scan_id, first.scan_id);
         assert!(read(&historical).is_none());
-        assert!(read(&crdt.acquire_or_capture_scan_snapshot(before.scan_id.as_ref()).unwrap().unwrap()).is_none());
+        assert!(read(
+            &crdt
+                .acquire_or_capture_scan_snapshot(before.scan_id.as_ref())
+                .unwrap()
+                .unwrap()
+        )
+        .is_none());
 
-        crdt.add_vertex(&location, b"second committed value").unwrap();
+        crdt.add_vertex(&location, b"second committed value")
+            .unwrap();
         crdt.commit(2).unwrap();
-        let second = crdt.acquire_or_capture_scan_snapshot(None).unwrap().unwrap();
+        let second = crdt
+            .acquire_or_capture_scan_snapshot(None)
+            .unwrap()
+            .unwrap();
         assert_eq!(read(&second), Some(b"second committed value".to_vec()));
-        assert_eq!(read(&crdt.acquire_or_capture_scan_snapshot(first.scan_id.as_ref()).unwrap().unwrap()),
-            Some(b"first committed value".to_vec()));
-        assert!(crdt.acquire_or_capture_scan_snapshot(Some(&[0xff; 32])).unwrap().is_none());
-        assert_eq!(crdt.known_snapshot_roots(), vec![vec![1; 32]], "wallet reads must not publish a new authenticated root");
+        assert_eq!(
+            read(
+                &crdt
+                    .acquire_or_capture_scan_snapshot(first.scan_id.as_ref())
+                    .unwrap()
+                    .unwrap()
+            ),
+            Some(b"first committed value".to_vec())
+        );
+        assert!(crdt
+            .acquire_or_capture_scan_snapshot(Some(&[0xff; 32]))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crdt.known_snapshot_roots(),
+            vec![vec![1; 32]],
+            "wallet reads must not publish a new authenticated root"
+        );
     }
 
     #[test]
@@ -2247,21 +3447,44 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = RocksDb::open(tmp.path()).unwrap();
         let store = Arc::new(RocksHypergraphStore::new(Arc::new(db).inner()));
-        let shard = ShardKey { l1: [0; 3], l2: [0xff; 32] };
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: [0xff; 32],
+        };
         let vertex = vec![0x11; 64];
         let txn = store.new_transaction(false).unwrap();
         for (version, blob) in [(0, b"first".as_slice()), (1, b"later".as_slice())] {
-            store.save_vertex_underlying_versioned(
-                txn.as_ref(), "vertex", "adds", &shard, &vertex, blob, version,
-            ).unwrap();
+            store
+                .save_vertex_underlying_versioned(
+                    txn.as_ref(),
+                    "vertex",
+                    "adds",
+                    &shard,
+                    &vertex,
+                    blob,
+                    version,
+                )
+                .unwrap();
         }
         txn.commit().unwrap();
         let crdt = quil_hypergraph::HypergraphCrdt::new(
-            store, Arc::new(quil_types::crypto::NoopInclusionProver),
+            store,
+            Arc::new(quil_types::crypto::NoopInclusionProver),
         );
-        assert_eq!(crdt.serve_vertex_blob(&shard, 0, &vertex, Some(0)).as_deref(), Some(b"first".as_slice()));
-        assert_eq!(crdt.serve_vertex_blob(&shard, 0, &vertex, Some(1)).as_deref(), Some(b"later".as_slice()));
-        assert_eq!(crdt.serve_vertex_blob(&shard, 0, &vertex, None).as_deref(), Some(b"later".as_slice()));
+        assert_eq!(
+            crdt.serve_vertex_blob(&shard, 0, &vertex, Some(0))
+                .as_deref(),
+            Some(b"first".as_slice())
+        );
+        assert_eq!(
+            crdt.serve_vertex_blob(&shard, 0, &vertex, Some(1))
+                .as_deref(),
+            Some(b"later".as_slice())
+        );
+        assert_eq!(
+            crdt.serve_vertex_blob(&shard, 0, &vertex, None).as_deref(),
+            Some(b"later".as_slice())
+        );
     }
 }
 
@@ -2270,10 +3493,20 @@ mod fixed_vertex_page_tests {
     use super::*;
     use quil_types::store::{HypergraphStore, VertexPageLimits};
 
-    fn put(db: &quil_forest::CoordinatedDb, shard: &ShardKey, domain: &[u8; 32], address: u8, version: Option<u64>, value: &[u8]) {
-        let mut key = domain.to_vec(); key.extend_from_slice(&[address; 32]);
+    fn put(
+        db: &quil_forest::CoordinatedDb,
+        shard: &ShardKey,
+        domain: &[u8; 32],
+        address: u8,
+        version: Option<u64>,
+        value: &[u8],
+    ) {
+        let mut key = domain.to_vec();
+        key.extend_from_slice(&[address; 32]);
         let key = match version {
-            Some(version) => crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", shard, &key, version),
+            Some(version) => crate::encoding::hypergraph_vertex_data_v2_key(
+                "vertex", "adds", shard, &key, version,
+            ),
             None => hypergraph_vertex_data_key("vertex", "adds", shard, &key),
         };
         db.put(key, value).unwrap();
@@ -2283,7 +3516,10 @@ mod fixed_vertex_page_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open_default(dir.path()).unwrap());
         let store = RocksHypergraphStore::new(db.clone());
-        let shard = ShardKey { l1: [1; 3], l2: [2; 32] };
+        let shard = ShardKey {
+            l1: [1; 3],
+            l2: [2; 32],
+        };
         let domain = [4; 32];
         put(&db, &shard, &domain, 1, None, b"one");
         put(&db, &shard, &domain, 2, Some(1), b"two-before");
@@ -2291,21 +3527,49 @@ mod fixed_vertex_page_tests {
         let snapshot = store.capture_snapshot().unwrap();
         // Exercise the object-safe API used by retained snapshot managers.
         let reader: &dyn SnapshotReadable = snapshot.as_ref();
-        let limits = VertexPageLimits { max_entries: 1, max_bytes: 1024 };
-        let first = reader.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, None, limits).unwrap();
+        let limits = VertexPageLimits {
+            max_entries: 1,
+            max_bytes: 1024,
+        };
+        let first = reader
+            .page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, None, limits)
+            .unwrap();
         assert_eq!(first.entries, vec![([1; 32], b"one".to_vec())]);
         assert!(first.has_more);
         put(&db, &shard, &domain, 2, Some(2), b"two-after");
         put(&db, &shard, &domain, 3, None, b"three-after");
         put(&db, &shard, &domain, 4, Some(1), b"four-after");
-        let second = reader.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[1; 32]), limits).unwrap();
+        let second = reader
+            .page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[1; 32]), limits)
+            .unwrap();
         assert_eq!(second.entries, vec![([2; 32], b"two-before".to_vec())]);
         assert!(second.has_more);
-        let third = reader.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[2; 32]), limits).unwrap();
+        let third = reader
+            .page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[2; 32]), limits)
+            .unwrap();
         assert_eq!(third.entries, vec![([3; 32], b"three-before".to_vec())]);
         assert!(!third.has_more);
-        let live = store.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[1; 32]), VertexPageLimits { max_entries: 4, ..limits }).unwrap();
-        assert_eq!(live.entries, vec![([2; 32], b"two-after".to_vec()), ([3; 32], b"three-after".to_vec()), ([4; 32], b"four-after".to_vec())]);
+        let live = store
+            .page_vertex_underlying_fixed(
+                "vertex",
+                "adds",
+                &shard,
+                &domain,
+                Some(&[1; 32]),
+                VertexPageLimits {
+                    max_entries: 4,
+                    ..limits
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            live.entries,
+            vec![
+                ([2; 32], b"two-after".to_vec()),
+                ([3; 32], b"three-after".to_vec()),
+                ([4; 32], b"four-after".to_vec())
+            ]
+        );
         assert!(!live.has_more);
     }
 
@@ -2314,7 +3578,11 @@ mod fixed_vertex_page_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open_default(dir.path()).unwrap());
         let store = RocksHypergraphStore::new(db.clone());
-        let shard = ShardKey { l1: [1; 3], l2: [2; 32] }; let domain = [4; 32];
+        let shard = ShardKey {
+            l1: [1; 3],
+            l2: [2; 32],
+        };
+        let domain = [4; 32];
         put(&db, &shard, &domain, 1, None, b"legacy");
         put(&db, &shard, &domain, 1, Some(1), b"old");
         put(&db, &shard, &domain, 1, Some(u64::MAX), b"new");
@@ -2322,27 +3590,69 @@ mod fixed_vertex_page_tests {
         put(&db, &shard, &domain, 3, Some(2), b"three");
         put(&db, &shard, &[9; 32], 1, Some(7), b"other domain");
         for length in [31, 33] {
-            let mut key = domain.to_vec(); key.extend_from_slice(&vec![1; length]);
-            db.put(crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard, &key, 4), b"variable").unwrap();
-            db.put(hypergraph_vertex_data_key("vertex", "adds", &shard, &key), b"variable").unwrap();
+            let mut key = domain.to_vec();
+            key.extend_from_slice(&vec![1; length]);
+            db.put(
+                crate::encoding::hypergraph_vertex_data_v2_key("vertex", "adds", &shard, &key, 4),
+                b"variable",
+            )
+            .unwrap();
+            db.put(
+                hypergraph_vertex_data_key("vertex", "adds", &shard, &key),
+                b"variable",
+            )
+            .unwrap();
         }
         let provider: &dyn HypergraphStore = &store;
-        let limits = VertexPageLimits { max_entries: 1, max_bytes: 1024 };
-        let mut cursor = None; let mut result = Vec::new();
+        let limits = VertexPageLimits {
+            max_entries: 1,
+            max_bytes: 1024,
+        };
+        let mut cursor = None;
+        let mut result = Vec::new();
         loop {
-            let page = provider.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, cursor.as_ref(), limits).unwrap();
+            let page = provider
+                .page_vertex_underlying_fixed(
+                    "vertex",
+                    "adds",
+                    &shard,
+                    &domain,
+                    cursor.as_ref(),
+                    limits,
+                )
+                .unwrap();
             assert!(!page.entries.is_empty());
             assert_eq!(page.entries.len(), 1);
             cursor = Some(page.entries.last().unwrap().0);
             result.extend(page.entries);
-            if !page.has_more { break; }
+            if !page.has_more {
+                break;
+            }
         }
-        assert_eq!(result, vec![([1; 32], b"new".to_vec()), ([2; 32], b"two".to_vec()), ([3; 32], b"three".to_vec())]);
+        assert_eq!(
+            result,
+            vec![
+                ([1; 32], b"new".to_vec()),
+                ([2; 32], b"two".to_vec()),
+                ([3; 32], b"three".to_vec())
+            ]
+        );
         put(&db, &shard, &domain, 255, Some(u64::MAX), b"last");
-        let last = provider.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[3; 32]), limits).unwrap();
+        let last = provider
+            .page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[3; 32]), limits)
+            .unwrap();
         assert_eq!(last.entries, vec![([255; 32], b"last".to_vec())]);
         assert!(!last.has_more);
-        let end = provider.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[255; 32]), limits).unwrap();
+        let end = provider
+            .page_vertex_underlying_fixed(
+                "vertex",
+                "adds",
+                &shard,
+                &domain,
+                Some(&[255; 32]),
+                limits,
+            )
+            .unwrap();
         assert!(end.entries.is_empty() && !end.has_more);
     }
     #[test]
@@ -2350,20 +3660,46 @@ mod fixed_vertex_page_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open_default(dir.path()).unwrap());
         let store = RocksHypergraphStore::new(db.clone());
-        let shard = ShardKey { l1: [1; 3], l2: [2; 32] }; let domain = [4; 32];
+        let shard = ShardKey {
+            l1: [1; 3],
+            l2: [2; 32],
+        };
+        let domain = [4; 32];
         put(&db, &shard, &domain, 1, None, &vec![9; 4096]);
         put(&db, &shard, &domain, 1, Some(0), &vec![9; 4096]);
         put(&db, &shard, &domain, 1, Some(1), b"new");
         put(&db, &shard, &domain, 2, None, b"two");
         put(&db, &shard, &domain, 3, Some(1), &vec![9; 4096]);
-        let limits = VertexPageLimits { max_entries: 10, max_bytes: 67 };
-        let first = store.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, None, limits).unwrap();
-        assert_eq!(first.entries, vec![([1; 32], b"new".to_vec())]); assert!(first.has_more);
-        let second = store.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[1; 32]), limits).unwrap();
-        assert_eq!(second.entries, vec![([2; 32], b"two".to_vec())]); assert!(second.has_more);
-        assert!(store.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[2; 32]), limits).is_err());
-        for limits in [VertexPageLimits { max_entries: 0, ..limits }, VertexPageLimits { max_bytes: 63, ..limits }] {
-            assert!(store.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, None, limits).is_err());
+        let limits = VertexPageLimits {
+            max_entries: 10,
+            max_bytes: 67,
+        };
+        let first = store
+            .page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, None, limits)
+            .unwrap();
+        assert_eq!(first.entries, vec![([1; 32], b"new".to_vec())]);
+        assert!(first.has_more);
+        let second = store
+            .page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[1; 32]), limits)
+            .unwrap();
+        assert_eq!(second.entries, vec![([2; 32], b"two".to_vec())]);
+        assert!(second.has_more);
+        assert!(store
+            .page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[2; 32]), limits)
+            .is_err());
+        for limits in [
+            VertexPageLimits {
+                max_entries: 0,
+                ..limits
+            },
+            VertexPageLimits {
+                max_bytes: 63,
+                ..limits
+            },
+        ] {
+            assert!(store
+                .page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, None, limits)
+                .is_err());
         }
     }
 
@@ -2376,7 +3712,11 @@ mod fixed_vertex_page_tests {
         let dir = tempfile::tempdir().unwrap();
         let db = quil_forest::CoordinatedDb::new(rocksdb::DB::open_default(dir.path()).unwrap());
         let store = RocksHypergraphStore::new(db.clone());
-        let shard = ShardKey { l1: [1; 3], l2: [2; 32] }; let domain = [4; 32];
+        let shard = ShardKey {
+            l1: [1; 3],
+            l2: [2; 32],
+        };
+        let domain = [4; 32];
         put(&db, &shard, &domain, 1, Some(1), b"one");
         put(&db, &shard, &domain, 2, None, &vec![9; 4096]);
         put(&db, &shard, &domain, 2, Some(1), &vec![9; 4096]);
@@ -2384,21 +3724,62 @@ mod fixed_vertex_page_tests {
         put(&db, &shard, &domain, 4, Some(2), &vec![9; 4096]);
         put(&db, &shard, &domain, 5, Some(1), b"five");
         let snapshot = store.capture_snapshot().unwrap();
-        let limits = VertexPageLimits { max_entries: 2, max_bytes: 200 };
+        let limits = VertexPageLimits {
+            max_entries: 2,
+            max_bytes: 200,
+        };
         let large = |address: &[u8; 32]| *address == [2; 32] || *address == [4; 32];
-        assert!(snapshot.page_vertex_underlying_fixed("vertex", "adds", &shard, &domain, Some(&[1; 32]), limits).is_err(),
-            "unskipped, the large row fails its page");
+        assert!(
+            snapshot
+                .page_vertex_underlying_fixed(
+                    "vertex",
+                    "adds",
+                    &shard,
+                    &domain,
+                    Some(&[1; 32]),
+                    limits
+                )
+                .is_err(),
+            "unskipped, the large row fails its page"
+        );
         let (mut cursor, mut rows, mut pages) = (None, Vec::new(), 0);
         loop {
-            let page = snapshot.page_vertex_underlying_fixed_skipping("vertex", "adds", &shard, &domain, cursor.as_ref(), limits, &large).unwrap();
+            let page = snapshot
+                .page_vertex_underlying_fixed_skipping(
+                    "vertex",
+                    "adds",
+                    &shard,
+                    &domain,
+                    cursor.as_ref(),
+                    limits,
+                    &large,
+                )
+                .unwrap();
             pages += 1;
             cursor = page.entries.last().map(|(address, _)| *address);
             rows.extend(page.entries);
-            if !page.has_more { break; }
+            if !page.has_more {
+                break;
+            }
         }
-        assert_eq!(rows, vec![([1; 32], b"one".to_vec()), ([3; 32], b"three".to_vec()), ([5; 32], b"five".to_vec())]);
+        assert_eq!(
+            rows,
+            vec![
+                ([1; 32], b"one".to_vec()),
+                ([3; 32], b"three".to_vec()),
+                ([5; 32], b"five".to_vec())
+            ]
+        );
         assert_eq!(pages, 2);
-        let none = snapshot.page_vertex_underlying_fixed_skipping("vertex", "adds", &shard, &domain, Some(&[1; 32]), limits, &|_| false);
+        let none = snapshot.page_vertex_underlying_fixed_skipping(
+            "vertex",
+            "adds",
+            &shard,
+            &domain,
+            Some(&[1; 32]),
+            limits,
+            &|_| false,
+        );
         assert!(none.is_err(), "skipping nothing pages as before");
     }
 }

@@ -27,7 +27,22 @@ pub struct VerifiedFrame {
 }
 
 fn invalid(message: &str) -> QuilError {
-    QuilError::InvalidSignature(format!("app session certificate: {message}"))
+    QuilError::InvalidSignature(format!("{CERTIFICATE_REFUSED}{message}"))
+}
+
+const CERTIFICATE_REFUSED: &str = "app session certificate: ";
+
+/// Why a frame whose generation the state read holds no session for is
+/// refused.
+const UNAUTHORIZED_GENERATION: &str = "generation has no authorization";
+
+/// Whether `error` refused a frame because the state it was verified against
+/// holds no session for its generation ([`verify`], [`verify_history`],
+/// [`verify_discarded_base_frame`]). Unlike the other refusals, which the
+/// session decides, a later GLOBAL frame can still authorize that generation.
+pub fn unauthorized_generation(error: &QuilError) -> bool {
+    matches!(error, QuilError::InvalidSignature(message)
+        if message.strip_prefix(CERTIFICATE_REFUSED) == Some(UNAUTHORIZED_GENERATION))
 }
 
 /// `None` permits the explicitly legacy, generation-zero verifier only when
@@ -58,6 +73,51 @@ pub fn verify_history(
     verify_with(state, claim, bytes, true)
 }
 
+/// The first data frame of a session GLOBAL ended at its base (sealed or
+/// fenced there, none of its frames executed): certified by that session's
+/// committee, frame `base_frame + 1` over its genesis, and past its terminal
+/// checkpoint, so [`verify_history`] refuses it. A header's state roots are
+/// its pre-state, which each voter checked against its own state before it
+/// voted, so this frame attests the session's base state as its certifying
+/// quorum held it. The frame itself stays discarded.
+pub fn verify_discarded_base_frame(
+    state: &impl Records,
+    claim: &FrameClaim<'_>,
+    bytes: &[u8],
+) -> Result<Session> {
+    let generation =
+        unverified_finalization_epoch(bytes).ok_or_else(|| invalid("malformed proposal prefix"))?;
+    if generation == 0 {
+        return Err(invalid("a legacy frame attests no session base"));
+    }
+    let session = session_at_generation(state, claim.filter, generation)?
+        .ok_or_else(|| invalid(UNAUTHORIZED_GENERATION))?;
+    let certificate = quil_cw_consensus::app_cert::check_finalization(
+        bytes,
+        &session.members,
+        &session.namespace()?,
+        claim.digest,
+    )
+    .map_err(|reason| invalid(&format!("generation {generation}: {reason}")))?;
+    let proposal = &certificate.finalization.proposal;
+    if proposal.round.epoch().get() != session.generation
+        || proposal.round.view().get() != claim.view
+        || claim.frame != session.base_frame + 1
+        || !proposal.parent.is_zero()
+        || claim.parent != session.genesis
+    {
+        return Err(invalid(
+            "frame is not the certified first frame of its session",
+        ));
+    }
+    let ended_at_base = submitted_checkpoint(state, &session.id()?)?
+        .is_some_and(|end| end.frame == session.base_frame && end.digest == session.genesis);
+    if !ended_at_base {
+        return Err(invalid("session did not end at its base"));
+    }
+    Ok(session)
+}
+
 fn verify_with(
     state: &impl Records,
     claim: &FrameClaim<'_>,
@@ -76,12 +136,15 @@ fn verify_with(
             || manages_application(state, claim.filter)?
             || head(state, claim.filter)?.is_some()
         {
-            return Err(invalid("generation has no authorization"));
+            return Err(invalid(UNAUTHORIZED_GENERATION));
         }
         return Ok(None);
     };
     let certificate = quil_cw_consensus::app_cert::check_finalization(
-        bytes, &session.members, &session.namespace()?, claim.digest,
+        bytes,
+        &session.members,
+        &session.namespace()?,
+        claim.digest,
     )
     .map_err(|reason| invalid(&format!("generation {generation}: {reason}")))?;
     let proposal = &certificate.finalization.proposal;
@@ -137,8 +200,11 @@ fn resealed_tip(
     if claim.frame != end.frame || claim.digest != end.digest || claim.view >= end.view {
         return Ok(false);
     }
-    Ok(super::session_tip(state, &session.id()?)?
-        .is_some_and(|tip| (tip.frame, tip.view, tip.digest) == (claim.frame, claim.view, claim.digest)))
+    Ok(
+        super::session_tip(state, &session.id()?)?.is_some_and(|tip| {
+            (tip.frame, tip.view, tip.digest) == (claim.frame, claim.view, claim.digest)
+        }),
+    )
 }
 
 /// Under a committee-handoff flag day (`LegacyHistory::Discard`) the legacy
@@ -152,7 +218,8 @@ pub fn refuse_legacy_after_flag_day(global_frame: u64) -> Result<()> {
                 && global_frame >= policy.activation_frame =>
         {
             Err(QuilError::InvalidSignature(
-                "legacy app certificates are not accepted after the committee-handoff flag day".into(),
+                "legacy app certificates are not accepted after the committee-handoff flag day"
+                    .into(),
             ))
         }
         _ => Ok(()),

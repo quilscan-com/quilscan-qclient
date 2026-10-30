@@ -10,10 +10,17 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
+use crate::autonat_health::{AutonatHealth, ProbeContext, ProbeFailure};
+use crate::external_addr::{ConfirmedExternalAddrs, ExternalAddrTracker};
+
 use quil_config::P2PConfig;
 use quil_types::error::QuilError;
 
 use crate::blossomsub_behaviour::{BlossomSubBehaviour, BlossomSubEvent};
+
+/// How often the swarm logs what it did with other nodes' AutoNAT dial-back
+/// requests, when it did anything.
+const AUTONAT_SERVER_SUMMARY_EVERY: Duration = Duration::from_secs(60 * 60);
 
 /// A received message from the network.
 #[derive(Debug, Clone)]
@@ -150,10 +157,8 @@ impl P2PNode {
             // Generate Ed448 key
             let id = crate::ed448_identity::Ed448Identity::generate()?;
             let config_hex = id.to_config_hex();
-            let kp = Keypair::ed448_from_config_bytes(
-                &hex::decode(&config_hex).unwrap(),
-            )
-            .map_err(|e| QuilError::P2p(format!("ed448 key error: {}", e)))?;
+            let kp = Keypair::ed448_from_config_bytes(&hex::decode(&config_hex).unwrap())
+                .map_err(|e| QuilError::P2p(format!("ed448 key error: {}", e)))?;
             (kp, Some(config_hex))
         } else {
             let key_bytes = hex::decode(&config.peer_priv_key)
@@ -162,9 +167,12 @@ impl P2PNode {
                 114 => Keypair::ed448_from_config_bytes(&key_bytes),
                 57 => Keypair::ed448_from_bytes(&key_bytes),
                 32 => Keypair::ed25519_from_bytes(key_bytes),
-                n => return Err(QuilError::P2p(format!(
-                    "unexpected key length: {} (expected 114/57/32)", n
-                ))),
+                n => {
+                    return Err(QuilError::P2p(format!(
+                        "unexpected key length: {} (expected 114/57/32)",
+                        n
+                    )))
+                }
             }
             .map_err(|e| QuilError::P2p(format!("invalid key: {}", e)))?;
             (kp, None)
@@ -270,8 +278,7 @@ impl P2PNode {
         // Synthetic worker key for host identity (connection-level only, keeps
         // worker processes from colliding on the real node's peer-id). Remains
         // a deterministic Ed448 synthetic derived from the Ed448 seed + core_id.
-        let worker_identity =
-            crate::ed448_identity::derive_worker_identity(&real_seed, core_id)?;
+        let worker_identity = crate::ed448_identity::derive_worker_identity(&real_seed, core_id)?;
         let mut worker_seed = [0u8; 57];
         worker_seed.copy_from_slice(&worker_identity.private_key);
         let worker_keypair = Keypair::ed448_from_bytes(&worker_seed)
@@ -396,8 +403,7 @@ impl P2PNode {
                 } else {
                     let proto = format!("/testnet/kad/1.0.0");
                     libp2p::kad::Config::new(
-                        libp2p::StreamProtocol::try_from_owned(proto)
-                            .expect("valid protocol"),
+                        libp2p::StreamProtocol::try_from_owned(proto).expect("valid protocol"),
                     )
                 };
                 kad_config.set_record_ttl(Some(std::time::Duration::from_secs(3600)));
@@ -405,11 +411,8 @@ impl P2PNode {
                 // Default libp2p-kad limit is 16KB — must increase to accept them.
                 kad_config.set_max_packet_size(1024 * 1024);
                 let kad_store = libp2p::kad::store::MemoryStore::new(local_peer_id);
-                let kademlia = libp2p::kad::Behaviour::with_config(
-                    local_peer_id,
-                    kad_store,
-                    kad_config,
-                );
+                let kademlia =
+                    libp2p::kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
 
                 let ping = libp2p::ping::Behaviour::default();
                 let identify = libp2p::identify::Behaviour::new(
@@ -427,13 +430,11 @@ impl P2PNode {
                 // prover key here so `msg.from` carries the prover's
                 // peer ID; the libp2p host (`key`) is the synthetic
                 // worker key for connection-level identity.
-                let (sign_peer_id, sign_key) = match (
-                    pubsub_from_peer_id,
-                    pubsub_signing_keypair.clone(),
-                ) {
-                    (Some(pid), Some(kp)) => (pid, kp),
-                    _ => (key.public().to_peer_id(), key.clone()),
-                };
+                let (sign_peer_id, sign_key) =
+                    match (pubsub_from_peer_id, pubsub_signing_keypair.clone()) {
+                        (Some(pid), Some(kp)) => (pid, kp),
+                        _ => (key.public().to_peer_id(), key.clone()),
+                    };
                 blossomsub.set_signing_identity(sign_peer_id, sign_key);
                 // Do NOT pre-subscribe to global bitmasks here. The
                 // caller (`main.rs` or `run_worker_node`) selects
@@ -447,9 +448,10 @@ impl P2PNode {
                 // every node to receive and relay ALL global traffic
                 // regardless of role — the root cause of bandwidth
                 // explosion on non-archive clusters.
+                // Probes go to the servers `ProbeServers` registers below.
                 let autonat = libp2p::autonat::Behaviour::new(
                     local_peer_id,
-                    libp2p::autonat::Config::default(),
+                    crate::autonat_servers::autonat_config(),
                 );
 
                 // Hard cap on swarm connections. Without these limits
@@ -469,8 +471,7 @@ impl P2PNode {
                     .with_max_established_per_peer(Some(2))
                     .with_max_pending_incoming(Some(64))
                     .with_max_pending_outgoing(Some(64));
-                let connection_limits =
-                    libp2p::connection_limits::Behaviour::new(conn_limits);
+                let connection_limits = libp2p::connection_limits::Behaviour::new(conn_limits);
 
                 let direct = libp2p::request_response::Behaviour::new(
                     [(
@@ -540,8 +541,9 @@ impl P2PNode {
         }
 
         if let Some(port) = want_quic {
-            let quic_addr: Multiaddr =
-                format!("/ip4/0.0.0.0/udp/{}/quic-v1", port).parse().unwrap();
+            let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port)
+                .parse()
+                .unwrap();
             match swarm.listen_on(quic_addr.clone()) {
                 Ok(_) => debug!(%quic_addr, "QUIC listener starting"),
                 Err(e) => debug!(error = format!("{:?}", e), "failed to start QUIC listener"),
@@ -562,9 +564,18 @@ impl P2PNode {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<P2PCommand>(256);
         let peer_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pc_writer = peer_count.clone();
-        let observed_addrs: std::sync::Arc<std::sync::RwLock<Vec<String>>> =
-            std::sync::Arc::new(std::sync::RwLock::new(Vec::new()));
-        let observed_addrs_writer = observed_addrs.clone();
+        // The current AutoNAT-confirmed external address of each listener
+        // transport (see `external_addr`), published to the handle.
+        let mut external_tracker =
+            crate::external_addr::ExternalAddrTracker::new(want_tcp, want_quic, is_routable);
+        let (external_tx, external_addrs) =
+            tokio::sync::watch::channel(crate::external_addr::ConfirmedExternalAddrs::default());
+        // AutoNAT's servers: peers that serve it, one per remote IP, and the
+        // configured bootstrap and direct peers.
+        // The listeners bind IPv4 only (see above).
+        let mut probe_servers = crate::autonat_servers::ProbeServers::new(is_routable, true, false);
+        // Operator lines on AutoNAT's status and failing probes.
+        let mut autonat_health = AutonatHealth::new(std::time::Instant::now());
         // P2P prometheus registry: the blossomsub behaviour owns it (its
         // `blossomsub_*` families are registered at construction); add the
         // swarm-level `libp2p_*` connection families alongside, and hand the
@@ -579,9 +590,18 @@ impl P2PNode {
 
         let direct_stats: std::sync::Arc<crate::direct::DirectStats> = Default::default();
         let loop_direct_stats = direct_stats.clone();
+        let gossip_traffic = swarm.behaviour().blossomsub.traffic();
+        let loop_gossip_traffic = gossip_traffic.clone();
         sup.spawn("p2p-swarm", move |cancel_token| async move {
             debug!("P2P swarm event loop started");
             let direct_stats = loop_direct_stats;
+            // One `gossip traffic by class` line per interval.
+            let mut traffic_timer = tokio::time::interval_at(
+                tokio::time::Instant::now() + crate::gossip_traffic::LOG_INTERVAL,
+                crate::gossip_traffic::LOG_INTERVAL,
+            );
+            traffic_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut traffic_logged = loop_gossip_traffic.snapshot();
             // Direct delivery state: sends awaiting their outcome, peers that
             // lack the protocol (until `UNSUPPORTED_RETRY_AFTER`), and the
             // bitmasks this node takes direct messages on.
@@ -596,6 +616,7 @@ impl P2PNode {
             let mut discovery_timer = tokio::time::interval(Duration::from_secs(30));
             discovery_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut discovery_count = 0u32;
+            let mut autonat_server_summary_at = std::time::Instant::now();
             // Throttle NeedPeers-driven Kademlia discovery. BlossomSub
             // can fire `NeedPeers` repeatedly when the mesh is short
             // of peers (bootstrap, partition, sustained churn); each
@@ -617,7 +638,42 @@ impl P2PNode {
                         debug!("P2P swarm shutting down — supervisor cancelled");
                         break;
                     }
+                    _ = traffic_timer.tick() => {
+                        let now = loop_gossip_traffic.snapshot();
+                        crate::gossip_traffic::log_interval(&now.since(&traffic_logged));
+                        traffic_logged = now;
+                    }
                     _ = discovery_timer.tick() => {
+                        // Other nodes' AutoNAT dial-back requests: one line
+                        // per hour, only when there were any.
+                        let summary_secs = autonat_server_summary_at.elapsed();
+                        if summary_secs >= AUTONAT_SERVER_SUMMARY_EVERY {
+                            autonat_server_summary_at = std::time::Instant::now();
+                            let stats = swarm.behaviour_mut().autonat.take_server_stats();
+                            if !stats.is_empty() {
+                                tracing::info!(
+                                    interval_secs = summary_secs.as_secs(),
+                                    served = stats.served,
+                                    served_requesters = stats.served_clients.len(),
+                                    failed = stats.failed,
+                                    failed_requesters = stats.failed_clients.len(),
+                                    failed_by_address = %stats.failed_by_address(),
+                                    failed_by_error = %stats.failed_by_error(),
+                                    most_failed = %stats.top_failed_clients(3),
+                                    refused = stats.refused.values().sum::<u32>(),
+                                    refused_by_reason = %stats.refused_by_reason(),
+                                    request_failures = stats.request_failures,
+                                    "AutoNAT dial-back requests of other nodes this node handled: served \
+                                     reached the requester, failed reached none of its addresses (by the \
+                                     first address tried: tcp/quic and default 8336, worker, ephemeral or \
+                                     other port; by error: refused, timeout, reset, no_route, wrong_peer), \
+                                     refused were declined by this node (denied: this node's connection \
+                                     limits, usually two connections already held to the requester; \
+                                     throttled: rate limits); background work for the network, no action \
+                                     needed"
+                                );
+                            }
+                        }
                         // Keep operator-configured direct peers (e.g. the
                         // genesis global archives) connected at all times.
                         // Unlike bootstrap re-dial, this is gated only on
@@ -730,6 +786,14 @@ impl P2PNode {
                                             debug!(%e, %dp_peer, "direct peer dial failed");
                                         }
                                     }
+                                    // The configured peers are AutoNAT servers
+                                    // from the start, so the first probe does not
+                                    // wait for identify.
+                                    for (peer, addr) in bootstrap_peers.iter().chain(&direct_peers) {
+                                        let autonat = &mut swarm.behaviour_mut().autonat;
+                                        autonat.add_server(*peer, Some(addr.clone()));
+                                        crate::autonat_servers::apply(autonat, probe_servers.pin(*peer, addr));
+                                    }
                                     // Start Kademlia bootstrap
                                     if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
                                         debug!(%e, "kad bootstrap failed");
@@ -750,7 +814,11 @@ impl P2PNode {
                                     }
                                 }
                             }
-                            libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                                crate::autonat_servers::apply(
+                                    &mut swarm.behaviour_mut().autonat,
+                                    probe_servers.on_connection(connection_id, peer_id, endpoint.get_remote_address()),
+                                );
                                 let count = swarm.connected_peers().count();
                                 pc_writer.store(count, std::sync::atomic::Ordering::Relaxed);
                                 swarm_metrics
@@ -760,7 +828,11 @@ impl P2PNode {
                                 swarm_metrics.connected_peers.set(count as i64);
                                 debug!(%peer_id, peers = count, "peer connected");
                             }
-                            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, endpoint, .. } => {
+                            libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, endpoint, num_established, .. } => {
+                                crate::autonat_servers::apply(
+                                    &mut swarm.behaviour_mut().autonat,
+                                    probe_servers.on_connection_closed(connection_id, peer_id, num_established),
+                                );
                                 let count = swarm.connected_peers().count();
                                 pc_writer.store(count, std::sync::atomic::Ordering::Relaxed);
                                 swarm_metrics
@@ -779,17 +851,36 @@ impl P2PNode {
                                 debug!(error = %error, "incoming connection failed");
                             }
                             libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
-                                let addr_str = address.to_string();
-                                debug!(%addr_str, "external address confirmed (NAT-observed)");
-                                let mut addrs = observed_addrs_writer.write().unwrap();
-                                if !addrs.contains(&addr_str) {
-                                    addrs.push(addr_str);
-                                }
+                                // AutoNAT's dial-back result. The tracker takes it
+                                // from the probe response below, which names the
+                                // confirming server.
+                                debug!(%address, "external address confirmed (AutoNAT dial-back)");
+                            }
+                            libp2p::swarm::SwarmEvent::ExternalAddrExpired { address } => {
+                                // Nothing emits this today; handled for completeness.
+                                let applied = external_tracker.apply(
+                                    crate::external_addr::ExternalAddrEvent::Expired(&address),
+                                    &swarm.behaviour().autonat.nat_status(),
+                                    std::time::Instant::now(),
+                                );
+                                debug!(%address, ?applied, "external address expired");
+                                publish_external(
+                                    &external_tx,
+                                    &mut external_tracker,
+                                    &autonat_health,
+                                    &swarm.behaviour().autonat.nat_status(),
+                                );
                             }
                             libp2p::swarm::SwarmEvent::Behaviour(event) => match event {
                                 NodeBehaviourEvent::Identify(
-                                    libp2p::identify::Event::Received { peer_id, info, .. }
+                                    libp2p::identify::Event::Received { connection_id, peer_id, info, .. }
                                 ) => {
+                                    let serves_autonat =
+                                        info.protocols.contains(&libp2p::autonat::DEFAULT_PROTOCOL_NAME);
+                                    crate::autonat_servers::apply(
+                                        &mut swarm.behaviour_mut().autonat,
+                                        probe_servers.on_identify(connection_id, peer_id, serves_autonat),
+                                    );
                                     let proto_list: Vec<String> = info.protocols.iter()
                                         .map(|p| p.to_string()).collect();
                                     let routable: Vec<&Multiaddr> = info.listen_addrs.iter()
@@ -925,6 +1016,66 @@ impl P2PNode {
                                         _ => {}
                                     }
                                 }
+                                NodeBehaviourEvent::Autonat(libp2p::autonat::Event::OutboundProbe(probe)) => {
+                                    use crate::external_addr::ExternalAddrEvent;
+                                    use libp2p::autonat::OutboundProbeEvent;
+                                    let now = std::time::Instant::now();
+                                    let (event, notice) = match &probe {
+                                        // Sent, not finished.
+                                        OutboundProbeEvent::Request { .. } => (None, None),
+                                        OutboundProbeEvent::Response { peer, address, .. } => {
+                                            let server = crate::external_addr::ProbeServer {
+                                                peer: *peer,
+                                                ip: probe_servers.ip_of_server(peer),
+                                            };
+                                            (
+                                                Some(ExternalAddrEvent::Confirmed(address, server)),
+                                                autonat_health.on_success(now),
+                                            )
+                                        }
+                                        OutboundProbeEvent::Error { peer, error, .. } => {
+                                            let server_ip = peer.as_ref().and_then(|p| probe_servers.ip_of_server(p));
+                                            let failure = ProbeFailure::of(error);
+                                            (
+                                                Some(ExternalAddrEvent::Failed(failure.miss())),
+                                                autonat_health.on_failure(failure, server_ip, now),
+                                            )
+                                        }
+                                    };
+                                    if let Some(event) = event {
+                                        // The status already reflects this probe.
+                                        let nat = swarm.behaviour().autonat.nat_status();
+                                        let applied = external_tracker.apply(event, &nat, now);
+                                        debug!(?probe, ?nat, ?applied, "AutoNAT probe finished");
+                                        publish_external(&external_tx, &mut external_tracker, &autonat_health, &nat);
+                                        let owed = autonat_health.flush_status(&nat, now);
+                                        for notice in owed.iter().chain(&notice) {
+                                            crate::autonat_health::log(
+                                                notice,
+                                                &probe_context(&swarm.behaviour().autonat, &probe_servers),
+                                            );
+                                        }
+                                    }
+                                }
+                                NodeBehaviourEvent::Autonat(
+                                    libp2p::autonat::Event::StatusChanged { old, new }
+                                ) => {
+                                    let applied = external_tracker.apply(
+                                        crate::external_addr::ExternalAddrEvent::StatusChanged,
+                                        &new,
+                                        std::time::Instant::now(),
+                                    );
+                                    debug!(?old, ?new, ?applied, "AutoNAT status changed");
+                                    if let Some(notice) =
+                                        autonat_health.on_status_changed(&new, std::time::Instant::now())
+                                    {
+                                        crate::autonat_health::log(
+                                            &notice,
+                                            &probe_context(&swarm.behaviour().autonat, &probe_servers),
+                                        );
+                                    }
+                                    publish_external(&external_tx, &mut external_tracker, &autonat_health, &new);
+                                }
                                 NodeBehaviourEvent::Direct(event) => {
                                     use crate::direct::DirectOutcome;
                                     use libp2p::request_response::{Event, Message, OutboundFailure};
@@ -1054,6 +1205,12 @@ impl P2PNode {
                                     .blossomsub
                                     .register_validator(bitmask, validator);
                             }
+                            Some(P2PCommand::RegisterAuthoredValidator { bitmask, validator }) => {
+                                swarm
+                                    .behaviour_mut()
+                                    .blossomsub
+                                    .register_authored_validator(bitmask, validator);
+                            }
                             Some(P2PCommand::Publish { bitmask, data, ack }) => {
                                 let result = swarm.behaviour_mut().blossomsub.publish(bitmask, data);
                                 if let Err(ref e) = result {
@@ -1159,7 +1316,16 @@ impl P2PNode {
         });
 
         Ok((
-            P2PHandle { peer_id, cmd_tx, observed_addrs, peer_count, metrics_registry, direct_stats },
+            P2PHandle {
+                peer_id,
+                cmd_tx,
+                external_addrs,
+                peer_count,
+                metrics_registry,
+                direct_stats,
+                gossip_traffic,
+                global_frame_gate: Default::default(),
+            },
             msg_rx,
         ))
     }
@@ -1169,17 +1335,29 @@ impl P2PNode {
 pub struct P2PHandle {
     pub peer_id: PeerId,
     cmd_tx: mpsc::Sender<P2PCommand>,
-    /// External addresses observed by the identify protocol (NAT-resolved).
-    observed_addrs: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
+    /// The current AutoNAT-confirmed external addresses, kept by the swarm
+    /// event loop.
+    external_addrs: tokio::sync::watch::Receiver<crate::external_addr::ConfirmedExternalAddrs>,
     /// Connected peer count, updated by the swarm event loop.
     peer_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// P2P prometheus registry (`blossomsub_*` + `libp2p_*` families),
     /// rendered on demand via [`render_metrics`](Self::render_metrics).
     metrics_registry: crate::metrics::SharedRegistry,
     direct_stats: std::sync::Arc<crate::direct::DirectStats>,
+    /// This process's gossip traffic by class, counted by the swarm.
+    gossip_traffic: std::sync::Arc<crate::gossip_traffic::GossipTraffic>,
+    /// GLOBAL_FRAME admission state, shared by the gossip validator and the
+    /// receive loop that verifies frames.
+    global_frame_gate: std::sync::Arc<crate::global_frame_gate::GlobalFrameGate>,
 }
 
 impl P2PHandle {
+    /// The GLOBAL_FRAME admission state: the receive loop records verified
+    /// headers and accepted frames in it, and the node sets the committee.
+    pub fn global_frame_gate(&self) -> std::sync::Arc<crate::global_frame_gate::GlobalFrameGate> {
+        self.global_frame_gate.clone()
+    }
+
     pub async fn subscribe(&self, bitmask: Vec<u8>) {
         let _ = self.cmd_tx.send(P2PCommand::Subscribe(bitmask)).await;
     }
@@ -1187,161 +1365,151 @@ impl P2PHandle {
     /// Subscribe and wait until the swarm loop has actually applied it.
     pub async fn subscribe_confirmed(&self, bitmask: Vec<u8>) -> quil_types::error::Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.cmd_tx.send(P2PCommand::SubscribeConfirmed { bitmask, ack: ack_tx }).await
-            .map_err(|_| QuilError::P2p("p2p command channel closed (swarm shutting down?)".into()))?;
-        ack_rx.await.map_err(|_| QuilError::P2p("p2p swarm dropped subscribe ack (event loop exited)".into()))
+        self.cmd_tx
+            .send(P2PCommand::SubscribeConfirmed {
+                bitmask,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| {
+                QuilError::P2p("p2p command channel closed (swarm shutting down?)".into())
+            })?;
+        ack_rx.await.map_err(|_| {
+            QuilError::P2p("p2p swarm dropped subscribe ack (event loop exited)".into())
+        })
     }
 
     /// Count connected peers which advertised this exact topic subscription.
-    pub async fn subscribed_peer_count(&self, bitmask: Vec<u8>) -> quil_types::error::Result<usize> {
+    pub async fn subscribed_peer_count(
+        &self,
+        bitmask: Vec<u8>,
+    ) -> quil_types::error::Result<usize> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.cmd_tx.send(P2PCommand::SubscribedPeerCount { bitmask, ack: ack_tx }).await
-            .map_err(|_| QuilError::P2p("p2p command channel closed (swarm shutting down?)".into()))?;
-        ack_rx.await.map_err(|_| QuilError::P2p("p2p swarm dropped topic-peer-count ack (event loop exited)".into()))
+        self.cmd_tx
+            .send(P2PCommand::SubscribedPeerCount {
+                bitmask,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| {
+                QuilError::P2p("p2p command channel closed (swarm shutting down?)".into())
+            })?;
+        ack_rx.await.map_err(|_| {
+            QuilError::P2p("p2p swarm dropped topic-peer-count ack (event loop exited)".into())
+        })
     }
 
     /// Refresh peers derived from committed committees; never trust PeerInfo
     /// for this exemption. Only the IP-colocation penalty is exempted.
-    pub async fn set_committee_peers(&self, peers: std::collections::HashSet<PeerId>) -> quil_types::error::Result<usize> {
+    pub async fn set_committee_peers(
+        &self,
+        peers: std::collections::HashSet<PeerId>,
+    ) -> quil_types::error::Result<usize> {
         if peers.len() > 16_384 {
-            return Err(QuilError::P2p("committee peer policy exceeds its bounds".into()));
+            return Err(QuilError::P2p(
+                "committee peer policy exceeds its bounds".into(),
+            ));
         }
         let (ack, received) = oneshot::channel();
-        self.cmd_tx.send(P2PCommand::SetCommitteePeers { peers, ack }).await
+        self.cmd_tx
+            .send(P2PCommand::SetCommitteePeers { peers, ack })
+            .await
             .map_err(|_| QuilError::P2p("p2p command channel closed".into()))?;
-        received.await.map_err(|_| QuilError::P2p("p2p swarm dropped committee policy ack".into()))
+        received
+            .await
+            .map_err(|_| QuilError::P2p("p2p swarm dropped committee policy ack".into()))
     }
 
-    /// Register a blossomsub-level validator on `bitmask` that filters stale
-    /// PeerInfo / KeyRegistry BEFORE the mesh forwards them, so stale gossip is
-    /// never re-broadcast (self-amplifying the flood) and only reaches the app
-    /// router's `*_ts_too_old` reject as a fallback. This is a CHEAP peek (no
-    /// canonical decode / signature verify); fresh messages `Accept` and still
-    /// get full app-level validation.
+    /// Register a blossomsub-level validator on `bitmask` (GLOBAL_PEER_INFO)
+    /// that checks PeerInfo / KeyRegistry BEFORE the mesh forwards them
+    /// ([`crate::peer_info::peer_info_gossip_verdict`]): the timestamp peek,
+    /// then size, full decode and the Falcon signatures. The Ed448 half of a
+    /// KeyRegistry binding is still verified by the receive loop.
     ///
     /// The response is GRADUATED by how stale the timestamp is:
-    /// - within `STALE_IGNORE_PAST_MS` of now (plus the small future skew
-    ///   allowance) → `Accept`;
-    /// - moderately stale (past `STALE_IGNORE_PAST_MS` but within
-    ///   `STALE_REJECT_PAST_MS`), or future-skewed → `Ignore` (drop, NO peer
+    /// - fresh → `Accept`;
+    /// - moderately stale, or future-skewed → `Ignore` (drop, NO peer
     ///   penalty) — a message can legitimately age in transit through an honest
     ///   relayer, who must not be punished for it;
-    /// - grossly stale (older than `STALE_REJECT_PAST_MS` ≈ 5 min) → `Reject`,
-    ///   which feeds gossipsub's P₄ invalid-message peer score. An honest,
+    /// - grossly stale (older than about 5 min) → `Reject`, which feeds
+    ///   gossipsub's P₄ invalid-message peer score. An honest,
     ///   roughly-NTP-synced relayer never forwards a 5-minute-old PeerInfo (it
     ///   would `Ignore` it too), so reaching us with one means the sender is
     ///   replaying / grossly clock-skewed / flooding — a sustained stream of
     ///   these graylists the peer (see the topic-score params in
     ///   `set_signing_identity`).
+    ///
+    /// A message no release accepts (malformed, oversized, unknown type, bad
+    /// signature) is dropped without penalty until strict validation
+    /// ([`crate::peer_info::strict_peer_info_validation`]) and rejected after:
+    /// releases before these checks forward such messages, and penalising
+    /// them for it would cut them off the mesh.
     pub async fn register_peer_info_staleness_validator(&self, bitmask: Vec<u8>) {
-        // Fresh window (Accept below this age). Past this but within the reject
-        // bound → Ignore (possible honest transit aging).
-        const STALE_IGNORE_PAST_MS: i64 = 60_000;
-        // Beyond this age → Reject + penalize; no honest relayer forwards
-        // something this old.
-        const STALE_REJECT_PAST_MS: i64 = 300_000; // 5 min
-        let validator: Box<
-            dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync,
-        > = Box::new(|_peer, data| {
-            use crate::ValidationResult;
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            if data.len() >= 4 {
-                let tp = u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4]));
-                if tp == crate::peer_info::PEER_INFO_TYPE {
-                    if let Some(ts) = crate::peer_info::peek_peer_info_timestamp(data) {
-                        if ts < now_ms - STALE_REJECT_PAST_MS {
-                            return ValidationResult::Reject;
-                        }
-                        if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 300_000 {
-                            return ValidationResult::Ignore;
-                        }
-                    }
-                } else if tp == crate::peer_info::KEY_REGISTRY_TYPE {
-                    if let Some(ts) =
-                        crate::peer_info::peek_key_registry_timestamp(data).map(|v| v as i64)
-                    {
-                        if ts < now_ms - STALE_REJECT_PAST_MS {
-                            return ValidationResult::Reject;
-                        }
-                        if ts < now_ms - STALE_IGNORE_PAST_MS || ts > now_ms + 5_000 {
-                            return ValidationResult::Ignore;
-                        }
-                    }
-                }
-            }
-            ValidationResult::Accept
-        });
+        let validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync> =
+            Box::new(|_peer, data| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                crate::peer_info::peer_info_gossip_result(
+                    crate::peer_info::peer_info_gossip_verdict(data, now_ms),
+                    crate::peer_info::strict_peer_info_validation(),
+                )
+            });
         let _ = self
             .cmd_tx
             .send(P2PCommand::RegisterValidator { bitmask, validator })
             .await;
     }
 
-    /// Mesh-level gate for the GLOBAL_FRAME topic. Runs in the gossip poll
-    /// thread BEFORE a message is delivered to the app recv loop or forwarded to
-    /// the mesh, so it must stay O(1): it does NOT decode the frame (frames can
-    /// be up to ~15 MiB) or verify the committee cert (that would move the
-    /// expensive work an attacker is trying to trigger into the swarm thread).
-    ///
-    /// It enforces two cheap invariants and reports `Reject` (which penalises the
-    /// sender's gossip score and stops propagation) when they fail:
-    ///   1. the message carries the canonical GLOBAL_FRAME type prefix, and
-    ///   2. no single peer exceeds `MAX_FRAMES_PER_SEC` frames in a 1s window.
-    ///
-    /// (1) sheds garbage floods; (2) caps a peer that floods unique (dedup-
-    /// evading) frames — the CPU-DoS vector where each frame otherwise forces a
-    /// VDF verify downstream. Legitimate gossip is head-only (~1 frame / 10s per
-    /// source), so the bound has ~80x headroom and never trips in normal flow.
-    /// The authoritative checks (genesis prover, committee finalization cert,
-    /// VDF) still run in the recv loop; this only bounds what reaches them.
-    pub async fn register_global_frame_validator(&self, bitmask: Vec<u8>, frame_type: u32) {
-        use std::collections::HashMap;
-        use std::sync::Mutex;
-        // Per-source fixed-window counter. Bounded: the mesh has at most a few
-        // dozen peers; if it somehow grows past the cap we clear it wholesale
-        // (a coarse but O(1) reset that can only *reprieve* a flooder briefly).
-        const MAX_FRAMES_PER_SEC: u32 = 8;
-        const MAP_CAP: usize = 4096;
-        let counters: std::sync::Arc<Mutex<HashMap<PeerId, (u64, u32)>>> =
-            std::sync::Arc::new(Mutex::new(HashMap::new()));
-        let validator: Box<
-            dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync,
-        > = Box::new(move |peer, data| {
-            use crate::ValidationResult;
-            // (1) cheap shape/type check — legit frames are canonical-wire with
-            // the 4-byte type prefix; anything else on this topic is bogus.
-            if data.len() < 4
-                || u32::from_be_bytes(data[..4].try_into().unwrap_or([0; 4])) != frame_type
-            {
-                return ValidationResult::Reject;
-            }
-            // (2) per-peer rate limit.
-            let now_s = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if let Ok(mut map) = counters.lock() {
-                if map.len() > MAP_CAP {
-                    map.clear();
-                }
-                let entry = map.entry(*peer).or_insert((now_s, 0));
-                if entry.0 == now_s {
-                    entry.1 = entry.1.saturating_add(1);
+    /// Mesh-level gate for GLOBAL_ALERT: only an alert the receive loop can
+    /// verify is forwarded ([`crate::peer_info::global_alert_well_formed`];
+    /// the Ed448 signature itself is verified there). Anything else is
+    /// dropped without penalty until strict validation, rejected after.
+    pub async fn register_global_alert_validator(&self, bitmask: Vec<u8>) {
+        let validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync> =
+            Box::new(|_peer, data| {
+                if crate::peer_info::global_alert_well_formed(data) {
+                    crate::ValidationResult::Accept
+                } else if crate::peer_info::strict_peer_info_validation() {
+                    crate::ValidationResult::Reject
                 } else {
-                    *entry = (now_s, 1);
+                    crate::ValidationResult::Ignore
                 }
-                if entry.1 > MAX_FRAMES_PER_SEC {
-                    return ValidationResult::Reject;
-                }
-            }
-            ValidationResult::Accept
-        });
+            });
         let _ = self
             .cmd_tx
             .send(P2PCommand::RegisterValidator { bitmask, validator })
+            .await;
+    }
+
+    /// Mesh-level gate for the GLOBAL_FRAME topic, see
+    /// [`GlobalFrameAdmission`](crate::global_frame_gate::GlobalFrameAdmission).
+    /// It runs in the gossip poll thread BEFORE a message is delivered to the
+    /// app recv loop or forwarded to the mesh, so it stays O(1): it does not
+    /// decode the frame (up to ~15 MiB) or verify the committee cert. It
+    /// rejects a wrong type prefix, ignores copies of frames the recv loop
+    /// already accepted (or stale ones), and rate-limits the rest per committee
+    /// author or, for frames the committee did not sign, per forwarding peer.
+    /// The authoritative checks (genesis prover, committee finalization cert,
+    /// VDF, requests root) still run in the recv loop.
+    pub async fn register_global_frame_validator(&self, bitmask: Vec<u8>, frame_type: u32) {
+        let admission = crate::global_frame_gate::GlobalFrameAdmission::new(
+            frame_type,
+            self.global_frame_gate.clone(),
+        );
+        let validator: Box<
+            dyn Fn(&PeerId, Option<&PeerId>, &[u8]) -> crate::ValidationResult + Send + Sync,
+        > = Box::new(move |peer, author, data| {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            admission.admit(peer, author, data, now_secs)
+        });
+        let _ = self
+            .cmd_tx
+            .send(P2PCommand::RegisterAuthoredValidator { bitmask, validator })
             .await;
     }
 
@@ -1373,11 +1541,7 @@ impl P2PHandle {
     /// exited without acknowledging the publish, or the underlying
     /// BlossomSub behaviour rejected the message (e.g. local node not
     /// subscribed to the bitmask).
-    pub async fn publish(
-        &self,
-        bitmask: Vec<u8>,
-        data: Vec<u8>,
-    ) -> quil_types::error::Result<()> {
+    pub async fn publish(&self, bitmask: Vec<u8>, data: Vec<u8>) -> quil_types::error::Result<()> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.cmd_tx
             .send(P2PCommand::Publish {
@@ -1386,9 +1550,9 @@ impl P2PHandle {
                 ack: Some(ack_tx),
             })
             .await
-            .map_err(|_| QuilError::P2p(
-                "p2p command channel closed (swarm shutting down?)".into(),
-            ))?;
+            .map_err(|_| {
+                QuilError::P2p("p2p command channel closed (swarm shutting down?)".into())
+            })?;
         match ack_rx.await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(reason)) => Err(QuilError::P2p(format!(
@@ -1507,10 +1671,22 @@ impl P2PHandle {
         data: Vec<u8>,
     ) -> crate::direct::DirectOutcome {
         let (ack, outcome) = oneshot::channel();
-        if self.cmd_tx.send(P2PCommand::SendDirect { peer, bitmask, data, ack }).await.is_err() {
+        if self
+            .cmd_tx
+            .send(P2PCommand::SendDirect {
+                peer,
+                bitmask,
+                data,
+                ack,
+            })
+            .await
+            .is_err()
+        {
             return crate::direct::DirectOutcome::Failed;
         }
-        outcome.await.unwrap_or(crate::direct::DirectOutcome::Failed)
+        outcome
+            .await
+            .unwrap_or(crate::direct::DirectOutcome::Failed)
     }
 
     /// Accept direct messages on `bitmask` (delivered like its gossip).
@@ -1525,17 +1701,38 @@ impl P2PHandle {
 
     /// Record that a send went over gossip after its direct attempt.
     pub fn note_direct_fallback(&self) {
-        self.direct_stats.fallbacks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.direct_stats
+            .fallbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn direct_stats(&self) -> crate::direct::DirectStatsSnapshot {
         self.direct_stats.snapshot()
     }
 
-    /// Externally observed addresses (NAT-resolved) as reported by
-    /// connected peers via the identify protocol.
+    /// This process's gossip traffic by class since it started.
+    pub fn gossip_traffic(&self) -> crate::gossip_traffic::GossipTrafficSnapshot {
+        self.gossip_traffic.snapshot()
+    }
+
+    /// The counters behind [`gossip_traffic`](Self::gossip_traffic), for a
+    /// reader that outlives this handle's borrow.
+    pub fn gossip_traffic_counters(&self) -> std::sync::Arc<crate::gossip_traffic::GossipTraffic> {
+        self.gossip_traffic.clone()
+    }
+
+    /// The node's current AutoNAT-confirmed external addresses: at most one
+    /// per listener transport, most recently accepted first, globally
+    /// routable and on a listen port (see [`crate::external_addr`]).
     pub fn observed_addresses(&self) -> Vec<String> {
-        self.observed_addrs.read().unwrap().clone()
+        self.external_addrs.borrow().addrs.clone()
+    }
+
+    /// Follow changes to [`observed_addresses`](Self::observed_addresses).
+    pub fn watch_external_addresses(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::external_addr::ConfirmedExternalAddrs> {
+        self.external_addrs.clone()
     }
 
     /// Construct a stub `P2PHandle` for tests that exercise callers of
@@ -1565,21 +1762,32 @@ impl P2PHandle {
         Self {
             peer_id,
             cmd_tx,
-            observed_addrs: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+            external_addrs: tokio::sync::watch::channel(Default::default()).1,
             peer_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics_registry: std::sync::Arc::new(std::sync::Mutex::new(
                 prometheus_client::registry::Registry::default(),
             )),
             direct_stats: Default::default(),
+            gossip_traffic: Default::default(),
+            global_frame_gate: Default::default(),
         }
     }
 }
 
 enum P2PCommand {
     Subscribe(Vec<u8>),
-    SubscribeConfirmed { bitmask: Vec<u8>, ack: oneshot::Sender<()> },
-    SubscribedPeerCount { bitmask: Vec<u8>, ack: oneshot::Sender<usize> },
-    SetCommitteePeers { peers: std::collections::HashSet<PeerId>, ack: oneshot::Sender<usize> },
+    SubscribeConfirmed {
+        bitmask: Vec<u8>,
+        ack: oneshot::Sender<()>,
+    },
+    SubscribedPeerCount {
+        bitmask: Vec<u8>,
+        ack: oneshot::Sender<usize>,
+    },
+    SetCommitteePeers {
+        peers: std::collections::HashSet<PeerId>,
+        ack: oneshot::Sender<usize>,
+    },
     Unsubscribe(Vec<u8>),
     /// Install a per-(source, target) gossip forward filter. Used by the
     /// devnet test proxy to impose bipartite network partitions.
@@ -1591,6 +1799,13 @@ enum P2PCommand {
     RegisterValidator {
         bitmask: Vec<u8>,
         validator: Box<dyn Fn(&PeerId, &[u8]) -> crate::ValidationResult + Send + Sync>,
+    },
+    /// Register a validator that also sees the message's signed author
+    /// (`None` for an unsigned message); see `RegisterValidator`.
+    RegisterAuthoredValidator {
+        bitmask: Vec<u8>,
+        validator:
+            Box<dyn Fn(&PeerId, Option<&PeerId>, &[u8]) -> crate::ValidationResult + Send + Sync>,
     },
     Publish {
         bitmask: Vec<u8>,
@@ -1619,9 +1834,15 @@ enum P2PCommand {
         ack: oneshot::Sender<f64>,
     },
     /// Replace a peer's application score override.
-    SetPeerScore { peer: PeerId, score: f64 },
+    SetPeerScore {
+        peer: PeerId,
+        score: f64,
+    },
     /// Add `delta` to a peer's application score override.
-    AddPeerScore { peer: PeerId, delta: f64 },
+    AddPeerScore {
+        peer: PeerId,
+        delta: f64,
+    },
     /// Disconnect + redial a peer.
     Reconnect {
         peer: PeerId,
@@ -1669,19 +1890,71 @@ pub fn message_id(data: &[u8]) -> Vec<u8> {
     id
 }
 
+/// Drop the addresses no dial-back confirmed for too long, publish the
+/// confirmed addresses with AutoNAT's current view when either changed, and
+/// log the tracker's pending-move and hold lines. Runs after every AutoNAT
+/// event, so an address goes at the first probe past its window.
+fn publish_external(
+    tx: &tokio::sync::watch::Sender<ConfirmedExternalAddrs>,
+    tracker: &mut ExternalAddrTracker,
+    health: &AutonatHealth,
+    nat: &libp2p::autonat::NatStatus,
+) {
+    let now = std::time::Instant::now();
+    tracker.expire_unconfirmed(now);
+    for notice in tracker.pending_notices(now) {
+        crate::external_addr::log_pending(&notice);
+    }
+    for notice in tracker.hold_notices() {
+        crate::external_addr::log_hold(
+            &notice,
+            crate::autonat_health::status_str(nat),
+            &health.run_failures(),
+        );
+    }
+    let next = ConfirmedExternalAddrs {
+        autonat: health.summary(nat),
+        ..tracker.snapshot()
+    };
+    tx.send_if_modified(|current| {
+        if *current == next {
+            return false;
+        }
+        *current = next;
+        true
+    });
+}
+
+/// AutoNAT's server and request state for an operator line.
+fn probe_context(
+    autonat: &libp2p::autonat::Behaviour,
+    servers: &crate::autonat_servers::ProbeServers,
+) -> ProbeContext {
+    ProbeContext {
+        eligible_servers: autonat.eligible_servers(),
+        servers: servers.count(),
+        addresses_sent: autonat.last_probe_addresses().len(),
+        confidence: autonat.confidence(),
+    }
+}
+
 /// Returns `true` if the multiaddr's IP component is publicly routable
 /// (not loopback, link-local, or private). Identify shares all listen
 /// addresses including localhost/private — we must drop those before adding
 /// them to Kademlia/dial, otherwise we generate thousands of useless dials
 /// against our own machine and rate-limit ourselves out of the network.
-fn is_routable(addr: &Multiaddr) -> bool {
+pub(crate) fn is_routable(addr: &Multiaddr) -> bool {
     use std::net::{Ipv4Addr, Ipv6Addr};
     for proto in addr.iter() {
         match proto {
             Protocol::Ip4(ip) => {
-                if ip.is_loopback() || ip.is_link_local() || ip.is_private()
-                    || ip == Ipv4Addr::UNSPECIFIED || ip.is_broadcast()
-                    || ip.is_documentation() || ip.is_multicast()
+                if ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_private()
+                    || ip == Ipv4Addr::UNSPECIFIED
+                    || ip.is_broadcast()
+                    || ip.is_documentation()
+                    || ip.is_multicast()
                 {
                     return false;
                 }

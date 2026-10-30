@@ -17,12 +17,18 @@ struct GlobalFlags {
     #[arg(long, global = true, env = "QUILIBRIUM_NETWORK")]
     network: Option<String>,
 
-    /// Verify the binary's release signatures before running
-    /// (default true, or the value of QUILIBRIUM_SIGNATURE_CHECK).
-    #[arg(long = "signature-check", global = true, env = "QUILIBRIUM_SIGNATURE_CHECK", default_value_t = true, action = clap::ArgAction::Set)]
-    signature_check: bool,
+    /// Accepted and ignored, so commands written for the Go client keep
+    /// working: qclient runs no startup self-check, and it verifies every
+    /// release it downloads regardless.
+    #[arg(
+        long = "signature-check",
+        global = true,
+        hide = true,
+        action = clap::ArgAction::Set
+    )]
+    _signature_check: Option<bool>,
 
-    /// Auto-approve prompts and bypass the signature check.
+    /// Auto-approve prompts.
     #[arg(short = 'y', long = "yes", global = true, default_value_t = false)]
     yes: bool,
 }
@@ -31,7 +37,6 @@ impl From<&GlobalFlags> for GlobalArgs {
     fn from(f: &GlobalFlags) -> Self {
         GlobalArgs {
             network: f.network.clone(),
-            signature_check: f.signature_check,
             yes: f.yes,
         }
     }
@@ -96,6 +101,9 @@ enum Commands {
     /// Download and install the latest (or a specific) qclient release.
     Update {
         version: Option<String>,
+        /// Install a version older than the linked one.
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Download the release signature files for the qclient binary.
     DownloadSignatures {
@@ -140,7 +148,9 @@ fn real_main() -> anyhow::Result<()> {
         Commands::Alias { command } => commands::alias::run(global, command),
         Commands::Key { command } => commands::key::run(global, command),
         Commands::Link => commands::link::run(),
-        Commands::Diagnostics { command } => commands::node::diagnostics_logs::run_identity(command),
+        Commands::Diagnostics { command } => {
+            commands::node::diagnostics_logs::run_identity(command)
+        }
 
         // Async (RPC-bearing) commands run on a Tokio runtime.
         Commands::Token(args) => runtime()?.block_on(commands::token::run(global, args)),
@@ -151,12 +161,16 @@ fn real_main() -> anyhow::Result<()> {
         Commands::Message(args) => runtime()?.block_on(commands::message::run(global, args)),
         Commands::Deploy { command } => runtime()?.block_on(commands::deploy::run(global, command)),
         Commands::Compute(args) => runtime()?.block_on(commands::compute::run(global, args)),
-        Commands::Update { version } => {
-            runtime()?.block_on(commands::release_cmds::update(version.as_deref()))
-        }
-        Commands::DownloadSignatures { version } => {
-            runtime()?.block_on(commands::release_cmds::download_signatures(version.as_deref()))
-        }
+        Commands::Update {
+            version,
+            allow_downgrade,
+        } => runtime()?.block_on(commands::release_cmds::update(
+            version.as_deref(),
+            *allow_downgrade,
+        )),
+        Commands::DownloadSignatures { version } => runtime()?.block_on(
+            commands::release_cmds::download_signatures(version.as_deref()),
+        ),
     }
 }
 
@@ -171,8 +185,27 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 mod tests {
     use clap::CommandFactory;
 
+    /// The Go client's `--signature-check` still parses, and help no longer
+    /// offers a check that qclient never ran.
+    #[test]
+    fn the_signature_check_flag_is_hidden_and_accepted() {
+        use clap::Parser;
+        for args in [
+            ["qclient", "--signature-check=false", "config", "print"],
+            ["qclient", "config", "print", "--signature-check=true"],
+        ] {
+            super::Cli::try_parse_from(args).unwrap();
+        }
+        let help = super::Cli::command().render_long_help().to_string();
+        assert!(!help.contains("--signature-check"), "{help}");
+        assert!(!help.contains("bypass"), "{help}");
+    }
+
     #[test]
     fn the_version_flag_reports_the_release_and_subpatch() {
-        assert_eq!(super::Cli::command().get_version(), Some(quil_config::display_version()));
+        assert_eq!(
+            super::Cli::command().get_version(),
+            Some(quil_config::display_version())
+        );
     }
 }

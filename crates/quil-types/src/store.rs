@@ -19,7 +19,9 @@ impl BackingStoreIdentity {
 }
 
 impl PartialEq for BackingStoreIdentity {
-    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 impl Eq for BackingStoreIdentity {}
 
@@ -210,10 +212,14 @@ pub trait ExecutionPublicationObserver {
 
 pub trait ClockStore: Send + Sync {
     /// Process-local backing storage identity for constructing execution contexts.
-    fn backing_store_identity(&self) -> Option<BackingStoreIdentity> { None }
+    fn backing_store_identity(&self) -> Option<BackingStoreIdentity> {
+        None
+    }
 
     fn prepare_execution_publication(&self) -> Result<Box<dyn ExecutionPublicationObserver + '_>> {
-        Err(QuilError::ExecutionUnavailable("clock does not support canonical execution publication".into()))
+        Err(QuilError::ExecutionUnavailable(
+            "clock does not support canonical execution publication".into(),
+        ))
     }
 
     fn new_transaction(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
@@ -225,10 +231,17 @@ pub trait ClockStore: Send + Sync {
     /// The canonical global frame's header alone, without its request
     /// bundles: shard-header execution reads each anchor frame's output
     /// several times, and a frame's bundles are most of its bytes.
-    fn get_global_clock_frame_header(&self, frame_number: u64) -> Result<proto::global::GlobalFrameHeader> {
+    fn get_global_clock_frame_header(
+        &self,
+        frame_number: u64,
+    ) -> Result<proto::global::GlobalFrameHeader> {
         self.get_global_clock_frame(frame_number)?
             .header
-            .ok_or_else(|| crate::error::QuilError::NotFound(format!("global frame {frame_number} has no header")))
+            .ok_or_else(|| {
+                crate::error::QuilError::NotFound(format!(
+                    "global frame {frame_number} has no header"
+                ))
+            })
     }
     fn put_global_clock_frame(
         &self,
@@ -259,52 +272,90 @@ pub trait ClockStore: Send + Sync {
     /// Persist the fee total (QUIL base units) of a materialized shard frame:
     /// the next proposal carries it as `FrameHeader.fee_total` and every
     /// validator recomputes it, so it must survive a restart. Default no-op.
-    fn put_shard_frame_fee_total(&self, _filter: &[u8], _frame_number: u64, _fee_total: u128) -> Result<()> {
+    fn put_shard_frame_fee_total(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+        _fee_total: u128,
+    ) -> Result<()> {
         Ok(())
     }
     /// The persisted fee total of a materialized shard frame, if recorded.
-    fn get_shard_frame_fee_total(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<u128>> {
+    fn get_shard_frame_fee_total(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<Option<u128>> {
         Ok(None)
     }
     /// Persist the settlement relay entries a materialized shard frame
     /// produced (canonical `settlement_record::encode_entries` bytes, empty
     /// for none). Later frame headers relay them. Default no-op.
-    fn put_shard_frame_settlements(&self, _filter: &[u8], _frame_number: u64, _entries: &[u8]) -> Result<()> {
+    fn put_shard_frame_settlements(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+        _entries: &[u8],
+    ) -> Result<()> {
         Ok(())
     }
     /// The persisted settlement entries of a shard frame, if recorded.
-    fn get_shard_frame_settlements(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<Vec<u8>>> {
+    fn get_shard_frame_settlements(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
     /// Persist a materialized shard frame's accumulator record: the digest of
     /// the shard's report at that frame (empty for none), and the report bytes
     /// under that digest. Later frame headers carry the report. Default no-op.
-    fn put_shard_frame_accumulator(&self, _filter: &[u8], _frame_number: u64, _digest: &[u8], _report: &[u8]) -> Result<()> {
+    fn put_shard_frame_accumulator(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+        _digest: &[u8],
+        _report: &[u8],
+    ) -> Result<()> {
         Ok(())
     }
     /// The recorded accumulator-report digest of a shard frame, if recorded.
-    fn get_shard_frame_accumulator(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<Vec<u8>>> {
+    fn get_shard_frame_accumulator(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
     /// Persist the spend entries a materialized shard frame produced
     /// (`spend_relay::encode_frame_entries` bytes). Default no-op.
-    fn put_shard_frame_spends(&self, _filter: &[u8], _frame_number: u64, _entries: &[u8]) -> Result<()> {
+    fn put_shard_frame_spends(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+        _entries: &[u8],
+    ) -> Result<()> {
         Ok(())
     }
     /// The recorded spend entries of a shard frame, if recorded.
-    fn get_shard_frame_spends(&self, _filter: &[u8], _frame_number: u64) -> Result<Option<Vec<u8>>> {
+    fn get_shard_frame_spends(
+        &self,
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
     /// The report bytes stored under `digest`, if recorded.
-    fn get_shard_accumulator_report(&self, _filter: &[u8], _digest: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn get_shard_accumulator_report(
+        &self,
+        _filter: &[u8],
+        _digest: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
     /// Read the per-bundle materialization outcomes for a frame (empty if the
     /// frame hasn't materialized yet or the backend doesn't record them).
-    fn get_global_clock_frame_outcomes(
-        &self,
-        _frame_number: u64,
-    ) -> Result<Vec<RequestOutcome>> {
+    fn get_global_clock_frame_outcomes(&self, _frame_number: u64) -> Result<Vec<RequestOutcome>> {
         Ok(Vec::new())
     }
     /// Returns up to `limit` candidate frames in
@@ -323,11 +374,7 @@ pub trait ClockStore: Send + Sync {
     ) -> Result<Vec<proto::global::GlobalFrame>> {
         Ok(Vec::new())
     }
-    fn delete_global_clock_frame_range(
-        &self,
-        min_frame: u64,
-        max_frame: u64,
-    ) -> Result<()>;
+    fn delete_global_clock_frame_range(&self, min_frame: u64, max_frame: u64) -> Result<()>;
     fn reset_global_clock_frames(&self) -> Result<()>;
 
     // Global certified state
@@ -373,10 +420,7 @@ pub trait ClockStore: Send + Sync {
     ) -> Result<()>;
 
     // Shard frames
-    fn get_latest_shard_clock_frame(
-        &self,
-        filter: &[u8],
-    ) -> Result<proto::global::AppShardFrame>;
+    fn get_latest_shard_clock_frame(&self, filter: &[u8]) -> Result<proto::global::AppShardFrame>;
     /// The latest stored frame number of shard `filter`, without reading the
     /// frame: an application frame can be megabytes, and status queries need
     /// only its number. `None` when the shard has no frame.
@@ -414,11 +458,35 @@ pub trait ClockStore: Send + Sync {
         parent_selector: &[u8],
         truncate: bool,
     ) -> Result<proto::global::AppShardFrame>;
-    fn set_latest_shard_clock_frame_number(
+    /// Store an authenticated application frame, whose output hashes to
+    /// `selector`, where shard frames are served from: as
+    /// [`Self::stage_shard_clock_frame`] then [`Self::commit_shard_clock_frame`]
+    /// leave it. A store may write it as a batch confined to the shard-frame
+    /// keys, so that a concurrent execution plan conflicts at commit only if
+    /// it touched them.
+    fn store_shard_clock_frame_for_serving(
         &self,
-        filter: &[u8],
-        frame_number: u64,
-    ) -> Result<()>;
+        selector: &[u8],
+        frame: &proto::global::AppShardFrame,
+    ) -> Result<()> {
+        let header = frame.header.as_ref().ok_or_else(|| {
+            crate::error::QuilError::InvalidArgument("shard frame has no header".into())
+        })?;
+        // Two transactions: the commit reads the staged copy from the store.
+        let txn = self.new_transaction(false)?;
+        self.stage_shard_clock_frame(selector, frame, txn.as_ref())?;
+        txn.commit()?;
+        let txn = self.new_transaction(false)?;
+        self.commit_shard_clock_frame(
+            &header.address,
+            header.frame_number,
+            selector,
+            txn.as_ref(),
+            false,
+        )?;
+        txn.commit()
+    }
+    fn set_latest_shard_clock_frame_number(&self, filter: &[u8], frame_number: u64) -> Result<()>;
     fn delete_shard_clock_frame_range(
         &self,
         filter: &[u8],
@@ -622,14 +690,8 @@ pub trait KeyStore: Send + Sync {
         identity_sig_of_proving: &[u8],
         proving_sig_of_identity: &[u8],
     ) -> Result<()>;
-    fn get_cross_signature_by_identity_key(
-        &self,
-        identity_key_address: &[u8],
-    ) -> Result<Vec<u8>>;
-    fn get_cross_signature_by_proving_key(
-        &self,
-        proving_key_address: &[u8],
-    ) -> Result<Vec<u8>>;
+    fn get_cross_signature_by_identity_key(&self, identity_key_address: &[u8]) -> Result<Vec<u8>>;
+    fn get_cross_signature_by_proving_key(&self, proving_key_address: &[u8]) -> Result<Vec<u8>>;
     fn put_signed_x448_key(
         &self,
         txn: &dyn Transaction,
@@ -677,7 +739,9 @@ pub trait WorkerStore: Send + Sync {
 pub trait ShardsStore: Send + Sync {
     /// Identity of the committed backing store. A staged metadata batch is
     /// deliberately not an independently capturable committed store.
-    fn backing_store_identity(&self) -> Option<BackingStoreIdentity> { None }
+    fn backing_store_identity(&self) -> Option<BackingStoreIdentity> {
+        None
+    }
 
     fn range_app_shards(&self) -> Result<Vec<ShardInfo>>;
     fn get_app_shards(&self, shard_key: &[u8], prefix: &[u32]) -> Result<Vec<ShardInfo>>;
@@ -811,28 +875,74 @@ pub struct LegacyCoinPageData {
 /// Legacy coins one page carries.
 pub const MAX_LEGACY_COINS_PER_PAGE: usize = 512;
 
+/// Coins (or escrows) a wallet scan page carries unless its request asks for
+/// more: the page every node and wallet used before `max_coins`, and the
+/// page a [`CoinWitnessProvider`] answers.
+pub const DEFAULT_SCAN_PAGE_ENTRIES: usize = 8;
+/// The most coins (or escrows) a wallet scan page carries on request.
+pub const MAX_SCAN_PAGE_ENTRIES: usize = 64;
+
+/// The page size a scan request's `max_coins` asks for: unset (zero) and
+/// values below [`DEFAULT_SCAN_PAGE_ENTRIES`] mean the default, values above
+/// [`MAX_SCAN_PAGE_ENTRIES`] the maximum.
+pub fn scan_page_entries(max_coins: u32) -> usize {
+    usize::try_from(max_coins)
+        .unwrap_or(MAX_SCAN_PAGE_ENTRIES)
+        .clamp(DEFAULT_SCAN_PAGE_ENTRIES, MAX_SCAN_PAGE_ENTRIES)
+}
+
+/// The most bytes an encoded scan page of `entries` coins or escrows takes:
+/// 32 KiB an entry, 256 KiB for the default page.
+pub fn scan_page_bytes(entries: usize) -> usize {
+    entries.saturating_mul(32 * 1024)
+}
+
 /// Node-side QCT3 wallet discovery, membership and mint-witness provider.
 pub trait CoinWitnessProvider: Send + Sync {
     /// `owner`'s legacy coins in `domain` after `after`. `None` when this node
     /// cannot list them (no complete owner index): the caller asks an
     /// archive instead.
-    fn legacy_coins(&self, _domain: &[u8; 32], _owner: &[u8; 32], _after: Option<&[u8; 32]>) -> Result<Option<LegacyCoinPageData>> {
+    fn legacy_coins(
+        &self,
+        _domain: &[u8; 32],
+        _owner: &[u8; 32],
+        _after: Option<&[u8; 32]>,
+    ) -> Result<Option<LegacyCoinPageData>> {
         Ok(None)
     }
 
-    fn escrow_page(&self, _domain: &[u8; 32], _snapshot_id: Option<&[u8; 32]>, _after: Option<&[u8; 32]>) -> Result<Option<EscrowPageData>> {
+    fn escrow_page(
+        &self,
+        _domain: &[u8; 32],
+        _snapshot_id: Option<&[u8; 32]>,
+        _after: Option<&[u8; 32]>,
+    ) -> Result<Option<EscrowPageData>> {
         Ok(None)
     }
 
-    fn mint_authorization_witness(&self, _receipt: &[u8; 32]) -> Result<MintAuthorizationWitnessData> {
-        Err(crate::error::QuilError::ExecutionUnavailable("mint authorization witnesses unavailable".into()))
+    fn mint_authorization_witness(
+        &self,
+        _receipt: &[u8; 32],
+    ) -> Result<MintAuthorizationWitnessData> {
+        Err(crate::error::QuilError::ExecutionUnavailable(
+            "mint authorization witnesses unavailable".into(),
+        ))
     }
-    fn coin_page(&self, _domain: &[u8; 32], _snapshot_id: Option<&[u8; 32]>, _after: Option<&[u8; 32]>) -> Result<Option<CoinPageData>> {
+    fn coin_page(
+        &self,
+        _domain: &[u8; 32],
+        _snapshot_id: Option<&[u8; 32]>,
+        _after: Option<&[u8; 32]>,
+    ) -> Result<Option<CoinPageData>> {
         Ok(None)
     }
 
     /// None means the provider has not enabled the token suite.
-    fn coin_witnesses(&self, _domain: &[u8; 32], _addresses: &[[u8; 32]]) -> Result<Option<CoinWitnessBundle>> {
+    fn coin_witnesses(
+        &self,
+        _domain: &[u8; 32],
+        _addresses: &[[u8; 32]],
+    ) -> Result<Option<CoinWitnessBundle>> {
         Ok(None)
     }
 
@@ -861,11 +971,37 @@ pub struct VertexDataPage {
     pub has_more: bool,
 }
 
+/// A page of the large-vertex index ([`SnapshotReadable::page_large_vertices_skipping`]).
+pub struct IndexedVertexPage {
+    /// Address and latest blob, in ascending address order, for one domain.
+    pub entries: Vec<([u8; 32], Vec<u8>)>,
+    /// The last address examined, returned or not: a page can hold no entry
+    /// and still move the scan on.
+    pub cursor: Option<[u8; 32]>,
+    /// Index entries examined, including passed-over and stale ones.
+    pub examined: usize,
+    pub has_more: bool,
+}
+
+/// Whether a store's index of its large vertex rows can answer a scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LargeVertexIndexState {
+    /// The backend keeps no such index; scans walk the whole keyspace.
+    Unsupported,
+    /// The rows the store held before it kept the index are still being
+    /// walked: `rows_walked` so far.
+    Building { rows_walked: u64 },
+    /// Every large row has an entry.
+    Complete,
+}
+
 pub trait HypergraphStore: Send + Sync {
     /// Clear legacy and versioned underlying rows in all four phases of one
     /// shard. Forest maintenance is separate and must share the same barrier.
     fn clear_shard_underlying(&self, _shard: &ShardKey) -> Result<()> {
-        Err(QuilError::ExecutionUnavailable("shard record reset unsupported".into()))
+        Err(QuilError::ExecutionUnavailable(
+            "shard record reset unsupported".into(),
+        ))
     }
 
     /// Delete every `root → (version, frame)` index entry of one shard id's four
@@ -875,23 +1011,37 @@ pub trait HypergraphStore: Send + Sync {
     }
 
     /// [`Self::clear_root_versions`] for one `(set, phase)` tree.
-    fn clear_phase_root_versions(&self, _set_type: &str, _phase_type: &str, _shard_id: &[u8]) -> Result<usize> {
+    fn clear_phase_root_versions(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_id: &[u8],
+    ) -> Result<usize> {
         Ok(0)
     }
 
     /// Required when constructing an execution fork: the forest and record
     /// store must address the same backing database/overlay. Unknown backends
     /// cannot claim this invariant by default.
-    fn backing_store_identity(&self) -> Option<BackingStoreIdentity> { None }
+    fn backing_store_identity(&self) -> Option<BackingStoreIdentity> {
+        None
+    }
 
     /// Page fixed 64-byte domain/address keys, merging latest MVCC and legacy
     /// values. The cursor is exclusive. Each call is a consistent snapshot;
     /// separate calls are not automatically pinned to the same version.
     fn page_vertex_underlying_fixed(
-        &self, _set_type: &str, _phase_type: &str, _shard: &ShardKey,
-        _domain: &[u8; 32], _after: Option<&[u8; 32]>, _limits: VertexPageLimits,
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard: &ShardKey,
+        _domain: &[u8; 32],
+        _after: Option<&[u8; 32]>,
+        _limits: VertexPageLimits,
     ) -> Result<VertexDataPage> {
-        Err(QuilError::Store("fixed vertex paging is unsupported by this backend".into()))
+        Err(QuilError::Store(
+            "fixed vertex paging is unsupported by this backend".into(),
+        ))
     }
 
     fn new_transaction(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
@@ -974,11 +1124,7 @@ pub trait HypergraphStore: Send + Sync {
     /// commit — the same-frame idempotency cache would otherwise reuse the
     /// stale cached root and skip the now-dirty tree. Default no-op for
     /// stores without a per-frame commit cache (test/in-memory impls).
-    fn delete_shard_commits(
-        &self,
-        _frame_number: u64,
-        _shard_address: &[u8],
-    ) -> Result<()> {
+    fn delete_shard_commits(&self, _frame_number: u64, _shard_address: &[u8]) -> Result<()> {
         Ok(())
     }
 
@@ -1005,7 +1151,7 @@ pub trait HypergraphStore: Send + Sync {
     /// content becomes durable atomically with the tree nodes and shard
     /// commit of the surrounding transaction — matching Go's
     /// `SaveVertexTree`, which threads the transaction through to
-    /// `txn.Set`. 
+    /// `txn.Set`.
     fn save_vertex_underlying(
         &self,
         txn: &dyn Transaction,
@@ -1089,9 +1235,10 @@ pub trait HypergraphStore: Send + Sync {
     }
 
     /// Delete every stored version of `vertex_key`'s blob from `first` on,
-    /// staged into `txn`. A shard rewind uses it for removals made after the
-    /// state it restores: any removes-phase blob hides its vertex, so a newer
-    /// empty one cannot undo a removal. Default: unsupported.
+    /// staged into `txn`; from 0, its unversioned (pre-versioning) blob too.
+    /// A shard rewind uses it for removals made after the state it restores:
+    /// any removes-phase blob hides its vertex, so a newer empty one cannot
+    /// undo a removal. Default: unsupported.
     fn delete_vertex_underlying_versions_from(
         &self,
         _txn: &dyn Transaction,
@@ -1101,7 +1248,9 @@ pub trait HypergraphStore: Send + Sync {
         _vertex_key: &[u8],
         _first: u64,
     ) -> Result<()> {
-        Err(crate::error::QuilError::Internal("this store keeps no blob versions to delete".into()))
+        Err(crate::error::QuilError::Internal(
+            "this store keeps no blob versions to delete".into(),
+        ))
     }
 
     /// Record `root_hash → (version, global_frame)` for a `(shard, phase)` tree,
@@ -1203,11 +1352,7 @@ pub trait HypergraphStore: Send + Sync {
 
     fn range_alt_shard_addresses(&self) -> Result<Vec<Vec<u8>>>;
 
-    fn reap_old_changesets(
-        &self,
-        txn: &dyn Transaction,
-        frame_number: u64,
-    ) -> Result<()>;
+    fn reap_old_changesets(&self, txn: &dyn Transaction, frame_number: u64) -> Result<()>;
 
     fn track_change(
         &self,
@@ -1246,9 +1391,7 @@ pub trait HypergraphStore: Send + Sync {
     /// receives. Returns `None` if the implementation cannot capture a
     /// snapshot (default behaviour); callers fall back to the live
     /// store. Mirrors Go `TreeBackingStore.NewDBSnapshot`.
-    fn capture_tree_snapshot(
-        &self,
-    ) -> Result<Option<std::sync::Arc<dyn SnapshotReadable>>> {
+    fn capture_tree_snapshot(&self) -> Result<Option<std::sync::Arc<dyn SnapshotReadable>>> {
         Ok(None)
     }
 }
@@ -1314,28 +1457,74 @@ pub trait SnapshotReadable: Send + Sync {
     /// Read a metadata key at the same captured sequence as the tree data.
     /// Consumers of commit cursors must not substitute a live-store read.
     fn read_record(&self, _key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Err(QuilError::Store("snapshot metadata reads are unsupported by this backend".into()))
+        Err(QuilError::Store(
+            "snapshot metadata reads are unsupported by this backend".into(),
+        ))
     }
 
     /// Page fixed domain/address vertex keys from this retained snapshot.
     /// Reusing the same handle across pages keeps concurrent commits invisible.
     /// Callers must bound handle lifetime/count because snapshots retain old DB data.
     fn page_vertex_underlying_fixed(
-        &self, _set_type: &str, _phase_type: &str, _shard: &ShardKey,
-        _domain: &[u8; 32], _after: Option<&[u8; 32]>, _limits: VertexPageLimits,
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard: &ShardKey,
+        _domain: &[u8; 32],
+        _after: Option<&[u8; 32]>,
+        _limits: VertexPageLimits,
     ) -> Result<VertexDataPage> {
-        Err(QuilError::Store("fixed vertex snapshot paging is unsupported by this backend".into()))
+        Err(QuilError::Store(
+            "fixed vertex snapshot paging is unsupported by this backend".into(),
+        ))
     }
 
     /// [`Self::page_vertex_underlying_fixed`], passing over the rows whose
     /// address `skip` names without copying, returning or counting them, so
     /// a large row the caller does not want cannot fail its pages.
     fn page_vertex_underlying_fixed_skipping(
-        &self, _set_type: &str, _phase_type: &str, _shard: &ShardKey,
-        _domain: &[u8; 32], _after: Option<&[u8; 32]>, _limits: VertexPageLimits,
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard: &ShardKey,
+        _domain: &[u8; 32],
+        _after: Option<&[u8; 32]>,
+        _limits: VertexPageLimits,
         _skip: &dyn Fn(&[u8; 32]) -> bool,
     ) -> Result<VertexDataPage> {
-        Err(QuilError::Store("fixed vertex snapshot paging is unsupported by this backend".into()))
+        Err(QuilError::Store(
+            "fixed vertex snapshot paging is unsupported by this backend".into(),
+        ))
+    }
+
+    /// The store this snapshot reads (`master`, `worker N`), for log lines.
+    fn store_name(&self) -> Option<String> {
+        None
+    }
+
+    /// Whether [`Self::page_large_vertices_skipping`] lists every large row.
+    fn large_vertex_index_state(&self) -> Result<LargeVertexIndexState> {
+        Ok(LargeVertexIndexState::Unsupported)
+    }
+
+    /// [`Self::page_vertex_underlying_fixed_skipping`] over only the rows the
+    /// large-vertex index names (at least `LARGE_VERTEX_MIN_BYTES`), so a scan
+    /// for large records passes over the small ones without reading them.
+    /// Index entries whose row is gone are passed over. Valid only while
+    /// [`Self::large_vertex_index_state`] is `Complete`.
+    fn page_large_vertices_skipping(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard: &ShardKey,
+        _domain: &[u8; 32],
+        _after: Option<&[u8; 32]>,
+        _limits: VertexPageLimits,
+        _skip: &dyn Fn(&[u8; 32]) -> bool,
+    ) -> Result<IndexedVertexPage> {
+        Err(QuilError::Store(
+            "large vertex index paging is unsupported by this backend".into(),
+        ))
     }
 
     /// Load the serialized tree blob for `(set_type, phase_type, shard_key)`
@@ -1389,5 +1578,23 @@ pub trait SnapshotReadable: Send + Sync {
         _vertex_key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod scan_page_tests {
+    use super::*;
+
+    /// A request without `max_coins` gets the page it always got; a larger
+    /// one is bounded by the node's maximum.
+    #[test]
+    fn a_scan_page_size_defaults_to_eight_and_is_bounded() {
+        assert_eq!(scan_page_entries(0), DEFAULT_SCAN_PAGE_ENTRIES);
+        assert_eq!(scan_page_entries(1), DEFAULT_SCAN_PAGE_ENTRIES);
+        assert_eq!(scan_page_entries(20), 20);
+        assert_eq!(scan_page_entries(64), MAX_SCAN_PAGE_ENTRIES);
+        assert_eq!(scan_page_entries(u32::MAX), MAX_SCAN_PAGE_ENTRIES);
+        assert_eq!(scan_page_bytes(DEFAULT_SCAN_PAGE_ENTRIES), 256 * 1024);
+        assert_eq!(scan_page_bytes(MAX_SCAN_PAGE_ENTRIES), 2 << 20);
     }
 }

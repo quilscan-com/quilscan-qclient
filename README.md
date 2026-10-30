@@ -38,12 +38,28 @@ interactive interface. `manage --render` prints one read-only TUI frame;
 mode cannot be combined with either text mode.
 
 Official source baseline: `QuilibriumNetwork/monorepo` branch `v2.1.0.25` at
-`b77ddfbe5785b6e56a46339e9cdeeef20b7f5dfc` (fetched 2026-10-19). The Rust
+`f2496cbf851569bf8d0f8d31a12526a14017f7e6` (pinned 2026-10-29, subpatch `.111`). The Rust
 client dependency closure and protobufs follow that pinned tree, with the
 Quilscan machine interface, independent reward query and version CLI retained.
 See [`QCLIENT_OUTPUT_MIGRATION.md`](QCLIENT_OUTPUT_MIGRATION.md) for output
 contracts and [`docs/qclient-upstream-sync.md`](docs/qclient-upstream-sync.md)
 for source scope and verification.
+
+## Independent token status
+
+```sh
+qclient token claimable-rewards --config /path/to/node/.config
+```
+
+This local command queries QUIL rewards, unshielded legacy coins and confidential
+balance through the official implementations. Each result is printed and flushed
+as soon as it completes, so output order can vary. Rewards and legacy reads have
+30-second deadlines; the confidential scan has no added overall deadline and
+honors the official per-RPC timeouts and `--max-pages` / `--max-coins` limits.
+Inspect each result for `unavailable`: read failures
+retain this command's zero-exit convention. Configuration and stdout failures can
+still return nonzero. The Agent streams and reports the three values separately,
+including successful results from a command that later fails or times out.
 
 ## License
 

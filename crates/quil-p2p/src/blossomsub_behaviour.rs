@@ -80,8 +80,9 @@ impl ValidationResult {
     }
 }
 
-/// A per-bitmask validator closure.
-type Validator = Arc<dyn Fn(&PeerId, &[u8]) -> ValidationResult + Send + Sync>;
+/// A per-bitmask validator closure: forwarding peer, signed author (if the
+/// message is signed) and data.
+type Validator = Arc<dyn Fn(&PeerId, Option<&PeerId>, &[u8]) -> ValidationResult + Send + Sync>;
 
 /// Events emitted by the behaviour to the swarm. Identical in shape to the
 /// historical `BlossomSubEvent` so `node.rs`'s match arms are unchanged.
@@ -132,6 +133,10 @@ pub struct BlossomSubBehaviour {
     pending_events: VecDeque<BlossomSubEvent>,
     /// Last time the NeedPeers cadence check ran.
     last_need_peers_check: std::time::Instant,
+    /// Operator log state for the message cache's byte budget.
+    cache_pressure: CachePressure,
+    /// Operator log state for gossip RPCs dropped before decoding.
+    rejected_rpcs: RejectedRpcLog,
     /// Whether gossipsub metric families have been registered (guards against
     /// double-registration on a repeated `set_signing_identity`).
     metrics_registered: bool,
@@ -140,6 +145,8 @@ pub struct BlossomSubBehaviour {
     /// Prometheus registry carrying gossipsub's metric families plus the
     /// swarm-level `libp2p_*` families that `node.rs` registers afterward.
     metrics_registry: crate::metrics::SharedRegistry,
+    /// Every message copy by class, kept across `set_signing_identity`.
+    traffic: Arc<crate::gossip_traffic::GossipTraffic>,
 }
 
 impl BlossomSubBehaviour {
@@ -157,11 +164,13 @@ impl BlossomSubBehaviour {
         // after construction, before the swarm polls or we subscribe) rebuilds
         // `inner` with the real key.
         let placeholder = Keypair::generate_ed25519();
+        let traffic: Arc<crate::gossip_traffic::GossipTraffic> = Default::default();
         let inner = Inner::new(
             gossipsub::MessageAuthenticity::Signed(placeholder),
             config.clone(),
         )
-        .expect("valid gossipsub config");
+        .expect("valid gossipsub config")
+        .with_traffic_observer(traffic.clone());
         Self {
             inner,
             config,
@@ -175,12 +184,20 @@ impl BlossomSubBehaviour {
             application_scores: HashMap::new(),
             pending_events: VecDeque::new(),
             last_need_peers_check: std::time::Instant::now(),
+            cache_pressure: CachePressure::default(),
+            rejected_rpcs: RejectedRpcLog::default(),
             metrics_registered: false,
             warned_forward_filter: false,
             metrics_registry: Arc::new(std::sync::Mutex::new(
                 prometheus_client::registry::Registry::default(),
             )),
+            traffic,
         }
+    }
+
+    /// This behaviour's gossip traffic counters (see [`crate::gossip_traffic`]).
+    pub fn traffic(&self) -> Arc<crate::gossip_traffic::GossipTraffic> {
+        self.traffic.clone()
     }
 
     /// Shared handle to this behaviour's prometheus registry.
@@ -202,7 +219,8 @@ impl BlossomSubBehaviour {
                 self.config.clone(),
             )
             .expect("valid gossipsub config")
-            .with_metrics(sub, gossipsub::MetricsConfig::default());
+            .with_metrics(sub, gossipsub::MetricsConfig::default())
+            .with_traffic_observer(self.traffic.clone());
             drop(guard);
             self.metrics_registered = true;
             inner
@@ -212,8 +230,12 @@ impl BlossomSubBehaviour {
                 self.config.clone(),
             )
             .expect("valid gossipsub config")
+            .with_traffic_observer(self.traffic.clone())
         };
         self.inner = inner;
+        // The new inner behaviour's cache and rejection counters start from zero.
+        self.cache_pressure = CachePressure::default();
+        self.rejected_rpcs = RejectedRpcLog::default();
         // Enable peer scoring. Two channels are active:
         //  (1) application score (`set_application_score`) — driven by the node
         //      (peer_authenticator / per-source drop-rate penalties);
@@ -249,6 +271,21 @@ impl BlossomSubBehaviour {
         &mut self,
         bitmask: Vec<u8>,
         validator: impl Fn(&PeerId, &[u8]) -> ValidationResult + Send + Sync + 'static,
+    ) {
+        self.validators.insert(
+            bitmask,
+            Arc::new(
+                move |peer: &PeerId, _author: Option<&PeerId>, data: &[u8]| validator(peer, data),
+            ),
+        );
+    }
+
+    /// Register a per-bitmask validator that also sees the message's signed
+    /// author (`None` for an unsigned message).
+    pub fn register_authored_validator(
+        &mut self,
+        bitmask: Vec<u8>,
+        validator: impl Fn(&PeerId, Option<&PeerId>, &[u8]) -> ValidationResult + Send + Sync + 'static,
     ) {
         self.validators.insert(bitmask, Arc::new(validator));
     }
@@ -305,7 +342,10 @@ impl BlossomSubBehaviour {
     /// subscribed or on a publish error — matching the historical contract.
     pub fn publish(&mut self, bitmask: Vec<u8>, data: Vec<u8>) -> Result<(), String> {
         if !self.subscriptions.contains(&bitmask) {
-            return Err(format!("not subscribed to bitmask {}", hex::encode(&bitmask)));
+            return Err(format!(
+                "not subscribed to bitmask {}",
+                hex::encode(&bitmask)
+            ));
         }
         match self.inner.publish(topic_for(&bitmask).hash(), data) {
             Ok(_) => Ok(()),
@@ -335,9 +375,9 @@ impl BlossomSubBehaviour {
     /// Total score for a peer (falls back to the mirrored application score if
     /// the scorer has no entry).
     pub fn score(&self, peer: &PeerId) -> f64 {
-        self.inner.peer_score(peer).unwrap_or_else(|| {
-            self.application_scores.get(peer).copied().unwrap_or(0.0)
-        })
+        self.inner
+            .peer_score(peer)
+            .unwrap_or_else(|| self.application_scores.get(peer).copied().unwrap_or(0.0))
     }
 
     /// Set the application-level score for a peer (0.0 clears the override).
@@ -371,9 +411,12 @@ impl BlossomSubBehaviour {
     /// Connected peers which advertised this exact bitmask. This becomes
     /// useful before the mesh heartbeat has populated `mesh_peers`.
     pub fn subscribed_peer_count(&self, bitmask: &[u8]) -> usize {
-        self.peer_subscriptions.iter().filter(|(peer, subscriptions)| {
-            self.connected_peers.contains_key(*peer) && subscriptions.contains(bitmask)
-        }).count()
+        self.peer_subscriptions
+            .iter()
+            .filter(|(peer, subscriptions)| {
+                self.connected_peers.contains_key(*peer) && subscriptions.contains(bitmask)
+            })
+            .count()
     }
 
     /// Exempt authorized committee peers from IP-colocation only.
@@ -426,6 +469,12 @@ impl BlossomSubBehaviour {
             return;
         }
         self.last_need_peers_check = now;
+        // The message cache's byte-budget signal shares this cadence, and so does the
+        // count of RPCs dropped before decoding.
+        self.cache_pressure
+            .observe(self.inner.message_cache_stats(), now);
+        self.rejected_rpcs
+            .observe(self.inner.rejected_rpc_stats(), now);
         if self.subscriptions.is_empty() {
             return;
         }
@@ -456,6 +505,228 @@ impl BlossomSubBehaviour {
 impl Default for BlossomSubBehaviour {
     fn default() -> Self {
         Self::new(0)
+    }
+}
+
+/// While the message cache evicts to stay within its byte budget, the warning repeats at this
+/// interval; this long without an eviction ends the episode.
+const CACHE_PRESSURE_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Operator log of the message cache's byte budget: a warning when evictions start, one per
+/// [`CACHE_PRESSURE_LOG_INTERVAL`] while they continue, and an info line when they stop.
+#[derive(Debug, Default)]
+struct CachePressure {
+    /// Counters at the previous check.
+    seen: gossipsub::MessageCacheStats,
+    episode: Option<CachePressureEpisode>,
+}
+
+#[derive(Debug)]
+struct CachePressureEpisode {
+    /// Counters before the episode's first eviction.
+    base: gossipsub::MessageCacheStats,
+    started: std::time::Instant,
+    last_eviction: std::time::Instant,
+    last_log: std::time::Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CachePressureLog {
+    Started,
+    Continuing,
+    Ended,
+}
+
+impl CachePressure {
+    fn observe(
+        &mut self,
+        stats: gossipsub::MessageCacheStats,
+        now: std::time::Instant,
+    ) -> Option<CachePressureLog> {
+        let evicting = stats.evicted_messages > self.seen.evicted_messages;
+        let before = std::mem::replace(&mut self.seen, stats);
+        let log = match self.episode.as_mut() {
+            None if evicting => CachePressureLog::Started,
+            None => return None,
+            Some(episode) if evicting => {
+                episode.last_eviction = now;
+                if now.duration_since(episode.last_log) < CACHE_PRESSURE_LOG_INTERVAL {
+                    return None;
+                }
+                episode.last_log = now;
+                CachePressureLog::Continuing
+            }
+            Some(episode) => {
+                if now.duration_since(episode.last_eviction) < CACHE_PRESSURE_LOG_INTERVAL {
+                    return None;
+                }
+                CachePressureLog::Ended
+            }
+        };
+        if log == CachePressureLog::Started {
+            self.episode = Some(CachePressureEpisode {
+                base: before,
+                started: now,
+                last_eviction: now,
+                last_log: now,
+            });
+        }
+        let episode = self.episode.as_ref()?;
+        let evicted_messages = stats
+            .evicted_messages
+            .saturating_sub(episode.base.evicted_messages);
+        let evicted_bytes = stats
+            .evicted_bytes
+            .saturating_sub(episode.base.evicted_bytes);
+        let evicted_unvalidated = stats
+            .evicted_unvalidated
+            .saturating_sub(episode.base.evicted_unvalidated);
+        let duration_secs = now.duration_since(episode.started).as_secs();
+        match log {
+            CachePressureLog::Started => tracing::warn!(
+                budget_bytes = stats.max_bytes,
+                cached_bytes = stats.bytes,
+                cached_messages = stats.messages,
+                evicted_messages,
+                evicted_bytes,
+                "gossip message cache reached its byte budget; evicting the oldest messages, \
+                 which peers can then no longer request from this node. Expected during a burst \
+                 of large messages; report it with these counts if it persists"
+            ),
+            CachePressureLog::Continuing => tracing::warn!(
+                budget_bytes = stats.max_bytes,
+                cached_bytes = stats.bytes,
+                cached_messages = stats.messages,
+                evicted_messages,
+                evicted_bytes,
+                evicted_unvalidated,
+                duration_secs,
+                "gossip message cache still evicting to stay within its byte budget"
+            ),
+            CachePressureLog::Ended => {
+                tracing::info!(
+                    budget_bytes = stats.max_bytes,
+                    cached_bytes = stats.bytes,
+                    evicted_messages,
+                    evicted_bytes,
+                    evicted_unvalidated,
+                    duration_secs,
+                    "gossip message cache back within its byte budget"
+                );
+                self.episode = None;
+            }
+        }
+        Some(log)
+    }
+}
+
+/// While gossip RPCs are dropped before decoding, the warning repeats at this interval; this
+/// long without one ends the episode.
+const REJECTED_RPC_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Operator log of the gossip RPCs the pubsub codec dropped before decoding them, because they
+/// carried more entries than an RPC may or were malformed: a warning when they start, one per
+/// [`REJECTED_RPC_LOG_INTERVAL`] while they continue, and an info line when they stop.
+#[derive(Debug, Default)]
+struct RejectedRpcLog {
+    /// Counters at the previous check.
+    seen: gossipsub::RejectedRpcStats,
+    episode: Option<RejectedRpcEpisode>,
+}
+
+#[derive(Debug)]
+struct RejectedRpcEpisode {
+    /// Counters before the episode's first rejection.
+    base: gossipsub::RejectedRpcStats,
+    /// Counters at the episode's previous line.
+    logged: gossipsub::RejectedRpcStats,
+    started: std::time::Instant,
+    last_rejection: std::time::Instant,
+    last_log: std::time::Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RejectedRpcLogLine {
+    Started,
+    Continuing,
+    Ended,
+}
+
+impl RejectedRpcLog {
+    fn observe(
+        &mut self,
+        stats: gossipsub::RejectedRpcStats,
+        now: std::time::Instant,
+    ) -> Option<RejectedRpcLogLine> {
+        let rejecting = stats.rejected > self.seen.rejected;
+        let before = std::mem::replace(&mut self.seen, stats);
+        let line = match self.episode.as_mut() {
+            None if rejecting => RejectedRpcLogLine::Started,
+            None => return None,
+            Some(episode) if rejecting => {
+                episode.last_rejection = now;
+                if now.duration_since(episode.last_log) < REJECTED_RPC_LOG_INTERVAL {
+                    return None;
+                }
+                RejectedRpcLogLine::Continuing
+            }
+            Some(episode) => {
+                if now.duration_since(episode.last_rejection) < REJECTED_RPC_LOG_INTERVAL {
+                    return None;
+                }
+                RejectedRpcLogLine::Ended
+            }
+        };
+        if line == RejectedRpcLogLine::Started {
+            self.episode = Some(RejectedRpcEpisode {
+                base: before,
+                logged: before,
+                started: now,
+                last_rejection: now,
+                last_log: now,
+            });
+        }
+        let episode = self.episode.as_mut()?;
+        let rejected = stats.rejected.saturating_sub(episode.logged.rejected);
+        let bytes = stats.bytes.saturating_sub(episode.logged.bytes);
+        let total = stats.rejected.saturating_sub(episode.base.rejected);
+        let duration_secs = now.duration_since(episode.started).as_secs();
+        let (last_peer, last_reason) = stats
+            .last
+            .map(|(peer, rejection)| (peer.to_string(), rejection.to_string()))
+            .unwrap_or_default();
+        episode.logged = stats;
+        episode.last_log = now;
+        match line {
+            RejectedRpcLogLine::Started => tracing::warn!(
+                rejected,
+                bytes,
+                %last_peer,
+                %last_reason,
+                "dropping gossip RPCs from remote peers before decoding them: they carry more \
+                 entries than an RPC may, or are malformed. Each sender is penalised and its \
+                 gossip stream closed. No action is needed on this node; report it with these \
+                 fields if it persists"
+            ),
+            RejectedRpcLogLine::Continuing => tracing::warn!(
+                rejected,
+                bytes,
+                total,
+                %last_peer,
+                %last_reason,
+                duration_secs,
+                "still dropping gossip RPCs from remote peers before decoding them"
+            ),
+            RejectedRpcLogLine::Ended => {
+                tracing::info!(
+                    total,
+                    duration_secs,
+                    "no gossip RPC dropped before decoding for a minute; the episode ended"
+                );
+                self.episode = None;
+            }
+        }
+        Some(line)
     }
 }
 
@@ -575,7 +846,9 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                         // `validate_messages()` is on, so we must report an
                         // outcome for every message before it is forwarded.
                         let outcome = match self.validators.get(&bitmask) {
-                            Some(v) => v(&propagation_source, &message.data),
+                            Some(v) => {
+                                v(&propagation_source, message.source.as_ref(), &message.data)
+                            }
                             None => ValidationResult::Accept,
                         };
                         let _ = self.inner.report_message_validation_result(
@@ -584,13 +857,11 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                             outcome.to_acceptance(),
                         );
                         if outcome == ValidationResult::Accept {
-                            return Poll::Ready(ToSwarm::GenerateEvent(
-                                BlossomSubEvent::Message {
-                                    propagation_source,
-                                    message_id: message_id.0,
-                                    message: to_pb_message(message, bitmask),
-                                },
-                            ));
+                            return Poll::Ready(ToSwarm::GenerateEvent(BlossomSubEvent::Message {
+                                propagation_source,
+                                message_id: message_id.0,
+                                message: to_pb_message(message, bitmask),
+                            }));
                         }
                         // Rejected / ignored: don't surface, keep polling.
                         continue;
@@ -601,9 +872,10 @@ impl NetworkBehaviour for BlossomSubBehaviour {
                             .entry(peer_id)
                             .or_default()
                             .insert(bitmask.clone());
-                        return Poll::Ready(ToSwarm::GenerateEvent(
-                            BlossomSubEvent::Subscribed { peer_id, bitmask },
-                        ));
+                        return Poll::Ready(ToSwarm::GenerateEvent(BlossomSubEvent::Subscribed {
+                            peer_id,
+                            bitmask,
+                        }));
                     }
                     gossipsub::Event::Unsubscribed { peer_id, topic } => {
                         let bitmask = bitmask_from_topic(&topic);
@@ -640,7 +912,8 @@ impl NetworkBehaviour for BlossomSubBehaviour {
 /// Map [`crate::BlossomsubParams`] onto a [`gossipsub::Config`], selecting the
 /// per-network protocol id and setting the BlossomSub message id
 /// (`[0x01] ++ SHA256(data)`). Fork-only knobs without a stock equivalent
-/// (`mesh_peers_per_subnet`, `mcache_max_bytes`) are dropped.
+/// (`mesh_peers_per_subnet`) are dropped; `mcache_max_bytes` maps onto the
+/// vendored crate's message-cache byte budget.
 /// Peer-score config. Two channels are active: (1) the application score
 /// (`set_application_score`, driven by the node — peer_authenticator + per-source
 /// drop-rate penalties); (2) topic P₄ (invalid-message) on GLOBAL_PEER_INFO, so
@@ -659,10 +932,17 @@ fn build_peer_score() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresh
     pi_topic.mesh_failure_penalty_weight = 0.0;
     pi_topic.invalid_message_deliveries_weight = -50.0; // P₄ = weight × counter²
     pi_topic.invalid_message_deliveries_decay = 0.5; // ~halves each decay_interval → recovers
-    // Keep `PeerScoreParams::default()` for everything else — notably
-    // `app_specific_weight` (the existing `set_application_score` channel),
-    // `ip_colocation_factor_weight` and `behaviour_penalty_weight`.
+                                                     // Keep `PeerScoreParams::default()` for everything else — notably
+                                                     // `app_specific_weight` (the existing `set_application_score` channel),
+                                                     // `ip_colocation_factor_weight` and `behaviour_penalty_weight`.
     let mut score_params = gossipsub::PeerScoreParams::default();
+    // GLOBAL_FRAME `[0,0]`: the gate `Reject`s only a wrong type prefix, which
+    // every build rejects, so an honest relay never forwards one; copies of
+    // known frames and rate-limited frames are `Ignore`d, without penalty.
+    // Invalid signatures on the topic count too.
+    score_params
+        .topics
+        .insert(topic_for(&[0u8, 0]).hash(), pi_topic.clone());
     // GLOBAL_PEER_INFO bitmask `[0,0,0,0]` → topic `hex("00000000")`.
     score_params
         .topics
@@ -698,12 +978,14 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         )
         .history_length(params.history_length)
         .history_gossip(params.history_gossip)
+        // The history windows bound the message cache by heartbeats only; this
+        // bounds its bytes (oldest, validated messages evicted first).
+        .mcache_max_bytes(params.mcache_max_bytes)
         // Mesh-degree (D) family is DELIBERATELY left at gossipsub's own
         // defaults (mesh_n=6, mesh_n_low=5, mesh_n_high=12, gossip_lazy=6,
-        // mesh_outbound_min=2) rather than the blossomsub-tuned config values
-        // (D=8/D_lo=6). Higher fan-out multiplies traffic on high-rate topics
-        // (e.g. GLOBAL_PEER_INFO); `params.{d,d_lo,d_hi,d_lazy,d_out}` are
-        // intentionally NOT applied here.
+        // mesh_outbound_min=2): higher fan-out multiplies traffic on
+        // high-rate topics (e.g. GLOBAL_PEER_INFO). `params.d_lo` only
+        // gates the under-meshed check in `maybe_emit_need_peers`.
         .gossip_factor(params.gossip_factor)
         .heartbeat_interval(params.heartbeat_interval)
         .heartbeat_initial_delay(params.heartbeat_initial_delay)
@@ -712,9 +994,12 @@ fn build_config(network: u8, params: &crate::BlossomsubParams) -> gossipsub::Con
         .unsubscribe_backoff(params.unsubscribe_backoff.as_secs())
         .iwant_followup_time(params.iwant_followup_time)
         .idontwant_message_size_threshold(params.idont_want_message_threshold)
-        // Per-message size cap (fork used `mcache_max_bytes` for the mcache; the
-        // stock knob is the per-message transmit cap). 16 MiB matches the RPC
-        // frame cap in `protocol.rs`.
+        // Per-RPC frame cap. 16 MiB matches the RPC frame cap in
+        // `protocol.rs` and is the smallest that carries the largest message
+        // the node gossips: a GLOBAL frame of up to 15 MiB
+        // (`MAX_GOSSIP_GLOBAL_FRAME`) plus its signature and header. The
+        // codec bounds each RPC's entries before decoding it, so decoding
+        // stays proportional to the frame.
         .max_transmit_size(crate::protocol::MAX_MESSAGE_SIZE)
         // Keep de-duplicated message IDs at least as long as the peer-score
         // delivery-record window (WAN margin); cost is holding 33-byte ids a bit
@@ -747,6 +1032,79 @@ mod propagation_tests {
     use libp2p::{Multiaddr, Swarm, SwarmBuilder};
     use std::time::Duration;
 
+    #[test]
+    fn build_config_applies_the_message_cache_byte_budget() {
+        let params = crate::BlossomsubParams::default();
+        assert_eq!(
+            build_config(0, &params).mcache_max_bytes(),
+            crate::params::MCACHE_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn cache_pressure_logs_start_bounded_repeats_and_end() {
+        let stats = |evicted_messages| gossipsub::MessageCacheStats {
+            evicted_messages,
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut pressure = CachePressure::default();
+        assert_eq!(pressure.observe(stats(0), at(0)), None);
+        assert_eq!(
+            pressure.observe(stats(5), at(1)),
+            Some(CachePressureLog::Started)
+        );
+        assert_eq!(pressure.observe(stats(9), at(2)), None);
+        assert_eq!(pressure.observe(stats(9), at(30)), None);
+        assert_eq!(
+            pressure.observe(stats(12), at(61)),
+            Some(CachePressureLog::Continuing)
+        );
+        assert_eq!(pressure.observe(stats(12), at(100)), None);
+        assert_eq!(
+            pressure.observe(stats(12), at(121)),
+            Some(CachePressureLog::Ended)
+        );
+        assert_eq!(pressure.observe(stats(12), at(200)), None);
+        assert_eq!(
+            pressure.observe(stats(13), at(201)),
+            Some(CachePressureLog::Started)
+        );
+    }
+
+    #[test]
+    fn rejected_rpc_logs_start_bounded_repeats_and_end() {
+        let stats = |rejected| gossipsub::RejectedRpcStats {
+            rejected,
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut log = RejectedRpcLog::default();
+        assert_eq!(log.observe(stats(0), at(0)), None);
+        assert_eq!(
+            log.observe(stats(1), at(1)),
+            Some(RejectedRpcLogLine::Started)
+        );
+        assert_eq!(log.observe(stats(40), at(2)), None);
+        assert_eq!(log.observe(stats(40), at(30)), None);
+        assert_eq!(
+            log.observe(stats(41), at(61)),
+            Some(RejectedRpcLogLine::Continuing)
+        );
+        assert_eq!(log.observe(stats(41), at(100)), None);
+        assert_eq!(
+            log.observe(stats(41), at(121)),
+            Some(RejectedRpcLogLine::Ended)
+        );
+        assert_eq!(log.observe(stats(41), at(200)), None);
+        assert_eq!(
+            log.observe(stats(42), at(201)),
+            Some(RejectedRpcLogLine::Started)
+        );
+    }
+
     // The peer-score config must pass gossipsub's own validation, or
     // `with_peer_score` errors and scoring silently stays OFF (warn path).
     #[test]
@@ -768,6 +1126,37 @@ mod propagation_tests {
         assert_eq!(tp.mesh_message_deliveries_weight, 0.0);
         assert_eq!(tp.first_message_deliveries_weight, 0.0);
         assert_eq!(tp.time_in_mesh_weight, 0.0);
+        // GLOBAL_FRAME is scored the same way, so its rejects penalise.
+        let frame = params
+            .topics
+            .get(&topic_for(&[0u8, 0]).hash())
+            .expect("GLOBAL_FRAME must be scored");
+        assert!(frame.invalid_message_deliveries_weight < 0.0);
+        assert_eq!(frame.mesh_message_deliveries_weight, 0.0);
+    }
+
+    /// The registered validator sees the signed author of a message.
+    #[test]
+    fn authored_validators_see_the_author() {
+        let mut behaviour = BlossomSubBehaviour::new(0);
+        let author = PeerId::random();
+        behaviour.register_authored_validator(vec![1], move |_, from, _| {
+            if from == Some(&author) {
+                ValidationResult::Accept
+            } else {
+                ValidationResult::Ignore
+            }
+        });
+        behaviour.register_validator(vec![2], |_, _| ValidationResult::Reject);
+        let forwarder = PeerId::random();
+        let one = &behaviour.validators[&vec![1]];
+        assert_eq!(
+            one(&forwarder, Some(&author), b""),
+            ValidationResult::Accept
+        );
+        assert_eq!(one(&forwarder, None, b""), ValidationResult::Ignore);
+        let two = &behaviour.validators[&vec![2]];
+        assert_eq!(two(&forwarder, None, b""), ValidationResult::Reject);
     }
 
     fn build_swarm() -> Swarm<BlossomSubBehaviour> {
@@ -795,8 +1184,12 @@ mod propagation_tests {
         let topic = vec![0x0c, 0xa1];
         let peer = PeerId::random();
         let disconnected = PeerId::random();
-        behaviour.peer_subscriptions.insert(peer, [topic.clone()].into_iter().collect());
-        behaviour.peer_subscriptions.insert(disconnected, [topic.clone()].into_iter().collect());
+        behaviour
+            .peer_subscriptions
+            .insert(peer, [topic.clone()].into_iter().collect());
+        behaviour
+            .peer_subscriptions
+            .insert(disconnected, [topic.clone()].into_iter().collect());
         behaviour.connected_peers.insert(peer, 1);
 
         assert_eq!(behaviour.subscribed_peer_count(&topic), 1);

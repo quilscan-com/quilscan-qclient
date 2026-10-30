@@ -26,6 +26,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fmt::{self, Debug},
     net::IpAddr,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -52,17 +53,21 @@ use web_time::{Instant, SystemTime};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::{Churn, Config as MetricsConfig, Inclusion, Metrics, Penalty};
+#[cfg(test)]
+use crate::rpc_proto::proto;
 use crate::{
     backoff::BackoffStorage,
     config::{Config, ValidationMode},
     gossip_promises::GossipPromises,
     handler::{Handler, HandlerEvent, HandlerIn},
-    mcache::MessageCache,
+    mcache::{MessageCache, MessageCacheStats},
     peer_score::{PeerScore, PeerScoreParams, PeerScoreState, PeerScoreThresholds, RejectReason},
+    protocol::RejectedRpcStats,
     rpc::Sender,
     subscription_filter::{AllowAllSubscriptionFilter, TopicSubscriptionFilter},
     time_cache::DuplicateCache,
     topic::{Hasher, Topic, TopicHash},
+    traffic::{TrafficKind, TrafficObserver},
     transform::{DataTransform, IdentityTransform},
     types::{
         ControlAction, Graft, IDontWant, IHave, IWant, Message, MessageAcceptance, MessageId,
@@ -71,8 +76,6 @@ use crate::{
     },
     FailedMessages, PublishError, SubscriptionError, TopicScoreParams, ValidationError,
 };
-#[cfg(test)]
-use crate::rpc_proto::proto;
 
 #[cfg(test)]
 mod tests;
@@ -340,12 +343,24 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     #[cfg(feature = "metrics")]
     metrics: Option<Metrics>,
 
+    /// QUILIBRIUM: told of every message copy received, sent and published.
+    traffic: Option<Arc<dyn TrafficObserver>>,
+
     /// Tracks the numbers of failed messages per peer-id.
     failed_messages: HashMap<PeerId, FailedMessages>,
 
     /// Tracks recently sent `IWANT` messages and checks if peers respond to them.
     gossip_promises: GossipPromises,
+
+    /// QUILIBRIUM: inbound RPCs dropped before decoding.
+    rejected_rpcs: RejectedRpcStats,
 }
+
+/// QUILIBRIUM: the behaviour penalty (P7) of a peer per RPC dropped before decoding. P7 is
+/// `behaviour_penalty_weight` times the squared penalty: at the default weight (-10) one
+/// dropped RPC scores -1000, below any usual graylist threshold, until the penalty decays.
+/// No honest peer sends such an RPC.
+const REJECTED_RPC_PENALTY: usize = 10;
 
 impl<D, F> Behaviour<D, F>
 where
@@ -430,6 +445,7 @@ where
         Ok(Behaviour {
             #[cfg(feature = "metrics")]
             metrics: None,
+            traffic: None,
             events: VecDeque::new(),
             publish_config: privacy.into(),
             duplicate_cache: DuplicateCache::new(config.duplicate_cache_time()),
@@ -443,7 +459,11 @@ where
                 config.heartbeat_interval(),
                 config.backoff_slack(),
             ),
-            mcache: MessageCache::new(config.history_gossip(), config.history_length()),
+            mcache: MessageCache::new(
+                config.history_gossip(),
+                config.history_length(),
+                config.mcache_max_bytes(),
+            ),
             heartbeat: Delay::new(config.heartbeat_interval() + config.heartbeat_initial_delay()),
             heartbeat_ticks: 0,
             px_peers: HashSet::new(),
@@ -457,6 +477,7 @@ where
             data_transform,
             failed_messages: Default::default(),
             gossip_promises: Default::default(),
+            rejected_rpcs: RejectedRpcStats::default(),
         })
     }
 
@@ -471,6 +492,13 @@ where
         self.metrics = Some(Metrics::new(metrics_registry, metrics_config));
         self
     }
+
+    /// QUILIBRIUM: report every message copy to `observer` (see
+    /// [`TrafficObserver`]), independent of the metrics feature.
+    pub fn with_traffic_observer(mut self, observer: Arc<dyn TrafficObserver>) -> Self {
+        self.traffic = Some(observer);
+        self
+    }
 }
 
 impl<D, F> Behaviour<D, F>
@@ -481,6 +509,11 @@ where
     /// Lists the hashes of the topics we are currently subscribed to.
     pub fn topics(&self) -> impl Iterator<Item = &TopicHash> {
         self.mesh.keys()
+    }
+
+    /// QUILIBRIUM: occupancy of the message cache and its byte-budget evictions.
+    pub fn message_cache_stats(&self) -> MessageCacheStats {
+        self.mcache.stats()
     }
 
     /// Lists all mesh peers for a certain topic hash.
@@ -506,6 +539,12 @@ where
     /// Lists all known peers and their associated protocol.
     pub fn peer_protocol(&self) -> impl Iterator<Item = (&PeerId, &PeerKind)> {
         self.connected_peers.iter().map(|(k, v)| (k, &v.kind))
+    }
+
+    /// QUILIBRIUM: inbound RPCs dropped before decoding, because they carried more entries
+    /// than an RPC may or were malformed (see [`RejectedRpcStats`]).
+    pub fn rejected_rpc_stats(&self) -> RejectedRpcStats {
+        self.rejected_rpcs
     }
 
     /// Returns the gossipsub score for a given peer, if one exists.
@@ -796,6 +835,18 @@ where
                 },
             ) {
                 publish_failed = false
+            }
+        }
+        // QUILIBRIUM: counted once the message is queued for a peer, before
+        // the memcache takes it (the checks below fail the publish otherwise).
+        if !publish_failed {
+            if let Some(traffic) = &self.traffic {
+                traffic.observe(
+                    TrafficKind::Published,
+                    &raw_message.topic,
+                    &raw_message.data,
+                    raw_protobuf_len,
+                );
             }
         }
         self.mcache.put(&msg_id, raw_message);
@@ -1800,6 +1851,14 @@ where
         if let Some(metrics) = self.metrics.as_mut() {
             metrics.msg_recvd_unfiltered(&raw_message.topic, raw_protobuf_len);
         }
+        if let Some(traffic) = &self.traffic {
+            traffic.observe(
+                TrafficKind::Received,
+                &raw_message.topic,
+                &raw_message.data,
+                raw_protobuf_len,
+            );
+        }
 
         // Try and perform the data transform to the message. If it fails, consider it invalid.
         // QUILIBRIUM: an identity transform takes the data instead of a copy
@@ -1887,6 +1946,14 @@ where
         if let Some(metrics) = self.metrics.as_mut() {
             metrics.msg_recvd(&message.topic);
         }
+        if let Some(traffic) = &self.traffic {
+            traffic.observe(
+                TrafficKind::FirstReceived,
+                &message.topic,
+                &message.data,
+                raw_protobuf_len,
+            );
+        }
 
         // Tells score that message arrived (but is maybe not fully validated yet).
         // Consider the message as delivered for gossip promises.
@@ -1968,6 +2035,17 @@ where
                 // advertising this message via an IHAVE and it's invalid it will be double
                 // penalized, one for sending us an invalid and again for breaking a promise.
                 peer_score.reject_invalid_message(propagation_source, topic_hash);
+                // QUILIBRIUM: an invalid signature costs us a verification the
+                // sender chose, and an honest peer forwards only messages it
+                // verified. Penalise it on every topic, not only on topics with
+                // score parameters, so a peer that keeps sending them is
+                // graylisted.
+                if matches!(
+                    reject_reason,
+                    RejectReason::ValidationError(ValidationError::InvalidSignature)
+                ) {
+                    peer_score.add_penalty(propagation_source, 1);
+                }
             }
         }
     }
@@ -2939,11 +3017,23 @@ where
     /// sending the message failed due to the channel to the connection handler being
     /// full (which indicates a slow peer).
     fn send_message(&mut self, peer_id: PeerId, rpc: RpcOut) -> bool {
-        #[cfg(feature = "metrics")]
-        if let Some(m) = self.metrics.as_mut() {
-            if let RpcOut::Publish { ref message, .. } | RpcOut::Forward { ref message, .. } = rpc {
-                // register bytes sent on the internal metrics.
-                m.msg_sent(&message.topic, message.raw_protobuf_len());
+        // QUILIBRIUM: the size is computed once, for the metrics and the
+        // traffic observer.
+        if let RpcOut::Publish { ref message, .. } | RpcOut::Forward { ref message, .. } = rpc {
+            #[cfg(feature = "metrics")]
+            let measured = self.metrics.is_some();
+            #[cfg(not(feature = "metrics"))]
+            let measured = false;
+            if measured || self.traffic.is_some() {
+                let bytes = message.raw_protobuf_len();
+                #[cfg(feature = "metrics")]
+                if let Some(m) = self.metrics.as_mut() {
+                    // register bytes sent on the internal metrics.
+                    m.msg_sent(&message.topic, bytes);
+                }
+                if let Some(traffic) = &self.traffic {
+                    traffic.observe(TrafficKind::Sent, &message.topic, &message.data, bytes);
+                }
             }
         }
 
@@ -3325,6 +3415,25 @@ where
                         _ => {}
                     }
                 }
+            }
+            HandlerEvent::RpcRejected {
+                rejection,
+                frame_len,
+            } => {
+                // QUILIBRIUM: the codec dropped the RPC undecoded and the handler closed the
+                // stream. The node logs the counts (`rejected_rpc_stats`).
+                tracing::debug!(
+                    peer=%propagation_source,
+                    %rejection,
+                    frame_len,
+                    "Dropped an RPC before decoding it"
+                );
+                if let PeerScoreState::Active(peer_score) = &mut self.peer_score {
+                    peer_score.add_penalty(&propagation_source, REJECTED_RPC_PENALTY);
+                }
+                self.rejected_rpcs.rejected += 1;
+                self.rejected_rpcs.bytes += frame_len as u64;
+                self.rejected_rpcs.last = Some((propagation_source, rejection));
             }
             HandlerEvent::Message {
                 rpc,

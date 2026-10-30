@@ -11,9 +11,12 @@
 
 use quil_types::crypto::Signer;
 use quil_types::proto::global::{
-    message_request::Request, AltShardUpdate, MessageRequest, ProverLeave,
-    ProverPause, ProverReject, ProverResume, ProverUpdate,
+    message_request::Request, AltShardUpdate, MessageRequest, ProverLeave, ProverPause,
+    ProverReject, ProverResume, ProverUpdate,
 };
+
+use quil_types::proto::node::node_service_client::NodeServiceClient;
+use tonic::transport::Channel;
 
 use super::{sign, ProverCtx};
 
@@ -40,29 +43,97 @@ fn parse_single_filter(arg: Option<&str>) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+/// Sign and send a multi-filter op as several ops when `filters` exceed what
+/// one carries (see [`sign::op_chunks`]), each built by `build` over its own
+/// filters at the same frame. Every op is signed before the first is sent, so
+/// a filter no node decodes stops the command before anything goes out; a
+/// failed send stops the rest and says how many filters went out.
+async fn send_split(
+    pc: &ProverCtx,
+    client: &mut NodeServiceClient<Channel>,
+    op: &str,
+    filters: &[Vec<u8>],
+    build: impl Fn(&[Vec<u8>]) -> anyhow::Result<Request>,
+) -> anyhow::Result<()> {
+    let chunks: Vec<&[Vec<u8>]> = sign::op_chunks(filters).collect();
+    let requests = chunks
+        .iter()
+        .map(|chunk| build(*chunk))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let count = requests.len();
+    let mut sent = 0;
+    for (index, (request, chunk)) in requests.into_iter().zip(&chunks).enumerate() {
+        pc.send_global(client, wrap(request))
+            .await
+            .map_err(|e| split_send_error(op, index, count, filters, sent, e))?;
+        sent += chunk.len();
+    }
+    if count > 1 {
+        println!(
+            "Prover {op} sent successfully as {count} messages for {} filters",
+            filters.len()
+        );
+    } else {
+        println!("Prover {op} sent successfully");
+    }
+    Ok(())
+}
+
+/// The error of a split op whose message `index` (from 0) of `count` was not
+/// sent after the first `sent` filters went out. After a partial send it
+/// lists the unsent filters as the arguments of a follow-up command, so a
+/// re-run does not resend the published ones.
+fn split_send_error(
+    op: &str,
+    index: usize,
+    count: usize,
+    filters: &[Vec<u8>],
+    sent: usize,
+    err: impl std::fmt::Display,
+) -> anyhow::Error {
+    let mut message = format!(
+        "prover {op} message {}/{count} not sent ({sent}/{} filters sent): {err}",
+        index + 1,
+        filters.len()
+    );
+    if sent > 0 {
+        let unsent: Vec<String> = filters[sent..].iter().map(hex::encode).collect();
+        message.push_str(&format!(
+            "\nsend the {} unsent filters with: qclient node prover {op} {}",
+            unsent.len(),
+            unsent.join(" ")
+        ));
+    }
+    anyhow::anyhow!(message)
+}
+
 pub async fn leave(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
-    let sig = sign::leave_sig(&pc.key_manager, &filters, frame)?;
-    let op = ProverLeave {
-        filters,
-        frame_number: frame,
-        public_key_signature_bls48581: Some(sig),
-    };
-    pc.send_global(&mut client, wrap(Request::Leave(op))).await?;
-    println!("Prover leave sent successfully");
-    Ok(())
+    send_split(pc, &mut client, "leave", &filters, |chunk| {
+        let sig = sign::leave_sig(&pc.key_manager, chunk, frame)?;
+        Ok(Request::Leave(ProverLeave {
+            filters: chunk.to_vec(),
+            frame_number: frame,
+            public_key_signature_bls48581: Some(sig),
+        }))
+    })
+    .await
 }
 
 pub async fn confirm(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()> {
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
-    let op = sign::confirm_op(&pc.key_manager, &filters, frame)?;
-    pc.send_global(&mut client, wrap(Request::Confirm(op))).await?;
-    println!("Prover confirm sent successfully");
-    Ok(())
+    send_split(pc, &mut client, "confirm", &filters, |chunk| {
+        Ok(Request::Confirm(sign::confirm_op(
+            &pc.key_manager,
+            chunk,
+            frame,
+        )?))
+    })
+    .await
 }
 
 // `filter` is deprecated in global.proto in favour of the repeated `filters`,
@@ -74,16 +145,16 @@ pub async fn reject(pc: &ProverCtx, filter_args: &[String]) -> anyhow::Result<()
     let filters = parse_filters(filter_args)?;
     let mut client = pc.connect().await?;
     let frame = pc.last_global_head_frame(&mut client).await?;
-    let sig = sign::reject_sig(&pc.key_manager, &filters, frame)?;
-    let op = ProverReject {
-        filter: Vec::new(), // deprecated field
-        frame_number: frame,
-        public_key_signature_bls48581: Some(sig),
-        filters,
-    };
-    pc.send_global(&mut client, wrap(Request::Reject(op))).await?;
-    println!("Prover reject sent successfully");
-    Ok(())
+    send_split(pc, &mut client, "reject", &filters, |chunk| {
+        let sig = sign::reject_sig(&pc.key_manager, chunk, frame)?;
+        Ok(Request::Reject(ProverReject {
+            filter: Vec::new(), // deprecated field
+            frame_number: frame,
+            public_key_signature_bls48581: Some(sig),
+            filters: chunk.to_vec(),
+        }))
+    })
+    .await
 }
 
 pub async fn pause(pc: &ProverCtx, filter_arg: Option<&str>) -> anyhow::Result<()> {
@@ -96,7 +167,8 @@ pub async fn pause(pc: &ProverCtx, filter_arg: Option<&str>) -> anyhow::Result<(
         frame_number: frame,
         public_key_signature_bls48581: Some(sig),
     };
-    pc.send_global(&mut client, wrap(Request::Pause(op))).await?;
+    pc.send_global(&mut client, wrap(Request::Pause(op)))
+        .await?;
     println!("Prover pause sent successfully");
     Ok(())
 }
@@ -111,29 +183,50 @@ pub async fn resume(pc: &ProverCtx, filter_arg: Option<&str>) -> anyhow::Result<
         frame_number: frame,
         public_key_signature_bls48581: Some(sig),
     };
-    pc.send_global(&mut client, wrap(Request::Resume(op))).await?;
+    pc.send_global(&mut client, wrap(Request::Resume(op)))
+        .await?;
     println!("Prover resume sent successfully");
     Ok(())
 }
 
 pub async fn delegate(pc: &ProverCtx, address: &str) -> anyhow::Result<()> {
     let addr_hex = address.strip_prefix("0x").unwrap_or(address);
-    let delegate_address =
-        hex::decode(addr_hex).map_err(|_| anyhow::anyhow!("Invalid delegate address: must be 32 bytes hex-encoded"))?;
+    let delegate_address = hex::decode(addr_hex)
+        .map_err(|_| anyhow::anyhow!("Invalid delegate address: must be 32 bytes hex-encoded"))?;
     if delegate_address.len() != 32 {
         anyhow::bail!("Invalid delegate address: must be 32 bytes hex-encoded");
     }
 
     let mut client = pc.connect().await?;
-    // The delegate signature covers only the delegate address (no frame),
-    // but Go still fetches node info first; we skip that as it's unused.
-    let sig = sign::update_sig(&pc.key_manager, &delegate_address)?;
+    let info = client
+        .get_node_info(tonic::Request::new(
+            quil_types::proto::node::GetNodeInfoRequest::default(),
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("get node info: {e}"))?
+        .into_inner();
+    if info.epoch_length_frames > 0 {
+        quil_types::consensus::set_epoch_length_frames(info.epoch_length_frames);
+    }
+    quil_types::consensus::init_prover_op_replay_guard_epoch(pc.node_config.p2p.network);
+    // From the prover operation replay guard epoch the update signs the head
+    // frame, so it cannot be submitted again later; before it the signature
+    // covers the delegate address alone (frame 0).
+    let frame = quil_execution::global_intrinsic::prover_ops::ProverUpdate::signed_frame(
+        info.last_global_head_frame,
+    );
+    let sig = sign::update_sig(&pc.key_manager, &delegate_address, frame)?;
     let op = ProverUpdate {
         delegate_address: delegate_address.clone(),
         public_key_signature_bls48581: Some(sig),
+        frame_number: frame,
     };
-    pc.send_global(&mut client, wrap(Request::Update(op))).await?;
-    println!("Delegate address updated to 0x{}", hex::encode(&delegate_address));
+    pc.send_global(&mut client, wrap(Request::Update(op)))
+        .await?;
+    println!(
+        "Delegate address updated to 0x{}",
+        hex::encode(&delegate_address)
+    );
     Ok(())
 }
 
@@ -155,7 +248,9 @@ pub async fn alt_shard_update(pc: &ProverCtx, roots_hex: &[String]) -> anyhow::R
     ];
     let mut roots: Vec<Vec<u8>> = Vec::with_capacity(4);
     for (i, arg) in roots_hex.iter().enumerate() {
-        roots.push(hex::decode(arg).map_err(|e| anyhow::anyhow!("invalid {} hex: {e}", root_names[i]))?);
+        roots.push(
+            hex::decode(arg).map_err(|e| anyhow::anyhow!("invalid {} hex: {e}", root_names[i]))?,
+        );
     }
 
     let mut client = pc.connect().await?;
@@ -189,7 +284,8 @@ pub async fn alt_shard_update(pc: &ProverCtx, roots_hex: &[String]) -> anyhow::R
         hyperedge_removes_root: roots[3].clone(),
         signature,
     };
-    pc.send_global(&mut client, wrap(Request::AltShardUpdate(op))).await?;
+    pc.send_global(&mut client, wrap(Request::AltShardUpdate(op)))
+        .await?;
     println!("Alt shard update sent successfully");
     Ok(())
 }
@@ -198,5 +294,36 @@ fn wrap(request: Request) -> MessageRequest {
     MessageRequest {
         request: Some(request),
         timestamp: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A partial send names the unsent filters as follow-up arguments, so a
+    /// re-run does not resend the published messages; a first failure has
+    /// nothing to leave out.
+    #[test]
+    fn a_partial_split_send_lists_the_unsent_filters() {
+        let filters: Vec<Vec<u8>> = (0..250u16).map(|n| n.to_be_bytes().to_vec()).collect();
+        let error = split_send_error("leave", 1, 3, &filters, 100, "boom").to_string();
+        let (head, follow_up) = error.split_once('\n').expect("a follow-up line");
+        assert_eq!(
+            head,
+            "prover leave message 2/3 not sent (100/250 filters sent): boom"
+        );
+        let args: Vec<&str> = follow_up
+            .strip_prefix("send the 150 unsent filters with: qclient node prover leave ")
+            .expect("the follow-up command")
+            .split(' ')
+            .collect();
+        assert_eq!(args.len(), 150);
+        assert_eq!((args[0], args[149]), ("0064", "00f9"));
+        let first = split_send_error("leave", 0, 3, &filters, 0, "boom").to_string();
+        assert_eq!(
+            first,
+            "prover leave message 1/3 not sent (0/250 filters sent): boom"
+        );
     }
 }

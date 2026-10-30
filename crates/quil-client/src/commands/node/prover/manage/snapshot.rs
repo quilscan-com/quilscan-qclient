@@ -1,6 +1,7 @@
 //! Quilscan's versioned, one-shot view of the official Manage model.
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use super::super::epoch::{ThresholdClock, ThresholdUnit};
 use super::super::format_quil_daily_round;
@@ -94,7 +95,7 @@ fn observed_reward_windows(
     json!({ "60m": estimate(0), "24h": estimate(1) })
 }
 
-fn allocation_json(row: &AllocationRow, model: &Model) -> Value {
+fn allocation_json(row: &AllocationRow, model: &Model, workers: &HashMap<i64, bool>) -> Value {
     let shard_known = row.shard_info_known;
     let reward_known = shard_known && row.ring != UNKNOWN_REWARD_RING;
     let worker = (row.worker_id >= 0).then_some(row.worker_id);
@@ -111,6 +112,7 @@ fn allocation_json(row: &AllocationRow, model: &Model) -> Value {
     json!({
         "filter": row.filter_hex,
         "worker": worker,
+        "worker_draining": worker.and_then(|id| workers.get(&id)).copied(),
         "status": row.status_name,
         "mode": mode,
         "allocation_reason": row.allocation_reason,
@@ -159,19 +161,34 @@ fn available_json(row: &ShardRow, model: &Model) -> Value {
 }
 
 pub(super) fn format_snapshot(model: &mut Model) -> serde_json::Result<String> {
+    let workers: HashMap<_, _> = model
+        .cached_worker_info
+        .iter()
+        .flat_map(|info| &info.worker_info)
+        .map(|worker| (i64::from(worker.core_id), worker.draining))
+        .collect();
     let allocation_rows = model.sorted_allocations();
     let available_rows = model.sorted_available();
-    let (tui, allocation_tui, available_tui) = super::view::snapshot_presentation(model, &allocation_rows, &available_rows);
-    let allocations: Vec<Value> = allocation_rows.iter().zip(allocation_tui).map(|(row, tui)| {
-        let mut value = allocation_json(row, model);
-        value["tui"] = tui;
-        value
-    }).collect();
-    let available_shards: Vec<Value> = available_rows.iter().zip(available_tui).map(|(row, tui)| {
-        let mut value = available_json(row, model);
-        value["tui"] = tui;
-        value
-    }).collect();
+    let (tui, allocation_tui, available_tui) =
+        super::view::snapshot_presentation(model, &allocation_rows, &available_rows);
+    let allocations: Vec<Value> = allocation_rows
+        .iter()
+        .zip(allocation_tui)
+        .map(|(row, tui)| {
+            let mut value = allocation_json(row, model, &workers);
+            value["tui"] = tui;
+            value
+        })
+        .collect();
+    let available_shards: Vec<Value> = available_rows
+        .iter()
+        .zip(available_tui)
+        .map(|(row, tui)| {
+            let mut value = available_json(row, model);
+            value["tui"] = tui;
+            value
+        })
+        .collect();
     serde_json::to_string_pretty(&json!({
         "schema_version": 1,
         "tui": tui,
@@ -182,6 +199,8 @@ pub(super) fn format_snapshot(model: &mut Model) -> serde_json::Result<String> {
         "current_epoch": model.current_epoch,
         "epoch_length_frames": model.epoch_length,
         "running_workers": model.running_workers,
+        "worker_capacity": (model.worker_capacity != 0).then_some(model.worker_capacity),
+        "draining_workers": model.cached_worker_info.as_ref().map(|_| workers.values().filter(|draining| **draining).count()),
         "allocated_workers": model.allocated_workers,
         "worker_info_available": model.cached_worker_info.is_some(),
         "frame_cadence": cadence_json(model.node_global_cadence.as_ref()),
@@ -213,10 +232,17 @@ pub(super) fn from_refresh(node_refresh: Msg, shard_refresh: Msg) -> anyhow::Res
     let shard_info = shard_result.map_err(|err| anyhow::anyhow!("fetch shard data: {err}"))?;
 
     let mut model = Model::new();
-    // Enter through the same successful-refresh lifecycle as the interactive
-    // screen: freshness and first observations belong to update, not formatting.
-    super::update::apply_msg(&mut model, Msg::DataRefresh {
-        node_info: Some(node_info), shard_info: Some(shard_info), worker_info, err: None,
-    });
+    // Match the interactive refresh order: install worker observations before
+    // shard refresh evaluates committed heads against the current local height.
+    super::update::apply_msg(
+        &mut model,
+        Msg::DataRefresh {
+            node_info: Some(node_info),
+            shard_info: None,
+            worker_info,
+            err: None,
+        },
+    );
+    super::update::apply_msg(&mut model, Msg::ShardRefresh(Ok(shard_info)));
     Ok(format_snapshot(&mut model)?)
 }

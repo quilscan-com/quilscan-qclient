@@ -139,6 +139,7 @@ struct List {
     schema_version: u32,
     requests: Vec<Request>,
     max_bundle_bytes: u64,
+    automatic: bool,
 }
 fn list_dto(listed: &ListLogRequestsResponse) -> anyhow::Result<List> {
     anyhow::ensure!(
@@ -154,6 +155,7 @@ fn list_dto(listed: &ListLogRequestsResponse) -> anyhow::Result<List> {
             .map(Request::from_proto)
             .collect::<anyhow::Result<_>>()?,
         max_bundle_bytes: listed.max_bundle_bytes,
+        automatic: listed.automatic,
     })
 }
 #[derive(Serialize)]
@@ -248,6 +250,10 @@ fn pending_exact<'a>(
     anyhow::ensure!(
         r.status() == LogRequestStatus::Pending && now < r.expires_unix_ms,
         "log request is no longer pending or has expired; refresh the queue"
+    );
+    anyhow::ensure!(
+        !listed.automatic,
+        "Node manages log requests automatically; manual preparation and approval are unavailable"
     );
     Ok(r)
 }
@@ -658,31 +664,53 @@ impl Claim {
         })
     }
 }
+/// Export only this selected Node's sources with the shared operator export.
+fn selected_request_export(
+    config: &quil_config::Config,
+    dir: &Path,
+    cwd: &Path,
+    request: &PendingLogRequest,
+    max: u64,
+) -> anyhow::Result<log_export::Export<bundle::Capped>> {
+    let selection =
+        bundle::request_selection(request.since_unix, request.until_unix, &request.filters)?;
+    let (readers, source, child) =
+        export::open_selected_source(config, dir, cwd, selection.since, selection.until)?;
+    let requester = Request::from_proto(request)?.requester_peer_id;
+    let mut home_paths = vec![dir.to_path_buf()];
+    home_paths.extend(config.logger.log_dir(dir).map(|path| {
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    }));
+    let options = log_export::ExportOptions {
+        home_paths: &home_paths,
+        ..Default::default()
+    };
+    bundle::request_export(
+        readers,
+        child,
+        &source,
+        &selection,
+        &request.request_id,
+        &requester,
+        Approval::Operator,
+        max as usize,
+        &options,
+    )
+}
+
 fn prepare_produced(
     store: &mut Store,
     own: &str,
     request: &PendingLogRequest,
     max: u64,
-    produced: export::Export<Capped>,
+    produced: log_export::Export<bundle::Capped>,
     now: u64,
 ) -> anyhow::Result<Preview> {
     let dto = Request::from_proto(request)?;
-    let (manifest, sums) = export::bundle_texts(&produced.manifest, &produced.log)?;
-    let plaintext = pack_bundle(&[
-        (BUNDLE_LOG, &produced.out.data),
-        ("manifest.json", manifest.as_bytes()),
-        ("SHA256SUMS", sums.as_bytes()),
-    ]);
-    anyhow::ensure!(
-        quil_crypto::seal::sealed_len(plaintext.len()) as u64 <= max,
-        "sealed export exceeds current Node maximum bundle size"
-    );
-    let sealed = quil_crypto::seal::seal(
-        &plaintext,
-        &request.recipient_kem_public_key,
-        &request.request_id,
-    )
-    .map_err(|e| anyhow::anyhow!("seal export: {e}"))?;
     let (redacted_samples, samples_truncated) = bound_samples(&produced.stats.samples);
     let source = &produced.manifest["source"];
     let preview = PreviewDetails {
@@ -699,14 +727,20 @@ fn prepare_produced(
             .unwrap_or("")
             .into(),
     };
+    let sealed = bundle::seal_export(
+        produced,
+        &request.request_id,
+        &request.recipient_kem_public_key,
+        usize::try_from(max).unwrap_or(usize::MAX),
+    )?;
     let (prepared_token, expires_unix_ms) =
-        store.save(own, request, &sealed, &produced.token_map, now)?;
+        store.save(own, request, &sealed.sealed, &sealed.token_map, now)?;
     let dto = Preview {
         schema_version: 1,
         request: dto,
         prepared_token,
         expires_unix_ms,
-        sealed_bytes: sealed.len() as u64,
+        sealed_bytes: sealed.sealed.len() as u64,
         preview,
     };
     if let Err(error) = json_bytes(&dto) {
@@ -784,23 +818,12 @@ async fn run_with_context(
             let listed = list(&mut client).await?;
             check_max(listed.max_bundle_bytes)?;
             let request = pending_exact(&listed, request_id, now_ms())?;
-            let selection = request_selection(request)?;
-            let (readers, source, child) = export::open_selected_source(
+            let produced = selected_request_export(
                 &config,
                 &dir,
                 &std::env::current_dir()?,
-                selection.since,
-                selection.until,
-            )?;
-            let requester = Request::from_proto(request)?.requester_peer_id;
-            let produced = approve_export(
-                readers,
-                child,
-                &source,
                 request,
-                &requester,
-                listed.max_bundle_bytes as usize,
-                None,
+                listed.max_bundle_bytes,
             )?;
             let preview = prepare_produced(
                 &mut Store::open(&dir, now_ms())?,
@@ -824,9 +847,17 @@ async fn run_with_context(
             )?;
             let maps = dir.join(".diagnostics/token-maps");
             create_private_dir(&maps)?;
-            prune_token_maps(&maps, std::time::SystemTime::now(), TOKEN_MAP_RETENTION);
+            bundle::prune_token_maps(
+                &maps,
+                std::time::SystemTime::now(),
+                bundle::TOKEN_MAP_RETENTION,
+            );
             let map_path = maps.join(format!("log-request-{request_id}-{token}.map.txt"));
-            export::write_token_map(&map_path, &format!("log request {request_id}"), &frozen.map)?;
+            log_export::write_token_map(
+                &map_path,
+                &format!("log request {request_id}"),
+                &frozen.map,
+            )?;
             let upload = logs::timed(
                 futures::stream::iter(upload_chunks(&request.request_id, &frozen.sealed)),
                 logs::upload_timeout(frozen.sealed.len() as u64),
@@ -912,7 +943,6 @@ mod tests {
                     Ok(Context {
                         global: GlobalArgs {
                             network: None,
-                            signature_check: false,
                             yes: false,
                         },
                         client_config: crate::config::ClientConfig::default_for_create(),
@@ -979,7 +1009,6 @@ mod tests {
         let ctx = Context {
             global: GlobalArgs {
                 network: Some(other.to_string_lossy().into()),
-                signature_check: false,
                 yes: false,
             },
             client_config: crate::config::ClientConfig::default_for_create(),
@@ -1028,6 +1057,7 @@ mod tests {
         let listed = list_dto(&ListLogRequestsResponse {
             requests: vec![r.clone()],
             max_bundle_bytes: 1 << 20,
+            ..Default::default()
         })
         .unwrap();
         let preview = Preview {
@@ -1287,6 +1317,204 @@ mod tests {
         assert!(Store::open(bad.path(), 100).is_err());
     }
     #[test]
+    fn machine_export_redacts_operator_in_selected_config_home() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(
+            source.path().join("master.log"),
+            "2026-10-14T12:30:00Z\tinfo\tnode.rs:7\tstarted by qclient_synthetic_operator\t{}\n",
+        )
+        .unwrap();
+        let mut config = quil_config::Config::default();
+        config.logger.path = source.path().to_string_lossy().into_owned();
+        let produced = selected_request_export(
+            &config,
+            Path::new("/home/qclient_synthetic_operator/.config"),
+            source.path(),
+            &req(),
+            1 << 20,
+        )
+        .unwrap();
+        assert_eq!(produced.stats.lines_kept, 1);
+        assert!(!produced.stats.samples.join("\n").contains("qclient_synthetic_operator"),
+            "selected config home must hide its operator even when the process runs as another user");
+        assert!(produced
+            .token_map
+            .values()
+            .any(|value| value == "qclient_synthetic_operator"));
+        assert_eq!(produced.manifest["request"]["approval"], "operator");
+    }
+
+    #[test]
+    fn automatic_ready_and_served_requests_keep_schema_and_are_not_preparable() {
+        for status in [LogRequestStatus::Ready, LogRequestStatus::Served] {
+            let mut request = req();
+            request.status = status as i32;
+            request.bundle_bytes = 1234;
+            let listed = ListLogRequestsResponse {
+                requests: vec![request.clone()],
+                max_bundle_bytes: 1 << 20,
+                automatic: true,
+            };
+            let json = serde_json::to_value(list_dto(&listed).unwrap()).unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 4);
+            assert_eq!(json["automatic"], true);
+            assert_eq!(
+                json["requests"][0]["status"],
+                if status == LogRequestStatus::Ready {
+                    "ready"
+                } else {
+                    "served"
+                }
+            );
+            assert_eq!(json["requests"][0]["bundle_bytes"], 1234);
+            assert!(pending_exact(&listed, &hex::encode(&request.request_id), 100).is_err());
+        }
+    }
+
+    #[test]
+    fn log_list_always_serializes_the_node_automatic_mode() {
+        for automatic in [false, true] {
+            let listed = ListLogRequestsResponse {
+                automatic,
+                max_bundle_bytes: 1 << 20,
+                ..Default::default()
+            };
+            let value = serde_json::to_value(list_dto(&listed).unwrap()).unwrap();
+            assert_eq!(value["schema_version"], 1);
+            assert_eq!(value.get("automatic"), Some(&serde_json::json!(automatic)));
+        }
+    }
+
+    #[test]
+    fn automatic_pending_rejects_the_shared_prepare_and_approve_guard() {
+        let r = req();
+        let listed = ListLogRequestsResponse {
+            automatic: true,
+            requests: vec![r.clone()],
+            max_bundle_bytes: 1 << 20,
+        };
+        let id = hex::encode(&r.request_id);
+        let error = pending_exact(&listed, &id, 100).unwrap_err().to_string();
+        assert!(error.contains("automatic"), "{error}");
+        let manual = ListLogRequestsResponse {
+            automatic: false,
+            ..listed
+        };
+        assert_eq!(
+            pending_exact(&manual, &id, 100).unwrap().request_id,
+            r.request_id
+        );
+    }
+
+    #[test]
+    fn automatic_mode_preserves_identity_pending_and_expiry_errors() {
+        let r = req();
+        let id = hex::encode(&r.request_id);
+        for (status, now) in [
+            (LogRequestStatus::Ready, 100),
+            (LogRequestStatus::Served, 100),
+            (LogRequestStatus::Pending, r.expires_unix_ms),
+        ] {
+            let listed = ListLogRequestsResponse {
+                automatic: true,
+                requests: vec![PendingLogRequest {
+                    status: status as i32,
+                    ..r.clone()
+                }],
+                max_bundle_bytes: 1 << 20,
+            };
+            assert!(pending_exact(&listed, &id, now)
+                .unwrap_err()
+                .to_string()
+                .contains("no longer pending or has expired"));
+        }
+        let listed = ListLogRequestsResponse {
+            automatic: true,
+            requests: vec![PendingLogRequest {
+                requester_peer_id: vec![],
+                ..r
+            }],
+            max_bundle_bytes: 1 << 20,
+        };
+        assert!(pending_exact(&listed, &id, 100)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid requester identity"));
+        assert!(pending_exact(&listed, &"00".repeat(16), 100)
+            .unwrap_err()
+            .to_string()
+            .contains("absent"));
+    }
+
+    #[test]
+    fn logs_contract_fixtures_from_actual_list_serializer() {
+        let Some(dir) = std::env::var_os("QCLIENT_CONTRACT_FIXTURE_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        assert!(dir.is_absolute());
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = req();
+        r.received_unix_ms = now_ms();
+        r.expires_unix_ms = r.received_unix_ms + 600_000;
+        r.until_unix = r.received_unix_ms / 1000;
+        r.since_unix = r.until_unix - 7200;
+        for (automatic, name) in [(false, "logs-manual.json"), (true, "logs-automatic.json")] {
+            let requests = [
+                LogRequestStatus::Pending,
+                LogRequestStatus::Ready,
+                LogRequestStatus::Served,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, status)| PendingLogRequest {
+                request_id: vec![0xab + index as u8; 16],
+                status: status as i32,
+                bundle_bytes: if index == 0 { 0 } else { 12345 },
+                ..r.clone()
+            })
+            .collect();
+            let dto = list_dto(&ListLogRequestsResponse {
+                automatic,
+                requests,
+                max_bundle_bytes: 1 << 20,
+            })
+            .unwrap();
+            std::fs::write(dir.join(name), json_bytes(&dto).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn preparation_preserves_the_shared_export_size_error_and_writes_no_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = req();
+        let selection =
+            bundle::request_selection(request.since_unix, request.until_unix, &request.filters)
+                .unwrap();
+        let produced = bundle::request_export(
+            Vec::new(),
+            None,
+            &log_export::SourceInfo::Files(Vec::new()),
+            &selection,
+            &request.request_id,
+            "requester",
+            Approval::Operator,
+            1 << 20,
+            &log_export::ExportOptions::default(),
+        )
+        .unwrap();
+        let mut store = Store::open(tmp.path(), 100).unwrap();
+        let error = prepare_produced(&mut store, "own", &request, 1, produced, 100)
+            .err()
+            .unwrap();
+        assert!(
+            bundle::is_too_large(&error),
+            "preserve the official typed size refusal: {error}"
+        );
+        assert!(store.stage_names().unwrap().is_empty());
+    }
+
+    #[test]
     fn prepared_export_uses_real_redaction_seal_and_checksums_without_upload() {
         let tmp = tempfile::tempdir().unwrap();
         let mut r = req();
@@ -1299,15 +1527,20 @@ mod tests {
         )
         .unwrap();
         let (readers, names) =
-            export::file_readers(src.path(), r.since_unix as i64, r.until_unix as i64).unwrap();
-        let produced = approve_export(
+            log_export::file_readers(src.path(), r.since_unix as i64, r.until_unix as i64).unwrap();
+        let produced = bundle::request_export(
             readers,
             None,
-            &export::SourceInfo::Files(names),
-            &r,
+            &log_export::SourceInfo::Files(names),
+            &bundle::request_selection(r.since_unix, r.until_unix, &r.filters).unwrap(),
+            &r.request_id,
             "requester",
+            Approval::Operator,
             1 << 20,
-            Some([7; 32]),
+            &log_export::ExportOptions {
+                salt: Some([7; 32]),
+                ..Default::default()
+            },
         )
         .unwrap();
         let mut store = Store::open(tmp.path(), 100).unwrap();
@@ -1324,7 +1557,7 @@ mod tests {
             .unwrap();
         let frozen = claim.validate("own", &r, 1 << 20, 101).unwrap();
         let plain = quil_crypto::seal::open(&frozen.sealed, &kem.secret, &r.request_id).unwrap();
-        let files = unpack_bundle(&plain).unwrap();
+        let files = bundle::unpack_bundle(&plain).unwrap();
         assert_eq!(files.len(), 3);
         assert_eq!(preview.sealed_bytes, frozen.sealed.len() as u64);
         assert!(!frozen.map.is_empty());

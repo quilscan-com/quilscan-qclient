@@ -45,18 +45,28 @@ pub struct PqConnectInfo {
 pub struct PqServerStream {
     inner: PqTokioStream,
     peer_id: PeerId,
+    /// The connection's place under the listener's caps, released with it.
+    _slot: Option<crate::connection_limits::ConnectionSlot>,
 }
 
 impl PqServerStream {
     pub fn peer_id(&self) -> PeerId {
         self.peer_id
     }
+
+    /// Hold `slot` for as long as the connection lives.
+    pub fn with_slot(mut self, slot: crate::connection_limits::ConnectionSlot) -> Self {
+        self._slot = Some(slot);
+        self
+    }
 }
 
 impl Connected for PqServerStream {
     type ConnectInfo = PqConnectInfo;
     fn connect_info(&self) -> Self::ConnectInfo {
-        PqConnectInfo { peer_id: self.peer_id }
+        PqConnectInfo {
+            peer_id: self.peer_id,
+        }
     }
 }
 
@@ -119,13 +129,20 @@ pub async fn pq_client_handshake(
 /// accepted TCP stream. Returns the verified client [`PeerId`] and the secured
 /// tokio stream for gRPC. Callers gate the `PeerId` against the archive/genesis
 /// allowlist (what the mTLS cert SAN + PoP enforced).
-pub async fn pq_server_handshake(tcp: TcpStream, falcon_signing_key: &[u8]) -> io::Result<PqServerStream> {
+pub async fn pq_server_handshake(
+    tcp: TcpStream,
+    falcon_signing_key: &[u8],
+) -> io::Result<PqServerStream> {
     let _ = tcp.set_nodelay(true);
     let kp = keypair_from_falcon(falcon_signing_key)?;
     let (peer_id, pq) = pq_upgrade(kp, tcp.compat(), /* initiator */ false)
         .await
         .map_err(pq_to_io)?;
-    Ok(PqServerStream { inner: pq.compat(), peer_id })
+    Ok(PqServerStream {
+        inner: pq.compat(),
+        peer_id,
+        _slot: None,
+    })
 }
 
 #[cfg(test)]
@@ -180,8 +197,14 @@ mod tests {
         io.read_exact(&mut echo).await.unwrap();
 
         assert_eq!(&echo, b"grpc-req", "encrypted round-trip over pqnoise");
-        assert_eq!(got_server_id, server_id, "client authenticated the server's Ed448 id");
+        assert_eq!(
+            got_server_id, server_id,
+            "client authenticated the server's Ed448 id"
+        );
         let got_client_id = server.await.unwrap();
-        assert_eq!(got_client_id, client_id, "server authenticated the client's Ed448 id");
+        assert_eq!(
+            got_client_id, client_id,
+            "server authenticated the client's Ed448 id"
+        );
     }
 }

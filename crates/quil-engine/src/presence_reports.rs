@@ -19,6 +19,13 @@
 //! not submit (offline, or unable to reach GLOBAL) loses its committee that
 //! epoch's report; the order changes every epoch.
 //!
+//! Nullify votes. From the presence exclusion frame a report also carries
+//! verified nullify votes ([`build_with_nullifies`]) of members its notarize
+//! votes leave out, and nullify voters count among the verified voters the
+//! submitter is drawn from. Stalled sessions' members often only nullify;
+//! a nullify protects its signer from exclusion for absence and earns no
+//! credit. Liveness keeps nullify signatures with the notarize ones.
+//!
 //! Traffic bound. Nothing is built before the presence report frame, in an
 //! epoch's last [`Pace::margin_frames`], or for a session whose tip advanced
 //! in the last [`Pace::stall_frames`]. A submitter sends at most
@@ -69,12 +76,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use quil_cw_consensus::adapters::{Liveness, NotarizeKey, NotarizedProposal};
+use quil_cw_consensus::adapters::{Liveness, NotarizeKey, NotarizedProposal, NullifyKey};
 use quil_cw_consensus::handoff::{Seal, Session, SessionVotes};
 use quil_execution::global_intrinsic::frame_header::FrameHeader;
 use quil_execution::global_intrinsic::handoff::{
     self,
-    presence::{NotarizeVote, PresenceProposal, PresenceReport, MAX_PRESENCE_PROPOSALS, MAX_PRESENCE_VOTES},
+    presence::{
+        NotarizeVote, NullifyVote, PresenceProposal, PresenceReport, MAX_PRESENCE_PROPOSALS,
+        MAX_PRESENCE_VOTES,
+    },
     Records,
 };
 use quil_types::consensus::epoch_length_frames;
@@ -103,10 +113,14 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
 /// Note that the GLOBAL request `request` was not published; for a presence
 /// report, its reporter gives back the budget it used.
 pub fn publication_failed(request: &[u8]) {
-    if !request.starts_with(&quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT.to_be_bytes()) {
+    if !request
+        .starts_with(&quil_execution::global_intrinsic::handoff::TYPE_PRESENCE_REPORT.to_be_bytes())
+    {
         return;
     }
-    let Ok(mut failed) = UNPUBLISHED.lock() else { return };
+    let Ok(mut failed) = UNPUBLISHED.lock() else {
+        return;
+    };
     if failed.len() >= MAX_UNPUBLISHED {
         failed.pop_front();
     }
@@ -114,7 +128,9 @@ pub fn publication_failed(request: &[u8]) {
 }
 
 fn take_unpublished(hash: &[u8; 32]) -> bool {
-    let Ok(mut failed) = UNPUBLISHED.lock() else { return false };
+    let Ok(mut failed) = UNPUBLISHED.lock() else {
+        return false;
+    };
     let before = failed.len();
     failed.retain(|entry| entry != hash);
     failed.len() != before
@@ -133,7 +149,9 @@ pub struct Pace {
 
 impl Pace {
     pub fn current() -> Self {
-        Self { length: epoch_length_frames() }
+        Self {
+            length: epoch_length_frames(),
+        }
     }
 
     pub fn epoch(&self, frame: u64) -> u64 {
@@ -177,8 +195,29 @@ impl Pace {
         hasher.update(b"quil/presence-report/first-frame");
         hasher.update(id);
         let digest: [u8; 32] = hasher.finalize().into();
-        let offset = u64::from_be_bytes(digest[..8].try_into().expect("8 bytes")) % self.spread_frames();
+        let offset =
+            u64::from_be_bytes(digest[..8].try_into().expect("8 bytes")) % self.spread_frames();
         epoch.saturating_mul(self.length).saturating_add(offset)
+    }
+
+    /// The first GLOBAL frame of `epoch` a member `member` of session `id`
+    /// that the epoch's reports left out may report itself for: the epoch's
+    /// second half, after the designated submitter's turns, plus an offset
+    /// drawn from the session and member within a quarter epoch, so the
+    /// left-out members do not all report at once.
+    pub fn self_report_frame(&self, id: &[u8; 32], epoch: u64, member: u32) -> u64 {
+        let mut hasher = Sha256::new();
+        hasher.update(b"quil/presence-report/self-report");
+        hasher.update(id);
+        hasher.update(epoch.to_be_bytes());
+        hasher.update(member.to_be_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        let offset =
+            u64::from_be_bytes(digest[..8].try_into().expect("8 bytes")) % self.spread_frames();
+        epoch
+            .saturating_mul(self.length)
+            .saturating_add(self.length / 2)
+            .saturating_add(offset)
     }
 
     /// Whether a report may land in GLOBAL frame `frame`: from `activation`
@@ -208,18 +247,38 @@ pub fn designated_submitter(session: &[u8; 32], epoch: u64, voters: &BTreeSet<u3
 /// [`Liveness`], or a test's.
 pub trait VoteSource {
     /// [`Liveness::notarize_votes`].
-    fn notarize_votes(&self, wanted: &dyn Fn(&NotarizeKey) -> bool) -> Vec<(NotarizeKey, Option<Vec<u8>>)>;
+    fn notarize_votes(
+        &self,
+        wanted: &dyn Fn(&NotarizeKey) -> bool,
+    ) -> Vec<(NotarizeKey, Option<Vec<u8>>)>;
     /// [`Liveness::notarized`].
     fn notarized(&self) -> Vec<NotarizedProposal>;
+    /// [`Liveness::nullify_votes`]; none unless the source keeps them.
+    fn nullify_votes(
+        &self,
+        _wanted: &dyn Fn(&NullifyKey) -> bool,
+    ) -> Vec<(NullifyKey, Option<Vec<u8>>)> {
+        Vec::new()
+    }
 }
 
 impl VoteSource for Liveness {
-    fn notarize_votes(&self, wanted: &dyn Fn(&NotarizeKey) -> bool) -> Vec<(NotarizeKey, Option<Vec<u8>>)> {
+    fn notarize_votes(
+        &self,
+        wanted: &dyn Fn(&NotarizeKey) -> bool,
+    ) -> Vec<(NotarizeKey, Option<Vec<u8>>)> {
         Liveness::notarize_votes(self, wanted)
     }
 
     fn notarized(&self) -> Vec<NotarizedProposal> {
         Liveness::notarized(self)
+    }
+
+    fn nullify_votes(
+        &self,
+        wanted: &dyn Fn(&NullifyKey) -> bool,
+    ) -> Vec<(NullifyKey, Option<Vec<u8>>)> {
+        Liveness::nullify_votes(self, wanted)
     }
 }
 
@@ -232,6 +291,8 @@ impl VoteSource for Liveness {
 pub struct VoteChecks {
     session: [u8; 32],
     results: BTreeMap<NotarizeKey, bool>,
+    /// Whether each nullify vote verifies ([`Self::refresh_nullifies`]).
+    nullify_results: BTreeMap<NullifyKey, bool>,
     /// Falcon verifications done.
     verifications: u64,
 }
@@ -244,6 +305,7 @@ impl VoteChecks {
         if self.session != id {
             self.session = id;
             self.results.clear();
+            self.nullify_results.clear();
         }
         let votes = {
             let results = &self.results;
@@ -255,13 +317,61 @@ impl VoteChecks {
                 (Some(valid), _) => *valid,
                 (None, Some(signature)) => {
                     self.verifications += 1;
-                    checker.verify_notarize(key.epoch, key.view, key.parent, key.payload, key.signer, &signature)
+                    checker.verify_notarize(
+                        key.epoch,
+                        key.view,
+                        key.parent,
+                        key.payload,
+                        key.signer,
+                        &signature,
+                    )
                 }
                 (None, None) => continue,
             };
             results.insert(key, valid);
         }
         self.results = results;
+    }
+
+    /// Check the nullify votes `source` holds of the session last
+    /// [`Self::refresh`]ed, as that checks notarize votes: each once, and
+    /// the results of votes no longer held dropped.
+    pub fn refresh_nullifies(&mut self, checker: &SessionVotes, source: &dyn VoteSource) {
+        let votes = {
+            let results = &self.nullify_results;
+            source.nullify_votes(&|key| !results.contains_key(key))
+        };
+        let mut results = BTreeMap::new();
+        for (key, signature) in votes {
+            let valid = match (self.nullify_results.get(&key), signature) {
+                (Some(valid), _) => *valid,
+                (None, Some(signature)) => {
+                    self.verifications += 1;
+                    checker.verify_nullify(key.epoch, key.view, key.signer, &signature)
+                }
+                (None, None) => continue,
+            };
+            results.insert(key, valid);
+        }
+        self.nullify_results = results;
+    }
+
+    /// Whether the nullify vote was checked and verifies.
+    pub fn valid_nullify(&self, key: &NullifyKey) -> bool {
+        self.nullify_results.get(key).copied().unwrap_or(false)
+    }
+
+    /// The members whose nullify votes of `session`'s generation verify.
+    pub fn nullify_voters(&self, session: &Session) -> BTreeSet<u32> {
+        self.nullify_results
+            .iter()
+            .filter(|(key, valid)| {
+                **valid
+                    && key.epoch == session.generation
+                    && (key.signer as usize) < session.members.len()
+            })
+            .map(|(key, _)| key.signer)
+            .collect()
     }
 
     /// Whether the vote was checked and verifies.
@@ -274,7 +384,9 @@ impl VoteChecks {
         self.results
             .iter()
             .filter(|(key, valid)| {
-                **valid && key.epoch == session.generation && (key.signer as usize) < session.members.len()
+                **valid
+                    && key.epoch == session.generation
+                    && (key.signer as usize) < session.members.len()
             })
             .map(|(key, _)| key.signer)
             .collect()
@@ -295,7 +407,11 @@ pub struct Built {
 
 impl Built {
     pub fn views(&self) -> Vec<u64> {
-        self.report.proposals.iter().map(|proposal| proposal.view).collect()
+        self.report
+            .proposals
+            .iter()
+            .map(|proposal| proposal.view)
+            .collect()
     }
 }
 
@@ -317,6 +433,25 @@ pub fn build(
     seen: &[NotarizedProposal],
     valid: impl Fn(&NotarizeKey) -> bool,
 ) -> Option<Built> {
+    build_with_nullifies(session, id, pace, inclusion, seen, valid, Vec::new())
+}
+
+/// [`build`], then the verified nullify votes `nullifies` (one per member,
+/// in ascending signer order) of the members its notarize votes left out,
+/// within [`MAX_PRESENCE_VOTES`]. A nullify protects its signer from
+/// exclusion for absence and earns nothing. With no notarize vote to carry,
+/// the report carries nullifies alone: a session whose members only
+/// nullify (no proposal reached them, or none they accept) still shows who
+/// follows it.
+pub fn build_with_nullifies(
+    session: &Session,
+    id: [u8; 32],
+    pace: Pace,
+    inclusion: u64,
+    seen: &[NotarizedProposal],
+    valid: impl Fn(&NotarizeKey) -> bool,
+    nullifies: Vec<NullifyVote>,
+) -> Option<Built> {
     // Latest first.
     let mut candidates: Vec<PresenceProposal> = eligible(session, pace, inclusion, seen)
         .map(|(seen, header)| PresenceProposal {
@@ -329,7 +464,10 @@ pub fn build(
                 .votes
                 .iter()
                 .filter(|(signer, _)| valid(&key(seen, *signer)))
-                .map(|(signer, signature)| NotarizeVote { signer: *signer, signature: signature.clone() })
+                .map(|(signer, signature)| NotarizeVote {
+                    signer: *signer,
+                    signature: signature.clone(),
+                })
                 .collect(),
         })
         .collect();
@@ -337,7 +475,11 @@ pub fn build(
     let mut chosen = Vec::new();
     while chosen.len() < MAX_PRESENCE_PROPOSALS && members.len() < MAX_PRESENCE_VOTES {
         let gain = |candidate: &PresenceProposal| {
-            candidate.votes.iter().filter(|vote| !members.contains(&vote.signer)).count()
+            candidate
+                .votes
+                .iter()
+                .filter(|vote| !members.contains(&vote.signer))
+                .count()
         };
         let mut best: Option<(usize, usize)> = None;
         for (index, candidate) in candidates.iter().enumerate() {
@@ -351,23 +493,79 @@ pub fn build(
         // Views ascend strictly in a report: another proposal of the same
         // view (an equivocating leader) cannot join this one.
         candidates.retain(|candidate| candidate.view != proposal.view);
-        proposal.votes.retain(|vote| !members.contains(&vote.signer));
+        proposal
+            .votes
+            .retain(|vote| !members.contains(&vote.signer));
         proposal.votes.truncate(MAX_PRESENCE_VOTES - members.len());
         members.extend(proposal.votes.iter().map(|vote| vote.signer));
         chosen.push(proposal);
     }
-    if chosen.is_empty() {
+    chosen.sort_by_key(|proposal| proposal.view);
+    let room = MAX_PRESENCE_VOTES.saturating_sub(members.len());
+    let nullifies: Vec<NullifyVote> = nullifies
+        .into_iter()
+        .filter(|vote| !members.contains(&vote.signer))
+        .take(room)
+        .collect();
+    members.extend(nullifies.iter().map(|vote| vote.signer));
+    if chosen.is_empty() && nullifies.is_empty() {
         return None;
     }
-    chosen.sort_by_key(|proposal| proposal.view);
     Some(Built {
-        report: PresenceReport { session: id, filter: session.filter.clone(), proposals: chosen },
+        report: PresenceReport {
+            session: id,
+            filter: session.filter.clone(),
+            proposals: chosen,
+            nullifies,
+        },
         members,
     })
 }
 
+/// Of the nullify votes `source` holds, the verified ones of `session`'s
+/// generation, the latest view of each member, in ascending signer order.
+/// Only views above `floor`, the highest GLOBAL recorded in earlier epochs
+/// ([`handoff::presence::nullify_floor`]), are taken: GLOBAL refuses the rest.
+fn verified_nullifies(
+    session: &Session,
+    checks: &VoteChecks,
+    source: &dyn VoteSource,
+    floor: u64,
+) -> Vec<NullifyVote> {
+    let mut latest: BTreeMap<u32, NullifyVote> = BTreeMap::new();
+    for (key, signature) in source.nullify_votes(&|key| checks.valid_nullify(key)) {
+        let Some(signature) = signature else { continue };
+        if key.epoch != session.generation
+            || key.view <= floor
+            || (key.signer as usize) >= session.members.len()
+        {
+            continue;
+        }
+        if latest
+            .get(&key.signer)
+            .is_none_or(|kept| kept.view < key.view)
+        {
+            latest.insert(
+                key.signer,
+                NullifyVote {
+                    view: key.view,
+                    signer: key.signer,
+                    signature,
+                },
+            );
+        }
+    }
+    latest.into_values().collect()
+}
+
 fn key(seen: &NotarizedProposal, signer: u32) -> NotarizeKey {
-    NotarizeKey { epoch: seen.epoch, view: seen.view, parent: seen.parent, payload: seen.payload, signer }
+    NotarizeKey {
+        epoch: seen.epoch,
+        view: seen.view,
+        parent: seen.parent,
+        payload: seen.payload,
+        signer,
+    }
 }
 
 /// The proposals in `seen` a report for inclusion in `inclusion` could
@@ -380,7 +578,12 @@ fn eligible<'a>(
 ) -> impl Iterator<Item = (&'a NotarizedProposal, FrameHeader)> + 'a {
     seen.iter()
         .rev()
-        .filter_map(move |seen| Some((seen, header(session, seen).filter(|header| anchored_in(pace, header, inclusion))?)))
+        .filter_map(move |seen| {
+            Some((
+                seen,
+                header(session, seen).filter(|header| anchored_in(pace, header, inclusion))?,
+            ))
+        })
         .take(MAX_CANDIDATES)
 }
 
@@ -388,11 +591,19 @@ fn eligible<'a>(
 /// proposal's view, without the certificate and storage openings a report
 /// must not carry.
 fn header(session: &Session, seen: &NotarizedProposal) -> Option<FrameHeader> {
-    if seen.epoch != session.generation || seen.view == 0 || seen.parent >= seen.view || Seal::is_encoding(&seen.body) {
+    if seen.epoch != session.generation
+        || seen.view == 0
+        || seen.parent >= seen.view
+        || Seal::is_encoding(&seen.body)
+    {
         return None;
     }
-    let frame = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(seen.body.as_slice()).ok()?;
-    let mut header = quil_execution::global_intrinsic::conversions::frame_header_from_proto(frame.header.as_ref()?);
+    let frame =
+        <quil_types::proto::global::AppShardFrame as prost::Message>::decode(seen.body.as_slice())
+            .ok()?;
+    let mut header = quil_execution::global_intrinsic::conversions::frame_header_from_proto(
+        frame.header.as_ref()?,
+    );
     header.public_key_signature_bls48581.clear();
     header.storage_attestation.clear();
     let matches = header.address == session.filter
@@ -432,11 +643,20 @@ fn ineligible(
     seen: &[NotarizedProposal],
     valid: &dyn Fn(&NotarizeKey) -> bool,
 ) -> Ineligible {
-    let mut why = Ineligible { sealed: seen.len(), ..Ineligible::default() };
+    let mut why = Ineligible {
+        sealed: seen.len(),
+        ..Ineligible::default()
+    };
     for seen in seen {
-        let Some(header) = header(session, seen) else { continue };
+        let Some(header) = header(session, seen) else {
+            continue;
+        };
         if anchored_in(pace, &header, inclusion) {
-            if !seen.votes.iter().any(|(signer, _)| valid(&key(seen, *signer))) {
+            if !seen
+                .votes
+                .iter()
+                .any(|(signer, _)| valid(&key(seen, *signer)))
+            {
                 why.unverified += 1;
             }
         } else if header.global_frame_number >= inclusion {
@@ -484,6 +704,10 @@ pub enum Wait {
     /// This node lacks the output of GLOBAL frame `anchor`, a proposal's
     /// anchor.
     Anchor { anchor: u64 },
+    /// GLOBAL already recorded every member the report carries present for
+    /// this epoch, so it would refuse the report
+    /// ([`handoff::presence::marks_new_member`]).
+    Recorded,
 }
 
 impl Wait {
@@ -493,6 +717,7 @@ impl Wait {
             Self::Superseded => "session superseded by a successor",
             Self::Closed => "session closed",
             Self::Anchor { .. } => "anchor GLOBAL frame missing from this node's stores",
+            Self::Recorded => "every member carried is already recorded present this epoch",
         }
     }
 
@@ -502,6 +727,9 @@ impl Wait {
             Self::UnknownSession => "this node's GLOBAL view materializes the session",
             Self::Superseded | Self::Closed => "this node's host retires the session",
             Self::Anchor { .. } => "this worker syncs the anchor GLOBAL frame",
+            Self::Recorded => {
+                "a member GLOBAL has not recorded present this epoch votes, or the epoch ends"
+            }
         }
     }
 }
@@ -515,7 +743,10 @@ pub enum Outcome {
     /// The session stalled, and another member submits: `designated`, the
     /// first of the `voters` whose votes this node verified (`None` while
     /// it verified none).
-    NotDesignated { designated: Option<u32>, voters: usize },
+    NotDesignated {
+        designated: Option<u32>,
+        voters: usize,
+    },
     /// This node submits, but no recent proposal can be reported.
     NothingEligible(Ineligible),
     /// An expected wait: the report is not checked or sent yet.
@@ -525,9 +756,19 @@ pub enum Outcome {
     /// disagrees with GLOBAL's rules, a defect.
     /// `refusals`: this epoch's so far, the first in `since` (an inclusion
     /// frame).
-    Refused { built: Built, error: QuilError, refusals: u32, since: u64 },
+    Refused {
+        built: Built,
+        error: QuilError,
+        refusals: u32,
+        since: u64,
+    },
     /// The report passes the check GLOBAL applies: submit `bytes`.
-    Submit { built: Built, bytes: Vec<u8>, added: usize, voters: usize },
+    Submit {
+        built: Built,
+        bytes: Vec<u8>,
+        added: usize,
+        voters: usize,
+    },
 }
 
 /// One look at a stalled session.
@@ -568,21 +809,30 @@ pub struct PresenceSchedule {
     first_refused: Option<u64>,
     /// The last submission's bytes digest and the members reported before
     /// it, to give its budget back if it was not published.
-    pending: Option<([u8; 32], BTreeSet<u32>)>,
+    pending: Option<([u8; 32], BTreeSet<u32>, bool)>,
+    /// The inclusion frame this member last reported itself for this epoch.
+    self_reported: Option<u64>,
 }
 
 impl PresenceSchedule {
     /// Start over for another session or epoch.
     pub fn observe(&mut self, session: [u8; 32], epoch: u64) {
         if (self.session, self.epoch) != (session, epoch) {
-            *self = Self { session, epoch, ..Self::default() };
+            *self = Self {
+                session,
+                epoch,
+                ..Self::default()
+            };
         }
     }
 
     /// Whether to look at the session's votes at committed GLOBAL frame
     /// `frame`: `every` frames after the last look. A look is recorded.
     pub fn look(&mut self, frame: u64, every: u64) -> bool {
-        if self.looked.is_some_and(|last| frame < last.saturating_add(every)) {
+        if self
+            .looked
+            .is_some_and(|last| frame < last.saturating_add(every))
+        {
             return false;
         }
         self.looked = Some(frame);
@@ -593,7 +843,9 @@ impl PresenceSchedule {
     /// frames after the last.
     pub fn due(&self, inclusion: u64, spacing: u64) -> bool {
         self.submitted < MAX_REPORTS_PER_EPOCH
-            && self.last.is_none_or(|last| inclusion >= last.saturating_add(spacing))
+            && self
+                .last
+                .is_none_or(|last| inclusion >= last.saturating_add(spacing))
     }
 
     /// How many of `members` the epoch's submitted reports did not carry.
@@ -609,20 +861,23 @@ impl PresenceSchedule {
 
     /// Record the bytes of the submission just counted, so that
     /// [`Self::reclaim`] can give it back.
-    fn pending(&mut self, bytes: &[u8], reported_before: BTreeSet<u32>) {
-        self.pending = Some((digest(bytes), reported_before));
+    fn pending(&mut self, bytes: &[u8], reported_before: BTreeSet<u32>, alone: bool) {
+        self.pending = Some((digest(bytes), reported_before, alone));
     }
 
     /// Give back the budget of the last submission if its publication
     /// failed ([`publication_failed`]): it no longer counts, nor do the
     /// members it carried. Its spacing still holds.
     fn reclaim(&mut self) {
-        if let Some((hash, before)) = self.pending.take() {
+        if let Some((hash, before, alone)) = self.pending.take() {
             if take_unpublished(&hash) {
                 self.submitted = self.submitted.saturating_sub(1);
                 self.reported = before;
+                if alone {
+                    self.self_reported = None;
+                }
             } else {
-                self.pending = Some((hash, before));
+                self.pending = Some((hash, before, alone));
             }
         }
     }
@@ -687,7 +942,10 @@ impl PresenceReporter {
         let (activation, pace) = (handoff::presence_report_frame(), look.pace);
         let session = look.session;
         let id = session.id().ok()?;
-        let me = session.members.binary_search_by(|member| member.as_slice().cmp(look.key)).ok()? as u32;
+        let me = session
+            .members
+            .binary_search_by(|member| member.as_slice().cmp(look.key))
+            .ok()? as u32;
         // The report lands in a later GLOBAL frame than the one viewed.
         let inclusion = look.frame.saturating_add(1);
         let epoch = pace.epoch(inclusion);
@@ -707,7 +965,16 @@ impl PresenceReporter {
         }
         // `log`: the outcome is a submission or refusal, or the first of its
         // cause this epoch.
-        let attempt = |outcome: Outcome, log: bool| Some(Attempt { session: id, epoch, inclusion, stalled, outcome, log });
+        let attempt = |outcome: Outcome, log: bool| {
+            Some(Attempt {
+                session: id,
+                epoch,
+                inclusion,
+                stalled,
+                outcome,
+                log,
+            })
+        };
         // It lands no earlier than after the latest GLOBAL frame this node
         // holds.
         let latest = look.latest.unwrap_or(look.frame).max(look.frame);
@@ -724,27 +991,84 @@ impl PresenceReporter {
         }
         let checker = SessionVotes::new(session).ok()?;
         self.checks.refresh(id, &checker, source);
-        let voters = self.checks.voters(session);
+        // From the presence exclusion frame nullify votes count too: they
+        // protect their signers from exclusion, and a session whose members
+        // only nullify has no notarize to report.
+        let nullifying = inclusion >= handoff::presence_exclusion_frame();
+        let mut voters = self.checks.voters(session);
+        if nullifying {
+            self.checks.refresh_nullifies(&checker, source);
+            voters.extend(self.checks.nullify_voters(session));
+        }
         let designated = designated_submitter(&id, epoch, &voters);
-        if designated != Some(me) {
-            let outcome = Outcome::NotDesignated { designated, voters: voters.len() };
+        // GLOBAL's records are kept by its own epoch of the inclusion frame.
+        let global_epoch = quil_types::consensus::epoch_for_frame(inclusion);
+        // One reporter's view must not decide who is absent: from its own
+        // frame of the epoch's second half, a member GLOBAL has not recorded
+        // present reports its own votes, again every resubmit spacing while
+        // GLOBAL still has no record of it (a report lost on the way, or
+        // dropped from a mempool), within the epoch's report budget, and at
+        // once again if its publication failed. GLOBAL's new-mark rule
+        // bounds what that costs.
+        let alone = designated != Some(me)
+            && nullifying
+            && inclusion >= pace.self_report_frame(&id, epoch, me)
+            && self
+                .schedule
+                .self_reported
+                .is_none_or(|at| inclusion >= at.saturating_add(pace.resubmit_frames()))
+            && !handoff::presence::recorded(look.view, session, global_epoch, me).unwrap_or(true);
+        if designated != Some(me) && !alone {
+            let outcome = Outcome::NotDesignated {
+                designated,
+                voters: voters.len(),
+            };
             // With no vote verified, this node cannot tell who submits.
-            let cause = if designated.is_some() { "not designated" } else { "no verified vote" };
+            let cause = if designated.is_some() {
+                "not designated"
+            } else {
+                "no verified vote"
+            };
             return attempt(outcome, self.schedule.note(cause));
         }
         let seen = source.notarized();
         let checks = &self.checks;
-        let valid = |key: &NotarizeKey| checks.valid(key);
-        let Some(built) = build(session, id, pace, inclusion, &seen, valid) else {
+        let valid = |key: &NotarizeKey| checks.valid(key) && (!alone || key.signer == me);
+        let nullifies = if nullifying {
+            let floor =
+                handoff::presence::nullify_floor(look.view, session, global_epoch).unwrap_or(0);
+            let mut nullifies = verified_nullifies(session, &self.checks, source, floor);
+            if alone {
+                nullifies.retain(|vote| vote.signer == me);
+            }
+            nullifies
+        } else {
+            Vec::new()
+        };
+        let Some(built) =
+            build_with_nullifies(session, id, pace, inclusion, &seen, valid, nullifies)
+        else {
             let why = ineligible(session, pace, inclusion, &seen, &valid);
-            return attempt(Outcome::NothingEligible(why), self.schedule.note("nothing eligible"));
+            return attempt(
+                Outcome::NothingEligible(why),
+                self.schedule.note("nothing eligible"),
+            );
         };
         let added = self.schedule.adds(&built.members);
-        if added == 0 {
+        // A member reporting itself again while GLOBAL has no record of it
+        // repeats its own vote: it adds nobody to this node's reports.
+        if added == 0 && !alone {
             self.schedule.idle(inclusion);
             return None;
         }
-        let outputs = match waits(look.view, &id, session, &built.report, &anchor_output) {
+        let outputs = match waits(
+            look.view,
+            inclusion,
+            &id,
+            session,
+            &built.report,
+            &anchor_output,
+        ) {
             Ok(outputs) => outputs,
             Err(wait) => {
                 return attempt(Outcome::Wait(wait), self.schedule.note(wait.cause()));
@@ -755,24 +1079,42 @@ impl PresenceReporter {
         let checked = built.report.to_canonical_bytes().and_then(|bytes| {
             let decoded = PresenceReport::from_canonical_bytes(&bytes)?;
             handoff::presence::verify(look.view, inclusion, &decoded, |anchor| {
-                outputs
-                    .get(&anchor)
-                    .cloned()
-                    .ok_or_else(|| QuilError::ExecutionUnavailable(format!("anchor {anchor} not fetched")))
+                outputs.get(&anchor).cloned().ok_or_else(|| {
+                    QuilError::ExecutionUnavailable(format!("anchor {anchor} not fetched"))
+                })
             })?;
             Ok(bytes)
         });
         match checked {
             Ok(bytes) => {
                 let before = self.schedule.reported.clone();
+                if alone {
+                    self.schedule.self_reported = Some(inclusion);
+                }
                 self.schedule.submitted(inclusion, &built.members);
-                self.schedule.pending(&bytes, before);
-                attempt(Outcome::Submit { built, bytes, added, voters: voters.len() }, true)
+                self.schedule.pending(&bytes, before, alone);
+                attempt(
+                    Outcome::Submit {
+                        built,
+                        bytes,
+                        added,
+                        voters: voters.len(),
+                    },
+                    true,
+                )
             }
             Err(error) => {
                 let (refusals, since) = self.schedule.refused(inclusion);
                 let log = refusals == 1 || refusals % REFUSALS_LOGGED_EVERY == 0;
-                attempt(Outcome::Refused { built, error, refusals, since }, log)
+                attempt(
+                    Outcome::Refused {
+                        built,
+                        error,
+                        refusals,
+                        since,
+                    },
+                    log,
+                )
             }
         }
     }
@@ -788,29 +1130,40 @@ impl PresenceReporter {
     }
 }
 
-/// The expected waits of GLOBAL's check of `report` ([`handoff::presence::verify`]):
-/// the session as head of its filter and not closed in `view`, and every
-/// anchor's output at hand, which it returns. What remains for the check to
-/// refuse is a defect of the report.
+/// The expected waits of GLOBAL's check of `report` for inclusion in GLOBAL
+/// frame `inclusion` ([`handoff::presence::verify`]): the session as head of
+/// its filter and not closed in `view`, a member the epoch's presence record
+/// lacks, and every anchor's output at hand, which it returns. What remains
+/// for the check to refuse is a defect of the report.
 fn waits(
     view: &impl Records,
+    inclusion: u64,
     id: &[u8; 32],
     session: &Session,
     report: &PresenceReport,
     anchor_output: &dyn Fn(u64) -> Result<Vec<u8>>,
 ) -> std::result::Result<BTreeMap<u64, Vec<u8>>, Wait> {
-    let committed = handoff::session(view, id).ok().flatten().ok_or(Wait::UnknownSession)?;
+    let committed = handoff::session(view, id)
+        .ok()
+        .flatten()
+        .ok_or(Wait::UnknownSession)?;
     if handoff::head(view, &session.filter).ok().flatten().as_ref() != Some(&committed) {
         return Err(Wait::Superseded);
     }
     if matches!(handoff::status(view, id), Ok(handoff::Status::Closed(_))) {
         return Err(Wait::Closed);
     }
+    if !handoff::presence::marks_new_member(view, inclusion, &committed, report).unwrap_or(true) {
+        return Err(Wait::Recorded);
+    }
     let mut outputs = BTreeMap::new();
     for proposal in &report.proposals {
         let anchor = proposal.header.global_frame_number;
         if !outputs.contains_key(&anchor) {
-            outputs.insert(anchor, anchor_output(anchor).map_err(|_| Wait::Anchor { anchor })?);
+            outputs.insert(
+                anchor,
+                anchor_output(anchor).map_err(|_| Wait::Anchor { anchor })?,
+            );
         }
     }
     Ok(outputs)
@@ -821,7 +1174,10 @@ mod tests {
     use super::*;
     use quil_cw_consensus::{
         _consensus::{
-            simplex::{scheme::Namespace, types::{Proposal, Subject}},
+            simplex::{
+                scheme::Namespace,
+                types::{Proposal, Subject},
+            },
             types::{Epoch, Round, View},
         },
         _crypto::{sha256::Digest, Signer as _},
@@ -894,7 +1250,10 @@ mod tests {
             genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
             base_frame: 10,
             authorization: [0x34; 32],
-            members: keys.iter().map(|key| key.public_key().as_ref().to_vec()).collect(),
+            members: keys
+                .iter()
+                .map(|key| key.public_key().as_ref().to_vec())
+                .collect(),
         };
         let id = session.id().unwrap();
         Committee { keys, session, id }
@@ -909,7 +1268,14 @@ mod tests {
             self.seen_in(&self.session, view, anchor, signers, view as u8)
         }
 
-        fn seen_in(&self, signing: &Session, view: u64, anchor: u64, signers: &[usize], salt: u8) -> NotarizedProposal {
+        fn seen_in(
+            &self,
+            signing: &Session,
+            view: u64,
+            anchor: u64,
+            signers: &[usize],
+            salt: u8,
+        ) -> NotarizedProposal {
             let mut header = quil_types::proto::global::FrameHeader {
                 address: self.session.filter.clone(),
                 frame_number: self.session.base_frame + view,
@@ -924,17 +1290,34 @@ mod tests {
             let h = quil_execution::global_intrinsic::conversions::frame_header_from_proto(&header);
             let beacon = quil_crypto::porep::derive_storage_beacon(anchor, &anchor_output(anchor));
             header.output = quil_crypto::porep::deterministic_app_frame_output(
-                &h.parent_selector, &h.requests_root, &h.state_roots, &beacon, h.frame_number, h.rank, &h.prover,
-                h.difficulty, h.fee_multiplier_vote as u64, h.timestamp, &h.storage_attestation_root,
-                h.fee_total_value(), &h.settlements, &h.accumulator, &h.spends,
+                &h.parent_selector,
+                &h.requests_root,
+                &h.state_roots,
+                &beacon,
+                h.frame_number,
+                h.rank,
+                &h.prover,
+                h.difficulty,
+                h.fee_multiplier_vote as u64,
+                h.timestamp,
+                &h.storage_attestation_root,
+                h.fee_total_value(),
+                &h.settlements,
+                &h.accumulator,
+                &h.spends,
             );
             let payload = quil_crypto::poseidon::hash_bytes_to_32(&header.output).unwrap();
             let body = prost::Message::encode_to_vec(&quil_types::proto::global::AppShardFrame {
                 header: Some(header),
                 ..Default::default()
             });
-            let participants: Set<_> =
-                self.keys.iter().map(|key| key.public_key()).collect::<Vec<_>>().try_into().unwrap();
+            let participants: Set<_> = self
+                .keys
+                .iter()
+                .map(|key| key.public_key())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
             let proposal = Proposal::new(
                 Round::new(Epoch::new(self.session.generation), View::new(view)),
                 View::new(view - 1),
@@ -943,23 +1326,70 @@ mod tests {
             let mut votes: Vec<(u32, Vec<u8>)> = signers
                 .iter()
                 .map(|&signer| {
-                    let scheme: Generic<Namespace> =
-                        Generic::signer(&signing.namespace().unwrap(), participants.clone(), self.keys[signer].clone())
-                            .unwrap();
-                    let vote = scheme.sign::<SimplexFalconScheme, Digest>(Subject::Notarize { proposal: &proposal }).unwrap();
+                    let scheme: Generic<Namespace> = Generic::signer(
+                        &signing.namespace().unwrap(),
+                        participants.clone(),
+                        self.keys[signer].clone(),
+                    )
+                    .unwrap();
+                    let vote = scheme
+                        .sign::<SimplexFalconScheme, Digest>(Subject::Notarize {
+                            proposal: &proposal,
+                        })
+                        .unwrap();
                     assert_eq!(vote.signer.get() as usize, signer);
                     (vote.signer.get(), vote.signature.get().unwrap().to_vec())
                 })
                 .collect();
             votes.sort_by_key(|(signer, _)| *signer);
-            NotarizedProposal { epoch: self.session.generation, view, parent: view - 1, payload, votes, body }
+            NotarizedProposal {
+                epoch: self.session.generation,
+                view,
+                parent: view - 1,
+                payload,
+                votes,
+                body,
+            }
+        }
+
+        /// Member `signer`'s nullify of `view` under the session's namespace,
+        /// as the session's liveness keeps it.
+        fn nullify(&self, view: u64, signer: usize) -> (NullifyKey, Vec<u8>) {
+            let participants: Set<_> = self
+                .keys
+                .iter()
+                .map(|key| key.public_key())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            let scheme: Generic<Namespace> = Generic::signer(
+                &self.session.namespace().unwrap(),
+                participants,
+                self.keys[signer].clone(),
+            )
+            .unwrap();
+            let round = Round::new(Epoch::new(self.session.generation), View::new(view));
+            let vote = scheme
+                .sign::<SimplexFalconScheme, Digest>(Subject::Nullify { round })
+                .unwrap();
+            assert_eq!(vote.signer.get() as usize, signer);
+            let key = NullifyKey {
+                epoch: self.session.generation,
+                view,
+                signer: vote.signer.get(),
+            };
+            (key, vote.signature.get().unwrap().to_vec())
         }
 
         /// A look by `member` at committed GLOBAL frame `frame`, the latest
         /// this node holds.
         fn look<'a, R: Records>(&'a self, view: &'a R, member: usize, frame: u64) -> Look<'a, R> {
             Look {
-                view, frame, latest: Some(frame), session: &self.session, key: &self.session.members[member],
+                view,
+                frame,
+                latest: Some(frame),
+                session: &self.session,
+                key: &self.session.members[member],
                 pace: PACE,
             }
         }
@@ -994,12 +1424,19 @@ mod tests {
                 Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
                 Arc::new(quil_hypergraph::testing::StubProver),
             ));
-            crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                quil_store::FOREST_NAMESPACE,
+            ));
             let state = quil_execution::hypergraph_state::HypergraphState::new(crdt.clone());
             handoff::initialize(&state, 2, session).unwrap();
             state.commit().unwrap();
             state.abort();
-            crdt.commit_with_global_cursor(2, &quil_store::encoding::global_materialized_cursor_key()).unwrap();
+            crdt.commit_with_global_cursor(
+                2,
+                &quil_store::encoding::global_materialized_cursor_key(),
+            )
+            .unwrap();
             Self { crdt, _db: db }
         }
 
@@ -1012,6 +1449,8 @@ mod tests {
     #[derive(Default)]
     struct Votes {
         proposals: Vec<NotarizedProposal>,
+        /// Kept nullify votes and their signatures.
+        nullifies: Vec<(NullifyKey, Vec<u8>)>,
         /// Lists of votes taken, signatures copied, and body reads.
         listed: Cell<u32>,
         copied: Cell<u32>,
@@ -1020,7 +1459,10 @@ mod tests {
 
     impl Votes {
         fn of(proposals: Vec<NotarizedProposal>) -> Self {
-            Self { proposals, ..Self::default() }
+            Self {
+                proposals,
+                ..Self::default()
+            }
         }
 
         fn reads(&self) -> (u32, u32, u32) {
@@ -1029,7 +1471,10 @@ mod tests {
     }
 
     impl VoteSource for Votes {
-        fn notarize_votes(&self, wanted: &dyn Fn(&NotarizeKey) -> bool) -> Vec<(NotarizeKey, Option<Vec<u8>>)> {
+        fn notarize_votes(
+            &self,
+            wanted: &dyn Fn(&NotarizeKey) -> bool,
+        ) -> Vec<(NotarizeKey, Option<Vec<u8>>)> {
             self.listed.set(self.listed.get() + 1);
             let mut votes = Vec::new();
             for proposal in &self.proposals {
@@ -1047,18 +1492,34 @@ mod tests {
             self.bodies.set(self.bodies.get() + 1);
             self.proposals.clone()
         }
+
+        fn nullify_votes(
+            &self,
+            wanted: &dyn Fn(&NullifyKey) -> bool,
+        ) -> Vec<(NullifyKey, Option<Vec<u8>>)> {
+            self.nullifies
+                .iter()
+                .map(|(key, signature)| (*key, wanted(key).then(|| signature.clone())))
+                .collect()
+        }
     }
 
     fn checked(c: &Committee, seen: &[NotarizedProposal]) -> VoteChecks {
         let mut checks = VoteChecks::default();
-        checks.refresh(c.id, &SessionVotes::new(&c.session).unwrap(), &Votes::of(seen.to_vec()));
+        checks.refresh(
+            c.id,
+            &SessionVotes::new(&c.session).unwrap(),
+            &Votes::of(seen.to_vec()),
+        );
         checks
     }
 
     /// [`build`] for `inclusion` from the votes of `seen` that verify.
     fn build_checked(c: &Committee, inclusion: u64, seen: &[NotarizedProposal]) -> Option<Built> {
         let checks = checked(c, seen);
-        build(&c.session, c.id, PACE, inclusion, seen, |key| checks.valid(key))
+        build(&c.session, c.id, PACE, inclusion, seen, |key| {
+            checks.valid(key)
+        })
     }
 
     fn signers(proposal: &PresenceProposal) -> Vec<u32> {
@@ -1080,16 +1541,28 @@ mod tests {
         // nobody.
         assert_eq!(built.views(), vec![6, 7]);
         assert_eq!(signers(&built.report.proposals[0]), vec![1, 2, 3]);
-        assert_eq!(signers(&built.report.proposals[1]), vec![0], "one vote per member");
+        assert_eq!(
+            signers(&built.report.proposals[1]),
+            vec![0],
+            "one vote per member"
+        );
         assert_eq!(built.members, BTreeSet::from([0, 1, 2, 3]));
         assert_eq!(built.report.session, c.id);
         // The codec accepts it: ascending views, one vote per member.
         let bytes = built.report.to_canonical_bytes().unwrap();
-        assert_eq!(PresenceReport::from_canonical_bytes(&bytes).unwrap(), built.report);
-        assert!(built.report.proposals.iter().all(|p| p.header.public_key_signature_bls48581.is_empty()
+        assert_eq!(
+            PresenceReport::from_canonical_bytes(&bytes).unwrap(),
+            built.report
+        );
+        assert!(built.report.proposals.iter().all(|p| p
+            .header
+            .public_key_signature_bls48581
+            .is_empty()
             && p.header.storage_attestation.is_empty()));
         // At most four proposals, though a fifth would add a member.
-        let seen: Vec<_> = (0..5).map(|member| c.seen(5 + member as u64, ANCHOR, &[member])).collect();
+        let seen: Vec<_> = (0..5)
+            .map(|member| c.seen(5 + member as u64, ANCHOR, &[member]))
+            .collect();
         let built = build_checked(&c, INCLUSION, &seen).unwrap();
         assert_eq!(built.report.proposals.len(), MAX_PRESENCE_PROPOSALS);
         assert_eq!(built.members.len(), MAX_PRESENCE_PROPOSALS);
@@ -1107,15 +1580,36 @@ mod tests {
         other_generation.epoch += 1;
         let mut seal = c.seen(8, ANCHOR, &[3]);
         let checkpoint = quil_cw_consensus::handoff::Checkpoint {
-            frame: 17, view: 7, digest: [2; 32], state_roots: [[3; 32]; 4], history_root: [4; 32],
+            frame: 17,
+            view: 7,
+            digest: [2; 32],
+            state_roots: [[3; 32]; 4],
+            history_root: [4; 32],
         };
-        seal.body = Seal { request: [1; 32], session: c.id, view: 8, checkpoint }.encode();
+        seal.body = Seal {
+            request: [1; 32],
+            session: c.id,
+            view: 8,
+            checkpoint,
+        }
+        .encode();
         let seen = [forged, foreign_namespace, other_generation, seal];
         let built = build_checked(&c, INCLUSION, &seen).unwrap();
-        assert_eq!(built.members, BTreeSet::from([0]), "only member 0's vote is a valid notarize of a session frame");
-        assert_eq!(checked(&c, &seen).voters(&c.session), BTreeSet::from([0, 3]), "votes that verify, of the generation");
+        assert_eq!(
+            built.members,
+            BTreeSet::from([0]),
+            "only member 0's vote is a valid notarize of a session frame"
+        );
+        assert_eq!(
+            checked(&c, &seen).voters(&c.session),
+            BTreeSet::from([0, 3]),
+            "votes that verify, of the generation"
+        );
         // Two proposals of one view: the report carries one of them.
-        let equivocated = vec![c.seen_in(&c.session, 9, ANCHOR, &[0, 1], 1), c.seen_in(&c.session, 9, ANCHOR, &[2, 3], 2)];
+        let equivocated = vec![
+            c.seen_in(&c.session, 9, ANCHOR, &[0, 1], 1),
+            c.seen_in(&c.session, 9, ANCHOR, &[2, 3], 2),
+        ];
         let built = build_checked(&c, INCLUSION, &equivocated).unwrap();
         assert_eq!(built.report.proposals.len(), 1);
         assert_eq!(built.members.len(), 2);
@@ -1132,15 +1626,29 @@ mod tests {
         ];
         let built = build_checked(&c, INCLUSION, &seen).unwrap();
         assert_eq!(built.members, BTreeSet::from([3]));
-        assert!(build_checked(&c, INCLUSION, &seen[..3]).is_none(), "nothing to report");
+        assert!(
+            build_checked(&c, INCLUSION, &seen[..3]).is_none(),
+            "nothing to report"
+        );
         let checks = checked(&c, &seen);
         assert_eq!(
-            ineligible(&c.session, PACE, INCLUSION, &seen[..3], &|key| checks.valid(key)),
-            Ineligible { sealed: 3, anchored_ahead: 1, anchored_before: 2, unverified: 0 },
+            ineligible(&c.session, PACE, INCLUSION, &seen[..3], &|key| checks
+                .valid(key)),
+            Ineligible {
+                sealed: 3,
+                anchored_ahead: 1,
+                anchored_before: 2,
+                unverified: 0
+            },
         );
         assert_eq!(
             ineligible(&c.session, PACE, INCLUSION, &seen, &|_| false),
-            Ineligible { sealed: 4, anchored_ahead: 1, anchored_before: 2, unverified: 1 },
+            Ineligible {
+                sealed: 4,
+                anchored_ahead: 1,
+                anchored_before: 2,
+                unverified: 1
+            },
         );
     }
 
@@ -1154,19 +1662,35 @@ mod tests {
         let global = Global::new(&c.session);
         let view = global.view();
         let (inclusion, anchor) = (c.inclusion(), c.anchor());
-        let seen = vec![c.seen(5, anchor, &[0, 1]), c.seen(6, anchor - 1, &[1, 2, 3])];
+        let seen = vec![
+            c.seen(5, anchor, &[0, 1]),
+            c.seen(6, anchor - 1, &[1, 2, 3]),
+        ];
         let built = build_checked(&c, inclusion, &seen).unwrap();
         handoff::presence::verify(&view, inclusion, &built.report, anchors).unwrap();
         // A different anchor output fails GLOBAL's recomputation.
-        assert!(handoff::presence::verify(&view, inclusion, &built.report, |frame| anchors(frame + 1)).is_err());
+        assert!(
+            handoff::presence::verify(&view, inclusion, &built.report, |frame| anchors(frame + 1))
+                .is_err()
+        );
         let votes = Votes::of(seen);
         let me = c.designated(&[0, 1, 2, 3]) as usize;
         let mut reporter = PresenceReporter::default();
-        let attempt = reporter.attempt(c.look(&view, me, inclusion - 1), &votes, anchors).unwrap();
+        let attempt = reporter
+            .attempt(c.look(&view, me, inclusion - 1), &votes, anchors)
+            .unwrap();
         assert!(attempt.log);
-        assert_eq!((attempt.inclusion, attempt.epoch, attempt.session), (inclusion, PACE.epoch(inclusion), c.id));
+        assert_eq!(
+            (attempt.inclusion, attempt.epoch, attempt.session),
+            (inclusion, PACE.epoch(inclusion), c.id)
+        );
         let (built, bytes, added, voters) = match attempt.outcome {
-            Outcome::Submit { built, bytes, added, voters } => (built, bytes, added, voters),
+            Outcome::Submit {
+                built,
+                bytes,
+                added,
+                voters,
+            } => (built, bytes, added, voters),
             other => panic!("{other:?}"),
         };
         assert_eq!((added, voters), (4, 4));
@@ -1174,7 +1698,194 @@ mod tests {
         assert_eq!(report, built.report);
         handoff::presence::verify(&view, inclusion, &report, anchors).unwrap();
         // It adds nobody later this epoch: nothing more is sent or logged.
-        assert!(reporter.attempt(c.look(&view, me, inclusion - 1 + PACE.resubmit_frames()), &votes, anchors).is_none());
+        assert!(reporter
+            .attempt(
+                c.look(&view, me, inclusion - 1 + PACE.resubmit_frames()),
+                &votes,
+                anchors
+            )
+            .is_none());
+    }
+
+    /// A session whose members only nullify (no proposal reaches quorum, or
+    /// none is made) reports their verified nullifies from the presence
+    /// exclusion frame, and GLOBAL accepts the report; a forged nullify is
+    /// left out. Before the frame its members verified no vote.
+    #[test]
+    fn a_session_that_only_nullifies_reports_its_nullifies_from_the_exclusion_frame() {
+        let _active = Active::new();
+        let c = committee(5);
+        let global = Global::new(&c.session);
+        let view = global.view();
+        let mut forged = c.nullify(1, 3);
+        forged.1[20] ^= 1;
+        let votes = Votes {
+            nullifies: vec![
+                c.nullify(1, 0),
+                c.nullify(1, 1),
+                c.nullify(2, 1),
+                c.nullify(1, 2),
+                forged,
+            ],
+            ..Votes::default()
+        };
+        let frame = c.inclusion() - 1;
+        let me = c.designated(&[0, 1, 2]) as usize;
+        handoff::set_presence_exclusion_frame_for_thread(Some(u64::MAX));
+        let attempt = PresenceReporter::default()
+            .attempt(c.look(&view, me, frame), &votes, anchors)
+            .unwrap();
+        assert!(
+            matches!(
+                attempt.outcome,
+                Outcome::NotDesignated {
+                    designated: None,
+                    voters: 0
+                }
+            ),
+            "{attempt:?}"
+        );
+        handoff::set_presence_exclusion_frame_for_thread(Some(0));
+        let attempt = PresenceReporter::default()
+            .attempt(c.look(&view, me, frame), &votes, anchors)
+            .unwrap();
+        let (built, bytes, voters) = match attempt.outcome {
+            Outcome::Submit {
+                built,
+                bytes,
+                voters,
+                ..
+            } => (built, bytes, voters),
+            other => panic!("{other:?}"),
+        };
+        handoff::set_presence_exclusion_frame_for_thread(None);
+        assert_eq!(voters, 3);
+        assert!(built.report.proposals.is_empty());
+        let carried: Vec<(u32, u64)> = built
+            .report
+            .nullifies
+            .iter()
+            .map(|vote| (vote.signer, vote.view))
+            .collect();
+        assert_eq!(
+            carried,
+            vec![(0, 1), (1, 2), (2, 1)],
+            "each member's latest verified nullify"
+        );
+        assert_eq!(built.members, BTreeSet::from([0, 1, 2]));
+        handoff::set_presence_exclusion_frame_for_thread(Some(0));
+        handoff::presence::verify(
+            &view,
+            c.inclusion(),
+            &PresenceReport::from_canonical_bytes(&bytes).unwrap(),
+            anchors,
+        )
+        .unwrap();
+        handoff::set_presence_exclusion_frame_for_thread(None);
+    }
+
+    /// A member that is not the designated submitter, and that GLOBAL has
+    /// not recorded present, reports its own vote from its own frame of the
+    /// epoch's second half (spread by member), again every resubmit spacing
+    /// while GLOBAL still has no record of it, with its budget given back
+    /// when publication fails, and no more once GLOBAL records it.
+    #[test]
+    fn an_unrecorded_member_reports_itself_late_in_the_epoch_until_recorded() {
+        let _active = Active::new();
+        handoff::set_presence_exclusion_frame_for_thread(Some(0));
+        let c = committee(5);
+        let global = Global::new(&c.session);
+        let view = global.view();
+        let votes = Votes {
+            nullifies: (0..5).map(|member| c.nullify(1, member)).collect(),
+            ..Votes::default()
+        };
+        let epoch = PACE.epoch(INCLUSION);
+        let designated = c.designated(&[0, 1, 2, 3, 4]);
+        let own = |member: u32| PACE.self_report_frame(&c.id, epoch, member);
+        let me = (0..5)
+            .filter(|member| *member != designated)
+            .min_by_key(|member| own(*member))
+            .unwrap();
+        let frames: BTreeSet<u64> = (0..5).map(own).collect();
+        assert!(frames.len() > 1, "members are spread");
+        let start = epoch * PACE.length;
+        assert!(frames
+            .iter()
+            .all(|frame| (start + PACE.length / 2..start + 3 * PACE.length / 4).contains(frame)));
+        let me_index = me as usize;
+        let mut reporter = PresenceReporter::default();
+        // Before its own frame it defers to the designated submitter.
+        let early = reporter
+            .attempt(c.look(&view, me_index, own(me) - 3), &votes, anchors)
+            .unwrap();
+        assert!(
+            matches!(early.outcome, Outcome::NotDesignated { .. }),
+            "{early:?}"
+        );
+        let submitted = |attempt: Option<Attempt>| match attempt.map(|attempt| attempt.outcome) {
+            Some(Outcome::Submit { built, bytes, .. }) => (built, bytes),
+            other => panic!("{other:?}"),
+        };
+        let (built, bytes) =
+            submitted(reporter.attempt(c.look(&view, me_index, own(me) - 1), &votes, anchors));
+        assert!(built.report.proposals.is_empty());
+        assert_eq!(built.members, BTreeSet::from([me]), "its own vote alone");
+        handoff::presence::verify(
+            &view,
+            own(me),
+            &PresenceReport::from_canonical_bytes(&bytes).unwrap(),
+            anchors,
+        )
+        .unwrap();
+        // Lost on the way (GLOBAL still has no record): reported again.
+        let retry = own(me) - 1 + PACE.resubmit_frames();
+        let (_, again) =
+            submitted(reporter.attempt(c.look(&view, me_index, retry), &votes, anchors));
+        assert_eq!(reporter.schedule.submitted, 2);
+        // A failed publication gives its budget and its turn back.
+        publication_failed(&again);
+        assert!(reporter
+            .attempt(c.look(&view, me_index, retry + 1), &votes, anchors)
+            .is_none());
+        assert_eq!(
+            (reporter.schedule.submitted, reporter.schedule.self_reported),
+            (1, None)
+        );
+        // Once GLOBAL records it, it reports itself no more.
+        handoff::set_presence_credit_frame_for_thread(Some(0));
+        let state = quil_execution::hypergraph_state::HypergraphState::new(global.crdt.clone());
+        let recorded = retry + 2;
+        handoff::presence::apply(
+            &state,
+            recorded,
+            &PresenceReport::from_canonical_bytes(&bytes).unwrap(),
+            anchors,
+        )
+        .unwrap();
+        state.commit().unwrap();
+        state.abort();
+        global
+            .crdt
+            .commit_with_global_cursor(
+                recorded,
+                &quil_store::encoding::global_materialized_cursor_key(),
+            )
+            .unwrap();
+        let view = global.view();
+        let after = reporter
+            .attempt(
+                c.look(&view, me_index, recorded + PACE.resubmit_frames()),
+                &votes,
+                anchors,
+            )
+            .unwrap();
+        assert!(
+            matches!(after.outcome, Outcome::NotDesignated { .. }),
+            "{after:?}"
+        );
+        handoff::set_presence_credit_frame_for_thread(None);
+        handoff::set_presence_exclusion_frame_for_thread(None);
     }
 
     /// A vote that does not verify neither makes its signer the submitter
@@ -1192,15 +1903,23 @@ mod tests {
         seen.votes[forger as usize].1[20] ^= 1;
         let votes = Votes::of(vec![seen]);
         let frame = c.inclusion() - 1;
-        let attempt = PresenceReporter::default().attempt(c.look(&view, me as usize, frame), &votes, anchors);
+        let attempt =
+            PresenceReporter::default().attempt(c.look(&view, me as usize, frame), &votes, anchors);
         let (built, voters) = match attempt {
-            Some(Attempt { outcome: Outcome::Submit { built, voters, .. }, .. }) => (built, voters),
+            Some(Attempt {
+                outcome: Outcome::Submit { built, voters, .. },
+                ..
+            }) => (built, voters),
             other => panic!("{other:?}"),
         };
         assert_eq!(voters, 3);
         assert_eq!(built.members, honest.iter().copied().collect());
         for member in (0..4).filter(|member| *member != me) {
-            let attempt = PresenceReporter::default().attempt(c.look(&view, member as usize, frame), &votes, anchors);
+            let attempt = PresenceReporter::default().attempt(
+                c.look(&view, member as usize, frame),
+                &votes,
+                anchors,
+            );
             assert!(
                 matches!(attempt, Some(Attempt {
                     outcome: Outcome::NotDesignated { designated: Some(designated), voters: 3 }, log: true, ..
@@ -1226,11 +1945,37 @@ mod tests {
             signature[20] ^= 1;
         }
         let mut reporter = PresenceReporter::default();
-        let attempt = reporter.attempt(c.look(&view, member, frame), &Votes::of(vec![forged]), anchors).unwrap();
-        assert!(matches!(attempt.outcome, Outcome::NotDesignated { designated: None, voters: 0 }) && attempt.log);
+        let attempt = reporter
+            .attempt(
+                c.look(&view, member, frame),
+                &Votes::of(vec![forged]),
+                anchors,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                attempt.outcome,
+                Outcome::NotDesignated {
+                    designated: None,
+                    voters: 0
+                }
+            ) && attempt.log
+        );
         let votes = Votes::of(vec![c.seen(6, c.anchor(), &[0, 1, 2, 3])]);
-        let attempt = reporter.attempt(c.look(&view, member, frame + PACE.check_frames()), &votes, anchors).unwrap();
-        assert!(matches!(attempt.outcome, Outcome::NotDesignated { designated: Some(_), voters: 4 }));
+        let attempt = reporter
+            .attempt(
+                c.look(&view, member, frame + PACE.check_frames()),
+                &votes,
+                anchors,
+            )
+            .unwrap();
+        assert!(matches!(
+            attempt.outcome,
+            Outcome::NotDesignated {
+                designated: Some(_),
+                voters: 4
+            }
+        ));
         assert!(attempt.log, "a new cause, logged too");
     }
 
@@ -1246,14 +1991,27 @@ mod tests {
         let frame = c.inclusion() - 1;
         let votes = Votes::of(vec![c.seen(5, c.anchor(), &[0, 1, 2, 3])]);
         let mut reporter = PresenceReporter::default();
-        let bytes = match reporter.attempt(c.look(&view, me, frame), &votes, anchors).map(|attempt| attempt.outcome) {
+        let bytes = match reporter
+            .attempt(c.look(&view, me, frame), &votes, anchors)
+            .map(|attempt| attempt.outcome)
+        {
             Some(Outcome::Submit { bytes, .. }) => bytes,
             other => panic!("{other:?}"),
         };
         publication_failed(&bytes);
-        let again = reporter.attempt(c.look(&view, me, frame + PACE.resubmit_frames()), &votes, anchors);
+        let again = reporter.attempt(
+            c.look(&view, me, frame + PACE.resubmit_frames()),
+            &votes,
+            anchors,
+        );
         assert!(
-            matches!(again, Some(Attempt { outcome: Outcome::Submit { added: 4, .. }, .. })),
+            matches!(
+                again,
+                Some(Attempt {
+                    outcome: Outcome::Submit { added: 4, .. },
+                    ..
+                })
+            ),
             "built again: {again:?}",
         );
     }
@@ -1272,26 +2030,56 @@ mod tests {
         let frame = c.inclusion() - 1;
         let votes = Votes::of(vec![c.seen(5, c.anchor(), &[0, 1, 2, 3])]);
         let mut reporter = PresenceReporter::default();
-        let attempt = reporter.attempt(c.look(&view, other, frame), &votes, anchors).unwrap();
-        assert!(matches!(attempt.outcome, Outcome::NotDesignated { designated: Some(d), voters: 4 } if d as usize == designated));
+        let attempt = reporter
+            .attempt(c.look(&view, other, frame), &votes, anchors)
+            .unwrap();
+        assert!(
+            matches!(attempt.outcome, Outcome::NotDesignated { designated: Some(d), voters: 4 } if d as usize == designated)
+        );
         assert!(attempt.log);
         assert_eq!((reporter.verifications(), votes.reads()), (4, (1, 4, 0)));
         // Within the spacing nothing is read or verified.
-        assert!(reporter.attempt(c.look(&view, other, frame + 1), &votes, anchors).is_none());
+        assert!(reporter
+            .attempt(c.look(&view, other, frame + 1), &votes, anchors)
+            .is_none());
         assert_eq!((reporter.verifications(), votes.reads()), (4, (1, 4, 0)));
         // The next look lists the votes again, but copies and verifies none
         // twice, and logs nothing new this epoch.
-        let attempt = reporter.attempt(c.look(&view, other, frame + PACE.check_frames()), &votes, anchors).unwrap();
+        let attempt = reporter
+            .attempt(
+                c.look(&view, other, frame + PACE.check_frames()),
+                &votes,
+                anchors,
+            )
+            .unwrap();
         assert!(matches!(attempt.outcome, Outcome::NotDesignated { .. }) && !attempt.log);
         assert_eq!((reporter.verifications(), votes.reads()), (4, (2, 4, 0)));
         // The submitter with nothing to report: the same spacing and checks.
         let stale = Votes::of(vec![c.seen(5, STALE, &[0, 1, 2, 3])]);
         let mut reporter = PresenceReporter::default();
-        let attempt = reporter.attempt(c.look(&view, designated, frame), &stale, anchors).unwrap();
-        let why = Ineligible { sealed: 1, anchored_ahead: 0, anchored_before: 1, unverified: 0 };
-        assert!(matches!(attempt.outcome, Outcome::NothingEligible(found) if found == why) && attempt.log);
-        assert!(reporter.attempt(c.look(&view, designated, frame + 1), &stale, anchors).is_none());
-        let attempt = reporter.attempt(c.look(&view, designated, frame + PACE.check_frames()), &stale, anchors).unwrap();
+        let attempt = reporter
+            .attempt(c.look(&view, designated, frame), &stale, anchors)
+            .unwrap();
+        let why = Ineligible {
+            sealed: 1,
+            anchored_ahead: 0,
+            anchored_before: 1,
+            unverified: 0,
+        };
+        assert!(
+            matches!(attempt.outcome, Outcome::NothingEligible(found) if found == why)
+                && attempt.log
+        );
+        assert!(reporter
+            .attempt(c.look(&view, designated, frame + 1), &stale, anchors)
+            .is_none());
+        let attempt = reporter
+            .attempt(
+                c.look(&view, designated, frame + PACE.check_frames()),
+                &stale,
+                anchors,
+            )
+            .unwrap();
         assert!(matches!(attempt.outcome, Outcome::NothingEligible(_)) && !attempt.log);
         assert_eq!((reporter.verifications(), stale.reads()), (4, (2, 4, 2)));
     }
@@ -1310,12 +2098,32 @@ mod tests {
         let votes = Votes::of(vec![c.seen(5, c.anchor(), &[0, 1, 2, 3])]);
         let missing = |_: u64| -> Result<Vec<u8>> { Err(QuilError::Store("no such frame".into())) };
         let mut reporter = PresenceReporter::default();
-        let attempt = reporter.attempt(c.look(&view, me, frame), &votes, missing).unwrap();
-        assert!(matches!(attempt.outcome, Outcome::Wait(Wait::Anchor { anchor }) if anchor == c.anchor()) && attempt.log);
-        let attempt = reporter.attempt(c.look(&view, me, frame + PACE.check_frames()), &votes, missing).unwrap();
-        assert!(matches!(attempt.outcome, Outcome::Wait(Wait::Anchor { .. })) && !attempt.log, "once per epoch");
+        let attempt = reporter
+            .attempt(c.look(&view, me, frame), &votes, missing)
+            .unwrap();
+        assert!(
+            matches!(attempt.outcome, Outcome::Wait(Wait::Anchor { anchor }) if anchor == c.anchor())
+                && attempt.log
+        );
+        let attempt = reporter
+            .attempt(
+                c.look(&view, me, frame + PACE.check_frames()),
+                &votes,
+                missing,
+            )
+            .unwrap();
+        assert!(
+            matches!(attempt.outcome, Outcome::Wait(Wait::Anchor { .. })) && !attempt.log,
+            "once per epoch"
+        );
         // The anchor arrives: the report goes out.
-        let attempt = reporter.attempt(c.look(&view, me, frame + 2 * PACE.check_frames()), &votes, anchors).unwrap();
+        let attempt = reporter
+            .attempt(
+                c.look(&view, me, frame + 2 * PACE.check_frames()),
+                &votes,
+                anchors,
+            )
+            .unwrap();
         assert!(matches!(attempt.outcome, Outcome::Submit { .. }));
         // An anchor output other than the one the frames were built on: the
         // check GLOBAL applies refuses the report, a defect. It is logged at
@@ -1325,12 +2133,32 @@ mod tests {
         let mut reporter = PresenceReporter::default();
         let mut logged = Vec::new();
         for k in 0..4 {
-            let attempt = reporter.attempt(c.look(&view, me, frame + k * PACE.resubmit_frames()), &votes, wrong).unwrap();
-            let Outcome::Refused { refusals, since, .. } = attempt.outcome else { panic!("{:?}", attempt.outcome) };
+            let attempt = reporter
+                .attempt(
+                    c.look(&view, me, frame + k * PACE.resubmit_frames()),
+                    &votes,
+                    wrong,
+                )
+                .unwrap();
+            let Outcome::Refused {
+                refusals, since, ..
+            } = attempt.outcome
+            else {
+                panic!("{:?}", attempt.outcome)
+            };
             assert_eq!((refusals, since), (k as u32 + 1, frame + 1));
             logged.push(attempt.log);
             if k == 0 {
-                assert!(reporter.attempt(c.look(&view, me, frame + PACE.check_frames()), &votes, wrong).is_none(), "spaced");
+                assert!(
+                    reporter
+                        .attempt(
+                            c.look(&view, me, frame + PACE.check_frames()),
+                            &votes,
+                            wrong
+                        )
+                        .is_none(),
+                    "spaced"
+                );
             }
         }
         assert_eq!(logged, [true, false, false, true]);
@@ -1338,8 +2166,13 @@ mod tests {
         let d = committee(4);
         let votes = Votes::of(vec![d.seen(5, d.anchor(), &[0, 1, 2, 3])]);
         let me = d.designated(&[0, 1, 2, 3]) as usize;
-        let attempt = PresenceReporter::default().attempt(d.look(&view, me, d.inclusion() - 1), &votes, anchors).unwrap();
-        assert!(matches!(attempt.outcome, Outcome::Wait(Wait::UnknownSession)), "{attempt:?}");
+        let attempt = PresenceReporter::default()
+            .attempt(d.look(&view, me, d.inclusion() - 1), &votes, anchors)
+            .unwrap();
+        assert!(
+            matches!(attempt.outcome, Outcome::Wait(Wait::UnknownSession)),
+            "{attempt:?}"
+        );
     }
 
     /// A report that could land after its epoch ends is held.
@@ -1354,13 +2187,21 @@ mod tests {
         let next_epoch = (PACE.epoch(INCLUSION) + 1) * PACE.length;
         let mut look = c.look(&view, 0, frame);
         look.latest = Some(next_epoch);
-        let attempt = PresenceReporter::default().attempt(look, &votes, anchors).unwrap();
-        assert!(matches!(attempt.outcome, Outcome::Held(Hold::ViewBehind { latest }) if latest == next_epoch));
+        let attempt = PresenceReporter::default()
+            .attempt(look, &votes, anchors)
+            .unwrap();
+        assert!(
+            matches!(attempt.outcome, Outcome::Held(Hold::ViewBehind { latest }) if latest == next_epoch)
+        );
         let late = next_epoch - PACE.margin_frames();
         let mut look = c.look(&view, 0, frame);
         look.latest = Some(late);
-        let attempt = PresenceReporter::default().attempt(look, &votes, anchors).unwrap();
-        assert!(matches!(attempt.outcome, Outcome::Held(Hold::EpochEnd { landing }) if landing == late + 1));
+        let attempt = PresenceReporter::default()
+            .attempt(look, &votes, anchors)
+            .unwrap();
+        assert!(
+            matches!(attempt.outcome, Outcome::Held(Hold::EpochEnd { landing }) if landing == late + 1)
+        );
         assert_eq!(votes.reads(), (0, 0, 0), "held before any vote is read");
     }
 
@@ -1369,13 +2210,19 @@ mod tests {
         let session = [7; 32];
         let voters = BTreeSet::from([0, 1, 2, 3]);
         assert_eq!(designated_submitter(&session, 4, &BTreeSet::new()), None);
-        let picks: BTreeSet<u32> = (0..64).filter_map(|epoch| designated_submitter(&session, epoch, &voters)).collect();
+        let picks: BTreeSet<u32> = (0..64)
+            .filter_map(|epoch| designated_submitter(&session, epoch, &voters))
+            .collect();
         assert!(picks.is_subset(&voters));
         assert!(picks.len() > 1, "the submitter changes across epochs");
         // A member that does not vote is never chosen; the others agree.
         for epoch in 0..16 {
             let first = designated_submitter(&session, epoch, &voters).unwrap();
-            let without: BTreeSet<u32> = voters.iter().copied().filter(|voter| *voter != first).collect();
+            let without: BTreeSet<u32> = voters
+                .iter()
+                .copied()
+                .filter(|voter| *voter != first)
+                .collect();
             let next = designated_submitter(&session, epoch, &without).unwrap();
             assert_ne!(next, first);
             assert_eq!(designated_submitter(&session, epoch, &voters), Some(first));
@@ -1396,7 +2243,10 @@ mod tests {
         assert!(mainnet.window_open(2_160, 0));
         // The thread's setting, never the process environment.
         handoff::set_presence_report_frame_for_thread(Some(u64::MAX));
-        assert!(!PACE.window_open(INCLUSION, handoff::presence_report_frame()), "unset");
+        assert!(
+            !PACE.window_open(INCLUSION, handoff::presence_report_frame()),
+            "unset"
+        );
         let active = Active::new();
         assert!(PACE.window_open(INCLUSION, handoff::presence_report_frame()));
         drop(active);
@@ -1405,7 +2255,10 @@ mod tests {
 
     #[test]
     fn a_member_reports_again_only_for_new_members_within_its_budget() {
-        let (spacing, every) = (Pace { length: 720 }.resubmit_frames(), Pace { length: 720 }.check_frames());
+        let (spacing, every) = (
+            Pace { length: 720 }.resubmit_frames(),
+            Pace { length: 720 }.check_frames(),
+        );
         assert_eq!((spacing, every), (60, 3));
         let mut schedule = PresenceSchedule::default();
         schedule.observe([1; 32], 10);
@@ -1419,7 +2272,10 @@ mod tests {
         assert_eq!(schedule.adds(&BTreeSet::from([0, 1, 2])), 1);
         schedule.submitted(7_265, &BTreeSet::from([0, 1, 2]));
         schedule.submitted(7_325, &BTreeSet::from([3]));
-        assert!(!schedule.due(7_500, spacing), "at most three reports per session and epoch");
+        assert!(
+            !schedule.due(7_500, spacing),
+            "at most three reports per session and epoch"
+        );
         // Another epoch, or another session, starts over.
         schedule.observe([1; 32], 11);
         assert!(schedule.due(7_920, spacing));
@@ -1451,10 +2307,15 @@ mod tests {
     #[test]
     fn a_session_reports_from_its_own_frame_of_the_first_quarter_epoch() {
         let mainnet = Pace { length: 720 };
-        let offsets: BTreeSet<u64> = (0..64u8).map(|i| mainnet.first_frame(&[i; 32], 10) - 7_200).collect();
+        let offsets: BTreeSet<u64> = (0..64u8)
+            .map(|i| mainnet.first_frame(&[i; 32], 10) - 7_200)
+            .collect();
         assert!(offsets.iter().all(|offset| *offset < 180), "{offsets:?}");
         assert!(offsets.len() > 32, "spread: {offsets:?}");
-        assert_eq!(mainnet.first_frame(&[1; 32], 11) - mainnet.first_frame(&[1; 32], 10), 720);
+        assert_eq!(
+            mainnet.first_frame(&[1; 32], 11) - mainnet.first_frame(&[1; 32], 10),
+            720
+        );
         let _active = Active::new();
         // A session whose first frame is not its epoch's first.
         let c = loop {
@@ -1468,9 +2329,17 @@ mod tests {
         let first = PACE.first_frame(&c.id, PACE.epoch(INCLUSION));
         let votes = Votes::of(vec![c.seen(5, first - 1, &[0, 1, 2, 3])]);
         let mut reporter = PresenceReporter::default();
-        assert!(reporter.attempt(c.look(&view, 0, first - 2), &votes, anchors).is_none());
-        assert_eq!(votes.reads(), (0, 0, 0), "nothing read before its first frame");
-        assert!(reporter.attempt(c.look(&view, 0, first - 1), &votes, anchors).is_some());
+        assert!(reporter
+            .attempt(c.look(&view, 0, first - 2), &votes, anchors)
+            .is_none());
+        assert_eq!(
+            votes.reads(),
+            (0, 0, 0),
+            "nothing read before its first frame"
+        );
+        assert!(reporter
+            .attempt(c.look(&view, 0, first - 1), &votes, anchors)
+            .is_some());
         assert_eq!(votes.reads().0, 1);
     }
 }

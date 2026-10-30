@@ -22,7 +22,7 @@ macro_rules! impl_hypergraph_storage {
                 matches: &dyn Fn(&[u8]) -> bool,
             ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
                 const READ_BEFORE_SEEK: usize = 4;
-                let mut it = self.db.raw_iterator();
+                let mut it = self.db.raw_iterator_opt(sweep_read_options());
                 it.seek(prefix);
                 let mut out = Vec::new();
                 let mut key_len: Option<usize> = None;
@@ -86,10 +86,10 @@ macro_rules! impl_hypergraph_storage {
             ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
                 use std::collections::HashMap;
                 let mut latest: HashMap<Vec<u8>, (u64, Vec<u8>)> = HashMap::new();
-                for entry in self
-                    .db
-                    .iterator(rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward))
-                {
+                for entry in self.db.iterator_opt(
+                    rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+                    sweep_read_options(),
+                ) {
                     let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
                     if !k.starts_with(prefix) {
                         break;
@@ -146,12 +146,40 @@ macro_rules! impl_hypergraph_storage {
                 bytes: &[u8],
             ) -> Result<()> {
                 let key = hypergraph_vertex_data_key(set_type, phase_type, shard_key, vertex_key);
-                <$txn>::for_store(txn, &self.db)?
-                    .batch
-                    .lock()
-                    .unwrap()
-                    .put(&key, bytes);
+                let records =
+                    self.large_vertex_records(set_type, phase_type, vertex_key, bytes.len());
+                let staged = <$txn>::for_store(txn, &self.db)?;
+                let mut batch = staged.batch.lock().unwrap();
+                batch.put(&key, bytes);
+                for (key, value) in records {
+                    batch.put(&key, &value);
+                }
                 Ok(())
+            }
+
+            /// The index entry of a large row, staged beside it in the same
+            /// batch, and the index's completion mark for a store that opened
+            /// empty.
+            fn large_vertex_records(
+                &self,
+                set_type: &str,
+                phase_type: &str,
+                vertex_key: &[u8],
+                len: usize,
+            ) -> Vec<(Vec<u8>, Vec<u8>)> {
+                if set_type != "vertex" || phase_type != "adds" {
+                    return Vec::new();
+                }
+                let mut records = Vec::new();
+                if let Some(entry) =
+                    crate::large_vertex_index::live_entry(set_type, phase_type, vertex_key, len)
+                {
+                    records.push((entry, Vec::new()));
+                }
+                if let Some((key, value)) = self.index_complete_mark_backend() {
+                    records.push((key.to_vec(), value));
+                }
+                records
             }
 
             /// Load one vertex's `underlying_data`, or `Ok(None)` if absent.
@@ -638,11 +666,14 @@ macro_rules! impl_hypergraph_storage {
                 let key = crate::encoding::hypergraph_vertex_data_v2_key(
                     set_type, phase_type, shard_key, vertex_key, version,
                 );
-                <$txn>::for_store(txn, &self.db)?
-                    .batch
-                    .lock()
-                    .unwrap()
-                    .put(&key, data);
+                let records =
+                    self.large_vertex_records(set_type, phase_type, vertex_key, data.len());
+                let staged = <$txn>::for_store(txn, &self.db)?;
+                let mut batch = staged.batch.lock().unwrap();
+                batch.put(&key, data);
+                for (key, value) in records {
+                    batch.put(&key, &value);
+                }
                 Ok(())
             }
 
@@ -674,6 +705,12 @@ macro_rules! impl_hypergraph_storage {
                 for key in stale {
                     batch.delete(&key);
                 }
+                if first == 0 {
+                    // The unversioned blob predates every version: it goes too.
+                    batch.delete(&crate::encoding::hypergraph_vertex_data_key(
+                        set_type, phase_type, shard_key, vertex_key,
+                    ));
+                }
                 Ok(())
             }
 
@@ -685,25 +722,10 @@ macro_rules! impl_hypergraph_storage {
                 vertex_key: &[u8],
                 version: u64,
             ) -> Result<Option<Vec<u8>>> {
-                // MVCC: reverse-seek to `vk_prefix ‖ V`; the first (largest ≤ V) key that
-                // still shares `vk_prefix` is the latest write with version ≤ V. Version
-                // is a fixed 8-byte non-inverted suffix, so a matching key has length
-                // exactly `vk_prefix.len() + 8`.
-                let vk_prefix = crate::encoding::hypergraph_vertex_data_v2_vk_prefix(
-                    set_type, phase_type, shard_key, vertex_key,
-                );
-                let seek = crate::encoding::hypergraph_vertex_data_v2_key(
-                    set_type, phase_type, shard_key, vertex_key, version,
-                );
-                let mut iter = self.db.iterator(rocksdb::IteratorMode::From(
-                    &seek,
-                    rocksdb::Direction::Reverse,
-                ));
-                if let Some(entry) = iter.next() {
-                    let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
-                    if k.len() == vk_prefix.len() + 8 && k.starts_with(&vk_prefix) {
-                        return Ok(Some(v.into_vec()));
-                    }
+                if let Some(blob) = vertex_version_at(
+                    &self.db, set_type, phase_type, shard_key, vertex_key, version,
+                )? {
+                    return Ok(Some(blob));
                 }
                 // Legacy fallback: an un-migrated (unversioned) blob written before the
                 // version dimension existed. The next commit re-writes it versioned.
@@ -764,10 +786,10 @@ macro_rules! impl_hypergraph_storage {
                 // Legacy (unversioned) keyspace fills any vertex not yet re-written v2.
                 let old_prefix =
                     crate::encoding::hypergraph_vertex_data_prefix(set_type, phase_type, shard_key);
-                for entry in self.db.iterator(rocksdb::IteratorMode::From(
-                    &old_prefix,
-                    rocksdb::Direction::Forward,
-                )) {
+                for entry in self.db.iterator_opt(
+                    rocksdb::IteratorMode::From(&old_prefix, rocksdb::Direction::Forward),
+                    sweep_read_options(),
+                ) {
                     let (k, v) = entry.map_err(|e| QuilError::Store(e.to_string()))?;
                     if !k.starts_with(&old_prefix) {
                         break;

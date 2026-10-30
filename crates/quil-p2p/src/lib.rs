@@ -1,10 +1,15 @@
+mod autonat_health;
+mod autonat_servers;
 pub mod blossomsub_behaviour;
 pub mod direct;
 pub mod ed448_identity;
-pub mod falcon_identity;
 pub mod ed448_noise;
 pub mod ed448_noise_transport;
 pub mod ed448_peer;
+pub mod external_addr;
+pub mod falcon_identity;
+pub mod global_frame_gate;
+pub mod gossip_traffic;
 pub mod handler;
 pub mod metrics;
 pub mod node;
@@ -20,25 +25,31 @@ pub mod tls_debug;
 // The BlossomSub behaviour + event + validation-result surface come from the
 // `blossomsub_behaviour` bridge over stock `libp2p::gossipsub`.
 pub use blossomsub_behaviour::{BlossomSubBehaviour, BlossomSubEvent, ValidationResult};
-pub use libp2p::identity::Keypair;
-pub use libp2p::PeerId;
+pub use direct::{DirectOutcome, DirectStatsSnapshot};
 pub use ed448_identity::{peer_id_from_ed448_pubkey, Ed448Identity};
 pub use falcon_identity::{
     falcon_identity_self_check, generate_falcon_signing_key, peer_id_base58_from_falcon_pubkey,
     peer_id_from_falcon_pubkey,
 };
+pub use global_frame_gate::{FrameStatus, GlobalFrameGate};
+pub use gossip_traffic::{
+    ClassTraffic, Flow, GossipClass, GossipTraffic, GossipTrafficSnapshot, TrafficKind,
+};
+pub use libp2p::identity::Keypair;
+pub use libp2p::PeerId;
 pub use node::{P2PHandle, P2PNode, ReceivedMessage};
-pub use direct::{DirectOutcome, DirectStatsSnapshot};
-pub use pqnoise_transport::{upgrade as pq_upgrade, PqNoiseError, PqOutput};
 pub use peer_authenticator::{AllowedPeerPolicy, AuthState, PeerAuthenticator};
 pub use peer_info::{
     build_worker_reachability, classify_peer_info_message, decode_canonical_key_registry,
     decode_canonical_peer_info, encode_canonical_peer_info, encode_key_registry,
-    peek_key_registry_timestamp, peek_peer_info_timestamp,
-    CanonicalCapability, CanonicalKeyRegistry, CanonicalPeerInfo, CanonicalReachability,
-    InMemoryPeerInfoManager, PeerInfoMessage, ARCHIVE_SERVICE_CAPABILITY_ID, KEY_REGISTRY_TYPE,
-    PEER_INFO_TYPE, BUILD_FINGERPRINT_CAPABILITY_ID, RELEASE_SUBPATCH_CAPABILITY_ID,
+    encode_signed_key_registry, key_registry_timestamp_message, peek_key_registry_timestamp,
+    peek_peer_info_timestamp, set_strict_peer_info_validation, strict_peer_info_validation,
+    verify_key_registry_timestamp, verify_peer_info, CanonicalCapability, CanonicalKeyRegistry,
+    CanonicalPeerInfo, CanonicalReachability, InMemoryPeerInfoManager, PeerInfoMessage,
+    ARCHIVE_SERVICE_CAPABILITY_ID, BUILD_FINGERPRINT_CAPABILITY_ID, KEY_REGISTRY_TIMESTAMP_DOMAIN,
+    KEY_REGISTRY_TYPE, PEER_INFO_TYPE, RELEASE_SUBPATCH_CAPABILITY_ID,
 };
+pub use pqnoise_transport::{upgrade as pq_upgrade, PqNoiseError, PqOutput};
 pub use signer_registry::{SignerEntry, SignerRegistry};
 
 /// BlossomSub protocol identifiers.
@@ -49,14 +60,9 @@ pub const BLOSSOMSUB_PROTOCOL_V2_1: &str = "/blossomsub/2.1.0";
 pub mod params {
     use std::time::Duration;
 
-    pub const D: usize = 8;
     pub const D_LO: usize = 6;
-    pub const D_HI: usize = 12;
-    pub const D_SCORE: usize = 4;
-    pub const D_OUT: usize = 2;
     pub const D_SAME: usize = 3;
     pub const D_SAME_LO: usize = 2;
-    pub const D_LAZY: usize = 6;
     // Bumped from 9/6 for WAN testnets: a peer that briefly drops
     // (NAT mapping churn, jitter, packet loss) needs the gossip
     // window long enough to discover missing messages via IHAVE
@@ -110,12 +116,7 @@ pub mod params {
 /// from the `params::*` constants.
 #[derive(Debug, Clone)]
 pub struct BlossomsubParams {
-    pub d: usize,
     pub d_lo: usize,
-    pub d_hi: usize,
-    pub d_score: usize,
-    pub d_out: usize,
-    pub d_lazy: usize,
     pub history_length: usize,
     pub history_gossip: usize,
     pub gossip_factor: f64,
@@ -126,11 +127,6 @@ pub struct BlossomsubParams {
     pub unsubscribe_backoff: std::time::Duration,
     pub iwant_followup_time: std::time::Duration,
     pub idont_want_message_threshold: usize,
-    /// Per-peer cap on cached IDONTWANT message IDs. Used to bound
-    /// the per-peer LRU that tracks which messages a remote peer has
-    /// asked us not to send. A malicious peer could otherwise
-    /// enumerate IDs and balloon our memory.
-    pub max_idont_want_messages: usize,
     /// Cap on mesh peers per IPv4 /24 (or IPv6 /48) per bitmask.
     /// Eclipse-resistance: see [`params::MESH_PEERS_PER_SUBNET`].
     /// `0` disables the check.
@@ -144,12 +140,7 @@ pub struct BlossomsubParams {
 impl Default for BlossomsubParams {
     fn default() -> Self {
         Self {
-            d: params::D,
             d_lo: params::D_LO,
-            d_hi: params::D_HI,
-            d_score: params::D_SCORE,
-            d_out: params::D_OUT,
-            d_lazy: params::D_LAZY,
             history_length: params::HISTORY_LENGTH,
             history_gossip: params::HISTORY_GOSSIP,
             gossip_factor: params::GOSSIP_FACTOR,
@@ -160,7 +151,6 @@ impl Default for BlossomsubParams {
             unsubscribe_backoff: params::UNSUBSCRIBE_BACKOFF,
             iwant_followup_time: params::IWANT_FOLLOWUP_TIME,
             idont_want_message_threshold: params::IDONT_WANT_MESSAGE_THRESHOLD,
-            max_idont_want_messages: 5000,
             mesh_peers_per_subnet: params::MESH_PEERS_PER_SUBNET,
             mcache_max_bytes: params::MCACHE_MAX_BYTES,
         }
@@ -185,12 +175,7 @@ impl BlossomsubParams {
             }
         };
         Self {
-            d: pos(cfg.d, d.d),
             d_lo: pos(cfg.d_lo, d.d_lo),
-            d_hi: pos(cfg.d_hi, d.d_hi),
-            d_score: pos(cfg.d_score, d.d_score),
-            d_out: pos(cfg.d_out, d.d_out),
-            d_lazy: pos(cfg.d_lazy, d.d_lazy),
             history_length: pos(cfg.history_length, d.history_length),
             history_gossip: pos(cfg.history_gossip, d.history_gossip),
             gossip_factor: if cfg.gossip_factor > 0.0 {
@@ -212,17 +197,11 @@ impl BlossomsubParams {
             } else {
                 d.idont_want_message_threshold
             },
-            max_idont_want_messages: if cfg.max_idont_want_messages > 0 {
-                cfg.max_idont_want_messages as usize
-            } else {
-                d.max_idont_want_messages
-            },
-            // No P2PConfig field yet — operators tune via `set_params`
-            // post-build if they need to. Default protects against
+            // No P2PConfig field yet. Default protects against
             // single-/24 eclipse on every node.
             mesh_peers_per_subnet: d.mesh_peers_per_subnet,
-            // No P2PConfig field yet — defaults to a 512 MiB ceiling,
-            // tunable via `set_params` post-build.
+            // No P2PConfig field yet: a 512 MiB ceiling, enforced by
+            // the vendored gossipsub's message cache.
             mcache_max_bytes: d.mcache_max_bytes,
         }
     }

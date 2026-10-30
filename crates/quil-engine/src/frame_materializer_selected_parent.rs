@@ -9,6 +9,10 @@ use quil_cw_consensus::adapters::{digest_from_identity, BlockStore, Digest, Prop
 use quil_types::proto::global::{GlobalFrame, GlobalFrameHeader};
 use std::time::{Duration, Instant};
 
+/// Largest encoded GLOBAL frame a member proposes or accepts (the default
+/// `max_frame_bytes` of [`GlobalParentLimits`]).
+pub const MAX_GLOBAL_FRAME_BYTES: usize = 16 << 20;
+
 #[derive(Clone, Copy, Debug)]
 pub struct GlobalParentLimits {
     pub branch: MaterializerBranchLimits,
@@ -31,7 +35,9 @@ pub struct GlobalParentLimits {
 /// long before the view goes. It also bounds how long the view keeps old
 /// database versions from compaction.
 const MAX_KEPT_EXECUTION_AGE: Duration = Duration::from_secs(300);
-const _: () = assert!(MAX_KEPT_EXECUTION_AGE.as_secs() * 2 <= quil_forest::DEFAULT_EXECUTION_VIEW_MAX_AGE.as_secs());
+const _: () = assert!(
+    MAX_KEPT_EXECUTION_AGE.as_secs() * 2 <= quil_forest::DEFAULT_EXECUTION_VIEW_MAX_AGE.as_secs()
+);
 
 impl Default for GlobalParentLimits {
     fn default() -> Self {
@@ -66,7 +72,7 @@ impl Default for GlobalParentLimits {
                 },
                 max_metadata_entries: 100_000,
                 max_metadata_bytes: 32 << 20,
-                max_frame_bytes: 16 << 20,
+                max_frame_bytes: MAX_GLOBAL_FRAME_BYTES,
                 max_frame_items: 100_000,
             },
             max_ancestors: 32,
@@ -99,16 +105,39 @@ struct Admission {
 }
 impl Admission {
     fn new(active: Arc<AtomicBool>, holder: &'static str, frame: u64) -> Self {
-        Self { active, holder, frame, since: Instant::now() }
+        Self {
+            active,
+            holder,
+            frame,
+            since: Instant::now(),
+        }
     }
 }
+/// A lease hold long enough to cost a view (35 s on mainnet) is logged on its
+/// own; shorter ones are counted into the inclusion summary
+/// ([`crate::inclusion_summary`]). Logged from one second up, they ran to
+/// about 126 lines an hour on every archive (2026-10-27).
+const LONG_LEASE_HOLD: std::time::Duration = std::time::Duration::from_secs(20);
+
 impl Drop for Admission {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
         let held = self.since.elapsed();
-        if held >= crate::stage_clock::SLOW_EXECUTION {
-            tracing::warn!(holder = self.holder, frame = self.frame, held_ms = held.as_millis() as u64,
-                "GLOBAL execution lease held long");
+        crate::inclusion_summary::note_lease(held);
+        if held >= LONG_LEASE_HOLD {
+            tracing::warn!(
+                holder = self.holder,
+                frame = self.frame,
+                held_ms = held.as_millis() as u64,
+                "GLOBAL execution lease held long: votes defer and a leader waits while it is held"
+            );
+        } else if held >= crate::stage_clock::SLOW_EXECUTION {
+            tracing::debug!(
+                holder = self.holder,
+                frame = self.frame,
+                held_ms = held.as_millis() as u64,
+                "GLOBAL execution lease held long"
+            );
         }
     }
 }
@@ -208,17 +237,24 @@ const AUTHENTICATED_ANCESTOR_BYTES: usize = 64 << 20;
 
 impl AuthenticatedAncestors {
     fn get(&self, digest: &Digest) -> Option<GlobalFrame> {
-        self.frames.iter().find(|(kept, _, _)| kept == digest).map(|(_, frame, _)| frame.clone())
+        self.frames
+            .iter()
+            .find(|(kept, _, _)| kept == digest)
+            .map(|(_, frame, _)| frame.clone())
     }
 
     fn remember(&mut self, digest: Digest, frame: &GlobalFrame) {
         let bytes = prost::Message::encoded_len(frame);
-        if bytes > AUTHENTICATED_ANCESTOR_BYTES || self.frames.iter().any(|(kept, _, _)| *kept == digest) {
+        if bytes > AUTHENTICATED_ANCESTOR_BYTES
+            || self.frames.iter().any(|(kept, _, _)| *kept == digest)
+        {
             return;
         }
         self.frames.push_back((digest, frame.clone(), bytes));
         self.bytes += bytes;
-        while self.frames.len() > AUTHENTICATED_ANCESTORS_KEPT || self.bytes > AUTHENTICATED_ANCESTOR_BYTES {
+        while self.frames.len() > AUTHENTICATED_ANCESTORS_KEPT
+            || self.bytes > AUTHENTICATED_ANCESTOR_BYTES
+        {
             match self.frames.pop_front() {
                 Some((_, _, evicted)) => self.bytes -= evicted,
                 None => break,
@@ -319,7 +355,11 @@ impl PreparedGlobalParent {
     /// its base itself keeps it; a reconcile must not move it toward any single
     /// proposer's declaration.
     pub(crate) fn divergent_parent_root(&self, header: &GlobalFrameHeader) -> Option<Vec<u8>> {
-        let extends = self.parent.header.as_ref().and_then(|h| h.frame_number.checked_add(1))
+        let extends = self
+            .parent
+            .header
+            .as_ref()
+            .and_then(|h| h.frame_number.checked_add(1))
             == Some(header.frame_number)
             && header.rank == self.context.view
             && header.parent_selector == self.context.parent.as_ref();
@@ -451,7 +491,10 @@ impl GlobalParentExecutor {
             Err(error) => return GlobalFinalizationAttempt::Rejected(error),
         };
         if let Err(error) = self.check_input_budget(frame) {
-            return GlobalFinalizationAttempt::Unavailable { error, retryable: false };
+            return GlobalFinalizationAttempt::Unavailable {
+                error,
+                retryable: false,
+            };
         }
         let Ok(_admission) = self.admit(frame) else {
             return GlobalFinalizationAttempt::Busy;
@@ -459,7 +502,28 @@ impl GlobalParentExecutor {
         match self.publish_finalization(frame, verifier, Some(parent_view)) {
             Ok(Some(result)) => GlobalFinalizationAttempt::Published(result),
             Ok(None) => GlobalFinalizationAttempt::Replayed,
-            Err(error) => GlobalFinalizationAttempt::Unavailable { error, retryable: true },
+            Err(error) => GlobalFinalizationAttempt::Unavailable {
+                error,
+                retryable: true,
+            },
+        }
+    }
+
+    /// Authenticate a finalization handed to the legacy materializer without
+    /// an atomic attempt, as [`Self::attempt_finalization`] (or, with its
+    /// chain and certified descendant, [`Self::attempt_implied_finalization`])
+    /// does before capturing. An error is a rejection.
+    pub fn authenticate_for_legacy(
+        &self,
+        frame: &GlobalFrame,
+        implied: Option<(&[GlobalFrame], &GlobalFrame)>,
+        verifier: &GlobalFrameVerifier,
+    ) -> Result<()> {
+        match implied {
+            None => self.authenticate_finalization(frame, verifier).map(|_| ()),
+            Some((chain, descendant)) => {
+                self.authenticate_implied(frame, chain, descendant, verifier)
+            }
         }
     }
 
@@ -485,7 +549,10 @@ impl GlobalParentExecutor {
             return GlobalFinalizationAttempt::Rejected(error);
         }
         if let Err(error) = self.check_input_budget(frame) {
-            return GlobalFinalizationAttempt::Unavailable { error, retryable: false };
+            return GlobalFinalizationAttempt::Unavailable {
+                error,
+                retryable: false,
+            };
         }
         let Ok(_admission) = self.admit(frame) else {
             return GlobalFinalizationAttempt::Busy;
@@ -493,7 +560,10 @@ impl GlobalParentExecutor {
         match self.publish_finalization(frame, verifier, None) {
             Ok(Some(result)) => GlobalFinalizationAttempt::Published(result),
             Ok(None) => GlobalFinalizationAttempt::Replayed,
-            Err(error) => GlobalFinalizationAttempt::Unavailable { error, retryable: true },
+            Err(error) => GlobalFinalizationAttempt::Unavailable {
+                error,
+                retryable: true,
+            },
         }
     }
 
@@ -508,13 +578,17 @@ impl GlobalParentExecutor {
         let mut parent = frame;
         for child in chain.iter().chain(std::iter::once(descendant)) {
             let (Some(p), Some(c)) = (parent.header.as_ref(), child.header.as_ref()) else {
-                return Err(unavailable("implied GLOBAL finalization has a frame without a header"));
+                return Err(unavailable(
+                    "implied GLOBAL finalization has a frame without a header",
+                ));
             };
             if p.frame_number.checked_add(1) != Some(c.frame_number)
                 || c.parent_selector != identity(p)?.as_ref()
                 || c.rank <= p.rank
             {
-                return Err(unavailable("implied GLOBAL finalization is not one ancestry"));
+                return Err(unavailable(
+                    "implied GLOBAL finalization is not one ancestry",
+                ));
             }
             parent = child;
         }
@@ -523,8 +597,12 @@ impl GlobalParentExecutor {
                 .header
                 .as_ref()
                 .ok_or_else(|| unavailable("implied GLOBAL ancestor has no header"))?;
-            if !verifier.validate(input)? || !verifier.verify_global_requests_root(header, &input.requests) {
-                return Err(unavailable("implied GLOBAL ancestor header/body authentication failed"));
+            if !verifier.validate(input)?
+                || !verifier.verify_global_requests_root(header, &input.requests)
+            {
+                return Err(unavailable(
+                    "implied GLOBAL ancestor header/body authentication failed",
+                ));
             }
         }
         Ok(())
@@ -581,9 +659,10 @@ impl GlobalParentExecutor {
             .header
             .as_ref()
             .ok_or_else(|| unavailable("finalized GLOBAL frame has no header"))?;
-        let published = self
-            .source
-            .materialize_atomically(frame, self.limits.branch.for_finalized_frame(), |branch| {
+        let published = self.source.materialize_atomically(
+            frame,
+            self.limits.branch.for_finalized_frame(),
+            |branch| {
                 let cursor = branch.cursor()?;
                 let base = self.executed_base(branch, verifier)?;
                 if header.frame_number == cursor {
@@ -610,7 +689,8 @@ impl GlobalParentExecutor {
                     ));
                 }
                 Ok(true)
-            })?;
+            },
+        )?;
         if published.is_some() {
             // The base moved: an execution kept over the old one is spent.
             self.release_executed(|_| true);
@@ -676,7 +756,8 @@ impl GlobalParentExecutor {
     /// node's single execution lease. On mainnet each execution of a frame of
     /// some 25 shard headers took about 5 s.
     pub(crate) fn publication_pending(&self, number: u64) -> bool {
-        self.finalized.load(Ordering::Acquire) >= number && self.source.last_materialized_frame() < number
+        self.finalized.load(Ordering::Acquire) >= number
+            && self.source.last_materialized_frame() < number
     }
 
     /// Whether a parent at `number` can be executed from `cursor`: at most
@@ -699,7 +780,9 @@ impl GlobalParentExecutor {
         // Each committee finalizes only its own frames: epoch 0 stops below the
         // succession frame, and epoch 1 starts at it. `number` is the parent.
         if quil_types::consensus::global_committee_epoch(number.saturating_add(1)) != self.epoch {
-            return Err(unavailable("selected GLOBAL frame belongs to another committee"));
+            return Err(unavailable(
+                "selected GLOBAL frame belongs to another committee",
+            ));
         }
         if self.limits.max_ancestors == 0 || self.limits.max_elapsed.is_zero() {
             return Err(unavailable("selected GLOBAL execution limits are empty"));
@@ -725,7 +808,11 @@ impl GlobalParentExecutor {
             .map_err(|_| unavailable("selected GLOBAL execution is busy"))?;
         let admission = Admission::new(
             self.active.clone(),
-            if for_proposal { "proposal" } else { "verification" },
+            if for_proposal {
+                "proposal"
+            } else {
+                "verification"
+            },
             number,
         );
         let mut timing = crate::stage_clock::StageClock::start_after(
@@ -887,7 +974,9 @@ impl GlobalParentExecutor {
                     }
                     timing.mark("keep execution");
                 }
-                Err(error) => tracing::debug!(frame = number, %error, "selected GLOBAL execution not kept"),
+                Err(error) => {
+                    tracing::debug!(frame = number, %error, "selected GLOBAL execution not kept")
+                }
             }
         }
         deadline()?;
@@ -931,16 +1020,28 @@ impl GlobalParentExecutor {
     /// within the reuse age and executed exactly the lowest frames of
     /// `ancestry` (highest first). One over another base, too old, or whose
     /// view is gone is released; one for another chain over this base stays.
-    fn kept_execution(&self, base: &ExecutedBaseKey, ancestry: &[GlobalFrame]) -> Option<KeptExecution> {
+    fn kept_execution(
+        &self,
+        base: &ExecutedBaseKey,
+        ancestry: &[GlobalFrame],
+    ) -> Option<KeptExecution> {
         let mut slot = self.executed.lock().ok()?;
         let max_age = self.limits.max_kept_age.min(MAX_KEPT_EXECUTION_AGE);
-        let current = slot.as_ref().is_some_and(|kept| kept.base == *base && kept.captured.elapsed() < max_age);
+        let current = slot
+            .as_ref()
+            .is_some_and(|kept| kept.base == *base && kept.captured.elapsed() < max_age);
         if !current {
             *slot = None;
             return None;
         }
         let kept = slot.as_ref()?;
-        if kept.frames.len() > ancestry.len() || !kept.frames.iter().zip(ancestry.iter().rev()).all(|(a, b)| a == b) {
+        if kept.frames.len() > ancestry.len()
+            || !kept
+                .frames
+                .iter()
+                .zip(ancestry.iter().rev())
+                .all(|(a, b)| a == b)
+        {
             return None;
         }
         match kept.branch.capture_child(self.limits.branch) {
@@ -1000,7 +1101,12 @@ impl GlobalParentExecutor {
                         && parent_view.is_none_or(|view| h.rank == view)
                 })
         };
-        if let Some(frame) = self.authenticated.lock().ok().and_then(|kept| kept.get(&digest)) {
+        if let Some(frame) = self
+            .authenticated
+            .lock()
+            .ok()
+            .and_then(|kept| kept.get(&digest))
+        {
             if fits(&frame) {
                 return Ok(frame);
             }
@@ -1042,7 +1148,11 @@ mod authenticated_ancestor_tests {
 
     fn frame(number: u64, padding: usize) -> GlobalFrame {
         GlobalFrame {
-            header: Some(GlobalFrameHeader { frame_number: number, output: vec![0; padding], ..Default::default() }),
+            header: Some(GlobalFrameHeader {
+                frame_number: number,
+                output: vec![0; padding],
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -1053,7 +1163,13 @@ mod authenticated_ancestor_tests {
         let digest = |n: u8| digest_from_identity([n; 32]);
         kept.remember(digest(1), &frame(1, 8));
         kept.remember(digest(1), &frame(99, 8));
-        assert_eq!(kept.get(&digest(1)).and_then(|f| f.header).map(|h| h.frame_number), Some(1), "first kept");
+        assert_eq!(
+            kept.get(&digest(1))
+                .and_then(|f| f.header)
+                .map(|h| h.frame_number),
+            Some(1),
+            "first kept"
+        );
         assert!(kept.get(&digest(2)).is_none());
         for n in 2..=(AUTHENTICATED_ANCESTORS_KEPT as u8 + 1) {
             kept.remember(digest(n), &frame(n as u64, 8));
@@ -1061,7 +1177,10 @@ mod authenticated_ancestor_tests {
         assert_eq!(kept.frames.len(), AUTHENTICATED_ANCESTORS_KEPT);
         assert!(kept.get(&digest(1)).is_none(), "the oldest goes first");
         kept.remember(digest(200), &frame(200, AUTHENTICATED_ANCESTOR_BYTES + 1));
-        assert!(kept.get(&digest(200)).is_none(), "an oversized frame is not kept");
+        assert!(
+            kept.get(&digest(200)).is_none(),
+            "an oversized frame is not kept"
+        );
         let bytes: usize = kept.frames.iter().map(|(_, _, bytes)| bytes).sum();
         assert_eq!(kept.bytes, bytes);
     }

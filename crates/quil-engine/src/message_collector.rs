@@ -5,7 +5,7 @@
 //! drains the buffer for the current rank when producing a frame.
 //! Messages older than the retention window are automatically pruned.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,9 @@ struct CollectedMessage {
     /// Its shard frames passed the collector's verifier (or that of the public
     /// collector a private proposal copied it from).
     verified: bool,
+    /// It carries a storage epoch proof, which a proposal takes only up to
+    /// `STORAGE_SEAL_BYTES_PER_FRAME`.
+    seal: bool,
 }
 
 impl CollectedMessage {
@@ -55,12 +58,38 @@ impl CollectedMessage {
         let mut checks = extract_shard_frame_checks(&data);
         let proof = !checks.is_empty();
         let shard = if checks.len() == 1 {
-            checks.pop().map(|c| ShardFrame { address: c.address, frame: c.frame_number, anchor: c.global_frame_number })
+            checks.pop().map(|c| ShardFrame {
+                address: c.address,
+                frame: c.frame_number,
+                anchor: c.global_frame_number,
+            })
         } else {
             None
         };
-        Self { hash: message_key(&data), data, shard, proof, verified: false }
+        let seal = carries_storage_seal(&data);
+        Self {
+            hash: message_key(&data),
+            data,
+            shard,
+            proof,
+            verified: false,
+            seal,
+        }
     }
+}
+
+/// Whether a collected message carries a storage epoch proof.
+fn carries_storage_seal(data: &[u8]) -> bool {
+    use quil_execution::global_intrinsic::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF;
+    quil_execution::message_envelope::CanonicalMessageBundle::from_canonical_bytes(data).is_ok_and(
+        |bundle| {
+            bundle
+                .requests
+                .iter()
+                .flatten()
+                .any(|request| request.inner_type_prefix == TYPE_STORAGE_EPOCH_PROOF)
+        },
+    )
 }
 
 /// The identity of a message for deduplication and consumption: a bundle's
@@ -72,7 +101,9 @@ fn message_key(data: &[u8]) -> [u8; 32] {
     match CanonicalMessageBundle::from_canonical_bytes(data) {
         Ok(mut bundle) => {
             bundle.timestamp = 0;
-            bundle.to_canonical_bytes().map_or_else(|_| sha256(data), |bytes| sha256(&bytes))
+            bundle
+                .to_canonical_bytes()
+                .map_or_else(|_| sha256(data), |bytes| sha256(&bytes))
         }
         Err(_) => sha256(data),
     }
@@ -84,6 +115,12 @@ fn message_key(data: &[u8]) -> [u8; 32] {
 /// times the consensus depth so a message can't be re-collected before
 /// it ages out.
 const MAX_FINALIZED_HASHES: usize = 8192;
+
+/// Shard frames of one shard a finalized frame carried that the collector
+/// remembers ([`MessageCollector::mark_finalized`]): the newest this many. A
+/// header rides GLOBAL at most `STORAGE_ANCHOR_LOCKSTEP_WINDOW` frames after
+/// its anchor, and a leader carries one frame per shard.
+const INCLUDED_FRAMES_KEPT: usize = 64;
 
 /// Bounded FIFO set of message hashes already included in a finalized
 /// frame. New `add_message` / `collect_for_rank` skip these so a message
@@ -152,8 +189,11 @@ struct RankBuffer {
 
 /// Drop `message`'s entries from a buffer's indexes.
 fn unindex(
-    seen: &mut HashMap<[u8; 32], u64>, verified: &mut HashSet<[u8; 32]>,
-    by_shard: &mut HashMap<Vec<u8>, HashSet<[u8; 32]>>, bytes: &mut usize, message: &CollectedMessage,
+    seen: &mut HashMap<[u8; 32], u64>,
+    verified: &mut HashSet<[u8; 32]>,
+    by_shard: &mut HashMap<Vec<u8>, HashSet<[u8; 32]>>,
+    bytes: &mut usize,
+    message: &CollectedMessage,
 ) {
     seen.remove(&message.hash);
     verified.remove(&message.hash);
@@ -197,7 +237,10 @@ impl RankBuffer {
             self.verified.insert(message.hash);
         }
         if let Some(shard) = &message.shard {
-            self.by_shard.entry(shard.address.clone()).or_default().insert(message.hash);
+            self.by_shard
+                .entry(shard.address.clone())
+                .or_default()
+                .insert(message.hash);
         }
         self.bytes += message.data.len();
         self.messages.insert(arrival, message);
@@ -206,8 +249,12 @@ impl RankBuffer {
 
     /// Keep only the messages `keep` accepts.
     fn retain(&mut self, keep: impl Fn(&CollectedMessage) -> bool) {
-        let (seen, verified, by_shard, bytes) =
-            (&mut self.seen, &mut self.verified, &mut self.by_shard, &mut self.bytes);
+        let (seen, verified, by_shard, bytes) = (
+            &mut self.seen,
+            &mut self.verified,
+            &mut self.by_shard,
+            &mut self.bytes,
+        );
         self.messages.retain(|_, m| {
             let kept = keep(m);
             if !kept {
@@ -220,7 +267,13 @@ impl RankBuffer {
     /// Remove the message with `key`.
     fn take(&mut self, key: &[u8; 32]) -> Option<CollectedMessage> {
         let message = self.messages.remove(self.seen.get(key)?)?;
-        unindex(&mut self.seen, &mut self.verified, &mut self.by_shard, &mut self.bytes, &message);
+        unindex(
+            &mut self.seen,
+            &mut self.verified,
+            &mut self.by_shard,
+            &mut self.bytes,
+            &message,
+        );
         Some(message)
     }
 
@@ -278,6 +331,10 @@ pub enum Refusal {
     RankFull,
     /// A shard frame failed verification against committed state.
     InvalidShardFrame,
+    /// A shard frame waits for GLOBAL execution to reach its anchor, and this
+    /// node holds no more of it: its shard's waiting frames are at their cap,
+    /// or it came from neither this node nor a known active prover.
+    AwaitingExecution,
 }
 
 impl Refusal {
@@ -287,12 +344,13 @@ impl Refusal {
             Self::UnknownShard => "shard frame address not in this node's committed shard set",
             Self::RankFull => "rank buffer full",
             Self::InvalidShardFrame => "shard frame failed verification",
+            Self::AwaitingExecution => "shard frame waits for this node's GLOBAL execution, which holds such frames only from active provers and up to a cap per shard",
         }
     }
 
     /// The same message may be accepted later: the submitter should retry.
     pub fn retryable(self) -> bool {
-        matches!(self, Self::RankFull)
+        matches!(self, Self::RankFull | Self::AwaitingExecution)
     }
 }
 
@@ -305,10 +363,32 @@ pub enum ShardFrameVerdict {
     Invalid(String),
     /// Committed state cannot judge it now; it may be valid later.
     Unavailable(String),
+    /// As [`Self::Unavailable`], but not held: the frames held for its shard
+    /// are at their cap. The submitter may retry.
+    Full(String),
+}
+
+/// Who delivered a message to the collector, as far as the receiving node
+/// can tell. Only a [`Provenance::Prover`] delivery may hold a shard frame
+/// unverified while it waits for GLOBAL execution: its certificate cannot be
+/// checked then, so any other sender could fill its shard's places with
+/// forged headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// This node itself, or a peer whose identity resolves to an active
+    /// prover.
+    Prover,
+    /// Any other sender.
+    Other,
 }
 
 /// Verifies the shard frames of a bundle ([`MessageCollector::set_shard_frame_verifier`]).
 pub type ShardFrameVerifier = std::sync::Arc<dyn Fn(&[u8]) -> ShardFrameVerdict + Send + Sync>;
+
+/// A [`ShardFrameVerifier`] that is also told who delivered the bundle
+/// ([`MessageCollector::set_shard_frame_verifier_with_provenance`]).
+pub type ProvenanceShardFrameVerifier =
+    std::sync::Arc<dyn Fn(&[u8], Provenance) -> ShardFrameVerdict + Send + Sync>;
 
 /// Shard-frame verifications run at once; past it, frames are held
 /// unverified.
@@ -402,7 +482,7 @@ pub struct MessageCollector {
     /// lower frames: a stall then holds one proof per shard instead of every
     /// member's copy of every frame, and no forged header can stand in for a
     /// real one.
-    shard_frame_verifier: RwLock<Option<ShardFrameVerifier>>,
+    shard_frame_verifier: RwLock<Option<ProvenanceShardFrameVerifier>>,
     verifications: std::sync::atomic::AtomicUsize,
     /// Highest VERIFIED frame admitted per shard address. Only verified
     /// frames move it: an unverified height would let an invalid candidate
@@ -419,9 +499,100 @@ pub struct MessageCollector {
     /// takes the shards that have waited longest.
     included: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
     finalizations: std::sync::atomic::AtomicU64,
+    /// The shard frames finalized frames carried, by shard address (the
+    /// newest [`INCLUDED_FRAMES_KEPT`] of each). Another copy of one, in any
+    /// bundle, is a duplicate: GLOBAL credits a shard frame per frame that
+    /// carries it, so carrying it again would credit it again.
+    included_frames: std::sync::Mutex<HashMap<Vec<u8>, BTreeSet<u64>>>,
+    /// Set while submits are refused for a full rank buffer, so an accepted
+    /// submit takes `rank_full` only to end the stretch.
+    rank_full_active: std::sync::atomic::AtomicBool,
+    /// The log of submits refused for a full rank buffer.
+    rank_full: std::sync::Mutex<RankFullLog>,
+}
+
+/// How often submits refused for a full rank buffer are logged while they
+/// continue: every submit path (peer messages, gRPC, the node's own ops)
+/// reaches the collector, and a stalled rank refuses thousands per minute
+/// (2026-10-27: ~40,000 lines per archive in 2.75 h).
+const RANK_FULL_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// A stretch of refusals for a full rank buffer, for [`RankFullLog::refuse`].
+struct RankFullLog {
+    outage: crate::outage::Outage,
+    /// Refusals since the last line.
+    unreported: u64,
+}
+
+impl RankFullLog {
+    fn new() -> Self {
+        Self {
+            outage: crate::outage::Outage::begin_after_repeating(1, RANK_FULL_LOG_EVERY),
+            unreported: 0,
+        }
+    }
+}
+
+/// The buffer a refusal found full, for its log line.
+struct RankFullState {
+    rank: u64,
+    pending: usize,
+    pending_bytes: usize,
+    ranks_held: usize,
 }
 
 impl MessageCollector {
+    /// Count a submit refused for a full rank buffer; log the first of a
+    /// stretch and then one line per [`RANK_FULL_LOG_EVERY`] with the count.
+    fn note_rank_full(&self, now: Instant, state: RankFullState) {
+        use crate::outage::OutageEvent;
+        self.rank_full_active
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut log = self.rank_full.lock().unwrap();
+        log.unreported += 1;
+        let (secs, refused) = match log.outage.observe(now, false) {
+            Some(OutageEvent::Began) => (0, log.unreported),
+            Some(OutageEvent::Continues { secs, .. }) => (secs, log.unreported),
+            _ => return,
+        };
+        log.unreported = 0;
+        tracing::warn!(
+            scope = "local",
+            action = "wait",
+            rank = state.rank,
+            refused,
+            for_secs = secs,
+            pending = state.pending,
+            pending_bytes = state.pending_bytes,
+            max_messages = MAX_MESSAGES_PER_RANK,
+            max_bytes = MAX_BYTES_PER_RANK,
+            ranks_held = state.ranks_held,
+            "message collector: refusing submits, rank buffer full (per-rank count/byte cap reached); `refused` counts refusals since the previous line; ends when the rank advances or the buffer is pruned"
+        );
+    }
+
+    /// Log the end of a stretch of refusals, if one is open.
+    fn note_rank_accepting(&self, now: Instant, rank: u64) {
+        use crate::outage::OutageEvent;
+        if !self
+            .rank_full_active
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let mut log = self.rank_full.lock().unwrap();
+        let unreported = std::mem::take(&mut log.unreported);
+        if let Some(OutageEvent::Ended { secs, failures }) = log.outage.observe(now, true) {
+            tracing::info!(
+                rank,
+                refused_total = failures,
+                refused_since_last_line = unreported,
+                lasted_secs = secs,
+                "message collector: accepting submits again after a full rank buffer"
+            );
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             buffers: RwLock::new(HashMap::new()),
@@ -438,12 +609,23 @@ impl MessageCollector {
             verification_ended: std::sync::Condvar::new(),
             included: std::sync::Mutex::new(HashMap::new()),
             finalizations: std::sync::atomic::AtomicU64::new(0),
+            included_frames: std::sync::Mutex::new(HashMap::new()),
+            rank_full_active: std::sync::atomic::AtomicBool::new(false),
+            rank_full: std::sync::Mutex::new(RankFullLog::new()),
         }
     }
 
     /// Install the admission check of shard frames. Archives, whose collector
     /// feeds GLOBAL proposals, verify against committed state.
     pub fn set_shard_frame_verifier(&self, verifier: ShardFrameVerifier) {
+        self.set_shard_frame_verifier_with_provenance(std::sync::Arc::new(
+            move |data: &[u8], _: Provenance| verifier(data),
+        ));
+    }
+
+    /// [`Self::set_shard_frame_verifier`] with a verifier that also judges by
+    /// who delivered the bundle.
+    pub fn set_shard_frame_verifier_with_provenance(&self, verifier: ProvenanceShardFrameVerifier) {
         *self.shard_frame_verifier.write().unwrap() = Some(verifier);
     }
 
@@ -460,32 +642,51 @@ impl MessageCollector {
     /// Every frame in `keys` is at or below a verified frame of its shard.
     fn superseded(&self, keys: &[(Vec<u8>, u64)]) -> bool {
         let tips = self.verified_tips.lock().unwrap();
-        keys.iter().all(|(address, frame)| tips.get(address).is_some_and(|tip| frame <= tip))
+        keys.iter()
+            .all(|(address, frame)| tips.get(address).is_some_and(|tip| frame <= tip))
+    }
+
+    /// A frame in `keys` is one a finalized frame carried.
+    fn carries_included(&self, keys: &[(Vec<u8>, u64)]) -> bool {
+        keys_included(&self.included_frames.lock().unwrap(), keys)
     }
 
     /// Whether the collector holds `data` as verified.
     pub fn is_verified(&self, data: &[u8]) -> bool {
         let key = message_key(data);
-        self.buffers.read().unwrap().values().any(|b| b.verified.contains(&key))
+        self.buffers
+            .read()
+            .unwrap()
+            .values()
+            .any(|b| b.verified.contains(&key))
     }
 
     /// Claim the verification of `shard`'s frame, waiting while another copy
     /// of it is verified, for that verdict or at most [`VERIFICATION_WAIT`].
     fn claim_verification(
-        &self, shard: &ShardFrame, keys: &[(Vec<u8>, u64)],
+        &self,
+        shard: &ShardFrame,
+        keys: &[(Vec<u8>, u64)],
     ) -> Result<VerificationClaim<'_>, Unclaimed> {
         let frame = (shard.address.clone(), shard.frame);
         let deadline = Instant::now() + VERIFICATION_WAIT;
         loop {
             let mut verifying = self.verifying.lock().unwrap();
             if verifying.insert(frame.clone()) {
-                return Ok(VerificationClaim { collector: self, frame });
+                return Ok(VerificationClaim {
+                    collector: self,
+                    frame,
+                });
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(Unclaimed::Busy);
             }
-            drop(self.verification_ended.wait_timeout(verifying, left).unwrap());
+            drop(
+                self.verification_ended
+                    .wait_timeout(verifying, left)
+                    .unwrap(),
+            );
             if self.superseded(keys) {
                 return Err(Unclaimed::Superseded);
             }
@@ -493,7 +694,8 @@ impl MessageCollector {
     }
 
     fn note_rank(&self, rank: u64) {
-        self.newest_rank.fetch_max(rank, std::sync::atomic::Ordering::AcqRel);
+        self.newest_rank
+            .fetch_max(rank, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Re-file every held message at rank 0 and restart the newest rank: a new
@@ -515,7 +717,8 @@ impl MessageCollector {
         if merged.len() > 0 {
             buffers.insert(0, merged);
         }
-        self.newest_rank.store(0, std::sync::atomic::Ordering::Release);
+        self.newest_rank
+            .store(0, std::sync::atomic::Ordering::Release);
     }
 
     /// Add an arriving message at the newest rank the collector has seen, so
@@ -535,8 +738,18 @@ impl MessageCollector {
     /// at ingestion.
     pub fn set_valid_shard_addresses(&self, addresses: HashSet<Vec<u8>>) {
         if !addresses.is_empty() {
-            self.verified_tips.lock().unwrap().retain(|address, _| addresses.contains(address));
-            self.included.lock().unwrap().retain(|address, _| addresses.contains(address));
+            self.verified_tips
+                .lock()
+                .unwrap()
+                .retain(|address, _| addresses.contains(address));
+            self.included
+                .lock()
+                .unwrap()
+                .retain(|address, _| addresses.contains(address));
+            self.included_frames
+                .lock()
+                .unwrap()
+                .retain(|address, _| addresses.contains(address));
         }
         *self.valid_shard_addresses.write().unwrap() = addresses;
     }
@@ -558,7 +771,8 @@ impl MessageCollector {
                 ));
             }
             valid.insert(quil_forest::shard_prefix_to_filter(
-                &row.shard_key[3..35], &row.prefix,
+                &row.shard_key[3..35],
+                &row.prefix,
             ));
         }
         self.set_valid_shard_addresses(valid);
@@ -604,13 +818,27 @@ impl MessageCollector {
     /// per-frame count cap, so a well-formed, non-duplicate message is
     /// always retained.
     pub fn add_message(&self, rank: u64, data: Vec<u8>) -> bool {
-        matches!(self.add_message_outcome(rank, data), SubmitOutcome::Accepted)
+        matches!(
+            self.add_message_outcome(rank, data),
+            SubmitOutcome::Accepted
+        )
+    }
+
+    /// [`Self::add_message`] for a message `provenance` delivered.
+    pub fn add_message_from(&self, rank: u64, data: Vec<u8>, provenance: Provenance) -> bool {
+        matches!(
+            self.add_message_outcome_from(rank, data, provenance),
+            SubmitOutcome::Accepted
+        )
     }
 
     /// Add a message the collector it was copied from held as verified (a
     /// private proposal copy, which has no verifier of its own).
     pub fn add_verified_message(&self, rank: u64, data: Vec<u8>) -> bool {
-        matches!(self.admit(rank, data, true), SubmitOutcome::Accepted)
+        matches!(
+            self.admit(rank, data, true, Provenance::Prover),
+            SubmitOutcome::Accepted
+        )
     }
 
     /// Add a message, distinguishing "newly accepted" from "we already
@@ -624,15 +852,37 @@ impl MessageCollector {
     ///
     /// With a shard-frame verifier installed this verifies shard frames,
     /// which can take milliseconds: see [`Self::requires_verification`].
+    ///
+    /// For this node's own messages: a peer's go through
+    /// [`Self::add_message_outcome_from`].
     pub fn add_message_outcome(&self, rank: u64, data: Vec<u8>) -> SubmitOutcome {
-        self.admit(rank, data, false)
+        self.admit(rank, data, false, Provenance::Prover)
     }
 
-    fn admit(&self, rank: u64, data: Vec<u8>, verified: bool) -> SubmitOutcome {
+    /// [`Self::add_message_outcome`] for a message `provenance` delivered.
+    pub fn add_message_outcome_from(
+        &self,
+        rank: u64,
+        data: Vec<u8>,
+        provenance: Provenance,
+    ) -> SubmitOutcome {
+        self.admit(rank, data, false, provenance)
+    }
+
+    fn admit(
+        &self,
+        rank: u64,
+        data: Vec<u8>,
+        verified: bool,
+        provenance: Provenance,
+    ) -> SubmitOutcome {
         // Prover-only mode filtering: check if the message is a
         // prover-protocol op (type prefix 0x0301-0x031A). If not,
         // reject it during degraded coverage.
-        if self.prover_only_mode.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .prover_only_mode
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             if !is_prover_message(&data) {
                 tracing::debug!(
                     "message collector: submit rejected — prover-only (degraded coverage) mode, non-prover message"
@@ -651,6 +901,17 @@ impl MessageCollector {
         }
 
         let checks = extract_shard_frame_checks(&message.data);
+        // A shard frame header decodes with bytes appended or a field in a
+        // second encoding, which would make a copy of a header a distinct
+        // message. Every node encodes headers canonically.
+        if let Some(c) = checks.iter().find(|c| !c.canonical) {
+            tracing::debug!(
+                address = %hex::encode(&c.address),
+                frame_number = c.frame_number,
+                "message collector: shard-frame submit refused — header is not in its canonical encoding"
+            );
+            return SubmitOutcome::Filtered(Refusal::InvalidShardFrame);
+        }
 
         // Reject addresses outside the known current shard set before spending
         // certificate-verification work. Missing attestations affect rewards,
@@ -673,7 +934,7 @@ impl MessageCollector {
                 // shard carries committed data, and the shard still progresses.
                 if c.global_frame_number > 0 && !c.has_attestation {
                     tracing::debug!(
-                        address = %hex::encode(&c.address[..c.address.len().min(8)]),
+                        address = %hex::encode(&c.address),
                         frame_number = c.frame_number,
                         global_frame_number = c.global_frame_number,
                         "message collector: storage frame carries no attestation — ACCEPTING (reward withheld by the intrinsic if data-bearing; frame not wedged)"
@@ -696,11 +957,24 @@ impl MessageCollector {
         // A frame at or below a verified frame of its shard adds nothing: the
         // leader carries one proof per shard, the highest. Another member's
         // copy of the same frame lands here too.
-        let keys: Vec<(Vec<u8>, u64)> = checks.iter().map(|c| (c.address.clone(), c.frame_number)).collect();
+        let keys: Vec<(Vec<u8>, u64)> = checks
+            .iter()
+            .map(|c| (c.address.clone(), c.frame_number))
+            .collect();
         if !keys.is_empty() && self.superseded(&keys) {
             return SubmitOutcome::Duplicate;
         }
-        if self.buffers.read().unwrap().values().any(|b| b.contains(&message.hash)) {
+        // A shard frame a finalized frame already carried, in another bundle.
+        if !keys.is_empty() && self.carries_included(&keys) {
+            return SubmitOutcome::Duplicate;
+        }
+        if self
+            .buffers
+            .read()
+            .unwrap()
+            .values()
+            .any(|b| b.contains(&message.hash))
+        {
             return SubmitOutcome::Duplicate;
         }
 
@@ -738,10 +1012,11 @@ impl MessageCollector {
                         self.0.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
-                let slot = claimed.then(|| Slot(&self.verifications))
-                    .filter(|slot| slot.0.fetch_add(1, Ordering::AcqRel) < MAX_CONCURRENT_VERIFICATIONS);
+                let slot = claimed.then(|| Slot(&self.verifications)).filter(|slot| {
+                    slot.0.fetch_add(1, Ordering::AcqRel) < MAX_CONCURRENT_VERIFICATIONS
+                });
                 if let Some(slot) = slot {
-                    let verdict = verify(&message.data);
+                    let verdict = verify(&message.data, provenance);
                     drop(slot);
                     match verdict {
                         ShardFrameVerdict::Valid => message.verified = true,
@@ -756,6 +1031,10 @@ impl MessageCollector {
                         ShardFrameVerdict::Unavailable(reason) => {
                             tracing::debug!(%reason, "message collector: shard frame not verifiable now; held unverified");
                         }
+                        ShardFrameVerdict::Full(reason) => {
+                            tracing::debug!(%reason, "message collector: shard frame not verifiable now and its shard's held frames are at their cap");
+                            return SubmitOutcome::Filtered(Refusal::AwaitingExecution);
+                        }
                     }
                 }
             }
@@ -765,10 +1044,16 @@ impl MessageCollector {
         // finalized frames from the rank a message is filed at, and a submit
         // handler's rank lags them on an archive that has not finalized since
         // it started (rank 0) or is still catching up.
-        let rank = self.finalized_ranks.lock().unwrap().back().map_or(rank, |last| rank.max(*last));
+        let rank = self
+            .finalized_ranks
+            .lock()
+            .unwrap()
+            .back()
+            .map_or(rank, |last| rank.max(*last));
         let mut buffers = self.buffers.write().unwrap();
-        // Another copy may have been verified while this one was.
-        if message.verified && self.superseded(&keys) {
+        // Another copy may have been verified while this one was, or a
+        // finalized frame carried it meanwhile.
+        if (message.verified && self.superseded(&keys)) || self.carries_included(&keys) {
             return SubmitOutcome::Duplicate;
         }
         let (hash, verified) = (message.hash, message.verified);
@@ -776,6 +1061,7 @@ impl MessageCollector {
         let buffer = buffers.entry(rank).or_insert_with(RankBuffer::new);
         match buffer.add(message) {
             AddOutcome::Added => {
+                self.note_rank_accepting(Instant::now(), rank);
                 if verified && !keys.is_empty() {
                     self.supersede(&mut buffers, &keys, hash);
                 }
@@ -783,14 +1069,14 @@ impl MessageCollector {
             }
             AddOutcome::Duplicate => SubmitOutcome::Duplicate,
             AddOutcome::Full => {
-                tracing::warn!(
-                    rank,
-                    pending = buffer.len(),
-                    pending_bytes = buffer.bytes,
-                    max_messages = MAX_MESSAGES_PER_RANK,
-                    max_bytes = MAX_BYTES_PER_RANK,
-                    ranks_held,
-                    "message collector: submit rejected — rank buffer full (per-rank count/byte cap reached)"
+                self.note_rank_full(
+                    Instant::now(),
+                    RankFullState {
+                        rank,
+                        pending: buffer.len(),
+                        pending_bytes: buffer.bytes,
+                        ranks_held,
+                    },
                 );
                 SubmitOutcome::Filtered(Refusal::RankFull)
             }
@@ -802,7 +1088,12 @@ impl MessageCollector {
     /// except `keep`, the message that raised it. Found through each buffer's
     /// shard index: reading every held message instead cost each verified
     /// arrival time in proportion to the shard count, under the buffers' lock.
-    fn supersede(&self, buffers: &mut HashMap<u64, RankBuffer>, keys: &[(Vec<u8>, u64)], keep: [u8; 32]) {
+    fn supersede(
+        &self,
+        buffers: &mut HashMap<u64, RankBuffer>,
+        keys: &[(Vec<u8>, u64)],
+        keep: [u8; 32],
+    ) {
         let mut tips = self.verified_tips.lock().unwrap();
         for (address, frame) in keys {
             let tip = tips.entry(address.clone()).or_insert(*frame);
@@ -811,10 +1102,14 @@ impl MessageCollector {
         for (address, _) in keys {
             let tip = tips[address];
             for buffer in buffers.values_mut() {
-                let Some(held) = buffer.by_shard.get(address) else { continue };
+                let Some(held) = buffer.by_shard.get(address) else {
+                    continue;
+                };
                 let below: Vec<[u8; 32]> = held
                     .iter()
-                    .filter(|key| **key != keep && buffer.shard_frame(key).is_some_and(|s| s.frame <= tip))
+                    .filter(|key| {
+                        **key != keep && buffer.shard_frame(key).is_some_and(|s| s.frame <= tip)
+                    })
                     .copied()
                     .collect();
                 for key in below {
@@ -894,9 +1189,13 @@ impl MessageCollector {
     /// leave GLOBAL unable to make any private proposal, and therefore any
     /// frame, again.
     pub(crate) fn snapshot_for_execution(
-        &self, rank: u64, max_bytes: usize, max_items: usize,
+        &self,
+        rank: u64,
+        max_bytes: usize,
+        max_items: usize,
     ) -> quil_types::error::Result<Vec<Vec<u8>>> {
-        Ok(self.snapshot_for_proposal(rank, max_bytes, max_items, None, &[])?
+        Ok(self
+            .snapshot_for_proposal(rank, max_bytes, max_items, None, &[])?
             .into_iter()
             .map(|(data, _)| data)
             .collect())
@@ -922,16 +1221,24 @@ impl MessageCollector {
     ///
     /// [`select_shard_tips`]: crate::leader_provider::select_shard_tips
     pub(crate) fn snapshot_for_proposal(
-        &self, rank: u64, max_bytes: usize, max_items: usize,
-        frame: Option<u64>, consumed: &[Vec<u8>],
+        &self,
+        rank: u64,
+        max_bytes: usize,
+        max_items: usize,
+        frame: Option<u64>,
+        consumed: &[Vec<u8>],
     ) -> quil_types::error::Result<Vec<(Vec<u8>, bool)>> {
         use crate::leader_provider::MAX_TIP_VERIFICATIONS;
         use quil_types::error::QuilError;
-        let unavailable = || QuilError::ExecutionUnavailable("proposal message snapshot lock failure".into());
+        let unavailable =
+            || QuilError::ExecutionUnavailable("proposal message snapshot lock failure".into());
         self.note_rank(rank);
         let consumed_keys: HashSet<[u8; 32]> = consumed.iter().map(|m| message_key(m)).collect();
-        let just_included: HashSet<Vec<u8>> =
-            consumed.iter().flat_map(|m| extract_shard_frame_keys(m)).map(|(address, _)| address).collect();
+        let just_included: HashSet<Vec<u8>> = consumed
+            .iter()
+            .flat_map(|m| extract_shard_frame_keys(m))
+            .map(|(address, _)| address)
+            .collect();
         let buffers = self.buffers.read().map_err(|_| unavailable())?;
         let finalized = self.finalized.read().map_err(|_| unavailable())?;
         let mut ranks: Vec<_> = buffers.keys().copied().filter(|r| *r <= rank).collect();
@@ -946,14 +1253,20 @@ impl MessageCollector {
         let mut shards: HashMap<&[u8], Vec<Candidate>> = HashMap::new();
         for rank in ranks {
             for (arrival, m) in buffers[&rank].iter() {
-                if finalized.contains(&m.hash) || consumed_keys.contains(&m.hash) || !seen.insert(m.hash) {
+                if finalized.contains(&m.hash)
+                    || consumed_keys.contains(&m.hash)
+                    || !seen.insert(m.hash)
+                {
                     continue;
                 }
                 if !m.proof {
                     others.push((rank, arrival, m));
                 } else if carried(m) {
                     match &m.shard {
-                        Some(shard) => shards.entry(shard.address.as_slice()).or_default().push((rank, arrival, m)),
+                        Some(shard) => shards
+                            .entry(shard.address.as_slice())
+                            .or_default()
+                            .push((rank, arrival, m)),
                         None => bundles.push((rank, arrival, m)),
                     }
                 }
@@ -965,7 +1278,9 @@ impl MessageCollector {
                 .into_iter()
                 .map(|(address, mut candidates)| {
                     // Highest frame first; the stable sort keeps newer ranks first within one.
-                    candidates.sort_by_key(|c| std::cmp::Reverse(c.2.shard.as_ref().map_or(0, |s| s.frame)));
+                    candidates.sort_by_key(|c| {
+                        std::cmp::Reverse(c.2.shard.as_ref().map_or(0, |s| s.frame))
+                    });
                     let (mut picks, mut unverified) = (Vec::new(), 0);
                     for candidate in candidates {
                         if candidate.2.verified {
@@ -990,45 +1305,88 @@ impl MessageCollector {
         };
         groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        let size = |candidates: &[Candidate]| candidates.iter().map(|c| c.2.data.len()).sum::<usize>();
-        let proof_bytes = size(&bundles) + groups.iter().map(|(_, picks)| size(picks)).sum::<usize>();
+        let size =
+            |candidates: &[Candidate]| candidates.iter().map(|c| c.2.data.len()).sum::<usize>();
+        let proof_bytes =
+            size(&bundles) + groups.iter().map(|(_, picks)| size(picks)).sum::<usize>();
         let others_cap = max_bytes - proof_bytes.min(max_bytes / 2);
-        let mut copied = Copied { taken: Vec::new(), bytes: 0, max_items };
+        let mut copied = Copied {
+            taken: Vec::new(),
+            bytes: 0,
+            max_items,
+        };
         let mut waiting = Vec::new();
+        // Storage epoch proofs are large (about 0.5–0.75 MB each) and cluster
+        // after each epoch's snapshot; past their share they wait.
+        let seal_budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let seal_len = |candidate: &Candidate| {
+            if candidate.2.seal {
+                candidate.2.data.len()
+            } else {
+                0
+            }
+        };
+        let mut seal_bytes = 0usize;
+        let mut seals_left = 0usize;
         for candidate in others {
-            if !copied.take(vec![candidate], others_cap) {
+            let len = seal_len(&candidate);
+            if seal_bytes + len > seal_budget {
+                seals_left += 1;
+            } else if copied.take(vec![candidate], others_cap) {
+                seal_bytes += len;
+            } else {
                 waiting.push(candidate);
             }
         }
         let proofs = bundles.len() + groups.len();
         let mut proofs_left = 0usize;
-        for picks in bundles.into_iter().map(|c| vec![c]).chain(groups.into_iter().map(|(_, picks)| picks)) {
+        for picks in bundles
+            .into_iter()
+            .map(|c| vec![c])
+            .chain(groups.into_iter().map(|(_, picks)| picks))
+        {
             if !copied.take(picks, max_bytes) {
                 proofs_left += 1;
             }
         }
-        let mut others_left = 0usize;
+        let mut others_left = seals_left;
         for candidate in waiting {
-            if !copied.take(vec![candidate], max_bytes) {
+            let len = seal_len(&candidate);
+            if seal_bytes + len > seal_budget || !copied.take(vec![candidate], max_bytes) {
                 others_left += 1;
+            } else {
+                seal_bytes += len;
             }
         }
         if proofs_left + others_left > 0 {
             match frame {
                 Some(frame) => tracing::info!(
-                    rank, frame, shards = proofs, shards_left = proofs_left, others_left,
-                    bytes = copied.bytes, max_bytes, max_items,
+                    rank,
+                    frame,
+                    shards = proofs,
+                    shards_left = proofs_left,
+                    others_left,
+                    bytes = copied.bytes,
+                    max_bytes,
+                    max_items,
                     "GLOBAL proposal budget full: messages left for a later frame",
                 ),
                 None => tracing::debug!(
-                    rank, others_left, bytes = copied.bytes, max_bytes, max_items,
+                    rank,
+                    others_left,
+                    bytes = copied.bytes,
+                    max_bytes,
+                    max_items,
                     "proposal budget full: messages left for a later frame",
                 ),
             }
         }
         let mut taken = copied.taken;
         taken.sort_unstable_by_key(|c| (c.0, c.1));
-        Ok(taken.into_iter().map(|(_, _, m)| (m.data.clone(), m.verified)).collect())
+        Ok(taken
+            .into_iter()
+            .map(|(_, _, m)| (m.data.clone(), m.verified))
+            .collect())
     }
 
     /// Age public GLOBAL inputs only after a finalized frame has materialized.
@@ -1071,11 +1429,25 @@ impl MessageCollector {
             return;
         }
         let hashes: HashSet<[u8; 32]> = raw_msgs.iter().map(|m| message_key(m)).collect();
+        let frames: Vec<(Vec<u8>, u64)> = raw_msgs
+            .iter()
+            .flat_map(|m| extract_shard_frame_keys(m))
+            .collect();
 
         {
             let mut buffers = self.buffers.write().unwrap();
+            let mut included = self.included_frames.lock().unwrap();
+            for (address, frame) in frames {
+                let kept = included.entry(address).or_default();
+                kept.insert(frame);
+                while kept.len() > INCLUDED_FRAMES_KEPT {
+                    kept.pop_first();
+                }
+            }
+            // Held copies of the carried shard frames leave too, however
+            // they are encoded or bundled.
             for buf in buffers.values_mut() {
-                buf.retain(|m| !hashes.contains(&m.hash));
+                buf.retain(|m| !hashes.contains(&m.hash) && !carries_included_frame(&included, m));
             }
             buffers.retain(|_, b| !b.is_empty());
         }
@@ -1085,10 +1457,16 @@ impl MessageCollector {
                 fin.insert(h);
             }
         }
-        let shards: HashSet<Vec<u8>> =
-            raw_msgs.iter().flat_map(|m| extract_shard_frame_keys(m)).map(|(address, _)| address).collect();
+        let shards: HashSet<Vec<u8>> = raw_msgs
+            .iter()
+            .flat_map(|m| extract_shard_frame_keys(m))
+            .map(|(address, _)| address)
+            .collect();
         if !shards.is_empty() {
-            let finalization = self.finalizations.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            let finalization = self
+                .finalizations
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                + 1;
             let mut included = self.included.lock().unwrap();
             for address in shards {
                 included.insert(address, finalization);
@@ -1177,7 +1555,9 @@ impl MessageCollector {
 
     /// Number of pending messages for a given rank.
     pub fn pending_count(&self, rank: u64) -> usize {
-        self.buffers.read().unwrap()
+        self.buffers
+            .read()
+            .unwrap()
             .get(&rank)
             .map(|b| b.len())
             .unwrap_or(0)
@@ -1185,10 +1565,7 @@ impl MessageCollector {
 
     /// Total messages across all ranks.
     pub fn total_pending(&self) -> usize {
-        self.buffers.read().unwrap()
-            .values()
-            .map(|b| b.len())
-            .sum()
+        self.buffers.read().unwrap().values().map(|b| b.len()).sum()
     }
 
     /// Set prover-only mode. When enabled, non-prover messages are
@@ -1264,11 +1641,42 @@ pub fn bundle_shard_frames_in_lockstep(data: &[u8], frame_number: u64) -> bool {
 /// (genesis/legacy) OR within `[expected - W, expected]`. Multi-member shards
 /// anchor to `latest − K`, so a strict `== expected` is unsatisfiable; the
 /// window absorbs K + transit.
+///
+/// From the required-anchor epoch
+/// ([`quil_types::consensus::MAINNET_REQUIRED_ANCHOR_EPOCH`]) GLOBAL refuses
+/// a shard frame without an anchor, so none rides a frame from then on.
 pub fn anchor_in_lockstep(anchor: u64, frame_number: u64) -> bool {
     use quil_execution::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW;
     let expected = frame_number.saturating_sub(1);
     let oldest = expected.saturating_sub(STORAGE_ANCHOR_LOCKSTEP_WINDOW);
-    anchor == 0 || (oldest..=expected).contains(&anchor)
+    if anchor == 0 {
+        return !quil_types::consensus::required_anchor_active(frame_number);
+    }
+    (oldest..=expected).contains(&anchor)
+}
+
+/// Shard `address`'s `frame` is one a finalized frame carried.
+fn frame_included(included: &HashMap<Vec<u8>, BTreeSet<u64>>, address: &[u8], frame: u64) -> bool {
+    included
+        .get(address)
+        .is_some_and(|frames| frames.contains(&frame))
+}
+
+/// A frame in `keys` is one a finalized frame carried.
+fn keys_included(included: &HashMap<Vec<u8>, BTreeSet<u64>>, keys: &[(Vec<u8>, u64)]) -> bool {
+    keys.iter()
+        .any(|(address, frame)| frame_included(included, address, *frame))
+}
+
+/// `message` carries a shard frame a finalized frame carried.
+fn carries_included_frame(
+    included: &HashMap<Vec<u8>, BTreeSet<u64>>,
+    message: &CollectedMessage,
+) -> bool {
+    if let Some(shard) = &message.shard {
+        return frame_included(included, &shard.address, shard.frame);
+    }
+    message.proof && keys_included(included, &extract_shard_frame_keys(&message.data))
 }
 
 /// A shard `FrameHeader` carried by a bundle, with the fields needed for both
@@ -1282,6 +1690,9 @@ struct ShardFrameCheck {
     /// True iff the header commits to a storage attestation
     /// (`storage_attestation_root` non-empty).
     has_attestation: bool,
+    /// The request carries the header's canonical encoding, which every
+    /// node produces: nothing appended, no field in a second encoding.
+    canonical: bool,
 }
 
 fn extract_shard_frame_checks(data: &[u8]) -> Vec<ShardFrameCheck> {
@@ -1297,11 +1708,15 @@ fn extract_shard_frame_checks(data: &[u8]) -> Vec<ShardFrameCheck> {
         if req.inner_type_prefix == TYPE_FRAME_HEADER {
             if let Ok(fh) = FrameHeader::from_canonical_bytes(&req.inner_bytes) {
                 if !fh.address.is_empty() {
+                    let canonical = fh
+                        .to_canonical_bytes()
+                        .is_ok_and(|bytes| bytes == req.inner_bytes);
                     out.push(ShardFrameCheck {
                         address: fh.address,
                         frame_number: fh.frame_number,
                         global_frame_number: fh.global_frame_number,
                         has_attestation: !fh.storage_attestation_root.is_empty(),
+                        canonical,
                     });
                 }
             }
@@ -1435,7 +1850,10 @@ mod tests {
         let collector = MessageCollector::new();
         let (held, arrival) = (vec![7u8; 32], vec![8u8; 32]);
         collector.carry_forward(500, &[held.clone()]);
-        assert!(collector.collect_for_rank(3).is_empty(), "held above a restarted instance's ranks");
+        assert!(
+            collector.collect_for_rank(3).is_empty(),
+            "held above a restarted instance's ranks"
+        );
         collector.rebase_ranks();
         assert!(collector.add_message_newest(arrival.clone()));
         let collected = collector.collect_for_rank(3);
@@ -1453,10 +1871,16 @@ mod tests {
         collector.carry_forward(50, &[held_a.clone(), held_b.clone()]);
         assert_eq!(collector.collect_for_rank(60).len(), 2);
         assert!(collector.add_message_newest(arrival.clone()));
-        assert_eq!(collector.snapshot_for_execution(60, 1 << 20, 1).unwrap(), vec![arrival.clone()],
-            "a copy limited to one message takes the newest");
+        assert_eq!(
+            collector.snapshot_for_execution(60, 1 << 20, 1).unwrap(),
+            vec![arrival.clone()],
+            "a copy limited to one message takes the newest"
+        );
         assert!(collector.collect_for_rank(65).contains(&arrival));
-        assert!(collector.collect_for_rank(65).contains(&arrival), "one collection does not prune a new arrival");
+        assert!(
+            collector.collect_for_rank(65).contains(&arrival),
+            "one collection does not prune a new arrival"
+        );
     }
 
     #[test]
@@ -1470,19 +1894,34 @@ mod tests {
         assert_eq!(mc.pending_count(1), 1, "moved out of its arrival rank");
         assert_eq!(mc.pending_count(4), 0);
         assert_eq!(mc.pending_count(8), 3, "into the proposal's rank");
-        assert_eq!(mc.collect_for_rank(8), vec![b"idle".to_vec(), b"held".to_vec(), b"second".to_vec(), b"arrived at 8".to_vec()],
-            "carried messages keep their order, ahead of later arrivals");
+        assert_eq!(
+            mc.collect_for_rank(8),
+            vec![
+                b"idle".to_vec(),
+                b"held".to_vec(),
+                b"second".to_vec(),
+                b"arrived at 8".to_vec()
+            ],
+            "carried messages keep their order, ahead of later arrivals"
+        );
         mc.remove(&[b"second".to_vec(), b"arrived at 8".to_vec()]);
         let collected = mc.collect_for_rank(12);
         assert!(collected.contains(&b"held".to_vec()) && collected.contains(&b"idle".to_vec()));
-        assert_eq!(mc.collect_for_rank(15), vec![b"held".to_vec()], "rank 1 aged out");
+        assert_eq!(
+            mc.collect_for_rank(15),
+            vec![b"held".to_vec()],
+            "rank 1 aged out"
+        );
         // Collection at 19 returns "held" and ages it out; the proposal holds
         // it back again from its own copy.
         assert_eq!(mc.collect_for_rank(19), vec![b"held".to_vec()]);
         assert_eq!(mc.total_pending(), 0);
         mc.carry_forward(19, &[b"held".to_vec()]);
         assert_eq!(mc.collect_for_rank(30), vec![b"held".to_vec()]);
-        assert!(mc.collect_for_rank(31).is_empty(), "not held back again: it ages out");
+        assert!(
+            mc.collect_for_rank(31).is_empty(),
+            "not held back again: it ages out"
+        );
         // A consumed message is not held again.
         mc.add_message(40, b"done".to_vec());
         mc.mark_finalized(&[b"done".to_vec()]);
@@ -1544,14 +1983,171 @@ mod tests {
     fn shard_bundle(addr: u8, frame: u64, copy: u64, timestamp: i64) -> Vec<u8> {
         use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
         use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
-        let fh = FrameHeader { address: vec![addr; 32], frame_number: frame, rank: copy, global_frame_number: 99, ..Default::default() };
-        let req = CanonicalMessageRequest { inner_type_prefix: TYPE_FRAME_HEADER, inner_bytes: fh.to_canonical_bytes().unwrap() };
-        CanonicalMessageBundle { requests: vec![Some(req)], timestamp }.to_canonical_bytes().unwrap()
+        let fh = FrameHeader {
+            address: vec![addr; 32],
+            frame_number: frame,
+            rank: copy,
+            global_frame_number: 99,
+            ..Default::default()
+        };
+        let req = CanonicalMessageRequest {
+            inner_type_prefix: TYPE_FRAME_HEADER,
+            inner_bytes: fh.to_canonical_bytes().unwrap(),
+        };
+        CanonicalMessageBundle {
+            requests: vec![Some(req)],
+            timestamp,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// A bundle carrying `header` bytes as they are, canonical or not.
+    fn header_bytes_bundle(header: Vec<u8>) -> Vec<u8> {
+        use quil_execution::global_intrinsic::frame_header::TYPE_FRAME_HEADER;
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: TYPE_FRAME_HEADER,
+                inner_bytes: header,
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// A shard frame a finalized frame carried leaves the collector in every
+    /// copy and is not held again, whatever bundle or member's copy carries
+    /// it; the shard's next frame is.
+    #[test]
+    fn a_shard_frame_a_finalized_frame_carried_is_not_held_again() {
+        let mc = MessageCollector::new();
+        assert_eq!(
+            mc.add_message_outcome(1, shard_bundle(0x11, 5, 1, 0)),
+            SubmitOutcome::Accepted
+        );
+        mc.mark_finalized(&[shard_bundle(0x11, 5, 0, 0)]);
+        assert_eq!(mc.total_pending(), 0, "another member's copy leaves too");
+        assert_eq!(
+            mc.add_message_outcome(2, shard_bundle(0x11, 5, 2, 0)),
+            SubmitOutcome::Duplicate
+        );
+        assert_eq!(
+            mc.add_message_outcome(2, shard_bundle(0x11, 6, 0, 0)),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.add_message_outcome(2, shard_bundle(0x22, 5, 0, 0)),
+            SubmitOutcome::Accepted,
+            "another shard's frame"
+        );
+    }
+
+    /// A header with bytes appended, or a field in another encoding, would
+    /// be a distinct message carrying the same shard frame: it is refused.
+    #[test]
+    fn a_shard_frame_header_not_in_its_canonical_encoding_is_refused() {
+        use quil_execution::global_intrinsic::frame_header::FrameHeader;
+        let header = FrameHeader {
+            address: vec![0x11; 32],
+            frame_number: 5,
+            global_frame_number: 99,
+            storage_attestation: vec![0xAB; 8],
+            ..Default::default()
+        };
+        let canonical = header.to_canonical_bytes().unwrap();
+        let mut appended = canonical.clone();
+        appended.extend_from_slice(&[0xEE; 3]);
+        assert_eq!(
+            FrameHeader::from_canonical_bytes(&appended).unwrap(),
+            header
+        );
+        let mc = MessageCollector::new();
+        assert_eq!(
+            mc.add_message_outcome(1, header_bytes_bundle(appended)),
+            SubmitOutcome::Filtered(Refusal::InvalidShardFrame)
+        );
+        assert_eq!(
+            mc.add_message_outcome(1, header_bytes_bundle(canonical)),
+            SubmitOutcome::Accepted
+        );
+    }
+
+    /// From the required-anchor epoch a proof without a GLOBAL anchor rides
+    /// no frame: GLOBAL refuses it then.
+    #[test]
+    fn an_unanchored_proof_rides_no_frame_from_the_required_anchor_epoch() {
+        quil_types::consensus::set_required_anchor_epoch_for_thread(Some(10));
+        let first = 10 * quil_types::consensus::epoch_length_frames();
+        assert!(anchor_in_lockstep(0, first - 1));
+        assert!(!anchor_in_lockstep(0, first));
+        assert!(anchor_in_lockstep(first - 1, first));
+        quil_types::consensus::set_required_anchor_epoch_for_thread(None);
+    }
+
+    /// Storage epoch proofs share at most `STORAGE_SEAL_BYTES_PER_FRAME` of a
+    /// proposal; the rest wait for a later one, behind nothing else.
+    #[test]
+    fn a_proposal_takes_seal_proofs_only_up_to_their_budget() {
+        use quil_execution::global_intrinsic::storage_epoch_proof::{
+            StorageEpochProof, TYPE_STORAGE_EPOCH_PROOF,
+        };
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        let budget = quil_types::consensus::STORAGE_SEAL_BYTES_PER_FRAME;
+        let seal = |member: u8| {
+            let seal = StorageEpochProof {
+                member: [member; 32],
+                seats: vec![
+                    quil_execution::global_intrinsic::storage_epoch_proof::SeatProof {
+                        seals: true,
+                        ..Default::default()
+                    },
+                ],
+                proof: vec![member; budget / 2 + 1],
+            };
+            let req = CanonicalMessageRequest {
+                inner_type_prefix: TYPE_STORAGE_EPOCH_PROOF,
+                inner_bytes: seal.to_canonical_bytes(),
+            };
+            CanonicalMessageBundle {
+                requests: vec![Some(req)],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let mc = MessageCollector::new();
+        assert!(mc.add_message(1, seal(1)));
+        assert!(mc.add_message(1, seal(2)));
+        assert!(mc.add_message(1, b"other".to_vec()));
+        let taken = mc
+            .snapshot_for_proposal(1, 4 * budget, 100, None, &[])
+            .unwrap();
+        assert_eq!(taken.len(), 2, "one seal and the other message");
+        assert!(taken.iter().any(|(data, _)| data == b"other"));
+        let first: Vec<Vec<u8>> = taken
+            .into_iter()
+            .map(|(data, _)| data)
+            .filter(|d| d != b"other")
+            .collect();
+        let next = mc
+            .snapshot_for_proposal(1, 4 * budget, 100, None, &first)
+            .unwrap();
+        assert_eq!(
+            next.len(),
+            2,
+            "the second seal once the first is consumed: {}",
+            next.len()
+        );
     }
 
     fn counting_verifier(
         verdict: impl Fn(u64) -> ShardFrameVerdict + Send + Sync + 'static,
-    ) -> (ShardFrameVerifier, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (
+        ShardFrameVerifier,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = calls.clone();
         let verifier: ShardFrameVerifier = std::sync::Arc::new(move |data: &[u8]| {
@@ -1568,18 +2164,41 @@ mod tests {
         mc.set_shard_frame_verifier(verifier);
         let first = shard_bundle(0x11, 5, 0, 1);
         assert!(mc.requires_verification(&first));
-        assert_eq!(mc.add_message_outcome(3, first.clone()), SubmitOutcome::Accepted);
+        assert_eq!(
+            mc.add_message_outcome(3, first.clone()),
+            SubmitOutcome::Accepted
+        );
         assert!(mc.is_verified(&first));
         // Another member's copy of frame 5, and an older frame: nothing new.
         assert!(!mc.requires_verification(&shard_bundle(0x11, 5, 1, 2)));
-        assert_eq!(mc.add_message_outcome(3, shard_bundle(0x11, 5, 1, 2)), SubmitOutcome::Duplicate);
-        assert_eq!(mc.add_message_outcome(3, shard_bundle(0x11, 4, 0, 3)), SubmitOutcome::Duplicate);
-        assert_eq!(mc.add_message_outcome(3, shard_bundle(0x22, 9, 0, 4)), SubmitOutcome::Accepted);
+        assert_eq!(
+            mc.add_message_outcome(3, shard_bundle(0x11, 5, 1, 2)),
+            SubmitOutcome::Duplicate
+        );
+        assert_eq!(
+            mc.add_message_outcome(3, shard_bundle(0x11, 4, 0, 3)),
+            SubmitOutcome::Duplicate
+        );
+        assert_eq!(
+            mc.add_message_outcome(3, shard_bundle(0x22, 9, 0, 4)),
+            SubmitOutcome::Accepted
+        );
         // A higher frame replaces the shard's held proof, at any rank.
-        assert_eq!(mc.add_message_outcome(4, shard_bundle(0x11, 7, 0, 5)), SubmitOutcome::Accepted);
+        assert_eq!(
+            mc.add_message_outcome(4, shard_bundle(0x11, 7, 0, 5)),
+            SubmitOutcome::Accepted
+        );
         assert_eq!(mc.total_pending(), 2);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3, "copies and older frames skip verification");
-        let mut held: Vec<_> = mc.collect_for_rank(4).iter().map(|m| extract_shard_frame_keys(m)[0].clone()).collect();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "copies and older frames skip verification"
+        );
+        let mut held: Vec<_> = mc
+            .collect_for_rank(4)
+            .iter()
+            .map(|m| extract_shard_frame_keys(m)[0].clone())
+            .collect();
         held.sort();
         assert_eq!(held, vec![(vec![0x11; 32], 7), (vec![0x22; 32], 9)]);
     }
@@ -1588,15 +2207,25 @@ mod tests {
     fn a_forged_shard_frame_is_refused_and_moves_nothing() {
         let mc = MessageCollector::new();
         let (verifier, _) = counting_verifier(|frame| {
-            if frame >= 100 { ShardFrameVerdict::Invalid("certificate".into()) } else { ShardFrameVerdict::Valid }
+            if frame >= 100 {
+                ShardFrameVerdict::Invalid("certificate".into())
+            } else {
+                ShardFrameVerdict::Valid
+            }
         });
         mc.set_shard_frame_verifier(verifier);
-        assert_eq!(mc.add_message_outcome(1, shard_bundle(0x11, 5, 0, 0)), SubmitOutcome::Accepted);
+        assert_eq!(
+            mc.add_message_outcome(1, shard_bundle(0x11, 5, 0, 0)),
+            SubmitOutcome::Accepted
+        );
         let refused = mc.add_message_outcome(1, shard_bundle(0x11, 1_000, 0, 0));
         assert_eq!(refused, SubmitOutcome::Filtered(Refusal::InvalidShardFrame));
         assert!(!Refusal::InvalidShardFrame.retryable());
         assert_eq!(mc.total_pending(), 1, "the real proof is still held");
-        assert_eq!(mc.add_message_outcome(1, shard_bundle(0x11, 6, 0, 0)), SubmitOutcome::Accepted);
+        assert_eq!(
+            mc.add_message_outcome(1, shard_bundle(0x11, 6, 0, 0)),
+            SubmitOutcome::Accepted
+        );
         assert_eq!(mc.total_pending(), 1);
     }
 
@@ -1605,9 +2234,19 @@ mod tests {
         let mc = MessageCollector::new();
         let (verifier, _) = counting_verifier(|_| ShardFrameVerdict::Unavailable("state".into()));
         mc.set_shard_frame_verifier(verifier);
-        assert_eq!(mc.add_message_outcome(1, shard_bundle(0x11, 5, 0, 0)), SubmitOutcome::Accepted);
-        assert_eq!(mc.add_message_outcome(1, shard_bundle(0x11, 4, 0, 0)), SubmitOutcome::Accepted);
-        assert_eq!(mc.total_pending(), 2, "an unverified frame supersedes nothing");
+        assert_eq!(
+            mc.add_message_outcome(1, shard_bundle(0x11, 5, 0, 0)),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.add_message_outcome(1, shard_bundle(0x11, 4, 0, 0)),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.total_pending(),
+            2,
+            "an unverified frame supersedes nothing"
+        );
         assert!(!mc.is_verified(&shard_bundle(0x11, 5, 0, 0)));
         assert!(Refusal::RankFull.retryable() && !Refusal::InvalidShardFrame.retryable());
         // Without a verifier, frames are held unverified and supersede nothing.
@@ -1622,15 +2261,33 @@ mod tests {
     fn copies_of_the_same_requests_are_one_message() {
         use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
         let bundle = |timestamp: i64| {
-            let req = CanonicalMessageRequest { inner_type_prefix: 0x0301, inner_bytes: b"join".to_vec() };
-            CanonicalMessageBundle { requests: vec![Some(req)], timestamp }.to_canonical_bytes().unwrap()
+            let req = CanonicalMessageRequest {
+                inner_type_prefix: 0x0301,
+                inner_bytes: b"join".to_vec(),
+            };
+            CanonicalMessageBundle {
+                requests: vec![Some(req)],
+                timestamp,
+            }
+            .to_canonical_bytes()
+            .unwrap()
         };
         let mc = MessageCollector::new();
-        assert_eq!(mc.add_message_outcome(1, bundle(1)), SubmitOutcome::Accepted);
-        assert_eq!(mc.add_message_outcome(2, bundle(2)), SubmitOutcome::Duplicate, "resent a minute later");
+        assert_eq!(
+            mc.add_message_outcome(1, bundle(1)),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.add_message_outcome(2, bundle(2)),
+            SubmitOutcome::Duplicate,
+            "resent a minute later"
+        );
         mc.mark_finalized(&[bundle(3)]);
         assert_eq!(mc.total_pending(), 0, "consumed by any copy");
-        assert_eq!(mc.add_message_outcome(3, bundle(4)), SubmitOutcome::Duplicate);
+        assert_eq!(
+            mc.add_message_outcome(3, bundle(4)),
+            SubmitOutcome::Duplicate
+        );
     }
 
     #[test]
@@ -1641,12 +2298,22 @@ mod tests {
         assert!(public.add_message(1, shard_bundle(0x11, 5, 0, 0)));
         assert!(public.add_message(1, b"plain".to_vec()));
         let copy = MessageCollector::new();
-        for (data, verified) in public.snapshot_for_proposal(2, 4096, 100, None, &[]).unwrap() {
-            if verified { copy.add_verified_message(2, data); } else { copy.add_message(2, data); }
+        for (data, verified) in public
+            .snapshot_for_proposal(2, 4096, 100, None, &[])
+            .unwrap()
+        {
+            if verified {
+                copy.add_verified_message(2, data);
+            } else {
+                copy.add_message(2, data);
+            }
         }
         assert!(copy.is_verified(&shard_bundle(0x11, 5, 0, 0)));
         assert!(!copy.is_verified(b"plain"));
-        assert_eq!(copy.add_message_outcome(2, shard_bundle(0x11, 4, 0, 0)), SubmitOutcome::Duplicate);
+        assert_eq!(
+            copy.add_message_outcome(2, shard_bundle(0x11, 4, 0, 0)),
+            SubmitOutcome::Duplicate
+        );
     }
 
     #[test]
@@ -1657,7 +2324,10 @@ mod tests {
         }
         // Filed at the last finalized rank while views end without a frame.
         assert!(mc.add_message(11, b"backlog".to_vec()));
-        assert_eq!(mc.snapshot_for_execution(400, 4096, 100).unwrap(), vec![b"backlog".to_vec()]);
+        assert_eq!(
+            mc.snapshot_for_execution(400, 4096, 100).unwrap(),
+            vec![b"backlog".to_vec()]
+        );
         // Counted in views, the first frame after the stall dropped it.
         mc.prune_after_finalization(500);
         assert_eq!(mc.pending_count(11), 1);
@@ -1687,7 +2357,10 @@ mod tests {
         // Later arrivals with the lagging rank are filed at the newest frame.
         assert!(mc.add_message(0, b"late".to_vec()));
         assert_eq!(mc.pending_count(1009), 1);
-        assert!(!mc.add_message(3, b"late".to_vec()), "deduplicated at the filed rank");
+        assert!(
+            !mc.add_message(3, b"late".to_vec()),
+            "deduplicated at the filed rank"
+        );
         assert_eq!(mc.snapshot_for_execution(1010, 4096, 100).unwrap().len(), 2);
         mc.prune_after_finalization(1010);
         assert_eq!(mc.pending_count(0), 0);
@@ -1743,7 +2416,10 @@ mod tests {
         // handler reports success and the prover doesn't see a transport error).
         let mut bundle = 0x0301u32.to_be_bytes().to_vec();
         bundle.extend_from_slice(b"prover-op");
-        assert_eq!(mc.add_message_outcome(1, bundle.clone()), SubmitOutcome::Accepted);
+        assert_eq!(
+            mc.add_message_outcome(1, bundle.clone()),
+            SubmitOutcome::Accepted
+        );
         assert_eq!(mc.add_message_outcome(1, bundle), SubmitOutcome::Duplicate);
         // In prover-only mode a non-prover message is a REAL reject (Filtered).
         mc.set_prover_only_mode(true);
@@ -1812,8 +2488,8 @@ mod tests {
         let mc = MessageCollector::new();
         assert!(mc.dedup_shard_frames(&vec![(vec![0xAAu8; 32], 100)]));
         let bundle = vec![
-            (vec![0xBBu8; 32], 50),     // fresh
-            (vec![0xAAu8; 32], 100),    // stale
+            (vec![0xBBu8; 32], 50),  // fresh
+            (vec![0xAAu8; 32], 100), // stale
         ];
         assert!(!mc.dedup_shard_frames(&bundle));
         // 0xBB should still be acceptable on its own.
@@ -1843,15 +2519,23 @@ mod tests {
         let mut key = vec![1, 2, 3];
         key.extend_from_slice(&app);
         let row = |prefix| ShardInfo {
-            shard_key: key.clone(), prefix, size: vec![], data_shards: 0, commitment: vec![],
+            shard_key: key.clone(),
+            prefix,
+            size: vec![],
+            data_shards: 0,
+            commitment: vec![],
         };
         let parent = row(vec![]);
-        let children = [row(quil_forest::bit_path_to_prefix(&[false])),
-                        row(quil_forest::bit_path_to_prefix(&[true]))];
+        let children = [
+            row(quil_forest::bit_path_to_prefix(&[false])),
+            row(quil_forest::bit_path_to_prefix(&[true])),
+        ];
         let bundle = |prefix: &[u32], frame_number| {
             let header = FrameHeader {
                 address: quil_forest::shard_prefix_to_filter(&app, prefix),
-                frame_number, global_frame_number: 10, ..Default::default()
+                frame_number,
+                global_frame_number: 10,
+                ..Default::default()
             };
             CanonicalMessageBundle {
                 timestamp: 0,
@@ -1859,42 +2543,68 @@ mod tests {
                     inner_type_prefix: TYPE_FRAME_HEADER,
                     inner_bytes: header.to_canonical_bytes().unwrap(),
                 })],
-            }.to_canonical_bytes().unwrap()
+            }
+            .to_canonical_bytes()
+            .unwrap()
         };
         let txn = clock.new_transaction(false).unwrap();
         shards.put_app_shard(txn.as_ref(), &parent).unwrap();
         txn.commit().unwrap();
         collector.refresh_valid_shard_addresses(&shards).unwrap();
-        assert_eq!(collector.add_message_outcome(1, bundle(&parent.prefix, 1)), SubmitOutcome::Accepted);
+        assert_eq!(
+            collector.add_message_outcome(1, bundle(&parent.prefix, 1)),
+            SubmitOutcome::Accepted
+        );
 
         let txn = clock.new_transaction(false).unwrap();
-        shards.delete_app_shard(txn.as_ref(), &key, &parent.prefix).unwrap();
-        for child in &children { shards.put_app_shard(txn.as_ref(), child).unwrap(); }
+        shards
+            .delete_app_shard(txn.as_ref(), &key, &parent.prefix)
+            .unwrap();
+        for child in &children {
+            shards.put_app_shard(txn.as_ref(), child).unwrap();
+        }
         // A staged topology must not leak through a committed-store refresh.
         collector.refresh_valid_shard_addresses(&shards).unwrap();
-        assert_eq!(collector.add_message_outcome(1, bundle(&children[0].prefix, 1)), SubmitOutcome::Filtered(Refusal::UnknownShard));
+        assert_eq!(
+            collector.add_message_outcome(1, bundle(&children[0].prefix, 1)),
+            SubmitOutcome::Filtered(Refusal::UnknownShard)
+        );
         txn.commit().unwrap();
         collector.refresh_valid_shard_addresses(&shards).unwrap();
         for child in &children {
-            assert_eq!(collector.add_message_outcome(1, bundle(&child.prefix, 1)), SubmitOutcome::Accepted);
+            assert_eq!(
+                collector.add_message_outcome(1, bundle(&child.prefix, 1)),
+                SubmitOutcome::Accepted
+            );
         }
-        assert_eq!(collector.add_message_outcome(1, bundle(&parent.prefix, 2)), SubmitOutcome::Filtered(Refusal::UnknownShard));
+        assert_eq!(
+            collector.add_message_outcome(1, bundle(&parent.prefix, 2)),
+            SubmitOutcome::Filtered(Refusal::UnknownShard)
+        );
 
         let txn = clock.new_transaction(false).unwrap();
-        for child in &children { shards.delete_app_shard(txn.as_ref(), &key, &child.prefix).unwrap(); }
+        for child in &children {
+            shards
+                .delete_app_shard(txn.as_ref(), &key, &child.prefix)
+                .unwrap();
+        }
         shards.put_app_shard(txn.as_ref(), &parent).unwrap();
         txn.commit().unwrap();
         collector.refresh_valid_shard_addresses(&shards).unwrap();
-        assert_eq!(collector.add_message_outcome(1, bundle(&parent.prefix, 2)), SubmitOutcome::Accepted);
-        assert_eq!(collector.add_message_outcome(1, bundle(&children[0].prefix, 2)), SubmitOutcome::Filtered(Refusal::UnknownShard));
+        assert_eq!(
+            collector.add_message_outcome(1, bundle(&parent.prefix, 2)),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            collector.add_message_outcome(1, bundle(&children[0].prefix, 2)),
+            SubmitOutcome::Filtered(Refusal::UnknownShard)
+        );
     }
 
     #[test]
     fn lockstep_gate_accepts_only_preceding_anchor() {
         use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
-        use quil_execution::message_envelope::{
-            CanonicalMessageBundle, CanonicalMessageRequest,
-        };
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
 
         // A bundle carrying one shard FrameHeader anchored to `anchor`.
         let make = |anchor: u64| -> Vec<u8> {
@@ -1908,26 +2618,53 @@ mod tests {
                 inner_type_prefix: TYPE_FRAME_HEADER,
                 inner_bytes: fh.to_canonical_bytes().unwrap(),
             };
-            CanonicalMessageBundle { requests: vec![Some(req)], timestamp: 0 }
-                .to_canonical_bytes()
-                .unwrap()
+            CanonicalMessageBundle {
+                requests: vec![Some(req)],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
         };
 
         // Building global frame 100: in lockstep iff anchor ∈ [99-W, 99] or 0.
         // With W = STORAGE_ANCHOR_LOCKSTEP_WINDOW, the window is [87, 99].
-        assert!(bundle_shard_frames_in_lockstep(&make(99), 100), "anchor==frame-1 in lockstep");
-        assert!(bundle_shard_frames_in_lockstep(&make(0), 100), "genesis anchor exempt");
-        assert!(bundle_shard_frames_in_lockstep(&make(98), 100), "anchor just inside window accepted");
-        assert!(bundle_shard_frames_in_lockstep(&make(87), 100), "oldest in-window anchor accepted");
-        assert!(!bundle_shard_frames_in_lockstep(&make(86), 100), "anchor older than window dropped");
-        assert!(!bundle_shard_frames_in_lockstep(&make(100), 100), "future anchor dropped");
+        assert!(
+            bundle_shard_frames_in_lockstep(&make(99), 100),
+            "anchor==frame-1 in lockstep"
+        );
+        assert!(
+            bundle_shard_frames_in_lockstep(&make(0), 100),
+            "genesis anchor exempt"
+        );
+        assert!(
+            bundle_shard_frames_in_lockstep(&make(98), 100),
+            "anchor just inside window accepted"
+        );
+        assert!(
+            bundle_shard_frames_in_lockstep(&make(87), 100),
+            "oldest in-window anchor accepted"
+        );
+        assert!(
+            !bundle_shard_frames_in_lockstep(&make(86), 100),
+            "anchor older than window dropped"
+        );
+        assert!(
+            !bundle_shard_frames_in_lockstep(&make(100), 100),
+            "future anchor dropped"
+        );
         // Non-bundle / non-shard-frame data passes (this gate only governs shard frames).
         assert!(bundle_shard_frames_in_lockstep(b"not a bundle", 100));
     }
 
     /// The shard address byte of each copied shard proof.
     fn shards_of(copy: &[Vec<u8>]) -> HashSet<u8> {
-        copy.iter().filter_map(|m| extract_shard_frame_keys(m).first().map(|(address, _)| address[0])).collect()
+        copy.iter()
+            .filter_map(|m| {
+                extract_shard_frame_keys(m)
+                    .first()
+                    .map(|(address, _)| address[0])
+            })
+            .collect()
     }
 
     /// Shard proofs and other messages each keep half a proposal's budget.
@@ -1938,14 +2675,20 @@ mod tests {
         let mc = MessageCollector::new();
         let join = vec![0x03; 10];
         mc.add_message(1, join.clone());
-        let proofs: Vec<_> = (1..=20u8).map(|shard| shard_bundle(shard, 5, 0, 0)).collect();
+        let proofs: Vec<_> = (1..=20u8)
+            .map(|shard| shard_bundle(shard, 5, 0, 0))
+            .collect();
         for proof in &proofs {
             assert!(mc.add_message(2, proof.clone()));
         }
         let budget = 10 * proofs[0].len();
         let copy = mc.snapshot_for_execution(2, budget, 100).unwrap();
         assert!(copy.contains(&join), "the older join rides");
-        assert_eq!(shards_of(&copy).len(), (budget - join.len()) / proofs[0].len(), "proofs take the rest");
+        assert_eq!(
+            shards_of(&copy).len(),
+            (budget - join.len()) / proofs[0].len(),
+            "proofs take the rest"
+        );
 
         let mc = MessageCollector::new();
         let proof = shard_bundle(0x11, 5, 0, 0);
@@ -1970,21 +2713,34 @@ mod tests {
         let size = shard_bundle(0x11, 5, 0, 0).len();
         let budget = 2 * size + size / 2;
         for &shard in &all {
-            assert_eq!(mc.add_message_outcome(1, shard_bundle(shard, 5, 0, 0)), SubmitOutcome::Accepted);
+            assert_eq!(
+                mc.add_message_outcome(1, shard_bundle(shard, 5, 0, 0)),
+                SubmitOutcome::Accepted
+            );
         }
         let first = mc.snapshot_for_execution(1, budget, 100).unwrap();
         assert_eq!(shards_of(&first).len(), 2);
         mc.mark_finalized(&first);
         for &shard in &all {
-            assert_eq!(mc.add_message_outcome(2, shard_bundle(shard, 6, 0, 0)), SubmitOutcome::Accepted);
+            assert_eq!(
+                mc.add_message_outcome(2, shard_bundle(shard, 6, 0, 0)),
+                SubmitOutcome::Accepted
+            );
         }
         let second = mc.snapshot_for_execution(2, budget, 100).unwrap();
-        assert_eq!(shards_of(&second), &all - &shards_of(&first), "the shards left out go next");
+        assert_eq!(
+            shards_of(&second),
+            &all - &shards_of(&first),
+            "the shards left out go next"
+        );
 
         // `second` executed but not finalized: one of its shards has a newer
         // frame, which still waits behind the shards `first` carried.
         let carried = *shards_of(&second).iter().next().unwrap();
-        assert_eq!(mc.add_message_outcome(3, shard_bundle(carried, 7, 0, 0)), SubmitOutcome::Accepted);
+        assert_eq!(
+            mc.add_message_outcome(3, shard_bundle(carried, 7, 0, 0)),
+            SubmitOutcome::Accepted
+        );
         let third: Vec<_> = mc
             .snapshot_for_proposal(3, budget, 100, None, &second)
             .unwrap()
@@ -2000,8 +2756,16 @@ mod tests {
     fn a_proposal_copies_no_proof_its_frame_cannot_carry() {
         let mc = MessageCollector::new();
         mc.add_message(1, shard_bundle(0x11, 5, 0, 0)); // anchored to GLOBAL frame 99
-        assert_eq!(mc.snapshot_for_proposal(1, 4096, 100, Some(112), &[]).unwrap().len(), 1);
-        assert!(mc.snapshot_for_proposal(1, 4096, 100, Some(113), &[]).unwrap().is_empty());
+        assert_eq!(
+            mc.snapshot_for_proposal(1, 4096, 100, Some(112), &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(mc
+            .snapshot_for_proposal(1, 4096, 100, Some(113), &[])
+            .unwrap()
+            .is_empty());
     }
 
     /// A shard's copied candidates are those its leader would examine: its
@@ -2057,14 +2821,21 @@ mod tests {
             entered.recv().unwrap();
             let b = admit(second.clone());
             std::thread::sleep(Duration::from_millis(200));
-            assert_eq!(calls.load(SeqCst), 1, "the second copy waits instead of verifying");
+            assert_eq!(
+                calls.load(SeqCst),
+                1,
+                "the second copy waits instead of verifying"
+            );
             drop(release);
             if first_valid {
                 assert_eq!(a.join().unwrap(), SubmitOutcome::Accepted);
                 assert_eq!(b.join().unwrap(), SubmitOutcome::Duplicate);
                 assert_eq!(calls.load(SeqCst), 1);
             } else {
-                assert_eq!(a.join().unwrap(), SubmitOutcome::Filtered(Refusal::InvalidShardFrame));
+                assert_eq!(
+                    a.join().unwrap(),
+                    SubmitOutcome::Filtered(Refusal::InvalidShardFrame)
+                );
                 assert_eq!(b.join().unwrap(), SubmitOutcome::Accepted);
                 assert_eq!(calls.load(SeqCst), 2);
             }
@@ -2090,19 +2861,27 @@ mod tests {
         let busy: Vec<_> = (0..MAX_CONCURRENT_VERIFICATIONS as u8)
             .map(|shard| {
                 let mc = mc.clone();
-                let handle = std::thread::spawn(move || mc.add_message_outcome(1, shard_bundle(0x20 + shard, 5, 0, 0)));
+                let handle = std::thread::spawn(move || {
+                    mc.add_message_outcome(1, shard_bundle(0x20 + shard, 5, 0, 0))
+                });
                 entered.recv().unwrap();
                 handle
             })
             .collect();
         let late = shard_bundle(0x11, 5, 0, 0);
-        assert_eq!(mc.add_message_outcome(1, late.clone()), SubmitOutcome::Accepted);
+        assert_eq!(
+            mc.add_message_outcome(1, late.clone()),
+            SubmitOutcome::Accepted
+        );
         assert!(!mc.is_verified(&late));
         drop(release);
         for handle in busy {
             assert_eq!(handle.join().unwrap(), SubmitOutcome::Accepted);
         }
-        assert_eq!(mc.verifications.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            mc.verifications.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     /// The shard index follows proofs that move between ranks.
@@ -2111,11 +2890,87 @@ mod tests {
         let mc = MessageCollector::new();
         let (verifier, _) = counting_verifier(|_| ShardFrameVerdict::Valid);
         mc.set_shard_frame_verifier(verifier);
-        assert_eq!(mc.add_message_outcome(3, shard_bundle(0x11, 5, 0, 0)), SubmitOutcome::Accepted);
-        assert_eq!(mc.add_message_outcome(3, b"join".to_vec()), SubmitOutcome::Accepted);
+        assert_eq!(
+            mc.add_message_outcome(3, shard_bundle(0x11, 5, 0, 0)),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.add_message_outcome(3, b"join".to_vec()),
+            SubmitOutcome::Accepted
+        );
         mc.rebase_ranks();
         assert!(mc.is_verified(&shard_bundle(0x11, 5, 0, 0)));
-        assert_eq!(mc.add_message_outcome(1, shard_bundle(0x11, 6, 0, 0)), SubmitOutcome::Accepted);
-        assert_eq!(mc.collect_for_rank(1), vec![b"join".to_vec(), shard_bundle(0x11, 6, 0, 0)]);
+        assert_eq!(
+            mc.add_message_outcome(1, shard_bundle(0x11, 6, 0, 0)),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.collect_for_rank(1),
+            vec![b"join".to_vec(), shard_bundle(0x11, 6, 0, 0)]
+        );
+    }
+
+    /// A rank that stays full refuses thousands of submits: the log shows the
+    /// first, one line per interval with the count, and the end.
+    #[test]
+    fn full_rank_refusals_log_a_bounded_summary() {
+        use crate::outage::test_logs::CapturedLogs;
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        let mc = MessageCollector::new();
+        for i in 0..MAX_MESSAGES_PER_RANK as u64 {
+            assert_eq!(
+                mc.add_message_outcome(1, i.to_be_bytes().to_vec()),
+                SubmitOutcome::Accepted
+            );
+        }
+        assert!(logs.lines_with("rank buffer full").is_empty());
+        for i in 0..1_000u64 {
+            let data = (MAX_MESSAGES_PER_RANK as u64 + i).to_be_bytes().to_vec();
+            assert_eq!(
+                mc.add_message_outcome(1, data),
+                SubmitOutcome::Filtered(Refusal::RankFull)
+            );
+        }
+        let first = logs.lines_with("refusing submits");
+        assert_eq!(first.len(), 1, "{first:?}");
+        for field in [
+            "WARN",
+            "rank=1",
+            "refused=1 ",
+            "pending=65536",
+            "ranks_held=1",
+        ] {
+            assert!(first[0].contains(field), "{field}: {}", first[0]);
+        }
+        // Within the interval nothing more; after it, one line with the count.
+        let state = || RankFullState {
+            rank: 1,
+            pending: MAX_MESSAGES_PER_RANK,
+            pending_bytes: 0,
+            ranks_held: 1,
+        };
+        let now = Instant::now();
+        mc.note_rank_full(now + RANK_FULL_LOG_EVERY / 2, state());
+        assert_eq!(logs.lines_with("refusing submits").len(), 1);
+        mc.note_rank_full(now + RANK_FULL_LOG_EVERY + Duration::from_secs(1), state());
+        let lines = logs.lines_with("refusing submits");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("refused=1001 "), "{}", lines[1]);
+        // The rank advances: submits are accepted and the end is logged once.
+        assert_eq!(
+            mc.add_message_outcome(2, b"next".to_vec()),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(
+            mc.add_message_outcome(2, b"after".to_vec()),
+            SubmitOutcome::Accepted
+        );
+        let ended = logs.lines_with("accepting submits again");
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        for field in ["INFO", "rank=2", "refused_total=1002"] {
+            assert!(ended[0].contains(field), "{field}: {}", ended[0]);
+        }
+        assert_eq!(logs.lines_with("rank buffer full").len(), 2);
     }
 }

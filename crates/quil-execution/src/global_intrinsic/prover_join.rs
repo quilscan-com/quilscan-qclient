@@ -16,15 +16,15 @@
 //! [u32 BE proof_len] [proof_len bytes]
 //! ```
 
-use quil_types::error::{QuilError, Result};
-use crate::canonical_cursor::{put_u32, put_u64, read_u32, read_u64, read_bytes};
-use super::sig_with_pop::SignatureWithPop;
 use super::seniority_merge::SeniorityMerge;
+use super::sig_with_pop::SignatureWithPop;
+use crate::canonical_cursor::{put_u32, put_u64, read_bytes, read_u32, read_u64};
+use quil_types::error::{QuilError, Result};
 
 pub const TYPE_PROVER_JOIN: u32 = 0x0301;
 
-const MAX_FILTERS: u32 = 100;
-const MAX_FILTER_LEN: u32 = 64;
+const MAX_FILTERS: u32 = super::prover_ops::MAX_FILTERS_PER_OP as u32;
+const MAX_FILTER_LEN: u32 = super::prover_ops::MAX_FILTER_LEN as u32;
 const MAX_SIG_LEN: u32 = 2249; // Falcon SignatureWithPop: 4+(4+666)+(4+901)+(4+666)
 const MAX_DELEGATE_ADDR_LEN: u32 = 32;
 const MAX_MERGE_TARGET_LEN: u32 = 675;
@@ -93,7 +93,8 @@ impl ProverJoin {
         let tp = read_u32(data, &mut cursor)?;
         if tp != TYPE_PROVER_JOIN {
             return Err(QuilError::InvalidArgument(format!(
-                "ProverJoin: invalid type prefix 0x{:08x}", tp
+                "ProverJoin: invalid type prefix 0x{:08x}",
+                tp
             )));
         }
 
@@ -101,7 +102,8 @@ impl ProverJoin {
         let fc = read_u32(data, &mut cursor)?;
         if fc > MAX_FILTERS {
             return Err(QuilError::InvalidArgument(format!(
-                "ProverJoin: invalid filter count {}", fc
+                "ProverJoin: invalid filter count {}",
+                fc
             )));
         }
         let mut filters = Vec::with_capacity(fc as usize);
@@ -109,7 +111,8 @@ impl ProverJoin {
             let fl = read_u32(data, &mut cursor)?;
             if fl > MAX_FILTER_LEN {
                 return Err(QuilError::InvalidArgument(format!(
-                    "ProverJoin: invalid filter length {}", fl
+                    "ProverJoin: invalid filter length {}",
+                    fl
                 )));
             }
             filters.push(read_bytes(data, &mut cursor, fl as usize)?);
@@ -121,7 +124,8 @@ impl ProverJoin {
         let sl = read_u32(data, &mut cursor)?;
         if sl > MAX_SIG_LEN {
             return Err(QuilError::InvalidArgument(format!(
-                "ProverJoin: invalid signature length {}", sl
+                "ProverJoin: invalid signature length {}",
+                sl
             )));
         }
         let public_key_signature_bls48581 = if sl > 0 {
@@ -135,7 +139,8 @@ impl ProverJoin {
         let dal = read_u32(data, &mut cursor)?;
         if dal > MAX_DELEGATE_ADDR_LEN {
             return Err(QuilError::InvalidArgument(format!(
-                "ProverJoin: invalid delegate address length {}", dal
+                "ProverJoin: invalid delegate address length {}",
+                dal
             )));
         }
         let delegate_address = read_bytes(data, &mut cursor, dal as usize)?;
@@ -149,7 +154,8 @@ impl ProverJoin {
             let mtl = read_u32(data, &mut cursor)?;
             if mtl > MAX_MERGE_TARGET_LEN {
                 return Err(QuilError::InvalidArgument(format!(
-                    "ProverJoin: invalid merge target length {}", mtl
+                    "ProverJoin: invalid merge target length {}",
+                    mtl
                 )));
             }
             let mb = read_bytes(data, &mut cursor, mtl as usize)?;
@@ -160,7 +166,8 @@ impl ProverJoin {
         let pl = read_u32(data, &mut cursor)?;
         if pl > MAX_PROOF_LEN {
             return Err(QuilError::InvalidArgument(format!(
-                "ProverJoin: invalid proof length {}", pl
+                "ProverJoin: invalid proof length {}",
+                pl
             )));
         }
         let proof = read_bytes(data, &mut cursor, pl as usize)?;

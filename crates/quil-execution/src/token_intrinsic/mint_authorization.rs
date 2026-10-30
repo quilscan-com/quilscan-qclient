@@ -1,13 +1,13 @@
 //! Global mint authorization record for later app-side consumption.
 //! Record construction alone confers no authority: only a membership proof
 //! against a consensus-authenticated global root can authorize app outputs.
+#[cfg(test)]
+use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use quil_lattice_ct::confidential::{
     transfer::{parameter_context, Output},
     MAX_PRIVATE_COINS,
 };
 use quil_types::error::{QuilError, Result};
-#[cfg(test)]
-use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use sha3::{Digest, Sha3_256, Sha3_384};
 
 /// Stable identity shared by global execution and the claiming wallet.
@@ -26,19 +26,39 @@ pub fn claim_from_witness(
     s: &quil_lattice_ct::confidential::mint::MintStatement,
     witness: quil_types::store::MintAuthorizationWitnessData,
 ) -> Result<quil_lattice_ct::confidential::mint_claim::MintClaim> {
-    if s.application != crate::domains::QUIL_TOKEN { return Err(invalid()); }
+    if s.application != crate::domains::QUIL_TOKEN {
+        return Err(invalid());
+    }
     if !witness.found {
         // Not yet visible at a global root this node retains; retry later.
         return Err(QuilError::ExecutionUnavailable(
             "mint authorization not yet finalized at a retained global root".into(),
         ));
     }
-    let root = witness.global_root.as_slice().try_into().map_err(|_| invalid())?;
+    let root = witness
+        .global_root
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid())?;
     let receipt = receipt_address(s)?;
-    verify_membership(&s.network, &s.application, &receipt, &s.outputs, s.fee, &root, &witness.forest_proof)?;
+    verify_membership(
+        &s.network,
+        &s.application,
+        &receipt,
+        &s.outputs,
+        s.fee,
+        &root,
+        &witness.forest_proof,
+    )?;
     Ok(quil_lattice_ct::confidential::mint_claim::MintClaim {
-        network: s.network, application: s.application, cited_global_frame: witness.cited_frame,
-        global_root: root, receipt, fee: s.fee, outputs: s.outputs.clone(), forest_proof: witness.forest_proof,
+        network: s.network,
+        application: s.application,
+        cited_global_frame: witness.cited_frame,
+        global_root: root,
+        receipt,
+        fee: s.fee,
+        outputs: s.outputs.clone(),
+        forest_proof: witness.forest_proof,
     })
 }
 
@@ -105,6 +125,31 @@ pub fn verify_membership(
     root: &[u8; 32],
     proof: &[u8],
 ) -> Result<()> {
+    verify_membership_with(
+        network,
+        application,
+        receipt,
+        outputs,
+        fee,
+        root,
+        proof,
+        true,
+    )
+}
+
+/// [`verify_membership`] under the consensus rule of the claim's anchor:
+/// `bind_values` from `quil_types::consensus::vertex_value_binding_active`.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_membership_with(
+    network: &[u8; 32],
+    application: &[u8; 32],
+    receipt: &[u8; 32],
+    outputs: &[Output],
+    fee: u128,
+    root: &[u8; 32],
+    proof: &[u8],
+    bind_values: bool,
+) -> Result<()> {
     if proof.len() > super::reward_witness::MAX_REWARD_PROOF_BYTES
         || proof.get(..4) != Some([1u8, 0, 0, 0].as_slice())
     {
@@ -116,10 +161,11 @@ pub fn verify_membership(
     if membership.inputs.len() != 1 || membership.inputs[0].vertex_address != address {
         return Err(invalid());
     }
-    quil_forest::verify_vertex_membership(
+    quil_forest::verify_vertex_membership_with(
         root,
         &membership.inputs[0],
         &fields(network, application, outputs, fee)?,
+        bind_values,
     )
     .map_err(|_| invalid())
 }
@@ -128,6 +174,88 @@ pub fn verify_membership(
 mod tests {
     use super::*;
     use quil_lattice_ct::confidential::{transfer::MEMO_BYTES, AmountOpening, CommitmentKey};
+
+    /// Rewrite the leaf at `key` to carry `value`, committing its original
+    /// value as `hash_target` and trimming the stored (recomputed)
+    /// commitment so the blob keeps its length.
+    fn with_unbound_value(blob: &[u8], key: &[u8], value: &[u8]) -> Vec<u8> {
+        fn rewrite(node: &mut quil_tries::VectorCommitmentNode, key: &[u8], value: &[u8]) -> bool {
+            match node {
+                quil_tries::VectorCommitmentNode::Leaf(leaf) if leaf.key == key => {
+                    leaf.hash_target = std::mem::replace(&mut leaf.value, value.to_vec());
+                    let keep = leaf.commitment.len() - value.len();
+                    leaf.commitment.truncate(keep);
+                    true
+                }
+                quil_tries::VectorCommitmentNode::Leaf(_) => false,
+                quil_tries::VectorCommitmentNode::Branch(branch) => branch
+                    .children
+                    .iter_mut()
+                    .flatten()
+                    .any(|child| rewrite(child, key, value)),
+            }
+        }
+        let mut root = quil_tries::deserialize_go_tree(blob).unwrap().unwrap();
+        assert!(rewrite(&mut root, key, value));
+        quil_tries::serialize_go_tree(Some(&root)).unwrap()
+    }
+
+    /// A record whose outputs-hash leaf commits the authorized hash as its
+    /// `hash_target` keeps the committed record while naming other outputs.
+    /// Under the binding rule only the authorized outputs verify.
+    #[test]
+    fn mint_authorization_rejects_outputs_its_record_does_not_bind() {
+        let network = [1; 32];
+        let app = crate::domains::QUIL_TOKEN;
+        let context = parameter_context(&network, &app);
+        let key = CommitmentKey::derive(&context);
+        let opening = AmountOpening::from_seed(&context, &[2; 32]);
+        let output = |amount: u128, owner: u8| Output {
+            commitment: key.commit(amount, &opening),
+            owner: [owner; IDENTITY_BYTES],
+            memo: [4; MEMO_BYTES],
+        };
+        let authorized = vec![output(7, 3)];
+        let other = vec![output(7_000_000, 5)];
+        let receipt = [6; 32];
+        let blob = create_record(&network, &app, &authorized, 2).unwrap();
+        let other_hash = fields(&network, &app, &other, 2).unwrap()[2].1.clone();
+        let forged_blob = with_unbound_value(&blob, &[4], &other_hash);
+        let leaf = quil_tries::vertex_leaf_value(&blob).unwrap();
+        assert_eq!(quil_tries::vertex_leaf_value(&forged_blob).unwrap(), leaf);
+        let forest = quil_forest::Forest::in_memory();
+        let root = forest
+            .commit_shard_phase_raw(
+                b"authorization-test",
+                quil_forest::Phase::VertexAdds,
+                0,
+                [(receipt.to_vec(), leaf)],
+            )
+            .unwrap();
+        let mut address = crate::domains::GLOBAL.to_vec();
+        address.extend_from_slice(&receipt);
+        let prove = |blob: &[u8]| {
+            let membership = forest
+                .build_vertex_membership_proof(
+                    b"authorization-test",
+                    quil_forest::Phase::VertexAdds,
+                    0,
+                    &address,
+                    blob,
+                )
+                .unwrap();
+            quil_forest::MembershipProof {
+                inputs: vec![membership],
+            }
+            .to_bytes()
+        };
+        let honest = prove(&blob);
+        let forged = prove(&forged_blob);
+        verify_membership(&network, &app, &receipt, &authorized, 2, &root, &honest).unwrap();
+        verify_membership_with(&network, &app, &receipt, &other, 2, &root, &forged, false)
+            .expect("the legacy rule reads the unbound outputs hash");
+        assert!(verify_membership(&network, &app, &receipt, &other, 2, &root, &forged).is_err());
+    }
 
     #[test]
     fn mint_authorization_binds_destination_outputs_fee_and_receipt() {
@@ -150,10 +278,18 @@ mod tests {
         ];
         // Structural statement only: native validity is covered by the full mint test.
         let statement = quil_lattice_ct::confidential::mint::MintStatement {
-            network, application: app, cited_frame: 1, reward_root: [8; 32], fee: 2,
+            network,
+            application: app,
+            cited_frame: 1,
+            reward_root: [8; 32],
+            fee: 2,
             claims: vec![quil_lattice_ct::confidential::mint::RewardClaim {
-                owner: [8; 32], value: 18, public_key: [0; 897], forest_proof: vec![1],
-            }], outputs: outputs.clone(),
+                owner: [8; 32],
+                value: 18,
+                public_key: [0; 897],
+                forest_proof: vec![1],
+            }],
+            outputs: outputs.clone(),
         };
         let receipt = receipt_address(&statement).unwrap();
         let blob = create_record(&network, &app, &outputs, 2).unwrap();
@@ -185,7 +321,10 @@ mod tests {
         }
         .to_bytes();
         let witness = quil_types::store::MintAuthorizationWitnessData {
-            found: true, cited_frame: 9, global_root: root.to_vec(), forest_proof: proof.clone(),
+            found: true,
+            cited_frame: 9,
+            global_root: root.to_vec(),
+            forest_proof: proof.clone(),
         };
         let from_witness = claim_from_witness(&statement, witness.clone()).unwrap();
         assert_eq!(from_witness.outputs, outputs);
@@ -239,9 +378,7 @@ mod tests {
         assert!(proof.len() < super::super::reward_witness::MAX_REWARD_PROOF_BYTES);
         #[cfg(feature = "native-proof")]
         {
-            use super::super::{
-                mint_claim::verify_from_clock, state::SnapshotLimits,
-            };
+            use super::super::{mint_claim::verify_from_clock, state::SnapshotLimits};
             use quil_types::{
                 execution::FrameExecutionContext,
                 proto::global::{GlobalFrame, GlobalFrameHeader},
@@ -250,10 +387,13 @@ mod tests {
             let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
             let context = FrameExecutionContext {
                 frame_number: 2,
-                finalized_global_frame: Some(9), venue: None, shard: quil_types::execution::ShardPath::WHOLE
+                finalized_global_frame: Some(9),
+                venue: None,
+                shard: quil_types::execution::ShardPath::WHOLE,
             };
-            let verify =
-                |context| verify_from_clock(clock.as_ref(), context, &network, &app, &claim_bytes, 2);
+            let verify = |context| {
+                verify_from_clock(clock.as_ref(), context, &network, &app, &claim_bytes, 2)
+            };
             assert!(matches!(
                 verify(context),
                 Err(QuilError::ExecutionUnavailable(_))
@@ -293,8 +433,8 @@ mod tests {
             // A real typed authorization membership proof can be consumed
             // through either venue. This fixture does not run native mint
             // proving; the global root above is seeded explicitly.
-            use quil_types::execution::ShardExecutionEngine;
             use crate::engines::{ExecutionMode, TokenExecutionEngine};
+            use quil_types::execution::ShardExecutionEngine;
             for mode in [ExecutionMode::Global, ExecutionMode::Application] {
                 let local = Arc::new(quil_hypergraph::HypergraphCrdt::new(
                     Arc::new(quil_hypergraph::testing::MemStore::new()),
@@ -302,60 +442,127 @@ mod tests {
                 ));
                 let view = crate::hypergraph_state::HypergraphState::new(local.clone());
                 let stubs = crate::testing::NoopExecutionCrypto::new();
-                let engine = TokenExecutionEngine::new_with_state(mode,
-                    Arc::new(quil_types::crypto::NoopInclusionProver), local,
-                    stubs.key_manager, clock.clone(),
-                ).with_token_proofs(super::super::dispatch::TokenPolicy {
+                let engine = TokenExecutionEngine::new_with_state(
+                    mode,
+                    Arc::new(quil_types::crypto::NoopInclusionProver),
+                    local,
+                    stubs.key_manager,
+                    clock.clone(),
+                )
+                .with_token_proofs(super::super::dispatch::TokenPolicy {
                     network,
                     limits: quil_lattice_ct::confidential::transfer::CompileLimits {
-                        max_inputs: 2, max_outputs: 2, max_depth: 32,
+                        max_inputs: 2,
+                        max_outputs: 2,
+                        max_depth: 32,
                     },
                     snapshots: limits,
-                    native_budget: quil_lattice_ct::confidential::relation::backend::native::NativeBudget {
-                        max_native_bytes: 0,
-                    },
-                }).unwrap();
-                let message = crate::message_envelope::CanonicalMessageRequest::wrap(claim_bytes.clone())
-                    .unwrap().to_canonical_bytes().unwrap();
+                    native_budget:
+                        quil_lattice_ct::confidential::relation::backend::native::NativeBudget {
+                            max_native_bytes: 0,
+                        },
+                })
+                .unwrap();
+                let message =
+                    crate::message_envelope::CanonicalMessageRequest::wrap(claim_bytes.clone())
+                        .unwrap()
+                        .to_canonical_bytes()
+                        .unwrap();
                 engine.validate_message(10, &app, &message).unwrap();
                 // A shard holding only part of the application runs it too: it
                 // verifies and relays, and the global frame decides. Nothing is
                 // written there, whatever part of the application it holds.
                 for partial in [
                     quil_types::execution::ShardPath::from_bits(&[false]),
-                    quil_types::execution::ShardPath::from_bits(&[true, false, true, true, false, true]),
+                    quil_types::execution::ShardPath::from_bits(&[
+                        true, false, true, true, false, true,
+                    ]),
                 ] {
-                    engine.process_message_with_context(FrameExecutionContext {
-                        frame_number: 10,
-                        finalized_global_frame: Some(9),
-                        venue: Some(quil_types::execution::Venue::Application), shard: partial,
-                    }, &0.into(), &app, &message).unwrap();
-                    assert!(super::super::roots::read_current(&view, &network, &app).unwrap().is_none());
+                    engine
+                        .process_message_with_context(
+                            FrameExecutionContext {
+                                frame_number: 10,
+                                finalized_global_frame: Some(9),
+                                venue: Some(quil_types::execution::Venue::Application),
+                                shard: partial,
+                            },
+                            &0.into(),
+                            &app,
+                            &message,
+                        )
+                        .unwrap();
+                    assert!(super::super::roots::read_current(&view, &network, &app)
+                        .unwrap()
+                        .is_none());
                 }
                 // An app-shard frame names its venue: replayed by a node whose
                 // engine is the global venue (an archive), it only verifies —
                 // it never commits inline outside a global frame.
-                engine.process_message_with_context(FrameExecutionContext {
-                    frame_number: 10, finalized_global_frame: Some(9), shard: quil_types::execution::ShardPath::WHOLE,
-                    venue: Some(quil_types::execution::Venue::Application),
-                }, &0.into(), &app, &message).unwrap();
-                assert!(super::super::roots::read_current(&view, &network, &app).unwrap().is_none());
+                engine
+                    .process_message_with_context(
+                        FrameExecutionContext {
+                            frame_number: 10,
+                            finalized_global_frame: Some(9),
+                            shard: quil_types::execution::ShardPath::WHOLE,
+                            venue: Some(quil_types::execution::Venue::Application),
+                        },
+                        &0.into(),
+                        &app,
+                        &message,
+                    )
+                    .unwrap();
+                assert!(super::super::roots::read_current(&view, &network, &app)
+                    .unwrap()
+                    .is_none());
                 if mode == ExecutionMode::Global {
                     // An explicit anchor is authoritative in either venue and
                     // bounds the citation: anchor 8 cannot admit frame 9's root.
-                    engine.process_message_with_context(FrameExecutionContext {
-                        frame_number: 100, finalized_global_frame: Some(8), venue: None, shard: quil_types::execution::ShardPath::WHOLE
-                    }, &0.into(), &app, &message).unwrap_err();
-                    assert!(super::super::roots::read_current(&view, &network, &app).unwrap().is_none());
+                    engine
+                        .process_message_with_context(
+                            FrameExecutionContext {
+                                frame_number: 100,
+                                finalized_global_frame: Some(8),
+                                venue: None,
+                                shard: quil_types::execution::ShardPath::WHOLE,
+                            },
+                            &0.into(),
+                            &app,
+                            &message,
+                        )
+                        .unwrap_err();
+                    assert!(super::super::roots::read_current(&view, &network, &app)
+                        .unwrap()
+                        .is_none());
                 }
-                engine.process_message_with_context(FrameExecutionContext {
-                    frame_number: 10,
-                    finalized_global_frame: if mode == ExecutionMode::Global { None } else { Some(9) }, venue: None, shard: quil_types::execution::ShardPath::WHOLE
-                }, &0.into(), &app, &message).unwrap();
+                engine
+                    .process_message_with_context(
+                        FrameExecutionContext {
+                            frame_number: 10,
+                            finalized_global_frame: if mode == ExecutionMode::Global {
+                                None
+                            } else {
+                                Some(9)
+                            },
+                            venue: None,
+                            shard: quil_types::execution::ShardPath::WHOLE,
+                        },
+                        &0.into(),
+                        &app,
+                        &message,
+                    )
+                    .unwrap();
                 let accepted = super::super::roots::read_current(&view, &network, &app).unwrap();
-                let replay = engine.process_message_with_context(FrameExecutionContext {
-                    frame_number: 11, finalized_global_frame: Some(9), venue: None, shard: quil_types::execution::ShardPath::WHOLE
-                }, &0.into(), &app, &message);
+                let replay = engine.process_message_with_context(
+                    FrameExecutionContext {
+                        frame_number: 11,
+                        finalized_global_frame: Some(9),
+                        venue: None,
+                        shard: quil_types::execution::ShardPath::WHOLE,
+                    },
+                    &0.into(),
+                    &app,
+                    &message,
+                );
                 if mode == ExecutionMode::Global {
                     // The global venue commits inline: outputs placed, and the
                     // receipt consumed once.
@@ -368,14 +575,27 @@ mod tests {
                     assert!(accepted.is_none());
                     replay.unwrap();
                 }
-                assert_eq!(super::super::roots::read_current(&view, &network, &app).unwrap(), accepted);
+                assert_eq!(
+                    super::super::roots::read_current(&view, &network, &app).unwrap(),
+                    accepted
+                );
             }
             // The claim commits like every other confidential operation; the
             // last app-path group contains two data bits in a full vertex ID.
             let tp = crate::token_engine::TYPE_LATTICE_MINT_CLAIM;
-            let commit = |frame| crate::token_intrinsic::commit_apply::commit_and_place(
-                &state, frame, &network, &app, tp, &claim_bytes, limits);
-            crdt.set_covered_prefix(&quil_tries::get_full_path(&app)).unwrap();
+            let commit = |frame| {
+                crate::token_intrinsic::commit_apply::commit_and_place(
+                    &state,
+                    frame,
+                    &network,
+                    &app,
+                    tp,
+                    &claim_bytes,
+                    limits,
+                )
+            };
+            crdt.set_covered_prefix(&quil_tries::get_full_path(&app))
+                .unwrap();
             assert!(matches!(commit(2), Err(QuilError::ExecutionUnavailable(_))));
             assert_eq!(state.changeset_len(), 0);
             crdt.set_covered_prefix(&[]).unwrap();
@@ -434,6 +654,84 @@ mod tests {
             claim_bytes.len()
         );
     }
+
+    /// A mint authorization record commits the hash of its authorized outputs.
+    /// A proof whose outputs-hash leaf carries another hash, with the
+    /// authorized hash moved to its `hash_target`, still matches the committed
+    /// record; it must not authorize those other outputs.
+    #[test]
+    fn reproduces_forged_mint_output_accepted() {
+        fn rewrite(node: &mut quil_tries::VectorCommitmentNode, key: &[u8], value: &[u8]) -> bool {
+            match node {
+                quil_tries::VectorCommitmentNode::Leaf(leaf) if leaf.key == key => {
+                    leaf.hash_target = std::mem::replace(&mut leaf.value, value.to_vec());
+                    let keep = leaf.commitment.len() - value.len();
+                    leaf.commitment.truncate(keep);
+                    true
+                }
+                quil_tries::VectorCommitmentNode::Leaf(_) => false,
+                quil_tries::VectorCommitmentNode::Branch(branch) => branch
+                    .children
+                    .iter_mut()
+                    .flatten()
+                    .any(|child| rewrite(child, key, value)),
+            }
+        }
+        let network = [1; 32];
+        let app = crate::domains::QUIL_TOKEN;
+        let context = parameter_context(&network, &app);
+        let key = CommitmentKey::derive(&context);
+        let opening = AmountOpening::from_seed(&context, &[2; 32]);
+        let output = |amount: u128, owner: u8| Output {
+            commitment: key.commit(amount, &opening),
+            owner: [owner; IDENTITY_BYTES],
+            memo: [4; MEMO_BYTES],
+        };
+        let authorized = vec![output(7, 3)];
+        let other = vec![output(7_000_000, 5)];
+        let receipt = [6; 32];
+        let blob = create_record(&network, &app, &authorized, 2).unwrap();
+        let other_hash = fields(&network, &app, &other, 2).unwrap()[2].1.clone();
+        let mut node = quil_tries::deserialize_go_tree(&blob).unwrap().unwrap();
+        assert!(rewrite(&mut node, &[4], &other_hash));
+        let forged_blob = quil_tries::serialize_go_tree(Some(&node)).unwrap();
+        let leaf = quil_tries::vertex_leaf_value(&blob).unwrap();
+        assert_eq!(quil_tries::vertex_leaf_value(&forged_blob).unwrap(), leaf);
+        let forest = quil_forest::Forest::in_memory();
+        let root = forest
+            .commit_shard_phase_raw(
+                b"authorization-test",
+                quil_forest::Phase::VertexAdds,
+                0,
+                [(receipt.to_vec(), leaf)],
+            )
+            .unwrap();
+        let mut address = crate::domains::GLOBAL.to_vec();
+        address.extend_from_slice(&receipt);
+        let prove = |blob: &[u8]| {
+            let membership = forest
+                .build_vertex_membership_proof(
+                    b"authorization-test",
+                    quil_forest::Phase::VertexAdds,
+                    0,
+                    &address,
+                    blob,
+                )
+                .unwrap();
+            quil_forest::MembershipProof {
+                inputs: vec![membership],
+            }
+            .to_bytes()
+        };
+        let honest = prove(&blob);
+        let forged = prove(&forged_blob);
+        verify_membership(&network, &app, &receipt, &authorized, 2, &root, &honest).unwrap();
+        assert!(
+            verify_membership(&network, &app, &receipt, &other, 2, &root, &forged).is_err(),
+            "forged mint outputs accepted: the membership proof verified outputs \
+             the authorization record does not bind"
+        );
+    }
 }
 
 /// The canonical GLOBAL prover-shard root committed by global frame
@@ -455,7 +753,9 @@ pub(crate) fn clock_reward_root(
     let frame = clock
         .get_global_clock_frame(cited_frame)
         .map_err(|e| unavailable(format!("cannot load canonical global reward frame: {e}")))?;
-    let header = frame.header.ok_or_else(|| unavailable("global reward frame has no header".into()))?;
+    let header = frame
+        .header
+        .ok_or_else(|| unavailable("global reward frame has no header".into()))?;
     if header.frame_number != cited_frame {
         return Err(unavailable("global reward frame number mismatch".into()));
     }

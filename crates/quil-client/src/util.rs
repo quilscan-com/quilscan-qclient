@@ -2,10 +2,13 @@
 
 use num_bigint::BigInt;
 
-/// The QUIL conversion factor `0x1DCD65000` = 8,000,000,000 base units
-/// per QUIL (`client/cmd/token/balance.go:94`).
+/// Base units per QUIL: `0x1DCD65000` = 8,000,000,000
+/// (`client/cmd/token/balance.go:94`).
+pub const UNITS_PER_QUIL: u64 = 0x1_DCD6_5000;
+
+/// [`UNITS_PER_QUIL`] as a [`BigInt`].
 pub fn conversion_factor() -> BigInt {
-    BigInt::from(0x1_DCD6_5000_u64)
+    BigInt::from(UNITS_PER_QUIL)
 }
 
 /// Parse a user-entered **decimal QUIL** amount (integer or fractional, e.g.
@@ -72,7 +75,8 @@ pub fn float_string_12(num: &BigInt, den: &BigInt) -> String {
     const PREC: u32 = 12;
     let scale = BigInt::from(10).pow(PREC);
 
-    let negative = (num.sign() == num_bigint::Sign::Minus) ^ (den.sign() == num_bigint::Sign::Minus);
+    let negative =
+        (num.sign() == num_bigint::Sign::Minus) ^ (den.sign() == num_bigint::Sign::Minus);
     let num_abs = num.magnitude();
     let den_abs = den.magnitude();
     let num_abs = BigInt::from(num_abs.clone());
@@ -165,6 +169,9 @@ mod tests {
     fn rounds_half_away_from_zero() {
         // den = 8e9, so 1 base unit = 0.000000000125 QUIL exactly -> 12 dp.
         let one_unit = BigInt::from(1u64);
-        assert_eq!(float_string_12(&one_unit, &conversion_factor()), "0.000000000125");
+        assert_eq!(
+            float_string_12(&one_unit, &conversion_factor()),
+            "0.000000000125"
+        );
     }
 }

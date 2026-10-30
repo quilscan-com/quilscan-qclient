@@ -49,9 +49,12 @@ libc = "0.2"
 http = "1"
 async-trait = "0.1"
 bs58 = "0.5"
+# Host (and container) memory, for the storage jobs.
+sysinfo = "0.37.2"
 
 [dev-dependencies]
 quil-store = { path = "../quil-store", features = ["test-utils"] }
+tokio = { version = "1", features = ["test-util"] }
 quil-hypergraph = { path = "../quil-hypergraph", features = ["test-utils"] }
 quil-execution = { path = "../quil-execution", features = ["testing-stubs"] }
 quil-crypto = { path = "../quil-crypto", features = ["vdf-prover"] }

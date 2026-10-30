@@ -28,11 +28,11 @@ use tracing::{debug, info};
 use quil_types::proto::global::app_shard_service_client::AppShardServiceClient;
 use quil_types::proto::global::global_service_client::GlobalServiceClient;
 use quil_types::proto::global::{
-    AppShardFrame, AppShardInfo, GetAppShardFrameRequest, GetAppShardsRequest,
-    GetForestHeadRequest, GetForestNodeRequest,
-    GetForestPreimageRequest, GetForestValueRequest, GetGlobalFrameRequest,
-    GetAppManifestRequest, GetGlobalProposalRequest, GetVertexBlobRequest, ResolveRootRequest,
-    GlobalFrame, GlobalProposal, SubmitGlobalConsensusRequest, SubmitGlobalMessageRequest,
+    AppShardFrame, AppShardInfo, GetAppManifestRequest, GetAppShardFrameRequest,
+    GetAppShardsRequest, GetForestHeadRequest, GetForestNodeRequest, GetForestPreimageRequest,
+    GetForestValueRequest, GetGlobalFrameRequest, GetGlobalProposalRequest, GetVertexBlobRequest,
+    GlobalFrame, GlobalProposal, ResolveRootRequest, SubmitGlobalConsensusRequest,
+    SubmitGlobalMessageRequest,
 };
 
 use crate::quil_tls::{build_quil_tls_cert, QuilTlsError};
@@ -145,6 +145,35 @@ static CONNECT_OUTAGES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, quil_engine::outage::Outage>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// The identity each archive endpoint this node knows the peer of must
+/// present: the mainnet genesis archives' static endpoints, and configured
+/// endpoints that name their peer. A PQNoise dial to such an endpoint that
+/// answers as anyone else fails, so neither the endpoint nor the network
+/// path to it can stand in for the archive it names. Other endpoints dial
+/// as before.
+static ARCHIVE_PEERS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, quil_p2p::PeerId>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Pin `endpoint` (`host:port`, as the pool dials it) to `peer`: every later
+/// PQNoise dial to it must reach that identity. A later pin replaces an
+/// earlier one.
+pub fn pin_archive_peer(endpoint: &str, peer: quil_p2p::PeerId) {
+    ARCHIVE_PEERS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(endpoint.to_string(), peer);
+}
+
+/// The identity pinned for `endpoint` ([`pin_archive_peer`]), if any.
+pub fn pinned_archive_peer(endpoint: &str) -> Option<quil_p2p::PeerId> {
+    ARCHIVE_PEERS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(endpoint)
+        .copied()
+}
+
 /// Record one connection attempt to `addr`; returns the transition to log.
 fn connect_outage(addr: &str, ok: bool) -> Option<quil_engine::outage::OutageEvent> {
     let now = std::time::Instant::now();
@@ -152,19 +181,69 @@ fn connect_outage(addr: &str, ok: bool) -> Option<quil_engine::outage::OutageEve
     if ok {
         outages.remove(addr)?.observe(now, true)
     } else {
-        outages.entry(addr.to_string()).or_default().observe(now, false)
+        outages
+            .entry(addr.to_string())
+            .or_default()
+            .observe(now, false)
     }
 }
 
-fn log_connect_outage(addr: &str, event: Option<quil_engine::outage::OutageEvent>, error_chain: &str) {
+fn log_connect_outage(
+    addr: &str,
+    event: Option<quil_engine::outage::OutageEvent>,
+    error_chain: &str,
+) {
     use quil_engine::outage::OutageEvent;
     match event {
-        Some(OutageEvent::Began) => tracing::warn!(%addr, error_chain, scope = "peer", action = "wait",
-            "archive connection failing; retried until the archive accepts connections again"),
-        Some(OutageEvent::Continues { secs, failures }) => tracing::warn!(%addr, secs, failures, error_chain,
-            scope = "peer", action = "wait", "archive connection still failing"),
-        Some(OutageEvent::Ended { secs, failures }) => info!(%addr, secs, failures, "archive connection recovered"),
+        Some(OutageEvent::Began) => {
+            tracing::warn!(%addr, error_chain, scope = "peer", action = "wait",
+            "archive connection failing; retried until the archive accepts connections again")
+        }
+        Some(OutageEvent::Continues { secs, failures }) => {
+            tracing::warn!(%addr, secs, failures, error_chain,
+            scope = "peer", action = "wait", "archive connection still failing")
+        }
+        Some(OutageEvent::Ended { secs, failures }) => {
+            info!(%addr, secs, failures, "archive connection recovered")
+        }
         None => {}
+    }
+}
+
+/// The runtime that dials archives for callers on a current-thread runtime
+/// and runs their channels' I/O. An in-process worker runs one: a
+/// synchronous call on its thread stalls every task there, and a PQNoise
+/// handshake stalled past the archive's 10 s deadline is dropped (the
+/// worker sees "pqnoise: io: unexpected end of file"), as is a channel
+/// that leaves the archive's keepalive pings unanswered past its timeout.
+/// Started at the first such dial; it lives as long as the process.
+fn archive_io() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("archive-io")
+            .enable_all()
+            .build()
+            .expect("failed to create the archive I/O runtime")
+    })
+}
+
+/// Whether a dial from here runs on [`archive_io`]: unless the caller's
+/// runtime has threads of its own to run it.
+fn dials_off_this_thread() -> bool {
+    !matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    )
+}
+
+/// A dial on [`archive_io`] ends with the caller that awaits it.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -224,15 +303,33 @@ impl ArchiveClient {
     /// Connect only to this worker's own master, which holds the same Falcon
     /// identity. Historical canonical frames and the archive directory rely
     /// on this pin; possession of an unrelated peer key is insufficient.
-    pub async fn connect_own_master(addr: &str, falcon_signing_key: &[u8]) -> Result<Self, ArchiveClientError> {
+    pub async fn connect_own_master(
+        addr: &str,
+        falcon_signing_key: &[u8],
+    ) -> Result<Self, ArchiveClientError> {
         let peer = quil_p2p::Keypair::falcon_from_bytes(falcon_signing_key)
             .map_err(|error| ArchiveClientError::TlsInit(format!("master identity: {error}")))?
-            .public().to_peer_id();
-        let connector = QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(peer);
+            .public()
+            .to_peer_id();
+        let connector =
+            QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(peer);
         Self::connect_pq(addr, connector).await
     }
 
-    async fn connect_pq(addr: &str, connector: QuilPqNoiseConnector) -> Result<Self, ArchiveClientError> {
+    async fn connect_pq(
+        addr: &str,
+        connector: QuilPqNoiseConnector,
+    ) -> Result<Self, ArchiveClientError> {
+        Self::dial_pq(addr, connector.pinned_for(addr), dials_off_this_thread()).await
+    }
+
+    /// [`Self::connect_pq`], on [`archive_io`] when `off_thread`, else on
+    /// the caller's runtime.
+    async fn dial_pq(
+        addr: &str,
+        connector: QuilPqNoiseConnector,
+        off_thread: bool,
+    ) -> Result<Self, ArchiveClientError> {
         // Note: scheme is `http://` — tonic's Endpoint refuses `https://`
         // unless its own `tls_config(...)` is set; we bypass that to install
         // our own PQNoise connector (no rustls/TLS on :8340 anymore).
@@ -260,7 +357,28 @@ impl ArchiveClient {
             .keep_alive_while_idle(true);
 
         debug!(%addr, "dialing archive node (PQNoise)");
-        let channel = match endpoint.connect_with_connector(connector).await {
+        let dialed = if off_thread {
+            // The channel's connection and buffer tasks run where they are
+            // spawned: the dial spawns them, and the buffer task those of a
+            // reconnect, all on `archive_io`.
+            let mut dial = AbortOnDrop(
+                archive_io().spawn(async move { endpoint.connect_with_connector(connector).await }),
+            );
+            match (&mut dial.0).await {
+                Ok(dialed) => dialed,
+                Err(error) => match error.try_into_panic() {
+                    Ok(panic) => std::panic::resume_unwind(panic),
+                    Err(error) => {
+                        return Err(ArchiveClientError::TlsInit(format!(
+                            "archive dial ended: {error}"
+                        )))
+                    }
+                },
+            }
+        } else {
+            endpoint.connect_with_connector(connector).await
+        };
+        let channel = match dialed {
             Ok(ch) => ch,
             Err(e) => {
                 // Walk the std::error::Error source chain so the actual
@@ -302,10 +420,7 @@ impl ArchiveClient {
     /// Submit a prover message (e.g. ProverJoin wrapped in MessageBundle)
     /// to the archive node for relay into the consensus pipeline.
     /// This is how Go nodes submit joins — via gRPC, not BlossomSub.
-    pub async fn submit_global_message(
-        &mut self,
-        data: Vec<u8>,
-    ) -> Result<(), ArchiveClientError> {
+    pub async fn submit_global_message(&mut self, data: Vec<u8>) -> Result<(), ArchiveClientError> {
         self.inner
             .submit_global_message(SubmitGlobalMessageRequest { data })
             .await?;
@@ -353,7 +468,11 @@ impl ArchiveClient {
     ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
         let resp = self
             .inner
-            .get_forest_node(GetForestNodeRequest { shard_id, phase, node_key })
+            .get_forest_node(GetForestNodeRequest {
+                shard_id,
+                phase,
+                node_key,
+            })
             .await?
             .into_inner();
         Ok(resp.found.then_some(resp.node))
@@ -370,10 +489,18 @@ impl ArchiveClient {
     ) -> Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
         let resp = self
             .inner
-            .get_forest_nodes(quil_types::proto::global::GetForestNodesRequest { shard_id, phase, node_keys })
+            .get_forest_nodes(quil_types::proto::global::GetForestNodesRequest {
+                shard_id,
+                phase,
+                node_keys,
+            })
             .await?
             .into_inner();
-        Ok(resp.nodes.into_iter().map(|n| n.found.then_some(n.data)).collect())
+        Ok(resp
+            .nodes
+            .into_iter()
+            .map(|n| n.found.then_some(n.data))
+            .collect())
     }
 
     /// Forest sync, batched: leaf values `(version, key_hash)` of one
@@ -386,14 +513,27 @@ impl ArchiveClient {
     ) -> Result<Vec<Option<Vec<u8>>>, ArchiveClientError> {
         let keys = keys
             .into_iter()
-            .map(|(version, key_hash)| quil_types::proto::global::ForestValueKey { version, key_hash })
+            .map(
+                |(version, key_hash)| quil_types::proto::global::ForestValueKey {
+                    version,
+                    key_hash,
+                },
+            )
             .collect();
         let resp = self
             .inner
-            .get_forest_values(quil_types::proto::global::GetForestValuesRequest { shard_id, phase, keys })
+            .get_forest_values(quil_types::proto::global::GetForestValuesRequest {
+                shard_id,
+                phase,
+                keys,
+            })
             .await?
             .into_inner();
-        Ok(resp.values.into_iter().map(|v| v.found.then_some(v.data)).collect())
+        Ok(resp
+            .values
+            .into_iter()
+            .map(|v| v.found.then_some(v.data))
+            .collect())
     }
 
     /// Forest sync, batched: vertex blobs `(id, version)` under one app
@@ -410,10 +550,18 @@ impl ArchiveClient {
             .collect();
         let resp = self
             .inner
-            .get_vertex_blobs(quil_types::proto::global::GetVertexBlobsRequest { shard_key, phase, blobs })
+            .get_vertex_blobs(quil_types::proto::global::GetVertexBlobsRequest {
+                shard_key,
+                phase,
+                blobs,
+            })
             .await?
             .into_inner();
-        Ok(resp.blobs.into_iter().map(|b| b.found.then_some(b.data)).collect())
+        Ok(resp
+            .blobs
+            .into_iter()
+            .map(|b| b.found.then_some(b.data))
+            .collect())
     }
 
     /// Forest sync, listed: leaves of one shard/phase tree with keys in
@@ -446,7 +594,9 @@ impl ArchiveClient {
             .map(|leaf| {
                 <[u8; 32]>::try_from(leaf.key_hash.as_slice())
                     .map(|key| (key, leaf.value))
-                    .map_err(|_| ArchiveClientError::MissingField("forest leaf key must be 32 bytes"))
+                    .map_err(|_| {
+                        ArchiveClientError::MissingField("forest leaf key must be 32 bytes")
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((leaves, resp.more))
@@ -462,7 +612,12 @@ impl ArchiveClient {
     ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
         let resp = self
             .inner
-            .get_forest_value(GetForestValueRequest { shard_id, phase, version, key_hash })
+            .get_forest_value(GetForestValueRequest {
+                shard_id,
+                phase,
+                version,
+                key_hash,
+            })
             .await?
             .into_inner();
         Ok(resp.found.then_some(resp.value))
@@ -494,7 +649,11 @@ impl ArchiveClient {
     ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
         let resp = self
             .inner
-            .get_forest_preimage(GetForestPreimageRequest { shard_id, phase, key_hash })
+            .get_forest_preimage(GetForestPreimageRequest {
+                shard_id,
+                phase,
+                key_hash,
+            })
             .await?
             .into_inner();
         Ok(resp.found.then_some(resp.raw_key))
@@ -517,7 +676,13 @@ impl ArchiveClient {
         // leaf value no longer matches the diff → "peer served unbound data").
         let resp = self
             .inner
-            .get_vertex_blob(GetVertexBlobRequest { shard_key, phase, id, version, exact_version: false })
+            .get_vertex_blob(GetVertexBlobRequest {
+                shard_key,
+                phase,
+                id,
+                version,
+                exact_version: false,
+            })
             .await?
             .into_inner();
         Ok(resp.found.then_some(resp.blob))
@@ -525,10 +690,19 @@ impl ArchiveClient {
 
     /// Ask this worker's authenticated master for its verified archive pool.
     pub async fn get_archive_endpoints(&mut self) -> Result<Vec<String>, ArchiveClientError> {
-        let response = self.inner.clone().max_decoding_message_size(32 * 515 + 128)
+        let response = self
+            .inner
+            .clone()
+            .max_decoding_message_size(32 * 515 + 128)
             .get_archive_endpoints(quil_types::proto::global::GetArchiveEndpointsRequest {})
-            .await?.into_inner();
-        if response.endpoints.len() > 32 || response.endpoints.iter().any(|e| e.is_empty() || e.len() > 512) {
+            .await?
+            .into_inner();
+        if response.endpoints.len() > 32
+            || response
+                .endpoints
+                .iter()
+                .any(|e| e.is_empty() || e.len() > 512)
+        {
             return Err(tonic::Status::data_loss("invalid archive directory dimensions").into());
         }
         Ok(response.endpoints)
@@ -536,14 +710,27 @@ impl ArchiveClient {
 
     /// Fetch and authenticate one bounded historical GLOBAL membership proof.
     pub async fn get_global_vertex_proof(
-        &mut self, root: [u8; 32], address: [u8; 32], allow_forward: bool,
+        &mut self,
+        root: [u8; 32],
+        address: [u8; 32],
+        allow_forward: bool,
     ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
-        let response = self.inner.clone().max_decoding_message_size(
-            quil_engine::storage_history::MAX_GLOBAL_VERTEX_PROOF_BYTES + 128,
-        ).get_global_vertex_proof(quil_types::proto::global::GetGlobalVertexProofRequest {
-            root: root.to_vec(), address: address.to_vec(), allow_forward,
-        }).await?.into_inner();
-        if !response.found { return Ok(None); }
+        let response = self
+            .inner
+            .clone()
+            .max_decoding_message_size(
+                quil_engine::storage_history::MAX_GLOBAL_VERTEX_PROOF_BYTES + 128,
+            )
+            .get_global_vertex_proof(quil_types::proto::global::GetGlobalVertexProofRequest {
+                root: root.to_vec(),
+                address: address.to_vec(),
+                allow_forward,
+            })
+            .await?
+            .into_inner();
+        if !response.found {
+            return Ok(None);
+        }
         quil_engine::storage_history::verify_global_vertex_proof(&root, &address, &response.proof)
             .map_err(|e| tonic::Status::data_loss(e.to_string()))?;
         Ok(Some(response.proof))
@@ -557,24 +744,39 @@ impl ArchiveClient {
         id: Vec<u8>,
         version: u64,
     ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
-        let resp = self.inner.get_vertex_blob(GetVertexBlobRequest {
-            shard_key, phase, id, version, exact_version: true,
-        }).await?.into_inner();
+        let resp = self
+            .inner
+            .get_vertex_blob(GetVertexBlobRequest {
+                shard_key,
+                phase,
+                id,
+                version,
+                exact_version: true,
+            })
+            .await?
+            .into_inner();
         Ok(resp.found.then_some(resp.blob))
     }
 
     /// Peer coin scan over the same authenticated :8340 channel: ask a node
-    /// that covers `domain` for one page. `Unavailable` means that peer does
+    /// that covers `domain` for one page of up to `max_coins` coins (a peer
+    /// without the field answers eight). `Unavailable` means that peer does
     /// not serve the application — try the next one, not an empty answer.
     pub async fn list_shard_coins(
         &mut self,
         domain: Vec<u8>,
         snapshot_id: Vec<u8>,
         after: Vec<u8>,
+        max_coins: u32,
     ) -> Result<quil_types::proto::global::ListShardCoinsResponse, ArchiveClientError> {
         Ok(self
             .app_shard
-            .list_shard_coins(quil_types::proto::global::ListShardCoinsRequest { domain, snapshot_id, after })
+            .list_shard_coins(quil_types::proto::global::ListShardCoinsRequest {
+                domain,
+                snapshot_id,
+                after,
+                max_coins,
+            })
             .await?
             .into_inner())
     }
@@ -587,7 +789,11 @@ impl ArchiveClient {
     ) -> Result<quil_types::proto::global::ListLegacyCoinsResponse, ArchiveClientError> {
         Ok(self
             .app_shard
-            .list_shard_legacy_coins(quil_types::proto::global::ListLegacyCoinsRequest { domain, owner, after })
+            .list_shard_legacy_coins(quil_types::proto::global::ListLegacyCoinsRequest {
+                domain,
+                owner,
+                after,
+            })
             .await?
             .into_inner())
     }
@@ -597,10 +803,18 @@ impl ArchiveClient {
         domain: Vec<u8>,
         snapshot_id: Vec<u8>,
         after: Vec<u8>,
+        max_escrows: u32,
     ) -> Result<quil_types::proto::global::ListShardEscrowsResponse, ArchiveClientError> {
-        Ok(self.app_shard.list_shard_escrows(quil_types::proto::global::ListShardCoinsRequest {
-            domain, snapshot_id, after,
-        }).await?.into_inner())
+        Ok(self
+            .app_shard
+            .list_shard_escrows(quil_types::proto::global::ListShardCoinsRequest {
+                domain,
+                snapshot_id,
+                after,
+                max_coins: max_escrows,
+            })
+            .await?
+            .into_inner())
     }
 
     /// A wallet vertex read with application coverage and worker-store routing.
@@ -609,9 +823,11 @@ impl ArchiveClient {
         &mut self,
         address: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, ArchiveClientError> {
-        let vertex = self.app_shard.get_shard_vertex(
-            quil_types::proto::global::GetShardVertexRequest { address },
-        ).await?.into_inner();
+        let vertex = self
+            .app_shard
+            .get_shard_vertex(quil_types::proto::global::GetShardVertexRequest { address })
+            .await?
+            .into_inner();
         Ok(vertex.found.then_some(vertex.blob))
     }
 
@@ -625,7 +841,10 @@ impl ArchiveClient {
     ) -> Result<quil_types::proto::global::GetShardCoinWitnessesResponse, ArchiveClientError> {
         Ok(self
             .app_shard
-            .get_shard_coin_witnesses(quil_types::proto::global::GetShardCoinWitnessesRequest { domain, addresses })
+            .get_shard_coin_witnesses(quil_types::proto::global::GetShardCoinWitnessesRequest {
+                domain,
+                addresses,
+            })
             .await?
             .into_inner())
     }
@@ -642,7 +861,11 @@ impl ArchiveClient {
     ) -> Result<Option<(u64, u64)>, ArchiveClientError> {
         let resp = self
             .inner
-            .resolve_root(ResolveRootRequest { shard_id, phase, root })
+            .resolve_root(ResolveRootRequest {
+                shard_id,
+                phase,
+                root,
+            })
             .await?
             .into_inner();
         Ok(resp.found.then_some((resp.version, resp.global_frame)))
@@ -661,7 +884,11 @@ impl ArchiveClient {
     ) -> Result<Option<Vec<(Vec<u8>, Vec<u8>, u64)>>, ArchiveClientError> {
         let resp = self
             .inner
-            .get_app_manifest(GetAppManifestRequest { app_address, phase, app_root })
+            .get_app_manifest(GetAppManifestRequest {
+                app_address,
+                phase,
+                app_root,
+            })
             .await?
             .into_inner();
         if !resp.found {
@@ -683,7 +910,59 @@ impl ArchiveClient {
     ) -> Result<GlobalFrame, ArchiveClientError> {
         let resp = self
             .inner
-            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: false })
+            .get_global_frame(GetGlobalFrameRequest {
+                frame_number,
+                historical_anchor: false,
+                header_only: false,
+                if_newer_than: 0,
+            })
+            .await?
+            .into_inner();
+        resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
+    }
+
+    /// GLOBAL frame `frame_number` as its header alone, for a caller that
+    /// checks headers and their links and never reads the request bundles,
+    /// which can make a frame megabytes long. A server that predates the
+    /// `header_only` flag sends the whole frame; its bundles are dropped
+    /// here, so the answer is the same either way.
+    pub async fn get_global_frame_header_only(
+        &mut self,
+        frame_number: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_global_frame(GetGlobalFrameRequest {
+                frame_number,
+                historical_anchor: false,
+                header_only: true,
+                if_newer_than: 0,
+            })
+            .await?
+            .into_inner();
+        let mut frame = resp
+            .frame
+            .ok_or(ArchiveClientError::MissingField("frame"))?;
+        frame.requests.clear();
+        Ok(frame)
+    }
+
+    /// The latest GLOBAL frame for a poller that holds frames up to
+    /// `newer_than`: whole when the archive's head is newer, else its header
+    /// alone, which gives the archive's height without the request bundles
+    /// the poller already holds. A server that predates `if_newer_than`
+    /// sends the whole head either way; `0` asks for it whole.
+    pub async fn get_global_head(
+        &mut self,
+        newer_than: u64,
+    ) -> Result<GlobalFrame, ArchiveClientError> {
+        let resp = self
+            .inner
+            .get_global_frame(GetGlobalFrameRequest {
+                frame_number: 0,
+                if_newer_than: newer_than,
+                ..Default::default()
+            })
             .await?
             .into_inner();
         resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
@@ -700,7 +979,12 @@ impl ArchiveClient {
     ) -> Result<GlobalFrame, ArchiveClientError> {
         let resp = self
             .inner
-            .get_global_frame(GetGlobalFrameRequest { frame_number, historical_anchor: true })
+            .get_global_frame(GetGlobalFrameRequest {
+                frame_number,
+                historical_anchor: true,
+                header_only: false,
+                if_newer_than: 0,
+            })
             .await?
             .into_inner();
         resp.frame.ok_or(ArchiveClientError::MissingField("frame"))
@@ -719,7 +1003,8 @@ impl ArchiveClient {
             .get_global_proposal(GetGlobalProposalRequest { frame_number })
             .await?
             .into_inner();
-        resp.proposal.ok_or(ArchiveClientError::MissingField("proposal"))
+        resp.proposal
+            .ok_or(ArchiveClientError::MissingField("proposal"))
     }
 
     /// Fetch a committed app-shard frame by its consensus `filter` (the app's
@@ -735,7 +1020,10 @@ impl ArchiveClient {
     ) -> Result<Option<AppShardFrame>, ArchiveClientError> {
         let resp = self
             .app_shard
-            .get_app_shard_frame(GetAppShardFrameRequest { filter, frame_number })
+            .get_app_shard_frame(GetAppShardFrameRequest {
+                filter,
+                frame_number,
+            })
             .await?
             .into_inner();
         Ok(resp.frame)
@@ -755,13 +1043,22 @@ impl ArchiveClient {
             .clone()
             .max_decoding_message_size(crate::stub_services::MAX_OUTGOING_HISTORY_BYTES * 2)
             .get_shard_outgoing_history(quil_types::proto::global::GetShardOutgoingHistoryRequest {
-                filter, from_frame, through_frame,
+                filter,
+                from_frame,
+                through_frame,
             })
             .await?
             .into_inner()
             .frames;
-        if frames.iter().enumerate().any(|(i, f)| f.frame_number != from_frame + i as u64) {
-            return Err(tonic::Status::data_loss("outgoing history page is not contiguous from the requested frame").into());
+        if frames
+            .iter()
+            .enumerate()
+            .any(|(i, f)| f.frame_number != from_frame + i as u64)
+        {
+            return Err(tonic::Status::data_loss(
+                "outgoing history page is not contiguous from the requested frame",
+            )
+            .into());
         }
         Ok(frames)
     }
@@ -806,8 +1103,7 @@ impl Default for AcceptAnyServerCert {
     /// `build_quil_client_config`).
     fn default() -> Self {
         Self {
-            supported: rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms,
+            supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
         }
     }
 }
@@ -878,12 +1174,16 @@ static CLIENT_CONFIG_CACHE: std::sync::OnceLock<
 pub fn build_quil_client_config(
     falcon_signing_key: &[u8],
 ) -> Result<Arc<ClientConfig>, ArchiveClientError> {
-    let cache = CLIENT_CONFIG_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache =
+        CLIENT_CONFIG_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some(cfg) = cache.lock().unwrap().get(falcon_signing_key) {
         return Ok(cfg.clone());
     }
     let cfg = build_quil_client_config_uncached(falcon_signing_key)?;
-    cache.lock().unwrap().insert(falcon_signing_key.to_vec(), cfg.clone());
+    cache
+        .lock()
+        .unwrap()
+        .insert(falcon_signing_key.to_vec(), cfg.clone());
     Ok(cfg)
 }
 
@@ -981,7 +1281,11 @@ pub struct QuilPqNoiseConnector {
 
 impl QuilPqNoiseConnector {
     pub fn new(falcon_signing_key: Vec<u8>) -> Self {
-        Self { falcon_signing_key: Arc::new(falcon_signing_key), expected_peer: None, refused_peer: None }
+        Self {
+            falcon_signing_key: Arc::new(falcon_signing_key),
+            expected_peer: None,
+            refused_peer: None,
+        }
     }
 
     pub fn with_expected_peer(mut self, peer: quil_p2p::PeerId) -> Self {
@@ -993,6 +1297,15 @@ impl QuilPqNoiseConnector {
     pub fn refusing_peer(mut self, peer: quil_p2p::PeerId) -> Self {
         self.refused_peer = Some(peer);
         self
+    }
+
+    /// Expect the identity pinned for `addr` ([`pin_archive_peer`]) unless
+    /// this connector already expects one.
+    fn pinned_for(self, addr: &str) -> Self {
+        match (self.expected_peer, pinned_archive_peer(addr)) {
+            (None, Some(peer)) => self.with_expected_peer(peer),
+            _ => self,
+        }
     }
 }
 
@@ -1017,10 +1330,14 @@ impl Service<Uri> for QuilPqNoiseConnector {
             let port = uri.port_u16().unwrap_or(443);
             let tcp = TcpStream::connect((host.as_str(), port)).await?;
             let (peer, stream) =
-                crate::pqnoise_channel::pq_client_handshake(tcp, falcon_signing_key.as_ref()).await?;
+                crate::pqnoise_channel::pq_client_handshake(tcp, falcon_signing_key.as_ref())
+                    .await?;
             if expected_peer.is_some_and(|expected| peer != expected) {
-                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
-                    "PQNoise server identity does not match the expected peer").into());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "PQNoise server identity does not match the expected peer",
+                )
+                .into());
             }
             if refused_peer == Some(peer) {
                 return Err(Box::new(OwnEndpoint) as Box<dyn std::error::Error + Send + Sync>);
@@ -1066,10 +1383,13 @@ mod error_chain_tests {
 
     #[test]
     fn the_chain_names_every_distinct_cause_below_the_error() {
-        let error = Layer("rpc error: h2 protocol error: http2 error", Some(Box::new(Layer(
-            "http2 error",
-            Some(Box::new(Layer("keep-alive timed out", None))),
-        ))));
+        let error = Layer(
+            "rpc error: h2 protocol error: http2 error",
+            Some(Box::new(Layer(
+                "http2 error",
+                Some(Box::new(Layer("keep-alive timed out", None))),
+            ))),
+        );
         assert_eq!(super::error_chain(&error), "keep-alive timed out");
         assert_eq!(super::error_chain(&Layer("alone", None)), "");
     }
@@ -1102,10 +1422,9 @@ mod tests {
     /// forgery: present someone else's cert, sign with your own key.
     fn signing_key_from_key(falcon_sk: &[u8]) -> Arc<dyn rustls::sign::SigningKey> {
         let tls = build_quil_tls_cert(falcon_sk).unwrap();
-        let key: PrivateKeyDer<'static> =
-            rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
-                .unwrap()
-                .unwrap();
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut tls.key_pem.as_bytes())
+            .unwrap()
+            .unwrap();
         rustls::crypto::ring::sign::any_supported_type(&key).unwrap()
     }
 
@@ -1208,14 +1527,105 @@ mod tests {
     fn connection_failures_are_one_outage_per_archive() {
         use quil_engine::outage::OutageEvent;
         let (a, b) = ("192.0.2.1:8340", "192.0.2.2:8340");
-        assert_eq!(super::connect_outage(a, true), None, "a success without failures logs nothing");
+        assert_eq!(
+            super::connect_outage(a, true),
+            None,
+            "a success without failures logs nothing"
+        );
         assert_eq!(super::connect_outage(a, false), Some(OutageEvent::Began));
         assert_eq!(super::connect_outage(a, false), None, "repeats are bounded");
-        assert_eq!(super::connect_outage(b, false), Some(OutageEvent::Began), "another archive is separate");
-        assert!(matches!(super::connect_outage(a, true), Some(OutageEvent::Ended { failures: 2, .. })));
+        assert_eq!(
+            super::connect_outage(b, false),
+            Some(OutageEvent::Began),
+            "another archive is separate"
+        );
+        assert!(matches!(
+            super::connect_outage(a, true),
+            Some(OutageEvent::Ended { failures: 2, .. })
+        ));
         assert_eq!(super::connect_outage(a, true), None);
-        assert_eq!(super::connect_outage(a, false), Some(OutageEvent::Began), "a new failure begins anew");
-        assert!(matches!(super::connect_outage(b, true), Some(OutageEvent::Ended { failures: 1, .. })));
+        assert_eq!(
+            super::connect_outage(a, false),
+            Some(OutageEvent::Began),
+            "a new failure begins anew"
+        );
+        assert!(matches!(
+            super::connect_outage(b, true),
+            Some(OutageEvent::Ended { failures: 1, .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod pinned_archive_tests {
+    use super::*;
+
+    /// A dial to an endpoint pinned to an archive's identity reaches only
+    /// that identity; an endpoint without a pin, and a connector that
+    /// already expects a peer, are unchanged.
+    #[tokio::test]
+    async fn a_pinned_archive_endpoint_must_answer_as_its_archive() {
+        for pinned_to_server in [true, false] {
+            let peer_of = |key: &[u8]| {
+                quil_p2p::Keypair::falcon_from_bytes(key)
+                    .unwrap()
+                    .public()
+                    .to_peer_id()
+            };
+            let server_key = quil_p2p::generate_falcon_signing_key();
+            let server = peer_of(&server_key);
+            let other = peer_of(&quil_p2p::generate_falcon_signing_key());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let handshake = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let _ = crate::pqnoise_channel::pq_server_handshake(tcp, &server_key).await;
+            });
+            let endpoint = address.to_string();
+            pin_archive_peer(&endpoint, if pinned_to_server { server } else { other });
+            let mut connector = QuilPqNoiseConnector::new(quil_p2p::generate_falcon_signing_key())
+                .pinned_for(&endpoint);
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                connector.call(format!("http://{address}").parse().unwrap()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), pinned_to_server);
+            if let Err(error) = result {
+                assert!(
+                    error.to_string().contains("identity does not match"),
+                    "{error}"
+                );
+            }
+            let _ = handshake.await;
+            // A later test in this process may listen on the same port.
+            ARCHIVE_PEERS.write().unwrap().remove(&endpoint);
+        }
+        let key = quil_p2p::generate_falcon_signing_key();
+        assert_eq!(
+            QuilPqNoiseConnector::new(key.clone())
+                .pinned_for("192.0.2.1:8340")
+                .expected_peer,
+            None
+        );
+        let explicit = quil_p2p::Keypair::falcon_from_bytes(&key)
+            .unwrap()
+            .public()
+            .to_peer_id();
+        let pinned = quil_p2p::Keypair::falcon_from_bytes(&quil_p2p::generate_falcon_signing_key())
+            .unwrap()
+            .public()
+            .to_peer_id();
+        pin_archive_peer("192.0.2.2:8340", pinned);
+        assert_eq!(pinned_archive_peer("192.0.2.2:8340"), Some(pinned));
+        assert_eq!(
+            QuilPqNoiseConnector::new(key)
+                .with_expected_peer(explicit)
+                .pinned_for("192.0.2.2:8340")
+                .expected_peer,
+            Some(explicit)
+        );
     }
 }
 
@@ -1227,20 +1637,36 @@ mod pinned_master_tests {
     async fn master_pin_accepts_own_key_and_rejects_a_legitimate_unrelated_peer() {
         for same_key in [true, false] {
             let client_key = quil_p2p::generate_falcon_signing_key();
-            let server_key = if same_key { client_key.clone() } else { quil_p2p::generate_falcon_signing_key() };
-            let expected = quil_p2p::Keypair::falcon_from_bytes(&client_key).unwrap().public().to_peer_id();
+            let server_key = if same_key {
+                client_key.clone()
+            } else {
+                quil_p2p::generate_falcon_signing_key()
+            };
+            let expected = quil_p2p::Keypair::falcon_from_bytes(&client_key)
+                .unwrap()
+                .public()
+                .to_peer_id();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let (tcp, _) = listener.accept().await.unwrap();
-                crate::pqnoise_channel::pq_server_handshake(tcp, &server_key).await.unwrap()
+                crate::pqnoise_channel::pq_server_handshake(tcp, &server_key)
+                    .await
+                    .unwrap()
             });
             let mut connector = QuilPqNoiseConnector::new(client_key).with_expected_peer(expected);
-            let result = tokio::time::timeout(Duration::from_secs(5),
-                connector.call(format!("http://{address}").parse().unwrap())).await.unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                connector.call(format!("http://{address}").parse().unwrap()),
+            )
+            .await
+            .unwrap();
             assert_eq!(result.is_ok(), same_key);
             if let Err(error) = result {
-                assert!(error.to_string().contains("identity does not match"), "{error}");
+                assert!(
+                    error.to_string().contains("identity does not match"),
+                    "{error}"
+                );
             }
             assert_eq!(server.await.unwrap().peer_id(), expected);
         }
@@ -1250,7 +1676,11 @@ mod pinned_master_tests {
     async fn an_archive_answering_with_this_nodes_identity_is_recognized() {
         for own in [true, false] {
             let key = quil_p2p::generate_falcon_signing_key();
-            let server_key = if own { key.clone() } else { quil_p2p::generate_falcon_signing_key() };
+            let server_key = if own {
+                key.clone()
+            } else {
+                quil_p2p::generate_falcon_signing_key()
+            };
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -1277,6 +1707,350 @@ mod pinned_master_tests {
             "connection closed",
         )));
         assert!(ArchiveClientError::Rpc(closed).is_transport_failure());
-        assert!(!ArchiveClientError::Rpc(tonic::Status::not_found("frame 7 not found")).is_transport_failure());
+        assert!(
+            !ArchiveClientError::Rpc(tonic::Status::not_found("frame 7 not found"))
+                .is_transport_failure()
+        );
+    }
+}
+
+#[cfg(test)]
+mod off_thread_dial_tests {
+    use super::*;
+    use quil_types::proto::global::app_shard_service_server::AppShardServiceServer;
+    use quil_types::proto::global::FrameHeader;
+    use std::time::Instant;
+
+    /// An archive's deadline for a client's PQNoise handshake, scaled down
+    /// from its 10 s.
+    const DEADLINE: Duration = Duration::from_secs(3);
+
+    /// Serves frames whose header output has a fixed size.
+    struct Frames(usize);
+
+    #[tonic::async_trait]
+    impl crate::stub_services::AppShardFrameProvider for Frames {
+        async fn get_app_shard_frame(
+            &self,
+            _filter: Vec<u8>,
+            frame_number: u64,
+        ) -> Result<Option<AppShardFrame>, tonic::Status> {
+            let header = FrameHeader {
+                frame_number,
+                output: vec![0x5a; self.0],
+                ..Default::default()
+            };
+            Ok(Some(AppShardFrame {
+                header: Some(header),
+                ..Default::default()
+            }))
+        }
+    }
+
+    /// An archive's peer listener: a PQNoise handshake within `deadline`,
+    /// then `AppShardService` over the stream, with h2 keepalive pings at
+    /// `keepalive` (interval, timeout) when given.
+    struct Archive {
+        runtime: Option<tokio::runtime::Runtime>,
+        address: String,
+        /// Each handshake's outcome: completed, failed or timed out.
+        handshakes: std::sync::mpsc::Receiver<&'static str>,
+    }
+
+    impl Archive {
+        fn serve(
+            threads: usize,
+            deadline: Duration,
+            keepalive: Option<(Duration, Duration)>,
+            frame_bytes: usize,
+        ) -> Self {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(threads)
+                .enable_all()
+                .build()
+                .unwrap();
+            let server_key = quil_p2p::generate_falcon_signing_key();
+            let listener = runtime
+                .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+                .unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let (handshakes_tx, handshakes) = std::sync::mpsc::channel();
+            let (streams_tx, streams) = tokio::sync::mpsc::unbounded_channel();
+            runtime.spawn(async move {
+                loop {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    let (key, handshakes_tx, streams_tx) = (
+                        server_key.clone(),
+                        handshakes_tx.clone(),
+                        streams_tx.clone(),
+                    );
+                    tokio::spawn(async move {
+                        // As an archive does: a handshake past the deadline is dropped.
+                        let outcome = tokio::time::timeout(
+                            deadline,
+                            crate::pqnoise_channel::pq_server_handshake(tcp, &key),
+                        )
+                        .await;
+                        let _ = handshakes_tx.send(match outcome {
+                            Ok(Ok(stream)) => {
+                                let _ = streams_tx.send(Ok::<_, std::io::Error>(stream));
+                                "completed"
+                            }
+                            Ok(Err(_)) => "failed",
+                            Err(_) => "timed out",
+                        });
+                    });
+                }
+            });
+            let frames = crate::stub_services::AppShardRpcServer::with_provider(Arc::new(Frames(
+                frame_bytes,
+            )));
+            runtime.spawn(
+                tonic::transport::Server::builder()
+                    .http2_keepalive_interval(keepalive.map(|(interval, _)| interval))
+                    .http2_keepalive_timeout(keepalive.map(|(_, timeout)| timeout))
+                    .add_service(AppShardServiceServer::new(frames))
+                    .serve_with_incoming(tokio_stream::wrappers::UnboundedReceiverStream::new(
+                        streams,
+                    )),
+            );
+            Archive {
+                runtime: Some(runtime),
+                address,
+                handshakes,
+            }
+        }
+    }
+
+    impl Drop for Archive {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.runtime.take() {
+                runtime.shutdown_background();
+            }
+        }
+    }
+
+    fn current_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// A dial from a current-thread runtime completes, and its channel
+    /// answers, although that runtime's only thread is blocked past the
+    /// archive's handshake deadline: an in-process worker whose thread a
+    /// synchronous call stalls keeps its archive connections.
+    #[test]
+    fn a_dial_completes_while_its_calling_thread_is_blocked_past_the_handshake_deadline() {
+        let archive = Archive::serve(2, DEADLINE, None, 16);
+        let worker = current_thread();
+        let client_key = quil_p2p::generate_falcon_signing_key();
+        let address = archive.address.clone();
+        let dialed = worker.block_on(async move {
+            let dial =
+                tokio::spawn(
+                    async move { ArchiveClient::connect_mtls(&address, &client_key).await },
+                );
+            // The dial takes its first step before this task resumes...
+            tokio::task::yield_now().await;
+            // ...then a synchronous call blocks this runtime's only thread
+            // for twice the archive's deadline.
+            std::thread::sleep(DEADLINE * 2);
+            dial.await.unwrap()
+        });
+        assert_eq!(
+            archive.handshakes.recv_timeout(Duration::from_secs(5)),
+            Ok("completed")
+        );
+        let mut client = dialed.expect("the dial completes");
+        let answered = worker.block_on(client.get_app_shard_frame(vec![0x21; 32], 1));
+        assert_eq!(
+            answered
+                .expect("the channel answers")
+                .and_then(|frame| frame.header)
+                .map(|h| h.frame_number),
+            Some(1)
+        );
+    }
+
+    /// An established channel answers the archive's keepalive pings while
+    /// the thread that dialed it is blocked for longer than the archive
+    /// waits for an answer (scaled down from its 20 s interval and 10 s
+    /// timeout): the archive keeps the connection, and the next call needs
+    /// no new handshake.
+    #[test]
+    fn an_established_channel_survives_its_calling_thread_blocked_past_the_archive_keepalive() {
+        let (interval, timeout) = (Duration::from_millis(500), Duration::from_secs(1));
+        let archive = Archive::serve(2, DEADLINE, Some((interval, timeout)), 16);
+        let worker = current_thread();
+        let client_key = quil_p2p::generate_falcon_signing_key();
+        let mut client = worker
+            .block_on(ArchiveClient::connect_mtls(&archive.address, &client_key))
+            .expect("the dial completes");
+        assert!(worker
+            .block_on(client.get_app_shard_frame(vec![0x21; 32], 1))
+            .is_ok());
+        assert_eq!(
+            archive.handshakes.try_iter().collect::<Vec<_>>(),
+            vec!["completed"]
+        );
+        // A synchronous call blocks the worker thread for twice as long as
+        // an unanswered ping keeps the connection.
+        worker.block_on(async { std::thread::sleep((interval + timeout) * 2) });
+        let answered = worker.block_on(client.get_app_shard_frame(vec![0x21; 32], 2));
+        assert_eq!(
+            answered
+                .expect("the channel answers")
+                .and_then(|frame| frame.header)
+                .map(|h| h.frame_number),
+            Some(2)
+        );
+        assert_eq!(
+            archive.handshakes.try_iter().collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "the channel reconnected"
+        );
+    }
+
+    fn env_or(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn secs(duration: Duration) -> String {
+        format!("{:.2}", duration.as_secs_f64())
+    }
+
+    /// Download throughput of many channels, each dialed from its own
+    /// current-thread runtime as in-process workers do, through the PQNoise
+    /// stack: dialed on [`archive_io`], whose two threads then carry every
+    /// channel's I/O, and dialed on each caller's runtime. Prints, per mode,
+    /// the aggregate MiB/s and the per-channel dial and download times.
+    ///
+    /// `ARCHIVE_IO_BENCH_CHANNELS` (48) channels each download
+    /// `ARCHIVE_IO_BENCH_MIB` (4) frames of 1 MiB; the archive runs
+    /// `ARCHIVE_IO_BENCH_SERVER_THREADS` (8) threads and drops handshakes
+    /// after its 10 s deadline. In the project image:
+    /// `cargo test --release --locked -p quil-rpc --lib archive_io_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a throughput measurement, run by hand"]
+    fn archive_io_throughput() {
+        let channels = env_or("ARCHIVE_IO_BENCH_CHANNELS", 48);
+        let frames = env_or("ARCHIVE_IO_BENCH_MIB", 4) as u64;
+        // The archive's own handshake deadline.
+        let deadline = Duration::from_secs(10);
+        let archive = Archive::serve(
+            env_or("ARCHIVE_IO_BENCH_SERVER_THREADS", 8),
+            deadline,
+            None,
+            1 << 20,
+        );
+        let client_key = quil_p2p::generate_falcon_signing_key();
+        let host_threads = std::thread::available_parallelism().map_or(0, |n| n.get());
+        println!("archive I/O throughput: {channels} channels x {frames} MiB, {host_threads} host threads");
+        for (mode, off_thread) in [
+            ("dialed on archive-io", true),
+            ("dialed on each caller's runtime", false),
+        ] {
+            let ready = Arc::new(std::sync::Barrier::new(channels + 1));
+            let workers: Vec<_> = (0..channels)
+                .map(|_| {
+                    let (address, key, ready) =
+                        (archive.address.clone(), client_key.clone(), ready.clone());
+                    std::thread::spawn(move || {
+                        let worker = current_thread();
+                        let started = Instant::now();
+                        let dialed = worker.block_on(ArchiveClient::dial_pq(
+                            &address,
+                            QuilPqNoiseConnector::new(key),
+                            off_thread,
+                        ));
+                        let dial = started.elapsed();
+                        ready.wait();
+                        let mut client = match dialed {
+                            Ok(client) => client,
+                            Err(error) => return (dial, Err(format!("dial: {error}"))),
+                        };
+                        let started = Instant::now();
+                        let downloaded = worker.block_on(async {
+                            let mut bytes = 0;
+                            for frame_number in 1..=frames {
+                                let frame = client
+                                    .get_app_shard_frame(vec![0x21; 32], frame_number)
+                                    .await;
+                                bytes += frame
+                                    .map_err(|error| format!("frame {frame_number}: {error}"))?
+                                    .and_then(|frame| frame.header)
+                                    .map_or(0, |header| header.output.len());
+                            }
+                            Ok::<_, String>(bytes)
+                        });
+                        (dial, downloaded.map(|bytes| (bytes, started.elapsed())))
+                    })
+                })
+                .collect();
+            ready.wait();
+            let started = Instant::now();
+            let results: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect();
+            let wall = started.elapsed();
+            let mut dials: Vec<_> = results.iter().map(|(dial, _)| *dial).collect();
+            let mut done: Vec<_> = results
+                .iter()
+                .filter_map(|(_, outcome)| outcome.as_ref().ok().map(|(_, at)| *at))
+                .collect();
+            let bytes: usize = results
+                .iter()
+                .filter_map(|(_, outcome)| outcome.as_ref().ok().map(|(bytes, _)| *bytes))
+                .sum();
+            let failures: Vec<_> = results
+                .iter()
+                .filter_map(|(_, outcome)| outcome.as_ref().err())
+                .collect();
+            dials.sort();
+            done.sort();
+            let spread = |times: &[Duration]| match times {
+                [] => "none".to_string(),
+                _ => format!(
+                    "min {} median {} max {} s",
+                    secs(times[0]),
+                    secs(times[times.len() / 2]),
+                    secs(times[times.len() - 1])
+                ),
+            };
+            println!(
+                "{mode}: {:.1} MiB/s aggregate, {} MiB in {} s; {} failed{}",
+                bytes as f64 / (1 << 20) as f64 / wall.as_secs_f64(),
+                bytes >> 20,
+                secs(wall),
+                failures.len(),
+                failures
+                    .first()
+                    .map_or(String::new(), |error| format!(" (first: {error})"))
+            );
+            println!("  dial: {}", spread(&dials));
+            println!("  download: {}", spread(&done));
+            println!(
+                "  per-channel download completion (s, sorted): {}",
+                done.iter()
+                    .map(|at| secs(*at))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            let handshakes: Vec<_> = archive.handshakes.try_iter().collect();
+            let count = |outcome: &str| handshakes.iter().filter(|seen| **seen == outcome).count();
+            println!(
+                "  archive handshakes: {} completed, {} timed out ({} s deadline), {} failed",
+                count("completed"),
+                count("timed out"),
+                deadline.as_secs(),
+                count("failed")
+            );
+        }
     }
 }

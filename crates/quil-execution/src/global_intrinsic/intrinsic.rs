@@ -7,39 +7,40 @@
 
 use std::sync::Arc;
 
-use sha2::{Sha256, Digest};
 use quil_types::crypto::KeyManager;
 use quil_types::error::{QuilError, Result};
 use quil_types::store::{
-    ClockStore, KvDb, PendingShardChange, ShardChangeKind, ShardsStore, ShardInfo,
+    ClockStore, KvDb, PendingShardChange, ShardChangeKind, ShardInfo, ShardsStore,
 };
+use sha2::{Digest, Sha256};
 
-use super::materialize;
-use super::reassignment;
 use super::consensus_types::{AltShardUpdate, TYPE_ALT_SHARD_UPDATE};
+use super::materialize;
 use super::prover_filter_ops::{
-    ProverLeave, ProverPause, ProverResume,
-    TYPE_PROVER_LEAVE, TYPE_PROVER_PAUSE, TYPE_PROVER_RESUME,
-};
-use super::prover_ops::{
-    ProverConfirm, ProverReject,
-    TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT,
+    ProverLeave, ProverPause, ProverResume, TYPE_PROVER_LEAVE, TYPE_PROVER_PAUSE,
+    TYPE_PROVER_RESUME,
 };
 use super::prover_join::{ProverJoin, TYPE_PROVER_JOIN};
+use super::prover_ops::{ProverConfirm, ProverReject, TYPE_PROVER_CONFIRM, TYPE_PROVER_REJECT};
+use super::reassignment;
 use super::verify;
 use crate::global_engine::{
-    TYPE_PROVER_KICK, TYPE_PROVER_UPDATE, TYPE_SENIORITY_MERGE,
-    TYPE_FRAME_HEADER, TYPE_SHARD_SPLIT, TYPE_SHARD_MERGE,
+    TYPE_FRAME_HEADER, TYPE_PROVER_KICK, TYPE_PROVER_UPDATE, TYPE_SENIORITY_MERGE,
+    TYPE_SHARD_MERGE, TYPE_SHARD_SPLIT,
 };
 use crate::global_schema::{read_field, write_field, GLOBAL_INTRINSIC_ADDRESS};
 use crate::hypergraph_state::{
-    HypergraphState, hyperedge_adds_discriminator,
-    vertex_adds_discriminator, vertex_removes_discriminator,
+    hyperedge_adds_discriminator, vertex_adds_discriminator, vertex_removes_discriminator,
+    HypergraphState,
 };
 
 #[cfg(test)]
 #[path = "fork_tests.rs"]
 mod fork_tests;
+
+#[cfg(test)]
+#[path = "header_cost_tests.rs"]
+mod header_cost_tests;
 
 /// The global intrinsic: holds dependencies for signature
 /// verification and state lookups. Dispatches `validate` and
@@ -80,7 +81,6 @@ pub struct GlobalIntrinsic {
     /// than hardcoding mainnet's layout. Injected by the node; absent ⇒ reset
     /// no-ops (paired with [`Self::archive_prover_addresses`]).
     reset_genesis_prefixes: Option<Arc<Vec<Vec<u32>>>>,
-
 }
 
 /// What a seal submission's drain headers do ([`GlobalIntrinsic::seal_drain`]).
@@ -105,12 +105,20 @@ struct SessionPassTiming {
 impl SessionPassTiming {
     fn start(frame: u64) -> Self {
         let now = std::time::Instant::now();
-        Self { frame, started: now, last: now, steps: Vec::new(), filters: 0, allocations: None }
+        Self {
+            frame,
+            started: now,
+            last: now,
+            steps: Vec::new(),
+            filters: 0,
+            allocations: None,
+        }
     }
 
     fn lap(&mut self, step: &'static str) {
         let now = std::time::Instant::now();
-        self.steps.push((step, now.duration_since(self.last).as_millis() as u64));
+        self.steps
+            .push((step, now.duration_since(self.last).as_millis() as u64));
         self.last = now;
     }
 }
@@ -133,7 +141,10 @@ fn ring_key_of(
     filter: &[u8],
 ) -> super::prover_rings::RingKey {
     scan.and_then(|scan| scan.ring_key(address, filter))
-        .unwrap_or(super::prover_rings::RingKey { cohort: u64::MAX, seniority: 0 })
+        .unwrap_or(super::prover_rings::RingKey {
+            cohort: u64::MAX,
+            seniority: 0,
+        })
 }
 
 impl GlobalIntrinsic {
@@ -142,11 +153,24 @@ impl GlobalIntrinsic {
         crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
         identity: &quil_types::store::BackingStoreIdentity,
     ) -> Result<()> {
-        if self.clock_store.as_ref().and_then(|store| store.backing_store_identity()).as_ref() != Some(identity)
-            || self.shards_store.as_ref().is_some_and(|store| store.backing_store_identity().as_ref() != Some(identity))
-            || self.hypergraph.as_ref().is_some_and(|source| !Arc::ptr_eq(source, crdt))
+        if self
+            .clock_store
+            .as_ref()
+            .and_then(|store| store.backing_store_identity())
+            .as_ref()
+            != Some(identity)
+            || self
+                .shards_store
+                .as_ref()
+                .is_some_and(|store| store.backing_store_identity().as_ref() != Some(identity))
+            || self
+                .hypergraph
+                .as_ref()
+                .is_some_and(|source| !Arc::ptr_eq(source, crdt))
         {
-            return Err(QuilError::ExecutionUnavailable("global intrinsic capture provider mismatch".into()));
+            return Err(QuilError::ExecutionUnavailable(
+                "global intrinsic capture provider mismatch".into(),
+            ));
         }
         Ok(())
     }
@@ -169,13 +193,19 @@ impl GlobalIntrinsic {
         Ok(Self {
             key_manager: self.key_manager.clone(),
             frame_prover: self.frame_prover.clone(),
-            clock_store: self.clock_store.as_ref().map(|_| context.clock_store.clone()),
+            clock_store: self
+                .clock_store
+                .as_ref()
+                .map(|_| context.clock_store.clone()),
             shards_store,
             shard_metadata_writes_enabled: self.shard_metadata_writes_enabled,
             bls_constructor: self.bls_constructor.clone(),
             hypergraph: self.hypergraph.as_ref().map(|_| context.crdt.clone()),
             inclusion_prover: self.inclusion_prover.clone(),
-            prover_registry: self.prover_registry.as_ref().map(|_| context.prover_registry.clone()),
+            prover_registry: self
+                .prover_registry
+                .as_ref()
+                .map(|_| context.prover_registry.clone()),
             reward_issuance: self.reward_issuance.clone(),
             archive_prover_addresses: self.archive_prover_addresses.clone(),
             reset_genesis_prefixes: self.reset_genesis_prefixes.clone(),
@@ -312,10 +342,7 @@ impl GlobalIntrinsic {
     /// the referenced frame's output + difficulty for the VDF verify
     /// chain. Without it, every ProverJoin in `validate` fails closed
     /// with "clock_store not installed".
-    pub fn with_clock_store(
-        mut self,
-        clock_store: Arc<dyn ClockStore>,
-    ) -> Self {
+    pub fn with_clock_store(mut self, clock_store: Arc<dyn ClockStore>) -> Self {
         self.clock_store = Some(clock_store);
         self
     }
@@ -362,11 +389,13 @@ impl GlobalIntrinsic {
     /// whose Go counterpart enforces it: `ProverJoin` (10-frame
     /// window in `validate_prover_join_structural`) and
     /// `ProverSeniorityMerge` (10-frame window in
-    /// `verify_prover_seniority_merge`). The other ops
-    /// (Pause/Resume/Confirm/Reject/Update/ShardSplit/Merge) do not
-    /// have per-op replay windows; the frame orchestrator handles
-    /// ordering. ProverConfirm/Reject's 360-720 window is a timing
-    /// constraint relative to JoinFrameNumber, not a freshness gate
+    /// `verify_prover_seniority_merge`). From the prover operation replay
+    /// guard epoch, Pause/Resume/Leave/Reject/Update must also be signed in
+    /// the frame's epoch at most 10 frames before it
+    /// (`verify::validate_prover_op_frame`). ProverConfirm must be signed in
+    /// the frame's epoch (`validate_confirm_epoch`). ShardSplit/Merge have
+    /// no per-op replay window. ProverConfirm/Reject's epoch window is a
+    /// timing constraint relative to JoinFrameNumber, not a freshness gate
     /// (enforced by `validate_confirm_timing`).
     ///
     /// `prover_tree` and `allocation_tree` are optional — when `None`,
@@ -391,27 +420,56 @@ impl GlobalIntrinsic {
 
         match type_prefix {
             super::handoff::TYPE_COMMITTEE_HANDOFF => {
-                let crdt = self.hypergraph.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(
-                    "handoff validation requires authenticated global state".into()))?;
+                let crdt = self.hypergraph.as_ref().ok_or_else(|| {
+                    QuilError::ExecutionUnavailable(
+                        "handoff validation requires authenticated global state".into(),
+                    )
+                })?;
                 let state = HypergraphState::new(crdt.clone());
                 let sealed = super::handoff::SealSubmission::from_canonical_bytes(input)?;
                 self.verify_seal_submission(frame_number, &sealed, &state)?;
                 Ok(true)
             }
             super::handoff::TYPE_PRESENCE_REPORT => {
-                super::handoff::presence::require_active(frame_number)?;
-                let crdt = self.hypergraph.as_ref().ok_or_else(|| QuilError::ExecutionUnavailable(
-                    "presence report validation requires authenticated global state".into()))?;
+                let op = super::handoff::presence::PresenceOp::from_canonical_bytes(input)?;
+                op.require_active(frame_number)?;
+                let crdt = self.hypergraph.as_ref().ok_or_else(|| {
+                    QuilError::ExecutionUnavailable(
+                        "presence report validation requires authenticated global state".into(),
+                    )
+                })?;
                 let state = HypergraphState::new(crdt.clone());
-                let report = super::handoff::presence::PresenceReport::from_canonical_bytes(input)?;
-                self.verify_presence_report(frame_number, &report, &state)?;
+                self.verify_presence_op(frame_number, &op, &state)?;
+                Ok(true)
+            }
+            super::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF => {
+                let crdt = self.hypergraph.as_ref().ok_or_else(|| {
+                    QuilError::ExecutionUnavailable(
+                        "storage epoch proof validation requires authenticated global state".into(),
+                    )
+                })?;
+                let state = HypergraphState::new(crdt.clone());
+                let proof =
+                    super::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(input)?;
+                self.verify_storage_epoch_proof(frame_number, &proof, &state)?;
                 Ok(true)
             }
             TYPE_PROVER_PAUSE => {
                 let op = ProverPause::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverPause", op.frame_number, frame_number)?;
+                verify::validate_signed_after(
+                    "ProverPause",
+                    op.frame_number,
+                    frame_number,
+                    allocation_tree,
+                    "ResumeFrameNumber",
+                )?;
                 if let Some(pt) = prover_tree {
                     return verify::verify_prover_pause(
-                        &op, pt, allocation_tree, self.key_manager.as_ref(),
+                        &op,
+                        pt,
+                        allocation_tree,
+                        self.key_manager.as_ref(),
                     );
                 }
                 // Structural-only validation (no tree = no sig check)
@@ -419,19 +477,29 @@ impl GlobalIntrinsic {
             }
             TYPE_PROVER_RESUME => {
                 let op = ProverResume::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverResume", op.frame_number, frame_number)?;
+                verify::validate_signed_after(
+                    "ProverResume",
+                    op.frame_number,
+                    frame_number,
+                    allocation_tree,
+                    "PauseFrameNumber",
+                )?;
                 if let Some(pt) = prover_tree {
                     return verify::verify_prover_resume(
-                        &op, pt, allocation_tree, self.key_manager.as_ref(),
+                        &op,
+                        pt,
+                        allocation_tree,
+                        self.key_manager.as_ref(),
                     );
                 }
                 Ok(true)
             }
             TYPE_PROVER_LEAVE => {
                 let op = ProverLeave::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverLeave", op.frame_number, frame_number)?;
                 if let Some(pt) = prover_tree {
-                    let sig_ok = verify::verify_prover_leave(
-                        &op, pt, self.key_manager.as_ref(),
-                    )?;
+                    let sig_ok = verify::verify_prover_leave(&op, pt, self.key_manager.as_ref())?;
                     if !sig_ok {
                         return Ok(false);
                     }
@@ -445,17 +513,29 @@ impl GlobalIntrinsic {
                         let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
                         let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
                         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
-                        let pubkey = crate::global_schema::read_field(pt, "prover:Prover", "PublicKey")
-                            .ok_or_else(|| QuilError::InvalidArgument(
-                                "ProverLeave: prover vertex missing PublicKey".into(),
-                            ))?;
+                        let pubkey =
+                            crate::global_schema::read_field(pt, "prover:Prover", "PublicKey")
+                                .ok_or_else(|| {
+                                    QuilError::InvalidArgument(
+                                        "ProverLeave: prover vertex missing PublicKey".into(),
+                                    )
+                                })?;
                         verify::verify_prover_leave_has_active_allocation(
                             &op,
                             &pubkey,
-                            |addr: &[u8; 32]| -> quil_types::error::Result<Option<quil_tries::VectorCommitmentTree>> {
+                            |addr: &[u8; 32]| -> quil_types::error::Result<
+                                Option<quil_tries::VectorCommitmentTree>,
+                            > {
                                 let blob = hg_state.get(domain, addr, &va_disc)?;
-                                Ok(blob.and_then(|b| if b.is_empty() { None }
-                                    else { Some(crate::prover_registry::rebuild_vertex_tree_from_blob(&b)) }))
+                                Ok(blob.and_then(|b| {
+                                    if b.is_empty() {
+                                        None
+                                    } else {
+                                        Some(crate::prover_registry::rebuild_vertex_tree_from_blob(
+                                            &b,
+                                        ))
+                                    }
+                                }))
                             },
                         )?;
                     }
@@ -466,10 +546,9 @@ impl GlobalIntrinsic {
             TYPE_PROVER_CONFIRM => {
                 let op = ProverConfirm::from_canonical_bytes(input)?;
                 verify::validate_confirm_epoch(op.frame_number, frame_number)?;
+                verify::validate_confirm_leaf_roots(&op, frame_number)?;
                 if let Some(pt) = prover_tree {
-                    let sig_ok = verify::verify_prover_confirm(
-                        &op, pt, self.key_manager.as_ref(),
-                    )?;
+                    let sig_ok = verify::verify_prover_confirm(&op, pt, self.key_manager.as_ref())?;
                     if !sig_ok {
                         return Ok(false);
                     }
@@ -487,10 +566,13 @@ impl GlobalIntrinsic {
                         let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
                         let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
                         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
-                        let pubkey = crate::global_schema::read_field(pt, "prover:Prover", "PublicKey")
-                            .ok_or_else(|| QuilError::InvalidArgument(
-                                "ProverConfirm: prover vertex missing PublicKey".into(),
-                            ))?;
+                        let pubkey =
+                            crate::global_schema::read_field(pt, "prover:Prover", "PublicKey")
+                                .ok_or_else(|| {
+                                    QuilError::InvalidArgument(
+                                        "ProverConfirm: prover vertex missing PublicKey".into(),
+                                    )
+                                })?;
                         for filter in &op.filters {
                             let alloc_addr =
                                 super::materialize::allocation_address(&pubkey, filter)?;
@@ -510,10 +592,9 @@ impl GlobalIntrinsic {
             }
             TYPE_PROVER_REJECT => {
                 let op = ProverReject::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverReject", op.frame_number, frame_number)?;
                 if let Some(pt) = prover_tree {
-                    let sig_ok = verify::verify_prover_reject(
-                        &op, pt, self.key_manager.as_ref(),
-                    )?;
+                    let sig_ok = verify::verify_prover_reject(&op, pt, self.key_manager.as_ref())?;
                     if !sig_ok {
                         return Ok(false);
                     }
@@ -521,22 +602,30 @@ impl GlobalIntrinsic {
                     // signature covers. The single `filter` field is a
                     // deprecated placeholder (encoded as "reserved").
                     if op.filters.is_empty() {
-                        return Err(QuilError::InvalidArgument("ProverReject: no filters".into()));
+                        return Err(QuilError::InvalidArgument(
+                            "ProverReject: no filters".into(),
+                        ));
                     }
                     if let Some(hg) = self.hypergraph.as_ref() {
                         let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
                         let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
                         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
-                        let pubkey = crate::global_schema::read_field(pt, "prover:Prover", "PublicKey")
-                            .ok_or_else(|| QuilError::InvalidArgument(
-                                "ProverReject: prover vertex missing PublicKey".into(),
-                            ))?;
+                        let pubkey =
+                            crate::global_schema::read_field(pt, "prover:Prover", "PublicKey")
+                                .ok_or_else(|| {
+                                    QuilError::InvalidArgument(
+                                        "ProverReject: prover vertex missing PublicKey".into(),
+                                    )
+                                })?;
                         for filter in &op.filters {
-                            let alloc_addr = super::materialize::allocation_address(&pubkey, filter)?;
+                            let alloc_addr =
+                                super::materialize::allocation_address(&pubkey, filter)?;
                             if let Some(blob) = hg_state.get(domain, &alloc_addr, &va_disc)? {
                                 if !blob.is_empty() {
                                     let alloc_tree =
-                                        crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+                                        crate::prover_registry::rebuild_vertex_tree_from_blob(
+                                            &blob,
+                                        );
                                     verify::validate_confirm_timing(frame_number, &alloc_tree)?;
                                 }
                             }
@@ -613,7 +702,10 @@ impl GlobalIntrinsic {
                 let op = super::prover_ops::ProverUpdate::from_canonical_bytes(input)?;
                 if let Some(pt) = prover_tree {
                     return verify::verify_prover_update(
-                        &op, pt, self.key_manager.as_ref(),
+                        &op,
+                        pt,
+                        frame_number,
+                        self.key_manager.as_ref(),
                     );
                 }
                 Ok(true)
@@ -621,7 +713,9 @@ impl GlobalIntrinsic {
             TYPE_ALT_SHARD_UPDATE => {
                 let op = AltShardUpdate::from_canonical_bytes(input)?;
                 super::alt_shard_update_materialize::validate_alt_shard_update(
-                    &op, frame_number, self.key_manager.as_ref(),
+                    &op,
+                    frame_number,
+                    self.key_manager.as_ref(),
                 )
             }
             TYPE_SHARD_SPLIT => {
@@ -635,9 +729,11 @@ impl GlobalIntrinsic {
                 // Fail-closed. No prover_tree means we couldn't
                 // resolve the signer's BLS pubkey, so the BLS verify
                 // can't run. Reject rather than accept on faith.
-                let pt = prover_tree.ok_or_else(|| QuilError::InvalidArgument(
-                    "ShardSplit: prover tree unavailable — cannot verify signature".into(),
-                ))?;
+                let pt = prover_tree.ok_or_else(|| {
+                    QuilError::InvalidArgument(
+                        "ShardSplit: prover tree unavailable — cannot verify signature".into(),
+                    )
+                })?;
                 let sig_ok = match verify::verify_shard_split(&op, pt, self.key_manager.as_ref()) {
                     Ok(v) => v,
                     Err(e) => {
@@ -646,7 +742,10 @@ impl GlobalIntrinsic {
                     }
                 };
                 if !sig_ok {
-                    tracing::warn!(frame = frame_number, "validate_message: ShardSplit sig_ok=false → rejected");
+                    tracing::warn!(
+                        frame = frame_number,
+                        "validate_message: ShardSplit sig_ok=false → rejected"
+                    );
                     return Ok(false);
                 }
                 // Signer must be an active global prover. Mirrors Go
@@ -668,9 +767,11 @@ impl GlobalIntrinsic {
             }
             TYPE_SHARD_MERGE => {
                 let op = super::prover_ops::ShardMerge::from_canonical_bytes(input)?;
-                let pt = prover_tree.ok_or_else(|| QuilError::InvalidArgument(
-                    "ShardMerge: prover tree unavailable — cannot verify signature".into(),
-                ))?;
+                let pt = prover_tree.ok_or_else(|| {
+                    QuilError::InvalidArgument(
+                        "ShardMerge: prover tree unavailable — cannot verify signature".into(),
+                    )
+                })?;
                 let sig_ok = verify::verify_shard_merge(&op, pt, self.key_manager.as_ref())?;
                 if !sig_ok {
                     return Ok(false);
@@ -691,15 +792,40 @@ impl GlobalIntrinsic {
                 }
                 Ok(true)
             }
-            TYPE_SENIORITY_MERGE => {
-                // This is the *outer* `ProverSeniorityMerge` (0x031A),
-                // not the inner `SeniorityMerge` target record (0x0310).
+            TYPE_SENIORITY_MERGE | super::prover_ops::TYPE_PROVER_SENIORITY_MERGE => {
+                // The op is the *outer* `ProverSeniorityMerge` (0x031A),
+                // not the inner `SeniorityMerge` target record (0x0310),
+                // whose prefix this arm long matched alone; engines route
+                // 0x031A here from the seniority succession epoch
+                // (`is_global_type_prefix_at`).
                 let op = super::prover_ops::ProverSeniorityMerge::from_canonical_bytes(input)?;
-                let pt = prover_tree.ok_or_else(|| QuilError::InvalidArgument(
-                    "ProverSeniorityMerge: prover tree unavailable — cannot verify signature".into(),
-                ))?;
+                let pt = prover_tree.ok_or_else(|| {
+                    QuilError::InvalidArgument(
+                        "ProverSeniorityMerge: prover tree unavailable — cannot verify signature"
+                            .into(),
+                    )
+                })?;
+                // From the seniority succession epoch the committed markers
+                // select the op's mode, and validation decides exactly as
+                // materialization does (`invoke_seniority_merge`).
+                if quil_types::consensus::seniority_succession_active(frame_number) {
+                    let crdt = self.hypergraph.as_ref().ok_or_else(|| {
+                        QuilError::ExecutionUnavailable(
+                            "seniority merge validation requires authenticated global state".into(),
+                        )
+                    })?;
+                    self.validate_seniority_merge(
+                        frame_number,
+                        &op,
+                        &HypergraphState::new(crdt.clone()),
+                    )?;
+                    return Ok(true);
+                }
                 let sigs_ok = verify::verify_prover_seniority_merge(
-                    &op, pt, frame_number, self.key_manager.as_ref(),
+                    &op,
+                    pt,
+                    frame_number,
+                    self.key_manager.as_ref(),
                 )?;
                 if !sigs_ok {
                     return Ok(false);
@@ -713,10 +839,9 @@ impl GlobalIntrinsic {
                     let hg_state = crate::hypergraph_state::HypergraphState::new(hg.clone());
                     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
                     let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
-                    verify::verify_prover_seniority_merge_spent_markers(
-                        &op,
-                        |addr: &[u8; 32]| hg_state.get(domain, addr, &va_disc),
-                    )?;
+                    verify::verify_prover_seniority_merge_spent_markers(&op, |addr: &[u8; 32]| {
+                        hg_state.get(domain, addr, &va_disc)
+                    })?;
                 }
                 Ok(true)
             }
@@ -730,6 +855,10 @@ impl GlobalIntrinsic {
                 // 2. Same frame_number + filter/address
                 // 3. Different outputs (the actual equivocation)
                 // 4. Both carry BLS signatures
+                //
+                // From the signed-slot epoch (`kick_signed_slot_active`)
+                // 2 and 3 compare what the votes sign instead: the same
+                // address and non-zero rank, different `Poseidon(output)`.
                 //
                 // When the full cryptographic deps are installed
                 // (BLS constructor + hypergraph + inclusion prover +
@@ -748,7 +877,13 @@ impl GlobalIntrinsic {
                     self.inclusion_prover.as_deref(),
                 ) {
                     super::kick_verify::verify_prover_kick_full(
-                        &op, frame_number, cs, fp, bls, hg, ip,
+                        &op,
+                        frame_number,
+                        cs,
+                        fp,
+                        bls,
+                        hg,
+                        ip,
                         self.prover_registry.as_deref(),
                     )?;
                     Ok(true)
@@ -768,7 +903,8 @@ impl GlobalIntrinsic {
                     Err(QuilError::InvalidArgument(
                         "ProverKick: crypto deps unavailable — cannot verify \
                          equivocation signatures; rejecting rather than accepting \
-                         a structurally-plausible-but-unverified kick".into(),
+                         a structurally-plausible-but-unverified kick"
+                            .into(),
                     ))
                 }
             }
@@ -798,6 +934,7 @@ impl GlobalIntrinsic {
                         "FrameHeader: bls_constructor not installed — cannot verify".into(),
                     )
                 })?;
+                Self::require_global_anchor(frame_number, &op)?;
                 // Header fields a certificate does not sign directly (fee
                 // total, settlement relay, ...) must reproduce the certified
                 // output, and a relay must be canonical for its window.
@@ -828,7 +965,13 @@ impl GlobalIntrinsic {
                         "FrameHeader: authenticated global state is required for session lookup".into()))?;
                     let state = HypergraphState::new(crdt.clone());
                     super::prover_shard_update::verify_frame_header_in_state(
-                        &state, &op, fp, bls, pr, committee_frame, frame_number,
+                        &state,
+                        &op,
+                        fp,
+                        bls,
+                        pr,
+                        committee_frame,
+                        frame_number,
                     )?;
                     return Ok(true);
                 }
@@ -837,7 +980,11 @@ impl GlobalIntrinsic {
                     if let Some(crdt) = self.hypergraph.as_ref() {
                         let state = HypergraphState::new(crdt.clone());
                         state.require_full_domain_coverage(&GLOBAL_INTRINSIC_ADDRESS)?;
-                        super::handoff::frames::require_legacy_allowed(&state, &op.address, op.frame_number)?;
+                        super::handoff::frames::require_legacy_allowed(
+                            &state,
+                            &op.address,
+                            op.frame_number,
+                        )?;
                     }
                     let sig = match op.public_key_signature_bls48581.is_empty() {
                         true => return Err(QuilError::InvalidArgument(
@@ -868,13 +1015,13 @@ impl GlobalIntrinsic {
                         rank: op.rank,
                         public_key_signature_bls48581: Some(
                             quil_types::proto::keys::Bls48581AggregateSignature {
-                                public_key: Some(
-                                    quil_types::proto::keys::Bls48581g2PublicKey {
-                                        key_value: sig.public_key.as_ref()
-                                            .map(|k| k.key_value.clone())
-                                            .unwrap_or_default(),
-                                    },
-                                ),
+                                public_key: Some(quil_types::proto::keys::Bls48581g2PublicKey {
+                                    key_value: sig
+                                        .public_key
+                                        .as_ref()
+                                        .map(|k| k.key_value.clone())
+                                        .unwrap_or_default(),
+                                }),
                                 signature: sig.signature.clone(),
                                 bitmask: sig.bitmask.clone(),
                             },
@@ -900,11 +1047,11 @@ impl GlobalIntrinsic {
                     } else {
                         frame_number
                     };
-                    let active = pr.get_active_provers(&op.address, committee_frame).map_err(|e| {
-                        QuilError::Internal(format!(
-                            "FrameHeader: get_active_provers: {e}"
-                        ))
-                    })?;
+                    let active = pr
+                        .get_active_provers(&op.address, committee_frame)
+                        .map_err(|e| {
+                            QuilError::Internal(format!("FrameHeader: get_active_provers: {e}"))
+                        })?;
                     let participant_indices: Vec<usize> =
                         quil_consensus::bitmask::set_bit_indices(&sig.bitmask).collect();
                     let active_pks: Vec<&[u8]> = active
@@ -913,12 +1060,13 @@ impl GlobalIntrinsic {
                         .filter(|(i, _)| participant_indices.contains(i))
                         .map(|(_, prover)| prover.public_key.as_slice())
                         .collect();
-                    let reconstructed_pubkey = bls
-                        .aggregate_public_keys(&active_pks)
-                        .map_err(|e| QuilError::Crypto(format!(
-                            "FrameHeader: aggregate_public_keys: {e}"
-                        )))?;
-                    let sig_pubkey_bytes: &[u8] = sig.public_key.as_ref()
+                    let reconstructed_pubkey =
+                        bls.aggregate_public_keys(&active_pks).map_err(|e| {
+                            QuilError::Crypto(format!("FrameHeader: aggregate_public_keys: {e}"))
+                        })?;
+                    let sig_pubkey_bytes: &[u8] = sig
+                        .public_key
+                        .as_ref()
                         .map(|k| k.key_value.as_slice())
                         .unwrap_or(&[]);
                     if reconstructed_pubkey.as_slice() != sig_pubkey_bytes {
@@ -927,7 +1075,7 @@ impl GlobalIntrinsic {
                             .map(|p| hex::encode(&p.address[..p.address.len().min(8)]))
                             .collect();
                         tracing::warn!(
-                            shard_address = %hex::encode(&op.address[..op.address.len().min(8)]),
+                            shard_address = %hex::encode(&op.address),
                             bitmask_hex = %hex::encode(&sig.bitmask),
                             participant_indices = ?participant_indices,
                             active_count = active.len(),
@@ -953,10 +1101,7 @@ impl GlobalIntrinsic {
                     // 74-byte short-circuit avoids tripping the
                     // multi-proof tail parser on a single-signer
                     // aggregate.
-                    let ids: Vec<&[u8]> = active
-                        .iter()
-                        .map(|p| p.address.as_slice())
-                        .collect();
+                    let ids: Vec<&[u8]> = active.iter().map(|p| p.address.as_slice()).collect();
                     let ids_arg: Option<&[&[u8]]> = if sig.signature.len() == 666 {
                         None
                     } else {
@@ -966,7 +1111,8 @@ impl GlobalIntrinsic {
                         Ok(true) => {}
                         Ok(false) => {
                             return Err(QuilError::Crypto(
-                                "FrameHeader: BLS signature / multiproof verification rejected".into(),
+                                "FrameHeader: BLS signature / multiproof verification rejected"
+                                    .into(),
                             ));
                         }
                         Err(e) => {
@@ -1013,40 +1159,75 @@ impl GlobalIntrinsic {
         match type_prefix {
             TYPE_PROVER_PAUSE => {
                 let op = ProverPause::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverPause", op.frame_number, frame_number)?;
                 self.invoke_filter_op(
                     frame_number,
                     &op.filter,
                     &op.public_key_signature_bls48581,
                     state,
                     &va_disc,
-                    |prover_tree, alloc_tree| verify::verify_prover_pause(
-                        &op, prover_tree, alloc_tree, self.key_manager.as_ref(),
-                    ),
+                    |prover_tree, alloc_tree| {
+                        verify::validate_signed_after(
+                            "ProverPause",
+                            op.frame_number,
+                            frame_number,
+                            alloc_tree,
+                            "ResumeFrameNumber",
+                        )?;
+                        verify::verify_prover_pause(
+                            &op,
+                            prover_tree,
+                            alloc_tree,
+                            self.key_manager.as_ref(),
+                        )
+                    },
                     |alloc_tree, fn_| materialize::materialize_prover_pause(alloc_tree, fn_),
                 )?;
                 self.refresh_prover_status(
-                    frame_number, &[op.filter.as_slice()], &op.public_key_signature_bls48581, state, &va_disc,
+                    frame_number,
+                    &[op.filter.as_slice()],
+                    &op.public_key_signature_bls48581,
+                    state,
+                    &va_disc,
                 )
             }
             TYPE_PROVER_RESUME => {
                 let op = ProverResume::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverResume", op.frame_number, frame_number)?;
                 self.invoke_filter_op(
                     frame_number,
                     &op.filter,
                     &op.public_key_signature_bls48581,
                     state,
                     &va_disc,
-                    |prover_tree, alloc_tree| verify::verify_prover_resume(
-                        &op, prover_tree, alloc_tree, self.key_manager.as_ref(),
-                    ),
+                    |prover_tree, alloc_tree| {
+                        verify::validate_signed_after(
+                            "ProverResume",
+                            op.frame_number,
+                            frame_number,
+                            alloc_tree,
+                            "PauseFrameNumber",
+                        )?;
+                        verify::verify_prover_resume(
+                            &op,
+                            prover_tree,
+                            alloc_tree,
+                            self.key_manager.as_ref(),
+                        )
+                    },
                     |alloc_tree, fn_| materialize::materialize_prover_resume(alloc_tree, fn_),
                 )?;
                 self.refresh_prover_status(
-                    frame_number, &[op.filter.as_slice()], &op.public_key_signature_bls48581, state, &va_disc,
+                    frame_number,
+                    &[op.filter.as_slice()],
+                    &op.public_key_signature_bls48581,
+                    state,
+                    &va_disc,
                 )
             }
             TYPE_PROVER_LEAVE => {
                 let op = ProverLeave::from_canonical_bytes(input)?;
+                verify::validate_prover_op_frame("ProverLeave", op.frame_number, frame_number)?;
                 for filter in &op.filters {
                     self.invoke_filter_op(
                         frame_number,
@@ -1054,21 +1235,26 @@ impl GlobalIntrinsic {
                         &op.public_key_signature_bls48581,
                         state,
                         &va_disc,
-                        |prover_tree, _alloc_tree| verify::verify_prover_leave(
-                            &op, prover_tree, self.key_manager.as_ref(),
-                        ),
+                        |prover_tree, _alloc_tree| {
+                            verify::verify_prover_leave(&op, prover_tree, self.key_manager.as_ref())
+                        },
                         |alloc_tree, fn_| materialize::materialize_prover_leave(alloc_tree, fn_),
                     )?;
                 }
                 let filters: Vec<&[u8]> = op.filters.iter().map(Vec::as_slice).collect();
                 self.refresh_prover_status(
-                    frame_number, &filters, &op.public_key_signature_bls48581, state, &va_disc,
+                    frame_number,
+                    &filters,
+                    &op.public_key_signature_bls48581,
+                    state,
+                    &va_disc,
                 )
             }
             TYPE_PROVER_CONFIRM => {
                 let op = ProverConfirm::from_canonical_bytes(input)?;
                 // Confirm applies to each filter in the confirm message.
                 verify::validate_confirm_epoch(op.frame_number, frame_number)?;
+                verify::validate_confirm_leaf_roots(&op, frame_number)?;
                 // Signed at or after the release frame, or ignored.
                 let release = super::prover_release::confirmed_release(&op);
                 // A join confirm records the prover's seniority for its rings
@@ -1091,9 +1277,13 @@ impl GlobalIntrinsic {
                         &op.public_key_signature_bls48581,
                         state,
                         &va_disc,
-                        |prover_tree, _alloc_tree| verify::verify_prover_confirm(
-                            &op, prover_tree, self.key_manager.as_ref(),
-                        ),
+                        |prover_tree, _alloc_tree| {
+                            verify::verify_prover_confirm(
+                                &op,
+                                prover_tree,
+                                self.key_manager.as_ref(),
+                            )
+                        },
                         |alloc_tree, fn_| {
                             // Check timing constraints first
                             verify::validate_confirm_timing(fn_, alloc_tree)?;
@@ -1111,8 +1301,13 @@ impl GlobalIntrinsic {
                             // filters still apply.
                             if current_status == materialize::STATUS_JOINING {
                                 if let Some(store) = self.shards_store.as_ref() {
-                                    let _timing = crate::step_timing::section("confirm: grid admits joining filter");
-                                    let grid = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records());
+                                    let _timing = crate::step_timing::section(
+                                        "confirm: grid admits joining filter",
+                                    );
+                                    let grid = quil_store::ShardMetadataBatch::new(
+                                        store.clone(),
+                                        state.pending_records(),
+                                    );
                                     if !grid_admits_filter(&grid, filter)? {
                                         return Ok(());
                                     }
@@ -1123,14 +1318,23 @@ impl GlobalIntrinsic {
                             // the halt-risk floor so they can drain onto
                             // the children (deep-split convergence).
                             let shard_removed = {
-                                let _timing = crate::step_timing::section("confirm: shard still registered");
+                                let _timing =
+                                    crate::step_timing::section("confirm: shard still registered");
                                 self.shards_store
                                     .as_ref()
-                                    .map(|s| !shard_filter_is_registered(
-                                        &quil_store::ShardMetadataBatch::new(s.clone(), state.pending_records()), filter))
+                                    .map(|s| {
+                                        !shard_filter_is_registered(
+                                            &quil_store::ShardMetadataBatch::new(
+                                                s.clone(),
+                                                state.pending_records(),
+                                            ),
+                                            filter,
+                                        )
+                                    })
                                     .unwrap_or(false)
                             };
-                            let _timing = crate::step_timing::section("confirm: halt-risk check and apply");
+                            let _timing =
+                                crate::step_timing::section("confirm: halt-risk check and apply");
                             check_leave_confirm_halt_risk(
                                 filter,
                                 current_status,
@@ -1139,9 +1343,18 @@ impl GlobalIntrinsic {
                                 shard_removed,
                             )?;
 
-                            materialize::materialize_prover_confirm(alloc_tree, fn_, release.as_ref())?;
-                            if current_status == materialize::STATUS_JOINING && super::prover_rings::governs(fn_) {
-                                super::prover_rings::write_key(alloc_tree, super::prover_rings::joined(fn_, seniority))?;
+                            materialize::materialize_prover_confirm(
+                                alloc_tree,
+                                fn_,
+                                release.as_ref(),
+                            )?;
+                            if current_status == materialize::STATUS_JOINING
+                                && super::prover_rings::governs(fn_)
+                            {
+                                super::prover_rings::write_key(
+                                    alloc_tree,
+                                    super::prover_rings::joined(fn_, seniority),
+                                )?;
                             }
                             Ok(())
                         },
@@ -1150,7 +1363,11 @@ impl GlobalIntrinsic {
                 {
                     let filters: Vec<&[u8]> = op.filters.iter().map(Vec::as_slice).collect();
                     self.refresh_prover_status(
-                        frame_number, &filters, &op.public_key_signature_bls48581, state, &va_disc,
+                        frame_number,
+                        &filters,
+                        &op.public_key_signature_bls48581,
+                        state,
+                        &va_disc,
                     )?;
                 }
                 // Fold: write the per-leaf storage-root vertices registered with
@@ -1163,9 +1380,12 @@ impl GlobalIntrinsic {
                         .public_key_signature_bls48581
                         .as_ref()
                         .and_then(|s| <[u8; 32]>::try_from(s.address.as_slice()).ok())
-                        .ok_or_else(|| QuilError::InvalidArgument(
-                            "prover confirm: leaf roots require a 32-byte signer address".into(),
-                        ))?;
+                        .ok_or_else(|| {
+                            QuilError::InvalidArgument(
+                                "prover confirm: leaf roots require a 32-byte signer address"
+                                    .into(),
+                            )
+                        })?;
                     let domain = &crate::global_schema::GLOBAL_INTRINSIC_ADDRESS[..];
                     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
                     // Epoch-aligned: a confirm in epoch E registers leaf roots for
@@ -1180,8 +1400,12 @@ impl GlobalIntrinsic {
                     // the shards it creates from the confirmed ones, so members
                     // are registered for the shard they hold when it applies.
                     let targets = match self.shards_store.as_ref() {
-                        Some(store) if frame_number >= super::leaf_root_registration::pre_registration_frame() => {
-                            let _timing = crate::step_timing::section("confirm: pending shard changes");
+                        Some(store)
+                            if frame_number
+                                >= super::leaf_root_registration::pre_registration_frame() =>
+                        {
+                            let _timing =
+                                crate::step_timing::section("confirm: pending shard changes");
                             super::leaf_root_registration::pre_registration_targets(
                                 &store.all_pending_shard_changes()?,
                                 &op.filters,
@@ -1193,7 +1417,9 @@ impl GlobalIntrinsic {
                     for group in &op.leaf_roots {
                         // Only honor leaf roots for filters confirmed here, or
                         // created from them by a change applying at `epoch`.
-                        if !op.filters.iter().any(|f| f == &group.filter) && !targets.contains(&group.filter) {
+                        if !op.filters.iter().any(|f| f == &group.filter)
+                            && !targets.contains(&group.filter)
+                        {
                             continue;
                         }
                         for entry in &group.entries {
@@ -1208,11 +1434,35 @@ impl GlobalIntrinsic {
                                 .map(|d| crate::prover_registry::rebuild_vertex_tree_from_blob(&d));
                             let tree = materialize::upsert_leaf_root_registration(
                                 existing.as_ref(),
-                                &member, &group.filter, &entry.prefix, epoch,
-                                &entry.leaf_root, entry.num_blocks, frame_number,
+                                &member,
+                                &group.filter,
+                                &entry.prefix,
+                                epoch,
+                                &entry.leaf_root,
+                                entry.num_blocks,
+                                frame_number,
                             )?;
                             let blob = crate::prover_registry::vertex_tree_to_blob(&tree);
                             state.set(domain, &addr, &va_disc, frame_number, blob)?;
+                        }
+                        // Hash storage proofs: the seat records the whole
+                        // registration, which every commitment opens and the
+                        // epoch proof seals.
+                        if quil_types::consensus::hash_storage_proofs_at(epoch)
+                            && !group.entries.is_empty()
+                        {
+                            let prefixes: Vec<Vec<u32>> = group
+                                .entries
+                                .iter()
+                                .map(|entry| entry.prefix.clone())
+                                .collect();
+                            let mut seat =
+                                super::storage_seat::read(state, &member, &group.filter)?
+                                    .unwrap_or_else(|| {
+                                        super::storage_seat::Seat::new(member, group.filter.clone())
+                                    });
+                            seat.register(epoch, &prefixes, frame_number);
+                            super::storage_seat::write(state, frame_number, &seat)?;
                         }
                     }
                 }
@@ -1225,8 +1475,11 @@ impl GlobalIntrinsic {
                 // encoded as "reserved"). Rejecting by it looked up an
                 // allocation that never exists, so no reject ever took effect.
                 if op.filters.is_empty() {
-                    return Err(QuilError::InvalidArgument("ProverReject: no filters".into()));
+                    return Err(QuilError::InvalidArgument(
+                        "ProverReject: no filters".into(),
+                    ));
                 }
+                verify::validate_prover_op_frame("ProverReject", op.frame_number, frame_number)?;
                 for filter in &op.filters {
                     self.invoke_filter_op(
                         frame_number,
@@ -1234,15 +1487,23 @@ impl GlobalIntrinsic {
                         &op.public_key_signature_bls48581,
                         state,
                         &va_disc,
-                        |prover_tree, _alloc_tree| verify::verify_prover_reject(
-                            &op, prover_tree, self.key_manager.as_ref(),
-                        ),
+                        |prover_tree, _alloc_tree| {
+                            verify::verify_prover_reject(
+                                &op,
+                                prover_tree,
+                                self.key_manager.as_ref(),
+                            )
+                        },
                         |alloc_tree, fn_| materialize::materialize_prover_reject(alloc_tree, fn_),
                     )?;
                 }
                 let filters: Vec<&[u8]> = op.filters.iter().map(Vec::as_slice).collect();
                 self.refresh_prover_status(
-                    frame_number, &filters, &op.public_key_signature_bls48581, state, &va_disc,
+                    frame_number,
+                    &filters,
+                    &op.public_key_signature_bls48581,
+                    state,
+                    &va_disc,
                 )
             }
             TYPE_PROVER_JOIN => {
@@ -1257,7 +1518,7 @@ impl GlobalIntrinsic {
                 let op = super::prover_ops::ProverUpdate::from_canonical_bytes(input)?;
                 self.invoke_update(frame_number, &op, state, &va_disc)
             }
-            TYPE_SENIORITY_MERGE => {
+            TYPE_SENIORITY_MERGE | super::prover_ops::TYPE_PROVER_SENIORITY_MERGE => {
                 let op = super::prover_ops::ProverSeniorityMerge::from_canonical_bytes(input)?;
                 self.invoke_seniority_merge(frame_number, &op, state, &va_disc)
             }
@@ -1271,13 +1532,25 @@ impl GlobalIntrinsic {
                 // certificate, and leaves the seal for a later submission.
                 let sealed = super::handoff::SealSubmission::from_canonical_bytes(input)?;
                 let savepoint = state.changeset_len();
-                let applied = self.seal_drain(frame_number, &sealed, state, true).and_then(|drain| {
-                    if drain.complete {
-                        super::handoff::apply_submission(state, frame_number, &sealed.submission).map(|_| ())
-                    } else {
-                        super::handoff::verify_closing_certificate(state, frame_number, &sealed.submission).map(|_| ())
-                    }
-                });
+                let applied = self
+                    .seal_drain(frame_number, &sealed, state, true)
+                    .and_then(|drain| {
+                        if drain.complete {
+                            super::handoff::apply_submission(
+                                state,
+                                frame_number,
+                                &sealed.submission,
+                            )
+                            .map(|_| ())
+                        } else {
+                            super::handoff::verify_closing_certificate(
+                                state,
+                                frame_number,
+                                &sealed.submission,
+                            )
+                            .map(|_| ())
+                        }
+                    });
                 if let Err(error) = applied {
                     state.rollback_to(savepoint);
                     return Err(error);
@@ -1285,9 +1558,63 @@ impl GlobalIntrinsic {
                 Ok(())
             }
             super::handoff::TYPE_PRESENCE_REPORT => {
-                // Validation only: an accepted report writes nothing yet.
-                let report = super::handoff::presence::PresenceReport::from_canonical_bytes(input)?;
-                self.verify_presence_report(frame_number, &report, state)
+                // A report is recorded from the presence credit frame; before
+                // it an accepted report writes nothing. A claim is accepted
+                // from the presence exclusion frame.
+                match super::handoff::presence::PresenceOp::from_canonical_bytes(input)? {
+                    super::handoff::presence::PresenceOp::Report(report) => {
+                        self.apply_presence_report(frame_number, &report, state)
+                    }
+                    super::handoff::presence::PresenceOp::Claim(claim) => {
+                        super::handoff::exclusion::apply_claim(
+                            state,
+                            frame_number,
+                            &claim,
+                            |anchor| self.presence_anchor_output(anchor),
+                        )
+                    }
+                }
+            }
+            super::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF => {
+                let proof =
+                    super::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(input)?;
+                let Some(settlements) =
+                    self.verify_storage_epoch_proof(frame_number, &proof, state)?
+                else {
+                    return Ok(());
+                };
+                let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+                for (part, settlement) in proof.seats.iter().zip(&settlements) {
+                    for (address, tree) in &settlement.sealed {
+                        let blob = crate::prover_registry::vertex_tree_to_blob(tree);
+                        state.set(
+                            &crate::global_schema::GLOBAL_INTRINSIC_ADDRESS[..],
+                            address,
+                            &va_disc,
+                            frame_number,
+                            blob,
+                        )?;
+                    }
+                    super::storage_seat::write(state, frame_number, &settlement.seat)?;
+                    if let Some(released) = &settlement.released {
+                        super::prover_shard_update::credit_storage_settlement(
+                            state,
+                            frame_number,
+                            &proof.member,
+                            released,
+                        )?;
+                    }
+                    let settled = settlement.seat.slot(part.epoch).filter(|_| part.settles);
+                    tracing::info!(frame = frame_number, epoch = part.epoch, member = %hex::encode(proof.member),
+                        shard = %hex::encode(&part.shard_filter), seats = proof.seats.len(),
+                        sealed_leaves = settlement.sealed.len(), frames = part.frames.len(), timely = settlement.timely,
+                        slowest_ms = settlement.slowest_ms,
+                        expected_proposals = settled.map_or(0.0, |slot| slot.expected as f64 / super::storage_seat::PROPOSAL as f64),
+                        held = %settled.map(|slot| slot.pending_amount().to_string()).unwrap_or_default(),
+                        released = ?settlement.released.as_ref().map(|r| r.to_string()),
+                        "storage epoch proof accepted");
+                }
+                Ok(())
             }
             TYPE_SHARD_SPLIT => {
                 let op = super::prover_ops::ShardSplit::from_canonical_bytes(input)?;
@@ -1305,7 +1632,8 @@ impl GlobalIntrinsic {
                 // and derive the commit record for parity; the caller
                 // can pick it up via the frame materializer layer.
                 let op = AltShardUpdate::from_canonical_bytes(input)?;
-                let _commit = super::alt_shard_update_materialize::materialize_alt_shard_update(&op)?;
+                let _commit =
+                    super::alt_shard_update_materialize::materialize_alt_shard_update(&op)?;
                 let _ = frame_number;
                 let _ = state;
                 let _ = va_disc;
@@ -1346,14 +1674,17 @@ impl GlobalIntrinsic {
             .map(|s| s.address.clone())
             .unwrap_or_default();
         if prover_address.len() < 32 {
-            return Err(QuilError::InvalidArgument("invoke_step: prover address too short".into()));
+            return Err(QuilError::InvalidArgument(
+                "invoke_step: prover address too short".into(),
+            ));
         }
 
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
 
         let load = crate::step_timing::section("filter op: load prover and allocation");
         // Load prover vertex data from CRDT.
-        let prover_data = state.get(domain, &prover_address, va_disc)?
+        let prover_data = state
+            .get(domain, &prover_address, va_disc)?
             .ok_or_else(|| QuilError::InvalidArgument("invoke_step: prover not found".into()))?;
 
         // Reconstruct the prover tree from stored data.
@@ -1364,18 +1695,20 @@ impl GlobalIntrinsic {
         let prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
 
         // Read public key from prover tree
-        let pubkey = read_field(&prover_tree, "prover:Prover", "PublicKey")
-            .unwrap_or_default();
+        let pubkey = read_field(&prover_tree, "prover:Prover", "PublicKey").unwrap_or_default();
         if pubkey.is_empty() {
-            return Err(QuilError::InvalidArgument("invoke_step: prover has no PublicKey".into()));
+            return Err(QuilError::InvalidArgument(
+                "invoke_step: prover has no PublicKey".into(),
+            ));
         }
 
         // Compute allocation address
         let alloc_addr = materialize::allocation_address(&pubkey, filter)?;
 
         // Load allocation vertex
-        let alloc_data = state.get(domain, &alloc_addr, va_disc)?
-            .ok_or_else(|| QuilError::InvalidArgument("invoke_step: allocation not found".into()))?;
+        let alloc_data = state.get(domain, &alloc_addr, va_disc)?.ok_or_else(|| {
+            QuilError::InvalidArgument("invoke_step: allocation not found".into())
+        })?;
 
         let mut alloc_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&alloc_data);
         drop(load);
@@ -1436,7 +1769,9 @@ impl GlobalIntrinsic {
             .map(|s| s.address.clone())
             .unwrap_or_default();
         if prover_address.len() < 32 {
-            return Err(QuilError::InvalidArgument("prover status: prover address too short".into()));
+            return Err(QuilError::InvalidArgument(
+                "prover status: prover address too short".into(),
+            ));
         }
         let _timing = crate::step_timing::section("prover status");
         self.derive_prover_status(frame_number, &prover_address, filters, state, va_disc)
@@ -1458,11 +1793,15 @@ impl GlobalIntrinsic {
         let mut prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
         let pubkey = read_field(&prover_tree, "prover:Prover", "PublicKey").unwrap_or_default();
         if pubkey.is_empty() {
-            return Err(QuilError::InvalidArgument("prover status: prover has no PublicKey".into()));
+            return Err(QuilError::InvalidArgument(
+                "prover status: prover has no PublicKey".into(),
+            ));
         }
 
         let ha_disc = hyperedge_adds_discriminator()?;
-        let hyperedge = state.get(domain, prover_address, &ha_disc)?.unwrap_or_default();
+        let hyperedge = state
+            .get(domain, prover_address, &ha_disc)?
+            .unwrap_or_default();
         let mut linked = materialize::hyperedge_allocation_addresses(&hyperedge)?;
         let mut unlinked: Vec<([u8; 32], quil_tries::VectorCommitmentTree)> = Vec::new();
         for filter in filters {
@@ -1470,8 +1809,14 @@ impl GlobalIntrinsic {
             if linked.contains(&address) || unlinked.iter().any(|(a, _)| *a == address) {
                 continue;
             }
-            if let Some(data) = state.get(domain, &address, va_disc)?.filter(|d| !d.is_empty()) {
-                unlinked.push((address, crate::prover_registry::rebuild_vertex_tree_from_blob(&data)));
+            if let Some(data) = state
+                .get(domain, &address, va_disc)?
+                .filter(|d| !d.is_empty())
+            {
+                unlinked.push((
+                    address,
+                    crate::prover_registry::rebuild_vertex_tree_from_blob(&data),
+                ));
             }
         }
         if !unlinked.is_empty() {
@@ -1484,7 +1829,10 @@ impl GlobalIntrinsic {
 
         let mut statuses = Vec::with_capacity(linked.len());
         for address in &linked {
-            let Some(data) = state.get(domain, address, va_disc)?.filter(|d| !d.is_empty()) else {
+            let Some(data) = state
+                .get(domain, address, va_disc)?
+                .filter(|d| !d.is_empty())
+            else {
                 continue;
             };
             let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&data);
@@ -1495,7 +1843,8 @@ impl GlobalIntrinsic {
             }
         }
         let status = materialize::compute_aggregate_prover_status(&statuses);
-        let current = read_field(&prover_tree, "prover:Prover", "Status").and_then(|b| b.first().copied());
+        let current =
+            read_field(&prover_tree, "prover:Prover", "Status").and_then(|b| b.first().copied());
         if current != Some(status) {
             write_field(&mut prover_tree, "prover:Prover", "Status", &[status])?;
             let prover_blob = crate::prover_registry::vertex_tree_to_blob(&prover_tree);
@@ -1518,13 +1867,16 @@ impl GlobalIntrinsic {
         state: &HypergraphState,
         va_disc: &[u8; 32],
     ) -> Result<()> {
-        let pubkey = op.public_key_signature_bls48581
+        let pubkey = op
+            .public_key_signature_bls48581
             .as_ref()
             .and_then(|s| s.public_key.as_ref())
             .cloned()
             .unwrap_or_default();
         if pubkey.is_empty() {
-            return Err(QuilError::InvalidArgument("invoke_step join: no public key".into()));
+            return Err(QuilError::InvalidArgument(
+                "invoke_step join: no public key".into(),
+            ));
         }
 
         // Defense-in-depth: re-verify the join SIGNATURE at materialize, matching
@@ -1542,12 +1894,7 @@ impl GlobalIntrinsic {
                 filter_count: 0,
             };
             let _timing = crate::step_timing::section("join: verify signatures");
-            if !verify::verify_prover_join_signatures(
-                op,
-                &jv,
-                self.key_manager.as_ref(),
-                None,
-            )? {
+            if !verify::verify_prover_join_signatures(op, &jv, self.key_manager.as_ref(), None)? {
                 return Err(QuilError::InvalidArgument(
                     "invoke_step join: signature verification failed".into(),
                 ));
@@ -1563,15 +1910,16 @@ impl GlobalIntrinsic {
         // `apply_due_shard_changes` consumes the pending record at E+2.
         if let Some(store) = self.shards_store.as_ref() {
             let _timing = crate::step_timing::section("join: pending changes and grid");
-            let pending = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records())
-                .all_pending_shard_changes()?;
+            let pending =
+                quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records())
+                    .all_pending_shard_changes()?;
             if !pending.is_empty() {
                 for filter in &op.filters {
                     if pending.iter().any(|c| c.affects_shard(filter)) {
                         return Err(QuilError::InvalidArgument(format!(
                             "invoke_step join: shard {} is frozen by a pending split/merge \
                              (join blocked until it settles at E+2)",
-                            hex::encode(&filter[..filter.len().min(8)]),
+                            hex::encode(filter),
                         )));
                     }
                 }
@@ -1593,7 +1941,8 @@ impl GlobalIntrinsic {
         // Check if prover was previously kicked (Go: global_prover_join.go:972-988)
         if let Ok(Some(existing_data)) = state.get(domain, &prover_address, va_disc) {
             if !existing_data.is_empty() {
-                let existing_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&existing_data);
+                let existing_tree =
+                    crate::prover_registry::rebuild_vertex_tree_from_blob(&existing_data);
                 let kick_frame = read_field(&existing_tree, "prover:Prover", "KickFrameNumber")
                     .unwrap_or_default();
                 if kick_frame.len() == 8 {
@@ -1613,10 +1962,12 @@ impl GlobalIntrinsic {
                     let alloc_addr = materialize::allocation_address(&pubkey, filter)?;
                     if let Ok(Some(alloc_data)) = state.get(domain, &alloc_addr, va_disc) {
                         if !alloc_data.is_empty() {
-                            let alloc_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&alloc_data);
-                            let status = read_field(&alloc_tree, "allocation:ProverAllocation", "Status")
-                                .and_then(|b| b.first().copied())
-                                .unwrap_or(4);
+                            let alloc_tree =
+                                crate::prover_registry::rebuild_vertex_tree_from_blob(&alloc_data);
+                            let status =
+                                read_field(&alloc_tree, "allocation:ProverAllocation", "Status")
+                                    .and_then(|b| b.first().copied())
+                                    .unwrap_or(4);
                             // Byte 4 (Rejected) and byte 6 (Historic) are ok to
                             // rejoin — a Historic slot was vacated by a reassignment
                             // and RETAINED for reactivation, so a fresh Join reclaims
@@ -1625,8 +1976,12 @@ impl GlobalIntrinsic {
                             // `verify_prover_join_allocations_expired`.
                             if status != 4 && status != materialize::STATUS_HISTORIC {
                                 // Check if the allocation has expired (720 frame window)
-                                let join_frame = read_field(&alloc_tree, "allocation:ProverAllocation", "JoinFrameNumber")
-                                    .unwrap_or_default();
+                                let join_frame = read_field(
+                                    &alloc_tree,
+                                    "allocation:ProverAllocation",
+                                    "JoinFrameNumber",
+                                )
+                                .unwrap_or_default();
                                 if join_frame.len() == 8 {
                                     let jf = u64::from_be_bytes(join_frame.try_into().unwrap());
                                     if frame_number < jf + 720 {
@@ -1658,16 +2013,64 @@ impl GlobalIntrinsic {
         // The fallback when there are no merge targets (or no
         // matching peer ids) is `0` — Go does **not** fall back to
         // `op.frame_number` for new provers, it just stores zero.
-        let computed_seniority: u64 = {
+        // From the seniority succession epoch a join credits as a merge does
+        // (`seniority_succession::credit_retro`): its unconsumed keys add
+        // only the retro parts they raise in the prover's `RetroCredited`,
+        // keys already counting for the joiner add nothing, and keys counting
+        // for another prover or fitting nothing are skipped. A key counts for
+        // one prover once, even when it was merged before.
+        let succession_rules = quil_types::consensus::seniority_succession_active(frame_number);
+        let join_credit: Option<(u64, super::seniority_succession::RetroParts)> =
+            if succession_rules {
+                use super::seniority_succession::{
+                    credit_retro, retro_parts, ProverRetro, TargetMarkers, TargetStanding,
+                };
+                let (mut added, mut own) = (Vec::new(), Vec::new());
+                for mt in op.merge_targets.iter().filter(|mt| mt.key_type == 0) {
+                    match TargetMarkers::read(state, &mt.prover_public_key)?
+                        .standing(&prover_address)
+                    {
+                        TargetStanding::Fresh => added.push(mt.prover_public_key.clone()),
+                        TargetStanding::Own => own.push(mt.prover_public_key.clone()),
+                        TargetStanding::Other(_) | TargetStanding::Unusable(_) => {}
+                    }
+                }
+                let ledger = state
+                    .get(domain, &prover_address, va_disc)?
+                    .filter(|blob| !blob.is_empty())
+                    .map(|blob| {
+                        ProverRetro::of(&crate::prover_registry::rebuild_vertex_tree_from_blob(
+                            &blob,
+                        ))
+                    })
+                    .unwrap_or_default();
+                Some(credit_retro(
+                    ledger.held,
+                    ledger.moved,
+                    &added,
+                    &own,
+                    &retro_parts,
+                ))
+            } else {
+                None
+            };
+        let computed_seniority: u64 = if succession_rules {
+            0
+        } else {
             let mut peer_ids: Vec<String> = Vec::new();
             for mt in &op.merge_targets {
                 // Spent-marker dedup: skip if another prover claimed it.
                 let spent_addr = materialize::spent_join_merge_address(&mt.prover_public_key)?;
                 if let Ok(Some(prior_blob)) = state.get(domain, &spent_addr, va_disc) {
                     if !prior_blob.is_empty() {
-                        let prior_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prior_blob);
-                        if let Some(stored_addr) = read_field(&prior_tree, "merge:SpentMerge", "ProverAddress") {
-                            if stored_addr.len() == 32 && stored_addr.as_slice() != prover_address.as_slice() {
+                        let prior_tree =
+                            crate::prover_registry::rebuild_vertex_tree_from_blob(&prior_blob);
+                        if let Some(stored_addr) =
+                            read_field(&prior_tree, "merge:SpentMerge", "ProverAddress")
+                        {
+                            if stored_addr.len() == 32
+                                && stored_addr.as_slice() != prover_address.as_slice()
+                            {
                                 continue;
                             }
                         }
@@ -1695,27 +2098,72 @@ impl GlobalIntrinsic {
 
         let initial_seniority = if prover_already_exists {
             // Read existing seniority, decide max with computed.
-            let existing_blob = state.get(domain, &prover_address, va_disc)?.unwrap_or_default();
-            let existing_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&existing_blob);
+            let existing_blob = state
+                .get(domain, &prover_address, va_disc)?
+                .unwrap_or_default();
+            let existing_tree =
+                crate::prover_registry::rebuild_vertex_tree_from_blob(&existing_blob);
             let existing = read_field(&existing_tree, "prover:Prover", "Seniority")
                 .and_then(|b| {
                     if b.len() == 8 {
                         Some(u64::from_be_bytes(b.try_into().unwrap()))
-                    } else { None }
+                    } else {
+                        None
+                    }
                 })
                 .unwrap_or(0);
-            std::cmp::max(existing, computed_seniority)
+            match &join_credit {
+                Some((credit, _)) => existing.saturating_add(*credit),
+                None => std::cmp::max(existing, computed_seniority),
+            }
         } else {
-            computed_seniority
+            join_credit
+                .as_ref()
+                .map_or(computed_seniority, |(credit, _)| *credit)
         };
 
-        let output = materialize::materialize_prover_join(
-            &pubkey, &op.filters, frame_number, initial_seniority,
+        let mut output = materialize::materialize_prover_join(
+            &pubkey,
+            &op.filters,
+            frame_number,
+            initial_seniority,
         )?;
+        // A rejoin rewrites the prover vertex. From the seniority succession
+        // epoch it keeps `LastSeniorityFrameNumber`, the accrual's
+        // once-per-frame key: a prover active on another shard may accrue
+        // in this frame before and after its rejoin. (A kick that still bars
+        // the prover refused the join above; a forgiven one stays forgiven.
+        // An amnestied prover rejoining from that epoch no longer regains its
+        // own keys' retro: keys already counting for a prover add nothing.)
+        if prover_already_exists && quil_types::consensus::seniority_succession_active(frame_number)
+        {
+            let existing_blob = state
+                .get(domain, &prover_address, va_disc)?
+                .unwrap_or_default();
+            let existing_tree =
+                crate::prover_registry::rebuild_vertex_tree_from_blob(&existing_blob);
+            // So does its retro moved out by successions, and the seniority
+            // penalties took from it (#976), which a later succession counts
+            // in its accrual.
+            for field in ["LastSeniorityFrameNumber", "RetroMoved", "SeniorityPenalty"] {
+                if let Some(value) = read_field(&existing_tree, "prover:Prover", field) {
+                    write_field(&mut output.prover_tree, "prover:Prover", field, &value)?;
+                }
+            }
+        }
+        if let Some((_, parts)) = &join_credit {
+            super::seniority_succession::set_credited_retro(&mut output.prover_tree, parts)?;
+        }
 
         // Write prover vertex
         let prover_blob = crate::prover_registry::vertex_tree_to_blob(&output.prover_tree);
-        state.set(domain, &output.prover_address, va_disc, frame_number, prover_blob)?;
+        state.set(
+            domain,
+            &output.prover_address,
+            va_disc,
+            frame_number,
+            prover_blob,
+        )?;
 
         // Write allocation vertices
         for (alloc_addr, alloc_tree) in &output.allocations {
@@ -1727,11 +2175,8 @@ impl GlobalIntrinsic {
         // enumerates the prover's allocations through it, and the prover's
         // status is derived from them, so a rejoin extends the existing
         // hyperedge instead of replacing it.
-        let alloc_pairs: Vec<([u8; 32], &quil_tries::VectorCommitmentTree)> = output
-            .allocations
-            .iter()
-            .map(|(a, t)| (*a, t))
-            .collect();
+        let alloc_pairs: Vec<([u8; 32], &quil_tries::VectorCommitmentTree)> =
+            output.allocations.iter().map(|(a, t)| (*a, t)).collect();
         let ha_disc = hyperedge_adds_discriminator()?;
         let existing_hyperedge = state
             .get(domain, &output.prover_address, &ha_disc)?
@@ -1740,7 +2185,13 @@ impl GlobalIntrinsic {
             &existing_hyperedge,
             &alloc_pairs,
         )?;
-        state.set(domain, &output.prover_address, &ha_disc, frame_number, hyperedge_blob)?;
+        state.set(
+            domain,
+            &output.prover_address,
+            &ha_disc,
+            frame_number,
+            hyperedge_blob,
+        )?;
         // A rejoining prover may still hold active allocations elsewhere.
         self.derive_prover_status(frame_number, &output.prover_address, &[], state, va_disc)?;
 
@@ -1749,13 +2200,24 @@ impl GlobalIntrinsic {
         // the consuming prover's address at `merge:SpentMerge.ProverAddress`
         // so a later join cannot re-claim the same target.
         for mt in &op.merge_targets {
+            // From the seniority succession epoch a join stamps only the keys
+            // no join or merge consumed: those it credited.
+            if succession_rules
+                && !super::seniority_succession::TargetMarkers::read(state, &mt.prover_public_key)?
+                    .is_empty()
+            {
+                continue;
+            }
             let spent_addr = materialize::spent_join_merge_address(&mt.prover_public_key)?;
             // If a *new-format* marker already exists for someone else,
             // skip. Legacy/empty markers can be overwritten.
             if let Ok(Some(prior_blob)) = state.get(domain, &spent_addr, va_disc) {
                 if !prior_blob.is_empty() {
-                    let prior_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prior_blob);
-                    if let Some(stored_addr) = read_field(&prior_tree, "merge:SpentMerge", "ProverAddress") {
+                    let prior_tree =
+                        crate::prover_registry::rebuild_vertex_tree_from_blob(&prior_blob);
+                    if let Some(stored_addr) =
+                        read_field(&prior_tree, "merge:SpentMerge", "ProverAddress")
+                    {
                         if stored_addr.len() == 32 {
                             // New format marker — skip regardless of who.
                             continue;
@@ -1888,7 +2350,8 @@ impl GlobalIntrinsic {
                         Some(d) if !d.is_empty() => d,
                         _ => continue,
                     };
-                    let mut alloc_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&alloc_data);
+                    let mut alloc_tree =
+                        crate::prover_registry::rebuild_vertex_tree_from_blob(&alloc_data);
                     materialize::materialize_prover_kick_allocation(&mut alloc_tree, frame_number)?;
                     let alloc_blob = crate::prover_registry::vertex_tree_to_blob(&alloc_tree);
                     state.set(domain, &alloc_addr, va_disc, frame_number, alloc_blob)?;
@@ -1915,31 +2378,62 @@ impl GlobalIntrinsic {
         // for the rationale. `validate()` may have returned Ok(true) without
         // checking the signature if the prover tree wasn't loadable from
         // state at admission time.
-        let sig = op.public_key_signature_bls48581.as_ref().ok_or_else(|| {
-            QuilError::InvalidArgument("invoke_update: missing signature".into())
-        })?;
+        let sig = op
+            .public_key_signature_bls48581
+            .as_ref()
+            .ok_or_else(|| QuilError::InvalidArgument("invoke_update: missing signature".into()))?;
         if sig.address.len() != 32 {
             return Err(QuilError::InvalidArgument(
                 "invoke_update: invalid prover address length".into(),
             ));
         }
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
-        let prover_data = state.get(domain, &sig.address, va_disc)?.ok_or_else(|| {
-            QuilError::InvalidArgument("invoke_update: prover not found".into())
-        })?;
+        let prover_data = state
+            .get(domain, &sig.address, va_disc)?
+            .ok_or_else(|| QuilError::InvalidArgument("invoke_update: prover not found".into()))?;
         if prover_data.is_empty() {
             return Err(QuilError::InvalidArgument(
                 "invoke_update: prover has no data".into(),
             ));
         }
         let prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
-        if !verify::verify_prover_update(op, &prover_tree, self.key_manager.as_ref())? {
+        let verified = verify::verify_prover_update(
+            op,
+            &prover_tree,
+            frame_number,
+            self.key_manager.as_ref(),
+        )?;
+        if !verified {
             return Err(QuilError::InvalidArgument(
                 "invoke_update: signature verification failed at materialize".into(),
             ));
         }
 
         super::prover_update_materialize::materialize_prover_update(op, frame_number, state)
+    }
+
+    /// Validate a `ProverSeniorityMerge` from the seniority succession epoch
+    /// over committed `state`: the decision `invoke_seniority_merge` makes,
+    /// without writing it. `Err` names why the op is refused.
+    pub fn validate_seniority_merge(
+        &self,
+        frame_number: u64,
+        op: &super::prover_ops::ProverSeniorityMerge,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        super::seniority_succession::plan_seniority_merge(
+            op,
+            frame_number,
+            state,
+            self.key_manager.as_ref(),
+            &super::seniority_succession::retro_parts,
+        )?
+        .map(drop)
+        .ok_or_else(|| {
+            QuilError::InvalidArgument(
+                "prover seniority merge: seniority succession is not active".into(),
+            )
+        })
     }
 
     /// SeniorityMerge invoke_step: merge seniority from old peer keys
@@ -1960,13 +2454,26 @@ impl GlobalIntrinsic {
         state: &HypergraphState,
         va_disc: &[u8; 32],
     ) -> Result<()> {
+        // From the seniority succession epoch: the same decision validation
+        // makes, over the frame's staged state.
+        if let Some(plan) = super::seniority_succession::plan_seniority_merge(
+            op,
+            frame_number,
+            state,
+            self.key_manager.as_ref(),
+            &super::seniority_succession::retro_parts,
+        )? {
+            return plan.apply(state, frame_number);
+        }
+
         if op.merge_targets.is_empty() {
             return Err(QuilError::InvalidArgument(
                 "invoke_step seniority_merge: no merge targets".into(),
             ));
         }
 
-        let prover_address = op.public_key_signature_bls48581
+        let prover_address = op
+            .public_key_signature_bls48581
             .as_ref()
             .map(|s| s.address.clone())
             .unwrap_or_default();
@@ -1979,10 +2486,11 @@ impl GlobalIntrinsic {
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
 
         // Load prover vertex
-        let prover_data = state.get(domain, &prover_address, va_disc)?
-            .ok_or_else(|| QuilError::InvalidArgument(
-                "invoke_step seniority_merge: prover not found".into(),
-            ))?;
+        let prover_data = state
+            .get(domain, &prover_address, va_disc)?
+            .ok_or_else(|| {
+                QuilError::InvalidArgument("invoke_step seniority_merge: prover not found".into())
+            })?;
         if prover_data.is_empty() {
             return Err(QuilError::InvalidArgument(
                 "invoke_step seniority_merge: prover has no data".into(),
@@ -1995,15 +2503,32 @@ impl GlobalIntrinsic {
         // already ran this on the bundle, but a buggy/dropped validate
         // path shouldn't bypass authority enforcement at materialize.
         if !verify::verify_prover_seniority_merge(
-            op, &prover_tree, frame_number, self.key_manager.as_ref(),
+            op,
+            &prover_tree,
+            frame_number,
+            self.key_manager.as_ref(),
         )? {
             return Err(QuilError::InvalidArgument(
                 "invoke_step seniority_merge: signature verification failed".into(),
             ));
         }
 
+        // Validation reads every request of a bundle against committed state,
+        // before any of them runs, so a target consumed earlier in the same
+        // bundle (by another copy of this op, another merge or a join) still
+        // passed it, and each copy added the target's seniority again. From
+        // the prover operation replay guard epoch, refuse the merge here when
+        // the frame's staged state already holds either spent marker of a
+        // target, as validation refuses one in committed state.
+        if quil_types::consensus::prover_op_replay_guard_active(frame_number) {
+            verify::verify_prover_seniority_merge_spent_markers(op, |addr: &[u8; 32]| {
+                state.get(domain, addr, va_disc)
+            })?;
+        }
+
         // Collect merge target public keys
-        let merge_target_pubkeys: Vec<Vec<u8>> = op.merge_targets
+        let merge_target_pubkeys: Vec<Vec<u8>> = op
+            .merge_targets
             .iter()
             .map(|mt| mt.prover_public_key.clone())
             .collect();
@@ -2017,7 +2542,8 @@ impl GlobalIntrinsic {
         // four retro epochs (max within each epoch, summed across
         // epochs) further `max`'d with the mainnet snapshot value.
         // This is NOT a MAX over individual peer seniorities.
-        let peer_ids: Vec<String> = op.merge_targets
+        let peer_ids: Vec<String> = op
+            .merge_targets
             .iter()
             .filter(|mt| mt.key_type == 0 && mt.prover_public_key.len() == 57)
             .map(|mt| ed448_pubkey_to_peer_id_string(&mt.prover_public_key))
@@ -2099,19 +2625,69 @@ impl GlobalIntrinsic {
             return super::prover_shard_update::verify_app_frame_output(op, &[]);
         }
         let clock_store = self.clock_store.as_ref().ok_or_else(|| {
-            QuilError::Internal("FrameHeader: clock_store not installed — cannot recompute output".into())
+            QuilError::Internal(
+                "FrameHeader: clock_store not installed — cannot recompute output".into(),
+            )
         })?;
         let anchor_output = clock_store
             .get_global_clock_frame_header(op.global_frame_number)
             .ok()
             .map(|header| header.output)
-            .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
-                "FrameHeader: anchored global frame {} unavailable — cannot recompute output",
-                op.global_frame_number
-            )))?;
+            .ok_or_else(|| {
+                QuilError::ExecutionUnavailable(format!(
+                    "FrameHeader: anchored global frame {} unavailable — cannot recompute output",
+                    op.global_frame_number
+                ))
+            })?;
         super::prover_shard_update::verify_app_frame_output(op, &anchor_output)
     }
 
+    /// From the required-anchor epoch GLOBAL frame `frame_number` refuses a
+    /// shard frame header that names no GLOBAL anchor
+    /// ([`quil_types::consensus::MAINNET_REQUIRED_ANCHOR_EPOCH`]): the
+    /// lockstep window, the storage seat and the proof-of-storage gate are
+    /// all keyed on the anchor, and such a header escapes each of them.
+    fn require_global_anchor(
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
+        if op.global_frame_number == 0
+            && quil_types::consensus::required_anchor_active(frame_number)
+        {
+            return Err(QuilError::InvalidArgument(format!(
+                "FrameHeader: shard {} frame {} names no GLOBAL anchor (required at frame {})",
+                hex::encode(&op.address),
+                op.frame_number,
+                frame_number
+            )));
+        }
+        Ok(())
+    }
+
+    /// The difficulty of the GLOBAL frame a shard frame header anchors to,
+    /// from this node's clock store; `None` for a header without an anchor.
+    /// [`Self::verify_shard_frame_output`] already required that frame.
+    fn anchor_difficulty(&self, op: &super::frame_header::FrameHeader) -> Result<Option<u32>> {
+        if op.global_frame_number == 0 {
+            return Ok(None);
+        }
+        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+            QuilError::Internal(
+                "FrameHeader: clock_store not installed — cannot price issuance".into(),
+            )
+        })?;
+        clock_store
+            .get_global_clock_frame_header(op.global_frame_number)
+            .map(|header| Some(header.difficulty))
+            .map_err(|_| {
+                QuilError::ExecutionUnavailable(format!(
+                    "FrameHeader: anchored global frame {} unavailable — cannot price issuance",
+                    op.global_frame_number
+                ))
+            })
+    }
+
+    #[cfg(test)]
     fn audit_storage_attestation(
         &self,
         frame_number: u64,
@@ -2119,6 +2695,21 @@ impl GlobalIntrinsic {
         bitmask: &[u8],
         state: &HypergraphState,
         va_disc: &[u8; 32],
+    ) -> Result<()> {
+        let mut timing = HeaderTiming::start();
+        self.audit_storage_attestation_timed(frame_number, op, bitmask, state, va_disc, &mut timing)
+    }
+
+    /// The PoRep storage audit of `op`, marking in `timing` where its registry
+    /// lookups end; the caller marks the end of the possession checks.
+    fn audit_storage_attestation_timed(
+        &self,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+        bitmask: &[u8],
+        state: &HypergraphState,
+        va_disc: &[u8; 32],
+        timing: &mut HeaderTiming,
     ) -> Result<()> {
         // Genesis / legacy-VDF frames anchor to 0 — no storage beacon, no
         // lockstep requirement.
@@ -2149,8 +2740,14 @@ impl GlobalIntrinsic {
         }
 
         // Anchor is in lockstep. If there's no attestation payload, there are no
-        // openings to audit — nothing more to do.
-        if op.storage_attestation.is_empty() {
+        // openings to audit — nothing more to do. A hash-proof epoch carries
+        // none to audit either: its frames commit a root the member's epoch
+        // proof covers (`storage_seat`, decided 2026-10-21).
+        if op.storage_attestation.is_empty()
+            || quil_types::consensus::hash_storage_proofs_at(
+                quil_types::consensus::epoch_for_frame(op.global_frame_number),
+            )
+        {
             return Ok(());
         }
         let att = <quil_types::proto::global::StorageAttestation as prost::Message>::decode(
@@ -2169,11 +2766,6 @@ impl GlobalIntrinsic {
         if openings.is_empty() {
             return Ok(());
         }
-        // Possession verify is γ-independent at k=1, so the bitmask is a
-        // don't-care for the per-opening audit (it bound the aggregate root,
-        // already committee-signed). Accept it to document the contract.
-        let _ = bitmask;
-
         let clock_store = self.clock_store.as_ref().ok_or_else(|| {
             QuilError::Internal(
                 "invoke_frame_header: clock_store not installed — cannot recompute ρ_N for audit"
@@ -2188,6 +2780,54 @@ impl GlobalIntrinsic {
         let rho_n =
             quil_crypto::porep::derive_storage_beacon(op.global_frame_number, &global_output);
         let active_epoch = quil_types::consensus::epoch_for_frame(op.global_frame_number);
+
+        // The attestation body travels beside the header; only its root is
+        // certified (bound into the frame output). Audit the openings only
+        // when they aggregate to that root: a body that does not was
+        // substituted in relay, names members the committee never attested,
+        // and must get no one kicked. The producer folds an empty bitmask
+        // into the root (a CW header carries no signer aggregate); a root
+        // over the certificate's bitmask is accepted as well.
+        let root_of = |bitmask: &[u8]| {
+            quil_crypto::porep::compute_storage_attestation_root(
+                &openings,
+                op.frame_number,
+                &rho_n,
+                bitmask,
+                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+            )
+        };
+        if op.storage_attestation_root.is_empty()
+            || (root_of(&[]) != op.storage_attestation_root
+                && root_of(bitmask) != op.storage_attestation_root)
+        {
+            tracing::warn!(
+                frame = frame_number,
+                shard = %hex::encode(&op.address),
+                shard_frame = op.frame_number,
+                openings = openings.len(),
+                "storage attestation does not match the frame's certified root: not audited, \
+                 no member kicked (the body was substituted in relay, or the frame certifies none)"
+            );
+            return Ok(());
+        }
+        // The root is `Σ_k γ^k · π_k`, with `γ` hashed over the whole body,
+        // so it binds every opening of a body of two or more. Over a single
+        // opening it is that opening's proof point (`γ^0 = 1`) and binds none
+        // of the opening's other fields, its member included: such a body
+        // gets no one kicked. A producer attaches `STORAGE_QUERIES_PER_LEAF`
+        // openings for each leaf it attests, so no attested body holds one.
+        const _: () = assert!(quil_types::consensus::STORAGE_QUERIES_PER_LEAF >= 2);
+        if openings.len() < 2 {
+            tracing::warn!(
+                frame = frame_number,
+                shard = %hex::encode(&op.address),
+                shard_frame = op.frame_number,
+                "storage attestation holds a single opening, which the frame's certified root \
+                 does not bind: not audited, no member kicked (a producer attaches at least two)"
+            );
+            return Ok(());
+        }
 
         // Registry cross-check: read the on-chain leaf-root registration vertex
         // `(member, leaf_id)` from committed state.
@@ -2212,15 +2852,24 @@ impl GlobalIntrinsic {
             Some((leaf_root, num_blocks, active_epoch))
         };
 
-        let failed = quil_crypto::porep::audit_frame_storage_attestations(
+        let audited = quil_crypto::porep::audit_storage_registry(
             &openings,
             &rho_n,
-            quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
             active_epoch,
             quil_types::consensus::STORAGE_AUDIT_SAMPLE,
             lookup,
         );
+        timing.mark("storage audit lookup");
+        let failed = quil_crypto::porep::audit_storage_possession(
+            &audited,
+            &rho_n,
+            quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+            active_epoch,
+        );
         for member in failed {
+            tracing::warn!(frame = frame_number, epoch = active_epoch, member = %hex::encode(&member),
+                hash = quil_types::consensus::hash_storage_proofs_at(active_epoch),
+                "storage audit failed: kicking the member");
             self.kick_prover_by_address(frame_number, &member, state, va_disc)?;
         }
         Ok(())
@@ -2237,41 +2886,71 @@ impl GlobalIntrinsic {
         state: &HypergraphState,
         session: &[u8; 32],
     ) -> Result<()> {
-        let fp = self.frame_prover.as_ref().ok_or_else(|| QuilError::Internal(
-            "seal drain: frame_prover not installed — cannot verify attestation".into(),
-        ))?;
-        let bls = self.bls_constructor.as_ref().ok_or_else(|| QuilError::Internal(
-            "seal drain: bls_constructor not installed — cannot verify attestation".into(),
-        ))?;
-        let pr = self.prover_registry.as_ref().ok_or_else(|| QuilError::Internal(
-            "seal drain: prover_registry not installed — cannot resolve members".into(),
-        ))?;
-        let committee_frame = if op.global_frame_number > 0 { op.global_frame_number } else { frame_number };
+        let fp = self.frame_prover.as_ref().ok_or_else(|| {
+            QuilError::Internal(
+                "seal drain: frame_prover not installed — cannot verify attestation".into(),
+            )
+        })?;
+        let bls = self.bls_constructor.as_ref().ok_or_else(|| {
+            QuilError::Internal(
+                "seal drain: bls_constructor not installed — cannot verify attestation".into(),
+            )
+        })?;
+        let pr = self.prover_registry.as_ref().ok_or_else(|| {
+            QuilError::Internal(
+                "seal drain: prover_registry not installed — cannot resolve members".into(),
+            )
+        })?;
+        let committee_frame = if op.global_frame_number > 0 {
+            op.global_frame_number
+        } else {
+            frame_number
+        };
         let (_, _, certified_by) = super::prover_shard_update::verify_frame_header_session(
-            state, op, fp.as_ref(), bls.as_ref(), pr.as_ref(), committee_frame, frame_number,
+            state,
+            op,
+            fp.as_ref(),
+            bls.as_ref(),
+            pr.as_ref(),
+            committee_frame,
+            frame_number,
         )?;
         if certified_by != Some(*session) {
-            return Err(QuilError::InvalidArgument("seal drain: header is not certified by the sealed session".into()));
+            return Err(QuilError::InvalidArgument(
+                "seal drain: header is not certified by the sealed session".into(),
+            ));
         }
         self.verify_shard_frame_output(op)?;
         super::prover_shard_update::verify_settlement_relay(op)?;
         #[cfg(feature = "confidential-tokens")]
         crate::token_intrinsic::global_accumulator::verify_report(&op.address, &op.accumulator)?;
         #[cfg(feature = "confidential-tokens")]
-        crate::token_intrinsic::global_commit::verify_relay(frame_number, op.frame_number, &op.spends)?;
+        crate::token_intrinsic::global_commit::verify_relay(
+            frame_number,
+            op.frame_number,
+            &op.spends,
+        )?;
         Ok(())
     }
 
     /// [`Self::check_drain_header`] for a header the seal certifies
     /// ([`Self::drain_certified_by_seal`]): everything but its own certificate.
     #[cfg_attr(not(feature = "confidential-tokens"), allow(unused_variables))]
-    fn check_seal_certified_header(&self, frame_number: u64, op: &super::frame_header::FrameHeader) -> Result<()> {
+    fn check_seal_certified_header(
+        &self,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
         self.verify_shard_frame_output(op)?;
         super::prover_shard_update::verify_settlement_relay(op)?;
         #[cfg(feature = "confidential-tokens")]
         crate::token_intrinsic::global_accumulator::verify_report(&op.address, &op.accumulator)?;
         #[cfg(feature = "confidential-tokens")]
-        crate::token_intrinsic::global_commit::verify_relay(frame_number, op.frame_number, &op.spends)?;
+        crate::token_intrinsic::global_commit::verify_relay(
+            frame_number,
+            op.frame_number,
+            &op.spends,
+        )?;
         Ok(())
     }
 
@@ -2293,16 +2972,25 @@ impl GlobalIntrinsic {
     ) -> Result<Vec<bool>> {
         let uncertified: Vec<bool> = headers
             .iter()
-            .map(|op| quil_cw_consensus::app_cert::unwrap_cert_from_header(&op.public_key_signature_bls48581).is_none())
+            .map(|op| {
+                quil_cw_consensus::app_cert::unwrap_cert_from_header(
+                    &op.public_key_signature_bls48581,
+                )
+                .is_none()
+            })
             .collect();
         let mut by_seal = vec![false; headers.len()];
-        if !uncertified.contains(&true) || frame_number < super::handoff::seal_checkpoint_drain_frame() {
+        if !uncertified.contains(&true)
+            || frame_number < super::handoff::seal_checkpoint_drain_frame()
+        {
             return Ok(by_seal);
         }
         // Only a valid seal certifies its checkpoint.
         super::handoff::verify_closing_certificate(state, frame_number, &sealed.submission)?;
         let checkpoint = &sealed.submission.seal.checkpoint;
-        let identity = |op: &super::frame_header::FrameHeader| quil_crypto::poseidon::hash_bytes_to_32(&op.output);
+        let identity = |op: &super::frame_header::FrameHeader| {
+            quil_crypto::poseidon::hash_bytes_to_32(&op.output)
+        };
         for index in (0..headers.len()).rev() {
             if !uncertified[index] {
                 continue;
@@ -2310,14 +2998,18 @@ impl GlobalIntrinsic {
             let op = &headers[index];
             by_seal[index] = match headers.get(index + 1) {
                 // A re-seal names its parent seal's view, above the frame's own.
-                None => op.frame_number == checkpoint.frame
-                    && op.rank <= checkpoint.view
-                    && identity(op)? == checkpoint.digest,
-                Some(child) => (by_seal[index + 1] || !uncertified[index + 1])
-                    && child.address == op.address
-                    && op.frame_number.checked_add(1) == Some(child.frame_number)
-                    && child.rank > op.rank
-                    && child.parent_selector == identity(op)?.as_slice(),
+                None => {
+                    op.frame_number == checkpoint.frame
+                        && op.rank <= checkpoint.view
+                        && identity(op)? == checkpoint.digest
+                }
+                Some(child) => {
+                    (by_seal[index + 1] || !uncertified[index + 1])
+                        && child.address == op.address
+                        && op.frame_number.checked_add(1) == Some(child.frame_number)
+                        && child.rank > op.rank
+                        && child.parent_selector == identity(op)?.as_slice()
+                }
             };
         }
         Ok(by_seal)
@@ -2348,7 +3040,10 @@ impl GlobalIntrinsic {
         let id = sealed.submission.seal.session;
         let recorded = handoff::session_tip(state, &id)?;
         if sealed.drain.is_empty() {
-            return Ok(SealDrain { executed: recorded, complete: true });
+            return Ok(SealDrain {
+                executed: recorded,
+                complete: true,
+            });
         }
         if frame_number < handoff::seal_drain_frame() {
             return Err(invalid("drain headers are not active"));
@@ -2361,7 +3056,10 @@ impl GlobalIntrinsic {
             .collect::<Result<Vec<_>>>()?;
         let by_seal = self.drain_certified_by_seal(frame_number, sealed, state, &headers)?;
         let mut executed = recorded;
-        let mut next = executed.as_ref().map_or(session.base_frame, |tip| tip.frame).saturating_add(1);
+        let mut next = executed
+            .as_ref()
+            .map_or(session.base_frame, |tip| tip.frame)
+            .saturating_add(1);
         let mut last: Option<u64> = None;
         let mut drained = 0usize;
         for (op, by_seal) in headers.into_iter().zip(by_seal) {
@@ -2383,9 +3081,13 @@ impl GlobalIntrinsic {
             } else {
                 self.check_drain_header(frame_number, &op, state, &id)?;
             }
-            let roots: Option<Vec<[u8; 32]>> =
-                op.state_roots.iter().map(|root| <[u8; 32]>::try_from(root.as_slice()).ok()).collect();
-            let state_roots = roots.and_then(|roots| <[[u8; 32]; 4]>::try_from(roots).ok())
+            let roots: Option<Vec<[u8; 32]>> = op
+                .state_roots
+                .iter()
+                .map(|root| <[u8; 32]>::try_from(root.as_slice()).ok())
+                .collect();
+            let state_roots = roots
+                .and_then(|roots| <[[u8; 32]; 4]>::try_from(roots).ok())
                 .ok_or_else(|| invalid("header state roots are malformed"))?;
             let tip = quil_cw_consensus::handoff::Checkpoint {
                 frame: op.frame_number,
@@ -2397,12 +3099,26 @@ impl GlobalIntrinsic {
             if execute {
                 handoff::record_session_tip(state, frame_number, &id, &tip)?;
                 if self.reward_issuance.is_some() && self.hypergraph.is_some() {
-                    super::prover_shard_update::materialize_settlement_records(&op, frame_number, state)?;
+                    self.commit_drained_storage(frame_number, &op, state)?;
+                    super::prover_shard_update::materialize_settlement_records(
+                        &op,
+                        frame_number,
+                        state,
+                    )?;
                     #[cfg(feature = "confidential-tokens")]
-                    crate::token_intrinsic::global_accumulator::materialize_report(state, frame_number, &op.address, &op.accumulator)?;
+                    crate::token_intrinsic::global_accumulator::materialize_report(
+                        state,
+                        frame_number,
+                        &op.address,
+                        &op.accumulator,
+                    )?;
                     #[cfg(feature = "confidential-tokens")]
                     crate::token_intrinsic::global_commit::materialize_relay(
-                        state, frame_number, &op.address, op.frame_number, &op.spends,
+                        state,
+                        frame_number,
+                        &op.address,
+                        op.frame_number,
+                        &op.spends,
                     )?;
                 }
             }
@@ -2413,14 +3129,18 @@ impl GlobalIntrinsic {
         let checkpoint = sealed.submission.seal.checkpoint.frame;
         let complete = match last {
             Some(last) if last == checkpoint => true,
-            Some(last) if last > checkpoint => return Err(invalid("headers run past the sealed checkpoint")),
+            Some(last) if last > checkpoint => {
+                return Err(invalid("headers run past the sealed checkpoint"))
+            }
             _ if frame_number < handoff::seal_recovery_frame() => {
                 return Err(invalid("headers do not end at the sealed checkpoint"));
             }
             _ if sealed.drain.len() != handoff::MAX_DRAIN_HEADERS => {
-                return Err(invalid("a partial drain carries exactly the most headers a submission may"));
+                return Err(invalid(
+                    "a partial drain carries exactly the most headers a submission may",
+                ));
             }
-            _ if drained == 0 => return Err(invalid("a partial drain's headers are already executed")),
+            _ if drained == 0 => return Err(invalid(handoff::superseded::PARTIAL_DRAIN_EXECUTED)),
             _ => false,
         };
         if execute && drained > 0 {
@@ -2438,6 +3158,70 @@ impl GlobalIntrinsic {
         Ok(SealDrain { executed, complete })
     }
 
+    /// A drained header's openings root joins its proposer's storage seat as
+    /// an executed frame's does, so its member proves it like the others; a
+    /// drained frame earns no reward, and executed this late its root rarely
+    /// counts as published.
+    fn commit_drained_storage(
+        &self,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        let epoch = quil_types::consensus::epoch_for_frame(op.global_frame_number);
+        if op.global_frame_number == 0 || !quil_types::consensus::hash_storage_proofs_at(epoch) {
+            return Ok(());
+        }
+        let Ok(member) = <[u8; 32]>::try_from(op.prover.as_slice()) else {
+            return Ok(());
+        };
+        let Some(commitment) = self.storage_commitment(frame_number, op)? else {
+            return Ok(());
+        };
+        let Some(mut seat) = super::storage_seat::read(state, &member, &op.address)? else {
+            return Ok(());
+        };
+        if seat.commit(
+            epoch,
+            op.frame_number,
+            commitment.beacon,
+            frame_number,
+            &commitment.rho_n,
+            &commitment.root,
+        ) {
+            super::storage_seat::write(state, frame_number, &seat)?;
+            if seat.first_commitment(epoch) {
+                let address = super::storage_seat::seat_address(&member, &op.address)?;
+                super::storage_seat::enqueue_expiry(state, frame_number, epoch, &address)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Close the seats whose epoch's settlement window ended, a bucket of the
+    /// epoch's expiry queue at a time (`storage_seat::enqueue_expiry`),
+    /// kicking each member that committed roots it never proved — also one
+    /// that never takes part in its shard again, which the frame path
+    /// (`StorageFrame::kicks`) would never reach. Where seats are written
+    /// (the archive-mode deps of `invoke_frame_header`) only.
+    fn sweep_storage_expiries(&self, frame_number: u64, state: &HypergraphState) -> Result<()> {
+        use super::storage_seat;
+        if self.reward_issuance.is_none() || self.hypergraph.is_none() {
+            return Ok(());
+        }
+        let kicks = storage_seat::sweep_expiries(state, frame_number)?;
+        if kicks.is_empty() {
+            return Ok(());
+        }
+        let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
+        for seat in kicks {
+            tracing::warn!(frame = frame_number, member = %hex::encode(seat.member), shard = %hex::encode(&seat.filter),
+                "storage epoch proof missing for committed openings: kicking the member (expiry sweep)");
+            self.kick_prover_by_address(frame_number, &seat.member, state, &va_disc)?;
+        }
+        Ok(())
+    }
+
     /// Check a committee-handoff seal submission, its drain headers included,
     /// without writing anything.
     pub fn verify_seal_submission(
@@ -2448,11 +3232,85 @@ impl GlobalIntrinsic {
     ) -> Result<()> {
         let drain = self.seal_drain(frame_number, sealed, state, false)?;
         if drain.complete {
-            super::handoff::verify_submission_at(state, frame_number, &sealed.submission, drain.executed)?;
+            super::handoff::verify_submission_at(
+                state,
+                frame_number,
+                &sealed.submission,
+                drain.executed,
+            )?;
         } else {
             super::handoff::verify_closing_certificate(state, frame_number, &sealed.submission)?;
         }
         Ok(())
+    }
+
+    /// Check a storage epoch proof against committed state
+    /// (`storage_epoch_proof::check`), returning what it changes; `None` when
+    /// this frame already applied it. Its seal beacons and the settled roots'
+    /// response times are GLOBAL frame outputs and timestamps from this
+    /// node's clock store: a node that lacks one cannot tell, and waits
+    /// rather than decide otherwise.
+    pub fn verify_storage_epoch_proof(
+        &self,
+        frame_number: u64,
+        proof: &super::storage_epoch_proof::StorageEpochProof,
+        state: &HypergraphState,
+    ) -> Result<Option<Vec<super::storage_epoch_proof::Settlement>>> {
+        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+            QuilError::Internal("storage epoch proof: clock_store not installed".into())
+        })?;
+        let changes = match self.shards_store.as_ref() {
+            Some(store) if proof.seats.iter().any(|seat| seat.seals) => {
+                store.all_pending_shard_changes()?
+            }
+            _ => Vec::new(),
+        };
+        let bits = |filter: &[u8]| match self.hypergraph.as_ref() {
+            Some(hypergraph) => hypergraph.canonical_bits_for_filter(filter),
+            None => quil_forest::decode_shard_filter_or_root(filter, 32).map(|(_, bits)| bits),
+        };
+        let context = super::storage_epoch_proof::SealContext {
+            changes: &changes,
+            bits: &bits,
+        };
+        let header = |frame: u64| {
+            clock_store
+                .get_global_clock_frame_header(frame)
+                .map_err(|_| {
+                    QuilError::ExecutionUnavailable(format!(
+                        "storage epoch proof: GLOBAL frame {frame} header unavailable"
+                    ))
+                })
+        };
+        super::storage_epoch_proof::check(
+            frame_number,
+            proof,
+            state,
+            |frame| header(frame).map(|header| header.output),
+            |frame| header(frame).map(|header| header.timestamp),
+            &context,
+        )
+    }
+
+    /// Check a presence report or claim against `state`, with each anchor
+    /// output from this node's clock store, without writing anything.
+    pub fn verify_presence_op(
+        &self,
+        frame_number: u64,
+        op: &super::handoff::presence::PresenceOp,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        match op {
+            super::handoff::presence::PresenceOp::Report(report) => {
+                self.verify_presence_report(frame_number, report, state)
+            }
+            super::handoff::presence::PresenceOp::Claim(claim) => {
+                super::handoff::exclusion::verify_claim(state, frame_number, claim, |anchor| {
+                    self.presence_anchor_output(anchor)
+                })
+                .map(|_| ())
+            }
+        }
     }
 
     /// Check a presence report against `state`, with each proposal's anchor
@@ -2464,17 +3322,40 @@ impl GlobalIntrinsic {
         state: &HypergraphState,
     ) -> Result<()> {
         super::handoff::presence::verify(state, frame_number, report, |anchor| {
-            let clock_store = self.clock_store.as_ref().ok_or_else(|| {
-                QuilError::Internal("presence report: clock_store not installed — cannot recompute output".into())
-            })?;
-            clock_store
-                .get_global_clock_frame_header(anchor)
-                .ok()
-                .map(|header| header.output)
-                .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
-                    "presence report: anchored global frame {anchor} unavailable — cannot recompute output"
-                )))
+            self.presence_anchor_output(anchor)
         })
+    }
+
+    /// Check a presence report as [`Self::verify_presence_report`] does and,
+    /// from the presence credit frame, record it
+    /// ([`super::handoff::presence::apply`]).
+    pub fn apply_presence_report(
+        &self,
+        frame_number: u64,
+        report: &super::handoff::presence::PresenceReport,
+        state: &HypergraphState,
+    ) -> Result<()> {
+        super::handoff::presence::apply(state, frame_number, report, |anchor| {
+            self.presence_anchor_output(anchor)
+        })
+        .map(|_| ())
+    }
+
+    /// The output of GLOBAL frame `anchor` from this node's clock store, which
+    /// a presence report's header output is recomputed from.
+    fn presence_anchor_output(&self, anchor: u64) -> Result<Vec<u8>> {
+        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+            QuilError::Internal(
+                "presence report: clock_store not installed — cannot recompute output".into(),
+            )
+        })?;
+        clock_store
+            .get_global_clock_frame_header(anchor)
+            .ok()
+            .map(|header| header.output)
+            .ok_or_else(|| QuilError::ExecutionUnavailable(format!(
+                "presence report: anchored global frame {anchor} unavailable — cannot recompute output"
+            )))
     }
 
     fn invoke_frame_header(
@@ -2495,12 +3376,19 @@ impl GlobalIntrinsic {
         // archive-mode extras: when absent, we skip the state
         // mutations but only AFTER the attestation has verified.
         let mut timing = HeaderTiming::start();
-        let fp = self.frame_prover.as_ref().ok_or_else(|| QuilError::Internal(
-            "invoke_frame_header: frame_prover not installed — cannot verify attestation".into(),
-        ))?;
-        let bls = self.bls_constructor.as_ref().ok_or_else(|| QuilError::Internal(
-            "invoke_frame_header: bls_constructor not installed — cannot verify attestation".into(),
-        ))?;
+        Self::require_global_anchor(frame_number, op)?;
+        let fp = self.frame_prover.as_ref().ok_or_else(|| {
+            QuilError::Internal(
+                "invoke_frame_header: frame_prover not installed — cannot verify attestation"
+                    .into(),
+            )
+        })?;
+        let bls = self.bls_constructor.as_ref().ok_or_else(|| {
+            QuilError::Internal(
+                "invoke_frame_header: bls_constructor not installed — cannot verify attestation"
+                    .into(),
+            )
+        })?;
         let pr = self.prover_registry.as_ref().ok_or_else(|| QuilError::Internal(
             "invoke_frame_header: prover_registry not installed — cannot resolve active provers".into(),
         ))?;
@@ -2512,16 +3400,25 @@ impl GlobalIntrinsic {
         } else {
             frame_number
         };
-        let (active_provers, bitmask_bytes, session) = super::prover_shard_update::verify_frame_header_session(
-            state, op, fp.as_ref(), bls.as_ref(), pr.as_ref(), committee_frame, frame_number,
-        ).map_err(|e| QuilError::InvalidArgument(format!(
-            "invoke_frame_header: frame header attestation invalid: {e}"
-        )))?;
+        let (active_provers, bitmask_bytes, session) =
+            super::prover_shard_update::verify_frame_header_session(
+                state,
+                op,
+                fp.as_ref(),
+                bls.as_ref(),
+                pr.as_ref(),
+                committee_frame,
+                frame_number,
+            )
+            .map_err(|e| {
+                QuilError::InvalidArgument(format!(
+                    "invoke_frame_header: frame header attestation invalid: {e}"
+                ))
+            })?;
         timing.mark("session");
 
-        self.verify_shard_frame_output(op).map_err(|e| QuilError::InvalidArgument(format!(
-            "invoke_frame_header: {e}"
-        )))?;
+        self.verify_shard_frame_output(op)
+            .map_err(|e| QuilError::InvalidArgument(format!("invoke_frame_header: {e}")))?;
         timing.mark("output");
         super::prover_shard_update::verify_settlement_relay(op)?;
         // A certified header's accumulator report must be canonical and name
@@ -2529,14 +3426,32 @@ impl GlobalIntrinsic {
         #[cfg(feature = "confidential-tokens")]
         crate::token_intrinsic::global_accumulator::verify_report(&op.address, &op.accumulator)?;
         #[cfg(feature = "confidential-tokens")]
-        crate::token_intrinsic::global_commit::verify_relay(frame_number, op.frame_number, &op.spends)?;
+        crate::token_intrinsic::global_commit::verify_relay(
+            frame_number,
+            op.frame_number,
+            &op.spends,
+        )?;
         timing.mark("verify relay/report");
+
+        // From the anchored issuance epoch GLOBAL credits each frame of an
+        // authorized session once: a header at or below the session's
+        // executed tip, read before this header advances it, was credited when
+        // GLOBAL first executed that frame.
+        let anchored_issuance = quil_types::consensus::anchored_issuance_active(frame_number);
+        let executed_tip = match session {
+            Some(session) if anchored_issuance => super::handoff::session_tip(state, &session)?,
+            _ => None,
+        };
+        let credit = !executed_tip.is_some_and(|tip| tip.frame >= op.frame_number);
 
         // The authorized session's executed tip: a seal is accepted only once
         // it reaches the sealed checkpoint.
         if let Some(session) = session {
-            let roots: Option<Vec<[u8; 32]>> =
-                op.state_roots.iter().map(|root| <[u8; 32]>::try_from(root.as_slice()).ok()).collect();
+            let roots: Option<Vec<[u8; 32]>> = op
+                .state_roots
+                .iter()
+                .map(|root| <[u8; 32]>::try_from(root.as_slice()).ok())
+                .collect();
             if let Some(Ok(state_roots)) = roots.map(<[[u8; 32]; 4]>::try_from) {
                 let tip = quil_cw_consensus::handoff::Checkpoint {
                     frame: op.frame_number,
@@ -2552,8 +3467,11 @@ impl GlobalIntrinsic {
         {
             // A legacy-verified header: its shard's generation-0 source is
             // registered from the highest one (`handoff::legacy`).
-            let roots: Option<Vec<[u8; 32]>> =
-                op.state_roots.iter().map(|root| <[u8; 32]>::try_from(root.as_slice()).ok()).collect();
+            let roots: Option<Vec<[u8; 32]>> = op
+                .state_roots
+                .iter()
+                .map(|root| <[u8; 32]>::try_from(root.as_slice()).ok())
+                .collect();
             if let Some(Ok(state_roots)) = roots.map(<[[u8; 32]; 4]>::try_from) {
                 let tip = super::handoff::legacy::LegacyTip {
                     checkpoint: quil_cw_consensus::handoff::Checkpoint {
@@ -2580,28 +3498,36 @@ impl GlobalIntrinsic {
 
         // Now that verification has passed, gate further state writes
         // on the archive-mode deps.
-        let (Some(ri), Some(hg)) = (
-            self.reward_issuance.as_ref(),
-            self.hypergraph.as_ref(),
-        ) else {
+        let (Some(ri), Some(hg)) = (self.reward_issuance.as_ref(), self.hypergraph.as_ref()) else {
             return Ok(());
         };
 
         // Cross-domain settlements the QUIL shard relays become GLOBAL
-        // records here, independent of the reward gates below.
+        // records here, independent of the reward gates below; from the
+        // committed-credit frame only with their committed spends, in the
+        // relay commit below.
         super::prover_shard_update::materialize_settlement_records(op, frame_number, state)?;
         timing.mark("settlements");
         // The shard's accumulator report joins the application's canonical
         // root, in the same deterministic order.
         #[cfg(feature = "confidential-tokens")]
-        crate::token_intrinsic::global_accumulator::materialize_report(state, frame_number, &op.address, &op.accumulator)?;
+        crate::token_intrinsic::global_accumulator::materialize_report(
+            state,
+            frame_number,
+            &op.address,
+            &op.accumulator,
+        )?;
         timing.mark("report");
         // Then the confidential operations the shard relayed, decided once in
         // this frame's order. The report is processed first so a spend can
         // cite the root it carries.
         #[cfg(feature = "confidential-tokens")]
         let committed_fees = crate::token_intrinsic::global_commit::materialize_relay(
-            state, frame_number, &op.address, op.frame_number, &op.spends,
+            state,
+            frame_number,
+            &op.address,
+            op.frame_number,
+            &op.spends,
         )?;
         timing.mark("relay");
         #[cfg(not(feature = "confidential-tokens"))]
@@ -2639,9 +3565,22 @@ impl GlobalIntrinsic {
         // `global_frame_number` are header fields and `state_size` derives from
         // committed state, so every node withholds identically. An empty shard
         // (`state_size == 0`) has nothing to attest and is unaffected.
-        let unproven_storage = op.global_frame_number > 0
-            && state_size_u64 > 0
-            && op.storage_attestation.is_empty();
+        // Hash-proof epochs gate each participant on its own sealed
+        // registration instead (`StorageFrame`, decided 2026-10-21): the
+        // proposer's attestation no longer decides the committee's reward.
+        // Paused KZG epochs (`MAINNET_STORAGE_ATTESTATION_PAUSE`) withhold
+        // nothing: their proposers attach no attestation.
+        // The first header of the shard at or after the next epoch's snapshot
+        // frame names the state its registrations for that epoch commit to.
+        super::storage_snapshot::record(state, frame_number, op)?;
+        let storage_epoch = quil_types::consensus::epoch_for_frame(op.global_frame_number);
+        let hash_storage = op.global_frame_number > 0
+            && quil_types::consensus::hash_storage_proofs_at(storage_epoch);
+        let unproven_storage = storage_reward_withheld(
+            op.global_frame_number,
+            state_size_u64,
+            !op.storage_attestation.is_empty(),
+        );
         if unproven_storage {
             // Previously silent: the reward basis is zeroed here WITHOUT halting
             // or evicting, so from the operator seat the node looks healthy while
@@ -2671,10 +3610,7 @@ impl GlobalIntrinsic {
         // — `total_size()` now enforces that exclusion at the live counter (the
         // prover registry / leaf-root registry / reward vertices don't count).
         let world_state_size = hg.total_size();
-        let world_size_u64 = world_state_size
-            .to_string()
-            .parse::<u64>()
-            .unwrap_or(0);
+        let world_size_u64 = world_state_size.to_string().parse::<u64>().unwrap_or(0);
 
         // The frame_prover ref is unused by the materialize impl
         // (it's a placeholder for parity with Go's signature) — pass
@@ -2697,8 +3633,9 @@ impl GlobalIntrinsic {
                     _: u64,
                     _: &[u8],
                     _: u64,
-                ) -> Result<quil_types::proto::global::FrameHeader>
-                { Err(QuilError::Internal("stub".into())) }
+                ) -> Result<quil_types::proto::global::FrameHeader> {
+                    Err(QuilError::Internal("stub".into()))
+                }
                 fn prove_global_frame_header(
                     &self,
                     _: &quil_types::proto::global::GlobalFrameHeader,
@@ -2711,22 +3648,75 @@ impl GlobalIntrinsic {
                     _: i64,
                     _: u32,
                     _: u8,
-                ) -> Result<quil_types::proto::global::GlobalFrameHeader>
-                { Err(QuilError::Internal("stub".into())) }
-                fn verify_global_frame_header(&self, _: &quil_types::proto::global::GlobalFrameHeader)
-                    -> Result<Vec<u8>>
-                { Ok(vec![]) }
-                fn calculate_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: u32)
-                    -> Result<Vec<u8>>
-                { Err(QuilError::Internal("stub".into())) }
-                fn verify_multi_proof(&self, _: &[u8; 32], _: u32, _: &[&[u8]], _: &[&[u8]])
-                    -> Result<bool>
-                { Ok(true) }
+                ) -> Result<quil_types::proto::global::GlobalFrameHeader> {
+                    Err(QuilError::Internal("stub".into()))
+                }
+                fn verify_global_frame_header(
+                    &self,
+                    _: &quil_types::proto::global::GlobalFrameHeader,
+                ) -> Result<Vec<u8>> {
+                    Ok(vec![])
+                }
+                fn calculate_multi_proof(
+                    &self,
+                    _: &[u8; 32],
+                    _: u32,
+                    _: &[&[u8]],
+                    _: u32,
+                ) -> Result<Vec<u8>> {
+                    Err(QuilError::Internal("stub".into()))
+                }
+                fn verify_multi_proof(
+                    &self,
+                    _: &[u8; 32],
+                    _: u32,
+                    _: &[&[u8]],
+                    _: &[&[u8]],
+                ) -> Result<bool> {
+                    Ok(true)
+                }
             }
             Arc::new(StubFrameProver)
         });
 
         timing.mark("sizes");
+        let mut storage = if hash_storage {
+            Some(super::prover_shard_update::StorageFrame {
+                epoch: storage_epoch,
+                commitment: self.storage_commitment(frame_number, op)?,
+                kicks: Vec::new(),
+            })
+        } else {
+            None
+        };
+        // The leader's difficulty is bound into the certified output but no
+        // voter compares it with GLOBAL's: from the anchored issuance epoch
+        // GLOBAL prices issuance at its own anchored frame's difficulty.
+        let issuance = if anchored_issuance {
+            let difficulty = super::prover_shard_update::anchored_issuance_difficulty(
+                op,
+                self.anchor_difficulty(op)?,
+            );
+            let claimed = u64::from(op.difficulty);
+            if crate::pricing::pomw_generation(claimed)
+                != crate::pricing::pomw_generation(difficulty)
+            {
+                tracing::warn!(
+                    shard = %hex::encode(&op.address),
+                    shard_frame = op.frame_number,
+                    anchor = op.global_frame_number,
+                    frame = frame_number,
+                    claimed,
+                    priced = difficulty,
+                    "shard header claims a difficulty outside its GLOBAL anchor's issuance \
+                     generation: its leader's value is ignored and issuance priced at the \
+                     anchor's (a defect or tampering in that shard's leader)",
+                );
+            }
+            super::prover_shard_update::HeaderIssuance { difficulty, credit }
+        } else {
+            super::prover_shard_update::HeaderIssuance::claimed(op)
+        };
         let participants = participant_indices.len();
         super::prover_shard_update::materialize_prover_shard_update_with_fees(
             op,
@@ -2741,6 +3731,8 @@ impl GlobalIntrinsic {
             shard_md,
             committed_fees,
             session,
+            storage.as_mut(),
+            issuance,
         )?;
         timing.mark("rewards/activity");
 
@@ -2754,10 +3746,74 @@ impl GlobalIntrinsic {
         // anchored global frame's committed VDF output + the on-chain leaf-root
         // registry), so every archive evicts identically and non-archive nodes
         // inherit it via sync.
-        self.audit_storage_attestation(frame_number, op, &bitmask_bytes, state, va_disc)?;
-        timing.mark("storage audit");
+        self.audit_storage_attestation_timed(
+            frame_number,
+            op,
+            &bitmask_bytes,
+            state,
+            va_disc,
+            &mut timing,
+        )?;
+        timing.mark("storage audit verify");
+        // Members whose seat closed an epoch without proving the roots they
+        // committed in it, after the activity update for the same reason.
+        for member in storage.map(|storage| storage.kicks).unwrap_or_default() {
+            tracing::warn!(frame = frame_number, member = %hex::encode(&member), shard = %hex::encode(&op.address),
+                "storage epoch proof missing for committed openings: kicking the member");
+            self.kick_prover_by_address(frame_number, &member, state, va_disc)?;
+        }
+        timing.mark("storage epoch kicks");
         timing.finish(frame_number, op, participants);
         Ok(())
+    }
+
+    /// A hash-epoch frame's commitment as GLOBAL frame `frame_number` chains
+    /// it (`storage_seat::decode_commitment`): its beacon frame must be at or
+    /// after the frame's anchor and before `frame_number`. `None` when the
+    /// frame commits nothing GLOBAL can chain; its proposer then published
+    /// nothing in it.
+    fn storage_commitment(
+        &self,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<Option<super::prover_shard_update::StorageCommitment>> {
+        let Some((root, beacon)) =
+            super::storage_seat::decode_commitment(&op.storage_attestation_root)
+        else {
+            return Ok(None);
+        };
+        if beacon < op.global_frame_number || beacon >= frame_number {
+            tracing::warn!(frame = frame_number, shard = %hex::encode(&op.address), app_frame = op.frame_number,
+                anchor = op.global_frame_number, beacon, "storage commitment names a beacon frame outside \
+                [anchor, this frame): not chained");
+            return Ok(None);
+        }
+        Ok(Some(super::prover_shard_update::StorageCommitment {
+            root,
+            beacon,
+            rho_n: self.storage_beacon(beacon)?,
+        }))
+    }
+
+    /// The storage beacon of GLOBAL frame `global_frame_number`, from this
+    /// node's clock store; a node that lacks the frame waits rather than
+    /// decide otherwise.
+    fn storage_beacon(&self, global_frame_number: u64) -> Result<Vec<u8>> {
+        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+            QuilError::Internal("storage beacon: clock_store not installed".into())
+        })?;
+        let output = clock_store
+            .get_global_clock_frame_header(global_frame_number)
+            .map(|header| header.output)
+            .map_err(|_| {
+                QuilError::ExecutionUnavailable(format!(
+                    "storage beacon: anchored global frame {global_frame_number} unavailable"
+                ))
+            })?;
+        Ok(quil_crypto::porep::derive_storage_beacon(
+            global_frame_number,
+            &output,
+        ))
     }
 
     /// Go parity (`global_shard_split.go` / `global_shard_merge.go`
@@ -2785,10 +3841,7 @@ impl GlobalIntrinsic {
     /// the `PendingShardChange` → `apply_due_shard_changes` no-oped → the
     /// follower's shards_store stayed single-shard forever (stale app_prefixes →
     /// size-buckets → compute_shard_root: the deep-split empty-leaf churn).
-    fn proposer_is_active_global(
-        &self,
-        prover_tree: &quil_tries::VectorCommitmentTree,
-    ) -> bool {
+    fn proposer_is_active_global(&self, prover_tree: &quil_tries::VectorCommitmentTree) -> bool {
         let Some(hg) = self.hypergraph.as_ref() else {
             // No committed state (follower) → trust the finalized frame, like validate.
             return true;
@@ -2837,14 +3890,15 @@ impl GlobalIntrinsic {
             .public_key_signature_bls48581
             .as_ref()
             .map(|s| s.address.clone())
-            .ok_or_else(|| QuilError::InvalidArgument(
-                "invoke_shard_split: missing signature".into(),
-            ))?;
+            .ok_or_else(|| {
+                QuilError::InvalidArgument("invoke_shard_split: missing signature".into())
+            })?;
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
-        let prover_data = state.get(domain, &prover_address, va_disc)?
-            .ok_or_else(|| QuilError::InvalidArgument(
-                "invoke_shard_split: prover not found".into(),
-            ))?;
+        let prover_data = state
+            .get(domain, &prover_address, va_disc)?
+            .ok_or_else(|| {
+                QuilError::InvalidArgument("invoke_shard_split: prover not found".into())
+            })?;
         if prover_data.is_empty() {
             return Err(QuilError::InvalidArgument(
                 "invoke_shard_split: prover has no data".into(),
@@ -2940,14 +3994,15 @@ impl GlobalIntrinsic {
             .public_key_signature_bls48581
             .as_ref()
             .map(|s| s.address.clone())
-            .ok_or_else(|| QuilError::InvalidArgument(
-                "invoke_shard_merge: missing signature".into(),
-            ))?;
+            .ok_or_else(|| {
+                QuilError::InvalidArgument("invoke_shard_merge: missing signature".into())
+            })?;
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
-        let prover_data = state.get(domain, &prover_address, va_disc)?
-            .ok_or_else(|| QuilError::InvalidArgument(
-                "invoke_shard_merge: prover not found".into(),
-            ))?;
+        let prover_data = state
+            .get(domain, &prover_address, va_disc)?
+            .ok_or_else(|| {
+                QuilError::InvalidArgument("invoke_shard_merge: prover not found".into())
+            })?;
         if prover_data.is_empty() {
             return Err(QuilError::InvalidArgument(
                 "invoke_shard_merge: prover has no data".into(),
@@ -3015,7 +4070,9 @@ impl GlobalIntrinsic {
         state: &HypergraphState,
     ) -> Result<()> {
         const DUE_FRAME_KEY: &[u8] = b"quil/global/due-shard-changes/frame/v1";
-        if state.get_record(DUE_FRAME_KEY)?.as_deref() == Some(frame_number.to_be_bytes().as_slice()) {
+        if state.get_record(DUE_FRAME_KEY)?.as_deref()
+            == Some(frame_number.to_be_bytes().as_slice())
+        {
             return Ok(());
         }
         self.restore_missing_pending_changes_or_warn(frame_number, state);
@@ -3024,10 +4081,15 @@ impl GlobalIntrinsic {
         self.reconcile_orphaned_blocks(frame_number, state, &flipped)?;
         #[cfg(not(feature = "confidential-tokens"))]
         let _ = flipped;
+        self.sweep_storage_expiries(frame_number, state)?;
         self.reconcile_committee_sessions(frame_number, state)?;
         self.log_local_shard_grid_once_per_epoch(frame_number, state);
+        // Logging only: the stale seal-drain copy summary is written once its
+        // interval ends, also when no further copy arrives.
+        super::handoff::superseded::flush_due(frame_number);
         state.stage_records([quil_types::store::RecordMutation {
-            key: DUE_FRAME_KEY.to_vec(), value: Some(frame_number.to_be_bytes().to_vec()),
+            key: DUE_FRAME_KEY.to_vec(),
+            value: Some(frame_number.to_be_bytes().to_vec()),
         }]);
         Ok(())
     }
@@ -3076,7 +4138,11 @@ impl GlobalIntrinsic {
     /// each epoch as a backstop. One shard's store error does not stop the
     /// scan of the others; it is logged once per epoch and the scan runs again
     /// next frame, with earlier verdicts kept.
-    fn restore_missing_pending_changes(&self, frame_number: u64, state: &HypergraphState) -> Result<usize> {
+    fn restore_missing_pending_changes(
+        &self,
+        frame_number: u64,
+        state: &HypergraphState,
+    ) -> Result<usize> {
         if PENDING_REPAIR_OFF.with(|off| off.get()) {
             return Ok(0);
         }
@@ -3086,12 +4152,19 @@ impl GlobalIntrinsic {
         if frame_number < policy.activation_frame {
             return Ok(0);
         }
-        let (Some(store), true) = (self.shards_store.as_ref(), self.shard_metadata_writes_enabled) else {
+        let (Some(store), true) = (
+            self.shards_store.as_ref(),
+            self.shard_metadata_writes_enabled,
+        ) else {
             return Ok(0);
         };
         let cursor = || {
-            self.hypergraph.as_ref()
-                .and_then(|hg| hg.read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key()).ok())
+            self.hypergraph
+                .as_ref()
+                .and_then(|hg| {
+                    hg.read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                        .ok()
+                })
                 .unwrap_or(0)
         };
         if !pending_repair_due(frame_number, cursor) {
@@ -3115,7 +4188,9 @@ impl GlobalIntrinsic {
         let overlapped = |filter: &[u8]| {
             shard(filter).is_some_and(|(app, bits)| {
                 grid.iter().any(|(other_app, other)| {
-                    *other_app == app && *other != bits && (other.starts_with(&bits) || bits.starts_with(other))
+                    *other_app == app
+                        && *other != bits
+                        && (other.starts_with(&bits) || bits.starts_with(other))
                 })
             })
         };
@@ -3144,14 +4219,16 @@ impl GlobalIntrinsic {
         let mut failure: Option<(Vec<u8>, QuilError)> = None;
         for filter in &filters {
             let examined = (|| -> Result<Option<([u8; 32], PendingShardChange)>> {
-                let Some(request) = super::handoff::schedule::retiring_request(state, filter)? else {
+                let Some(request) = super::handoff::schedule::retiring_request(state, filter)?
+                else {
                     return Ok(None);
                 };
                 if !seen.insert(request) {
                     return Ok(None);
                 }
                 for change in pending.iter().filter(|change| {
-                    same(&change.parent, filter) || change.children.iter().any(|child| same(child, filter))
+                    same(&change.parent, filter)
+                        || change.children.iter().any(|child| same(child, filter))
                 }) {
                     if super::handoff::schedule::topology_request(state, change)? == Some(request) {
                         return Ok(None);
@@ -3164,7 +4241,13 @@ impl GlobalIntrinsic {
                     return Ok(None);
                 }
                 use super::handoff::schedule::Recovery;
-                match super::handoff::schedule::recover_topology_change(state, &request, floor, &in_grid, &overlapped)? {
+                match super::handoff::schedule::recover_topology_change(
+                    state,
+                    &request,
+                    floor,
+                    &in_grid,
+                    &overlapped,
+                )? {
                     Recovery::Restore(mut change) => {
                         if change.kind == ShardChangeKind::Merge {
                             match self.merge_children_order(&change) {
@@ -3254,24 +4337,36 @@ impl GlobalIntrinsic {
     /// restored: telling whether any prover holds two of the children would
     /// take a scan of every committed prover. A split's order does not
     /// matter: its allocations move by filter.
-    fn merge_children_order(&self, change: &PendingShardChange) -> std::result::Result<Vec<Vec<u8>>, &'static str> {
+    fn merge_children_order(
+        &self,
+        change: &PendingShardChange,
+    ) -> std::result::Result<Vec<Vec<u8>>, &'static str> {
         const ABSENT: &str = "the merge's order of its children is in no local frame record";
         let mut sorted = change.children.clone();
         sorted.sort();
-        let Some(clock) = self.clock_store.as_ref() else { return Err(ABSENT) };
-        let Ok(frame) = clock.get_global_clock_frame(change.proposed_frame) else { return Err(ABSENT) };
-        let outcomes = clock.get_global_clock_frame_outcomes(change.proposed_frame).unwrap_or_default();
+        let Some(clock) = self.clock_store.as_ref() else {
+            return Err(ABSENT);
+        };
+        let Ok(frame) = clock.get_global_clock_frame(change.proposed_frame) else {
+            return Err(ABSENT);
+        };
+        let outcomes = clock
+            .get_global_clock_frame_outcomes(change.proposed_frame)
+            .unwrap_or_default();
         let known = outcomes.len() == frame.requests.len();
         let mut orders: Vec<(bool, Vec<Vec<u8>>)> = Vec::new();
         for (index, bundle) in frame.requests.iter().enumerate() {
             for request in &bundle.requests {
-                let Some(quil_types::proto::global::message_request::Request::ShardMerge(op)) = &request.request else {
+                let Some(quil_types::proto::global::message_request::Request::ShardMerge(op)) =
+                    &request.request
+                else {
                     continue;
                 };
                 let mut named = op.shard_addresses.clone();
                 named.sort();
                 if op.parent_address == change.parent && named == sorted {
-                    let succeeded = known && outcomes[index].status == quil_types::store::RequestStatus::Succeeded;
+                    let succeeded = known
+                        && outcomes[index].status == quil_types::store::RequestStatus::Succeeded;
                     orders.push((succeeded, op.shard_addresses.clone()));
                 }
             }
@@ -3289,8 +4384,12 @@ impl GlobalIntrinsic {
     /// The `local shard grid` line at the first frame this process executes
     /// in each epoch (see [`log_local_shard_grid`]).
     fn log_local_shard_grid_once_per_epoch(&self, frame_number: u64, state: &HypergraphState) {
-        static LOGGED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-        let (Some(store), true) = (self.shards_store.as_ref(), self.shard_metadata_writes_enabled) else {
+        static LOGGED_EPOCH: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(u64::MAX);
+        let (Some(store), true) = (
+            self.shards_store.as_ref(),
+            self.shard_metadata_writes_enabled,
+        ) else {
             return;
         };
         let epoch = quil_types::consensus::epoch_for_frame(frame_number);
@@ -3308,8 +4407,10 @@ impl GlobalIntrinsic {
         frame_number: u64,
         state: &HypergraphState,
     ) -> Result<Vec<([u8; 32], Vec<bool>)>> {
-        let (Some(store), true) = (self.shards_store.as_ref(), self.shard_metadata_writes_enabled)
-        else {
+        let (Some(store), true) = (
+            self.shards_store.as_ref(),
+            self.shard_metadata_writes_enabled,
+        ) else {
             return Ok(Vec::new());
         };
         let store = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records());
@@ -3384,7 +4485,10 @@ impl GlobalIntrinsic {
         // executed within the proposal budget).
         let prover_scan = std::cell::OnceCell::new();
         let cell = &prover_scan;
-        let scan = self.hypergraph.as_deref().map(|hg| move || committed_prover_scan(cell, hg));
+        let scan = self
+            .hypergraph
+            .as_deref()
+            .map(|hg| move || committed_prover_scan(cell, hg));
         // Stage the local grid topology and pending-record consumption.
         // L1(3) || L2(32) grid key, matching genesis + the original immediate path.
         let grid_key = |l2: &[u8]| -> Vec<u8> {
@@ -3433,8 +4537,13 @@ impl GlobalIntrinsic {
             let bit_path_mode =
                 change.proposed_frame >= super::materialize::unified_tree_cutover_frame();
             let removed = materialize::materialize_shard_split(
-                &change.parent, &change.children, bit_path_mode)?.removed_parent;
-            Ok(removed.is_some_and(|(l2, path)| !live.contains(&(grid_key(&l2), canon_bits(&path)))))
+                &change.parent,
+                &change.children,
+                bit_path_mode,
+            )?
+            .removed_parent;
+            Ok(removed
+                .is_some_and(|(l2, path)| !live.contains(&(grid_key(&l2), canon_bits(&path)))))
         };
         // Sources governed by an authorized committee session must seal their
         // final checkpoint first; such a change stays pending until its
@@ -3456,7 +4565,13 @@ impl GlobalIntrinsic {
                     let checkpoint = state.changeset_len();
                     let size = |filter: &[u8]| self.split_child_size(filter);
                     match super::handoff::schedule::gate_topology_change_sized(
-                        state, frame_number, &policy, &change, scan.as_ref().map(|f| f as _), even, &size,
+                        state,
+                        frame_number,
+                        &policy,
+                        &change,
+                        scan.as_ref().map(|f| f as _),
+                        even,
+                        &size,
                     ) {
                         Ok(super::handoff::schedule::TopologyGate::Apply) => ready.push(change),
                         Ok(super::handoff::schedule::TopologyGate::Wait) => {}
@@ -3465,7 +4580,9 @@ impl GlobalIntrinsic {
                         // materializing node computes it identically. A local
                         // store fault still fails the frame, or one archive would
                         // skip what the others scheduled.
-                        Err(error) if !matches!(error, QuilError::InvalidArgument(_)) => return Err(error),
+                        Err(error) if !matches!(error, QuilError::InvalidArgument(_)) => {
+                            return Err(error)
+                        }
                         Err(error) => {
                             state.rollback_to(checkpoint);
                             tracing::error!(frame = frame_number, parent = hex::encode(&change.parent),
@@ -3495,9 +4612,13 @@ impl GlobalIntrinsic {
             if stale_split(change)? {
                 continue;
             }
-            let reassigned = scan.as_ref().map(|scan| scan()).transpose().and_then(|scan| {
-                self.reassign_shard_allocations(state, &va_disc, change, frame_number, scan)
-            });
+            let reassigned = scan
+                .as_ref()
+                .map(|scan| scan())
+                .transpose()
+                .and_then(|scan| {
+                    self.reassign_shard_allocations(state, &va_disc, change, frame_number, scan)
+                });
             if let Err(e) = reassigned {
                 tracing::error!(
                     frame = frame_number,
@@ -3528,9 +4649,10 @@ impl GlobalIntrinsic {
                     // DIFFERENT partition on top of the real children (overlapping
                     // shards → provers on "both sides"). Still consume the pending
                     // record below so it stops re-firing.
-                    let parent_in_grid = output.removed_parent.as_ref().map_or(true, |(l2, path)| {
-                        live.contains(&(grid_key(l2), canon_bits(path)))
-                    });
+                    let parent_in_grid =
+                        output.removed_parent.as_ref().map_or(true, |(l2, path)| {
+                            live.contains(&(grid_key(l2), canon_bits(path)))
+                        });
                     if !parent_in_grid {
                         tracing::warn!(
                             parent = hex::encode(&change.parent),
@@ -3587,10 +4709,23 @@ impl GlobalIntrinsic {
                         // the application's deepest shard, or that shard would own
                         // part of a block and could never report its subtree.
                         #[cfg(feature = "confidential-tokens")]
-                        if let Some(application) = change.parent.get(..32).and_then(|a| <[u8; 32]>::try_from(a).ok()) {
-                            let deepest = output.new_shards.iter().map(|(_, path)| canon_bits(path).len()).max().unwrap_or(0);
+                        if let Some(application) = change
+                            .parent
+                            .get(..32)
+                            .and_then(|a| <[u8; 32]>::try_from(a).ok())
+                        {
+                            let deepest = output
+                                .new_shards
+                                .iter()
+                                .map(|(_, path)| canon_bits(path).len())
+                                .max()
+                                .unwrap_or(0);
                             crate::token_intrinsic::global_commit::raise_placement_width(
-                                state, frame_number, &application, deepest)?;
+                                state,
+                                frame_number,
+                                &application,
+                                deepest,
+                            )?;
                         }
                         // Deep-bifurcation: the parent is REPLACED by the
                         // partition (spine + leaves) — remove it so the set stays
@@ -3683,7 +4818,10 @@ impl GlobalIntrinsic {
         if frame_number < global_commit::orphan_replacement_frame() {
             return Ok(());
         }
-        let (Some(store), true) = (self.shards_store.as_ref(), self.shard_metadata_writes_enabled) else {
+        let (Some(store), true) = (
+            self.shards_store.as_ref(),
+            self.shard_metadata_writes_enabled,
+        ) else {
             return Ok(());
         };
         let first = state.get_record(RECONCILED_KEY)?.is_none();
@@ -3691,29 +4829,50 @@ impl GlobalIntrinsic {
             return Ok(());
         }
         let store = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records());
-        let mut grid: std::collections::BTreeMap<[u8; 32], Vec<Vec<bool>>> = std::collections::BTreeMap::new();
+        let mut grid: std::collections::BTreeMap<[u8; 32], Vec<Vec<bool>>> =
+            std::collections::BTreeMap::new();
         for row in store.range_app_shards()? {
-            let Some(application) = row.shard_key.get(3..35).and_then(|a| <[u8; 32]>::try_from(a).ok()) else { continue };
+            let Some(application) = row
+                .shard_key
+                .get(3..35)
+                .and_then(|a| <[u8; 32]>::try_from(a).ok())
+            else {
+                continue;
+            };
             let bits = quil_forest::shard_bit_path_from_prefix(&row.prefix)
                 .unwrap_or_else(|| quil_forest::prefix_to_bits(&row.prefix, 6));
             grid.entry(application).or_default().push(bits);
         }
         let applications: std::collections::BTreeSet<[u8; 32]> = if first {
-            grid.keys().copied().chain(flipped.iter().map(|(application, _)| *application)).collect()
+            grid.keys()
+                .copied()
+                .chain(flipped.iter().map(|(application, _)| *application))
+                .collect()
         } else {
-            flipped.iter().map(|(application, _)| *application).collect()
+            flipped
+                .iter()
+                .map(|(application, _)| *application)
+                .collect()
         };
         for application in applications {
             let registered = grid.get(&application).cloned().unwrap_or_default();
-            let removed: Vec<Vec<bool>> = flipped.iter()
+            let removed: Vec<Vec<bool>> = flipped
+                .iter()
                 .filter(|(flipped_application, _)| *flipped_application == application)
                 .map(|(_, path)| path.clone())
                 .collect();
-            global_commit::reconcile_orphans(state, frame_number, &application, &registered, &removed)?;
+            global_commit::reconcile_orphans(
+                state,
+                frame_number,
+                &application,
+                &registered,
+                &removed,
+            )?;
         }
         if first {
             state.stage_records([quil_types::store::RecordMutation {
-                key: RECONCILED_KEY.to_vec(), value: Some(vec![1]),
+                key: RECONCILED_KEY.to_vec(),
+                value: Some(vec![1]),
             }]);
         }
         Ok(())
@@ -3724,7 +4883,11 @@ impl GlobalIntrinsic {
     /// maintenance batch on a fixed cadence: eligibility moves at epoch
     /// boundaries, so most passes change nothing, while a shard formed by a
     /// split or a first join is not left without a session for a whole epoch.
-    fn reconcile_committee_sessions(&self, frame_number: u64, state: &HypergraphState) -> Result<()> {
+    fn reconcile_committee_sessions(
+        &self,
+        frame_number: u64,
+        state: &HypergraphState,
+    ) -> Result<()> {
         const CADENCE_FRAMES: u64 = super::handoff::schedule::SESSION_PASS_FRAMES;
         let Some(policy) = quil_types::consensus::committee_handoff_policy() else {
             return Ok(());
@@ -3747,23 +4910,59 @@ impl GlobalIntrinsic {
         filters.dedup();
         timing.filters = filters.len();
         timing.lap("grid filters");
+        let mut scanned: Option<crate::prover_registry::CommittedProverScan> = None;
+        // From the presence exclusion frame, the epoch's first pass first
+        // excludes the absent members of sessions that stalled through the
+        // previous epoch, where that unlocks quorum (`handoff::exclusion`),
+        // and fences those sessions early.
+        let mut absent: Vec<super::handoff::exclusion::Decision> = Vec::new();
+        if super::handoff::exclusion::evaluates(frame_number) {
+            let scan: &crate::prover_registry::CommittedProverScan =
+                scanned.insert(crate::prover_registry::CommittedProverScan::try_scan(hg)?);
+            let mut desired = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
+                Ok(super::handoff::schedule::desired_members(
+                    scan,
+                    filter,
+                    frame_number,
+                ))
+            };
+            let checkpoint = state.changeset_len();
+            match super::handoff::exclusion::evaluate(state, frame_number, &filters, &mut desired) {
+                Ok(decisions) => absent = decisions,
+                Err(error) if matches!(error, QuilError::InvalidArgument(_)) => {
+                    state.rollback_to(checkpoint);
+                    tracing::error!(frame = frame_number, %error, "committee presence: exclusion pass failed; nothing excluded");
+                }
+                Err(error) => return Err(error),
+            }
+            timing.lap("presence exclusions");
+            // Fenced before the due fences and the membership pass, which
+            // then seat eligibility less the exclusions written here.
+            if !absent.is_empty() {
+                super::handoff::schedule::fence_absent(state, frame_number, &absent)?;
+                timing.lap("early fences");
+            }
+        }
         // Closing sessions that never sealed are fenced first, so a successor
         // they authorize is visible to the reconciliation below. A fenced
         // membership successor takes the eligibility that reconciliation
         // compares against: the same scan, read only once a fence needs it.
-        let mut scanned: Option<crate::prover_registry::CommittedProverScan> = None;
         let mut eligible = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
             if scanned.is_none() {
                 scanned = Some(crate::prover_registry::CommittedProverScan::try_scan(hg)?);
             }
-            Ok(scanned.as_ref().map_or_else(Vec::new, |scan| {
+            let desired = scanned.as_ref().map_or_else(Vec::new, |scan| {
                 super::handoff::schedule::desired_members(scan, filter, frame_number)
-            }))
+            });
+            super::handoff::exclusion::seated(state, frame_number, filter, desired)
         };
         let checkpoint = state.changeset_len();
         if let Err(error) = super::handoff::schedule::fence_stalled_sources(
-            state, frame_number, &filters, Some(&mut eligible))
-        {
+            state,
+            frame_number,
+            &filters,
+            Some(&mut eligible),
+        ) {
             if !matches!(error, QuilError::InvalidArgument(_)) {
                 return Err(error);
             }
@@ -3779,11 +4978,13 @@ impl GlobalIntrinsic {
         // `first_session_boundary_frame`) or every grid shard already has a
         // session. In that state `reconcile_membership` decides nothing, so
         // the outcome is identical.
-        let flag_day_pending = policy.legacy_history == quil_types::consensus::LegacyHistory::Discard
+        let flag_day_pending = policy.legacy_history
+            == quil_types::consensus::LegacyHistory::Discard
             && !super::handoff::flag_day_applied(state)?;
         let mid_epoch = !super::handoff::schedule::first_pass_of_epoch(frame_number);
         let membership_frozen = frame_number >= policy.membership_boundary_frame && mid_epoch;
-        let first_sessions_frozen = frame_number >= policy.first_session_boundary_frame && mid_epoch;
+        let first_sessions_frozen =
+            frame_number >= policy.first_session_boundary_frame && mid_epoch;
         let mut sessionless = false;
         if !first_sessions_frozen {
             for filter in &filters {
@@ -3814,7 +5015,8 @@ impl GlobalIntrinsic {
             && !super::handoff::flag_day_applied(state)?
         {
             let checkpoint = state.changeset_len();
-            match self.apply_handoff_flag_day(frame_number, state, &store, &mut scan, &mut filters) {
+            match self.apply_handoff_flag_day(frame_number, state, &store, &mut scan, &mut filters)
+            {
                 Ok(()) => state.stage_records(store.into_records()),
                 Err(error) if matches!(error, QuilError::InvalidArgument(_)) => {
                     state.rollback_to(checkpoint);
@@ -3829,7 +5031,9 @@ impl GlobalIntrinsic {
         // Legacy shards enter through generation zero first, so reconciliation
         // never gives one an empty-genesis first session.
         let checkpoint = state.changeset_len();
-        if let Err(error) = super::handoff::legacy::migrate(state, frame_number, &policy, &filters, &scan) {
+        if let Err(error) =
+            super::handoff::legacy::migrate(state, frame_number, &policy, &filters, &scan)
+        {
             if !matches!(error, QuilError::InvalidArgument(_)) {
                 return Err(error);
             }
@@ -3839,8 +5043,12 @@ impl GlobalIntrinsic {
         timing.lap("generation-zero migration");
         let checkpoint = state.changeset_len();
         if let Err(error) = super::handoff::schedule::reconcile_membership(
-            state, frame_number, &policy, &filters, &scan)
-        {
+            state,
+            frame_number,
+            &policy,
+            &filters,
+            &scan,
+        ) {
             if !matches!(error, QuilError::InvalidArgument(_)) {
                 return Err(error);
             }
@@ -3892,7 +5100,12 @@ impl GlobalIntrinsic {
             return Ok(false);
         }
         let address = materialize::prover_address_from_pubkey(prover_public_key)?;
-        super::prover_shard_update::credit_global_frame_fees(state, frame_number, &address, fee_total)
+        super::prover_shard_update::credit_global_frame_fees(
+            state,
+            frame_number,
+            &address,
+            fee_total,
+        )
     }
 
     pub fn maybe_apply_split_reset(
@@ -4085,7 +5298,9 @@ impl GlobalIntrinsic {
             } else if let Some(hg) = self.hypergraph.as_ref() {
                 // No shared scan supplied — scan on demand (still committed state).
                 Ok(crate::prover_registry::active_provers_on_filter_committed(
-                    hg, filter, frame_number,
+                    hg,
+                    filter,
+                    frame_number,
                 ))
             } else if let Some(pr) = pr {
                 let provers = pr.get_active_provers(filter, frame_number).map_err(|e| {
@@ -4131,14 +5346,24 @@ impl GlobalIntrinsic {
                     // senior together on the most valuable child); any other
                     // allocation on the parent moves by the same rule, over the
                     // children's sizes now. Each starts a new cohort.
-                    let targets = super::handoff::schedule::topology_targets(state, change)?.unwrap_or_default();
+                    let targets = super::handoff::schedule::topology_targets(state, change)?
+                        .unwrap_or_default();
                     let mut moves: Vec<(Vec<u8>, Vec<u8>, usize)> = Vec::new();
-                    let mut others: Vec<((Vec<u8>, Vec<u8>), Vec<u8>, super::prover_rings::RingKey)> = Vec::new();
+                    let mut others: Vec<(
+                        (Vec<u8>, Vec<u8>),
+                        Vec<u8>,
+                        super::prover_rings::RingKey,
+                    )> = Vec::new();
                     for (public_key, address) in provers {
                         let child = targets
                             .iter()
                             .find(|target| target.members.contains(&public_key))
-                            .and_then(|target| change.children.iter().position(|child| *child == target.filter));
+                            .and_then(|target| {
+                                change
+                                    .children
+                                    .iter()
+                                    .position(|child| *child == target.filter)
+                            });
                         match child {
                             Some(index) => moves.push((public_key, address, index)),
                             None => {
@@ -4147,22 +5372,45 @@ impl GlobalIntrinsic {
                             }
                         }
                     }
-                    let order = super::prover_rings::children_by_value(&change.children, |filter| self.split_child_size(filter));
-                    let ranked = others.iter().map(|(item, address, key)| (item.clone(), address.as_slice(), *key)).collect();
-                    for (group, index) in super::prover_rings::split_groups(ranked, k)?.into_iter().zip(order) {
-                        moves.extend(group.into_iter().map(|(public_key, address)| (public_key, address, index)));
+                    let order =
+                        super::prover_rings::children_by_value(&change.children, |filter| {
+                            self.split_child_size(filter)
+                        });
+                    let ranked = others
+                        .iter()
+                        .map(|(item, address, key)| (item.clone(), address.as_slice(), *key))
+                        .collect();
+                    for (group, index) in super::prover_rings::split_groups(ranked, k)?
+                        .into_iter()
+                        .zip(order)
+                    {
+                        moves.extend(
+                            group
+                                .into_iter()
+                                .map(|(public_key, address)| (public_key, address, index)),
+                        );
                     }
                     for (public_key, address, index) in moves {
-                        let key = super::prover_rings::moved(ring_key_of(scan, &address, &change.parent), frame_number);
+                        let key = super::prover_rings::moved(
+                            ring_key_of(scan, &address, &change.parent),
+                            frame_number,
+                        );
                         self.rekey_allocation_with_key(
-                            state, va_disc, &vr_disc, &ha_disc, &public_key, &address,
-                            &change.parent, &change.children[index], frame_number, Some(key),
+                            state,
+                            va_disc,
+                            &vr_disc,
+                            &ha_disc,
+                            &public_key,
+                            &address,
+                            &change.parent,
+                            &change.children[index],
+                            frame_number,
+                            Some(key),
                         )?;
                     }
                     return Ok(());
                 }
-                let even = frame_number
-                    >= super::materialize::unified_tree_cutover_frame();
+                let even = frame_number >= super::materialize::unified_tree_cutover_frame();
                 if even {
                     // Deterministic order independent of enumeration order.
                     provers.sort_by(|a, b| a.1.cmp(&b.1));
@@ -4175,8 +5423,15 @@ impl GlobalIntrinsic {
                     };
                     let new_filter = &change.children[idx];
                     self.rekey_allocation(
-                        state, va_disc, &vr_disc, &ha_disc, public_key, address,
-                        &change.parent, new_filter, frame_number,
+                        state,
+                        va_disc,
+                        &vr_disc,
+                        &ha_disc,
+                        public_key,
+                        address,
+                        &change.parent,
+                        new_filter,
+                        frame_number,
                     )?;
                 }
             }
@@ -4186,10 +5441,23 @@ impl GlobalIntrinsic {
                     let provers = enumerate(child)?;
                     for (public_key, address) in &provers {
                         // A merged shard ranks its members as one new cohort.
-                        let key = rings.then(|| super::prover_rings::moved(ring_key_of(scan, address, child), frame_number));
+                        let key = rings.then(|| {
+                            super::prover_rings::moved(
+                                ring_key_of(scan, address, child),
+                                frame_number,
+                            )
+                        });
                         self.rekey_allocation_with_key(
-                            state, va_disc, &vr_disc, &ha_disc, public_key, address,
-                            child, &change.parent, frame_number, key,
+                            state,
+                            va_disc,
+                            &vr_disc,
+                            &ha_disc,
+                            public_key,
+                            address,
+                            child,
+                            &change.parent,
+                            frame_number,
+                            key,
                         )?;
                     }
                 }
@@ -4227,22 +5495,30 @@ impl GlobalIntrinsic {
         filters: &mut Vec<Vec<u8>>,
     ) -> Result<()> {
         use quil_types::consensus::ProverStatus;
-        let hg = self.hypergraph.as_ref().ok_or_else(|| QuilError::InvalidArgument("flag day needs the hypergraph".into()))?;
+        let hg = self
+            .hypergraph
+            .as_ref()
+            .ok_or_else(|| QuilError::InvalidArgument("flag day needs the hypergraph".into()))?;
         let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
         let va_disc = vertex_adds_discriminator()?;
         let vr_disc = vertex_removes_discriminator()?;
         let ha_disc = hyperedge_adds_discriminator()?;
-        let live = |status: &ProverStatus| !matches!(status, ProverStatus::Historic | ProverStatus::Kicked);
+        let live = |status: &ProverStatus| {
+            !matches!(status, ProverStatus::Historic | ProverStatus::Kicked)
+        };
         // The scan is committed state; a split or merge earlier in this pass
         // may already have moved (and retired) an allocation it lists.
         let live_now = |public_key: &[u8], filter: &[u8]| -> Result<bool> {
             let address = materialize::allocation_address(public_key, filter)?;
-            Ok(state.get(domain, &address, &va_disc)?.filter(|blob| !blob.is_empty()).is_some_and(|blob| {
-                let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
-                read_field(&tree, "allocation:ProverAllocation", "Status")
-                    .and_then(|bytes| bytes.first().copied())
-                    .is_some_and(|byte| byte != materialize::STATUS_HISTORIC && byte != 4)
-            }))
+            Ok(state
+                .get(domain, &address, &va_disc)?
+                .filter(|blob| !blob.is_empty())
+                .is_some_and(|blob| {
+                    let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
+                    read_field(&tree, "allocation:ProverAllocation", "Status")
+                        .and_then(|bytes| bytes.first().copied())
+                        .is_some_and(|byte| byte != materialize::STATUS_HISTORIC && byte != 4)
+                }))
         };
 
         // 1. Ring keys.
@@ -4250,7 +5526,14 @@ impl GlobalIntrinsic {
             .allocations_with_keys()
             .filter(|(_, alloc, _, recorded)| !recorded && live(&alloc.status))
             .filter_map(|(prover, alloc, key, _)| {
-                scan.public_key(prover).map(|pk| (prover.to_vec(), pk.to_vec(), alloc.confirmation_filter.clone(), key))
+                scan.public_key(prover).map(|pk| {
+                    (
+                        prover.to_vec(),
+                        pk.to_vec(),
+                        alloc.confirmation_filter.clone(),
+                        key,
+                    )
+                })
             })
             .collect();
         for (prover, public_key, filter, key) in &unkeyed {
@@ -4258,35 +5541,55 @@ impl GlobalIntrinsic {
                 continue;
             }
             let address = materialize::allocation_address(public_key, filter)?;
-            let Some(blob) = state.get(domain, &address, &va_disc)?.filter(|b| !b.is_empty()) else { continue };
+            let Some(blob) = state
+                .get(domain, &address, &va_disc)?
+                .filter(|b| !b.is_empty())
+            else {
+                continue;
+            };
             let mut tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
             super::prover_rings::write_key(&mut tree, *key)?;
-            state.set(domain, &address, &va_disc, frame_number, crate::prover_registry::vertex_tree_to_blob(&tree))?;
+            state.set(
+                domain,
+                &address,
+                &va_disc,
+                frame_number,
+                crate::prover_registry::vertex_tree_to_blob(&tree),
+            )?;
             scan.recorded(prover, filter, *key);
         }
 
         // 2. Root shards for gridless applications.
         let grid_key = |l2: &[u8]| -> Vec<u8> {
-            let mut key = quil_hypergraph::addressing::get_bloom_filter_indices(l2, 256, 3).to_vec();
+            let mut key =
+                quil_hypergraph::addressing::get_bloom_filter_indices(l2, 256, 3).to_vec();
             key.extend_from_slice(l2);
             key
         };
         let mut apps: Vec<[u8; 32]> = scan
             .allocations_with_keys()
             .filter(|(_, alloc, _, _)| live(&alloc.status) && alloc.confirmation_filter.len() >= 32)
-            .filter_map(|(_, alloc, _, _)| <[u8; 32]>::try_from(&alloc.confirmation_filter[..32]).ok())
+            .filter_map(|(_, alloc, _, _)| {
+                <[u8; 32]>::try_from(&alloc.confirmation_filter[..32]).ok()
+            })
             .collect();
         apps.sort();
         apps.dedup();
         for app in &apps {
-            if !filters.iter().any(|filter| filter.len() >= 32 && filter[..32] == app[..]) {
-                store.put_app_shard(store as &dyn quil_types::store::Transaction, &quil_types::store::ShardInfo {
-                    shard_key: grid_key(app),
-                    prefix: Vec::new(),
-                    size: Vec::new(),
-                    data_shards: 0,
-                    commitment: Vec::new(),
-                })?;
+            if !filters
+                .iter()
+                .any(|filter| filter.len() >= 32 && filter[..32] == app[..])
+            {
+                store.put_app_shard(
+                    store as &dyn quil_types::store::Transaction,
+                    &quil_types::store::ShardInfo {
+                        shard_key: grid_key(app),
+                        prefix: Vec::new(),
+                        size: Vec::new(),
+                        data_shards: 0,
+                        commitment: Vec::new(),
+                    },
+                )?;
                 filters.push(app.to_vec());
                 tracing::info!(frame = frame_number, app = hex::encode(app),
                     "committee handoff flag day: application without a grid shard receives its root shard");
@@ -4304,15 +5607,23 @@ impl GlobalIntrinsic {
             .iter()
             .filter_map(|filter| bits_of(filter).map(|(app, bits)| (filter.clone(), app, bits)))
             .collect();
-        let mut off_grid: std::collections::BTreeMap<Vec<u8>, Vec<(Vec<u8>, Vec<u8>, super::prover_rings::RingKey)>> =
-            std::collections::BTreeMap::new();
+        let mut off_grid: std::collections::BTreeMap<
+            Vec<u8>,
+            Vec<(Vec<u8>, Vec<u8>, super::prover_rings::RingKey)>,
+        > = std::collections::BTreeMap::new();
         for (prover, alloc, key, _) in scan.allocations_with_keys() {
-            if !live(&alloc.status) || alloc.confirmation_filter.len() < 32 || filters.contains(&alloc.confirmation_filter) {
+            if !live(&alloc.status)
+                || alloc.confirmation_filter.len() < 32
+                || filters.contains(&alloc.confirmation_filter)
+            {
                 continue;
             }
             if let Some(public_key) = scan.public_key(prover) {
                 if live_now(public_key, &alloc.confirmation_filter)? {
-                    off_grid.entry(alloc.confirmation_filter.clone()).or_default().push((public_key.to_vec(), prover.to_vec(), key));
+                    off_grid
+                        .entry(alloc.confirmation_filter.clone())
+                        .or_default()
+                        .push((public_key.to_vec(), prover.to_vec(), key));
                 }
             }
         }
@@ -4322,39 +5633,54 @@ impl GlobalIntrinsic {
             .map(|(prover, alloc, _, _)| (prover.to_vec(), alloc.confirmation_filter.clone()))
             .collect();
         for (from, provers) in off_grid {
-            let Some((app, bits)) = bits_of(&from) else { continue };
+            let Some((app, bits)) = bits_of(&from) else {
+                continue;
+            };
             let same_app = grid.iter().filter(|(_, row_app, _)| *row_app == app);
-            let ancestor = same_app.clone()
+            let ancestor = same_app
+                .clone()
                 .filter(|(_, _, row_bits)| bits.starts_with(row_bits))
                 .max_by_key(|(_, _, row_bits)| row_bits.len())
                 .map(|(filter, _, _)| filter.clone());
-            let assigned: Vec<((Vec<u8>, Vec<u8>, super::prover_rings::RingKey), Vec<u8>)> = match ancestor {
-                Some(to) => provers.into_iter().map(|p| (p, to.clone())).collect(),
-                None => {
-                    let children: Vec<Vec<u8>> = same_app
-                        .filter(|(_, _, row_bits)| row_bits.starts_with(&bits))
-                        .map(|(filter, _, _)| filter.clone())
-                        .collect();
-                    if children.is_empty() {
-                        tracing::warn!(frame = frame_number, filter = hex::encode(&from), provers = provers.len(),
+            let assigned: Vec<((Vec<u8>, Vec<u8>, super::prover_rings::RingKey), Vec<u8>)> =
+                match ancestor {
+                    Some(to) => provers.into_iter().map(|p| (p, to.clone())).collect(),
+                    None => {
+                        let children: Vec<Vec<u8>> = same_app
+                            .filter(|(_, _, row_bits)| row_bits.starts_with(&bits))
+                            .map(|(filter, _, _)| filter.clone())
+                            .collect();
+                        if children.is_empty() {
+                            tracing::warn!(frame = frame_number, filter = hex::encode(&from), provers = provers.len(),
                             "committee handoff flag day: no grid shard overlaps an off-grid filter; its allocations stay");
-                        continue;
+                            continue;
+                        }
+                        let order = super::prover_rings::children_by_value(&children, |filter| {
+                            self.split_child_size(filter)
+                        });
+                        let ranked = provers
+                            .iter()
+                            .map(|p| (p.clone(), p.1.as_slice(), p.2))
+                            .collect();
+                        super::prover_rings::split_groups(ranked, children.len())?
+                            .into_iter()
+                            .zip(order)
+                            .flat_map(|(group, index)| group.into_iter().map(move |p| (p, index)))
+                            .map(|(p, index)| (p, children[index].clone()))
+                            .collect()
                     }
-                    let order = super::prover_rings::children_by_value(&children, |filter| self.split_child_size(filter));
-                    let ranked = provers.iter().map(|p| (p.clone(), p.1.as_slice(), p.2)).collect();
-                    super::prover_rings::split_groups(ranked, children.len())?
-                        .into_iter()
-                        .zip(order)
-                        .flat_map(|(group, index)| group.into_iter().map(move |p| (p, index)))
-                        .map(|(p, index)| (p, children[index].clone()))
-                        .collect()
-                }
-            };
+                };
             for ((public_key, prover, key), to) in assigned {
                 if held.contains(&(prover.clone(), to.clone())) {
                     let address = materialize::allocation_address(&public_key, &from)?;
-                    if let Some(blob) = state.get(domain, &address, &va_disc)?.filter(|b| !b.is_empty()) {
-                        let historic = reassignment::set_allocation_status(&blob, materialize::STATUS_HISTORIC)?;
+                    if let Some(blob) = state
+                        .get(domain, &address, &va_disc)?
+                        .filter(|b| !b.is_empty())
+                    {
+                        let historic = reassignment::set_allocation_status(
+                            &blob,
+                            materialize::STATUS_HISTORIC,
+                        )?;
                         state.set(domain, &address, &va_disc, frame_number, historic)?;
                     }
                     scan.retired(&prover, &from);
@@ -4362,13 +5688,25 @@ impl GlobalIntrinsic {
                 }
                 let moved = super::prover_rings::moved(key, frame_number);
                 self.rekey_allocation_with_key(
-                    state, &va_disc, &vr_disc, &ha_disc, &public_key, &prover, &from, &to, frame_number, Some(moved),
+                    state,
+                    &va_disc,
+                    &vr_disc,
+                    &ha_disc,
+                    &public_key,
+                    &prover,
+                    &from,
+                    &to,
+                    frame_number,
+                    Some(moved),
                 )?;
                 scan.moved(&prover, &from, &to, moved);
                 held.insert((prover, to));
             }
-            tracing::info!(frame = frame_number, from = hex::encode(&from),
-                "committee handoff flag day: off-grid allocations moved onto the grid");
+            tracing::info!(
+                frame = frame_number,
+                from = hex::encode(&from),
+                "committee handoff flag day: off-grid allocations moved onto the grid"
+            );
         }
         super::handoff::record_flag_day(state, frame_number)
     }
@@ -4378,9 +5716,15 @@ impl GlobalIntrinsic {
     /// archive holds alike once sequenced ingest has run). 0 off the unified
     /// tree or without a hypergraph.
     fn split_child_size(&self, filter: &[u8]) -> u128 {
-        let Some(hg) = self.hypergraph.as_ref() else { return 0 };
-        let Some((app, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) else { return 0 };
-        let Ok(app) = <[u8; 32]>::try_from(app.as_slice()) else { return 0 };
+        let Some(hg) = self.hypergraph.as_ref() else {
+            return 0;
+        };
+        let Some((app, bits)) = quil_forest::decode_shard_filter_or_root(filter, 32) else {
+            return 0;
+        };
+        let Ok(app) = <[u8; 32]>::try_from(app.as_slice()) else {
+            return 0;
+        };
         u128::from(hg.unified_live_size_at_bits(&app, &bits).unwrap_or(0))
     }
 
@@ -4405,7 +5749,16 @@ impl GlobalIntrinsic {
         frame_number: u64,
     ) -> Result<()> {
         self.rekey_allocation_with_key(
-            state, va_disc, vr_disc, ha_disc, pubkey, prover_address, old_filter, new_filter, frame_number, None,
+            state,
+            va_disc,
+            vr_disc,
+            ha_disc,
+            pubkey,
+            prover_address,
+            old_filter,
+            new_filter,
+            frame_number,
+            None,
         )
     }
 
@@ -4465,7 +5818,10 @@ impl GlobalIntrinsic {
             .get(domain, prover_address, ha_disc)?
             .unwrap_or_default();
         let new_he = reassignment::rebuild_hyperedge_with_reassigned_atom(
-            &existing_he, &old_addr, &new_addr, &new_tree,
+            &existing_he,
+            &old_addr,
+            &new_addr,
+            &new_tree,
         )?;
         state.set(domain, prover_address, ha_disc, frame_number, new_he)?;
 
@@ -4486,7 +5842,6 @@ impl GlobalIntrinsic {
         }
         Ok(())
     }
-
 }
 
 /// Convert an Ed448 public key (57 bytes) to a base58-encoded libp2p
@@ -4497,7 +5852,7 @@ impl GlobalIntrinsic {
 /// 2. SHA2-256 hash (key > 42 bytes, so not inlined)
 /// 3. Multihash-wrap: `[0x12, 0x20, <32-byte SHA256>]`
 /// 4. Base58-encode the 34-byte multihash
-fn ed448_pubkey_to_peer_id_string(pubkey: &[u8]) -> String {
+pub(crate) fn ed448_pubkey_to_peer_id_string(pubkey: &[u8]) -> String {
     // Step 1: protobuf encode
     let mut proto = Vec::with_capacity(4 + pubkey.len());
     proto.push(0x08); // field 1 tag (varint)
@@ -4570,12 +5925,17 @@ impl HeaderTiming {
 
     fn start() -> Self {
         let now = std::time::Instant::now();
-        Self { started: now, last: now, steps: Vec::new() }
+        Self {
+            started: now,
+            last: now,
+            steps: Vec::new(),
+        }
     }
 
     fn mark(&mut self, step: &'static str) {
         let now = std::time::Instant::now();
-        self.steps.push((step, now.duration_since(self.last).as_micros()));
+        self.steps
+            .push((step, now.duration_since(self.last).as_micros()));
         self.last = now;
     }
 
@@ -4620,7 +5980,12 @@ struct RepairTrigger {
 }
 
 static PENDING_REPAIR_TRIGGER: std::sync::Mutex<RepairTrigger> =
-    std::sync::Mutex::new(RepairTrigger { armed: true, epoch: u64::MAX, highest: None, through: 0 });
+    std::sync::Mutex::new(RepairTrigger {
+        armed: true,
+        epoch: u64::MAX,
+        highest: None,
+        through: 0,
+    });
 
 /// Scan for lost pending changes at the next executed frame. For GLOBAL state
 /// that changed outside execution: a prover-shard reconcile (with or without
@@ -4629,18 +5994,26 @@ static PENDING_REPAIR_TRIGGER: std::sync::Mutex<RepairTrigger> =
 /// a partially synced prover shard may have produced.
 pub fn request_pending_repair() {
     rearm_pending_repair();
-    PENDING_REPAIR_SETTLED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    PENDING_REPAIR_SETTLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Scan again at the next executed frame, keeping earlier verdicts.
 fn rearm_pending_repair() {
-    PENDING_REPAIR_TRIGGER.lock().unwrap_or_else(|e| e.into_inner()).armed = true;
+    PENDING_REPAIR_TRIGGER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .armed = true;
 }
 
 /// Whether `frame`'s execution scans for lost pending changes (see
 /// [`RepairTrigger`]); `cursor` is the store's materialized cursor, read once.
 fn pending_repair_due(frame: u64, cursor: impl FnOnce() -> u64) -> bool {
-    let mut trigger = PENDING_REPAIR_TRIGGER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut trigger = PENDING_REPAIR_TRIGGER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let highest = *trigger.highest.get_or_insert_with(cursor);
     if frame >= highest {
         trigger.highest = Some(frame);
@@ -4650,8 +6023,14 @@ fn pending_repair_due(frame: u64, cursor: impl FnOnce() -> u64) -> bool {
             trigger.armed = true;
             // Verdicts are re-examined, and unresolved or superseded ones
             // reported, once per epoch while they last.
-            PENDING_REPAIR_SETTLED.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            PENDING_REPAIR_SUPERSEDED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            PENDING_REPAIR_SETTLED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            PENDING_REPAIR_SUPERSEDED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
         }
         if trigger.armed {
             trigger.armed = false;
@@ -4668,20 +6047,27 @@ fn pending_repair_due(frame: u64, cursor: impl FnOnce() -> u64) -> bool {
 /// the reason for an unresolved one (`None`: never, as a membership request
 /// or one before the floors). Cleared each epoch and by
 /// [`request_pending_repair`].
-static PENDING_REPAIR_SETTLED: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], Option<&'static str>>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PENDING_REPAIR_SETTLED: std::sync::Mutex<
+    std::collections::BTreeMap<[u8; 32], Option<&'static str>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The unresolved requests the last complete scan reported, by grid filter.
 static PENDING_REPAIR_UNRESOLVED: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], Vec<u8>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 fn settled(request: &[u8; 32]) -> Option<Option<&'static str>> {
-    PENDING_REPAIR_SETTLED.lock().unwrap_or_else(|e| e.into_inner()).get(request).copied()
+    PENDING_REPAIR_SETTLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(request)
+        .copied()
 }
 
 /// Settle `request`; false if it was already settled.
 fn settle(request: [u8; 32], reason: Option<&'static str>) -> bool {
-    let mut settled = PENDING_REPAIR_SETTLED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut settled = PENDING_REPAIR_SETTLED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if settled.len() >= 65_536 {
         settled.clear();
     }
@@ -4721,8 +6107,13 @@ fn report_unresolved(frame: u64, filter: &[u8], request: &[u8; 32], reason: &'st
 
 /// End the report of every request the previous complete scan found
 /// unresolved that this one did not.
-fn report_resolved(frame: u64, current: &std::collections::BTreeMap<[u8; 32], (Vec<u8>, &'static str)>) {
-    let mut reported = PENDING_REPAIR_UNRESOLVED.lock().unwrap_or_else(|e| e.into_inner());
+fn report_resolved(
+    frame: u64,
+    current: &std::collections::BTreeMap<[u8; 32], (Vec<u8>, &'static str)>,
+) {
+    let mut reported = PENDING_REPAIR_UNRESOLVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for (request, filter) in reported.iter() {
         if !current.contains_key(request) {
             tracing::info!(
@@ -4734,7 +6125,10 @@ fn report_resolved(frame: u64, current: &std::collections::BTreeMap<[u8; 32], (V
             );
         }
     }
-    *reported = current.iter().map(|(request, (filter, _))| (*request, filter.clone())).collect();
+    *reported = current
+        .iter()
+        .map(|(request, (filter, _))| (*request, filter.clone()))
+        .collect();
 }
 
 /// Requests the repair counted as applied here while a source is in the grid
@@ -4746,7 +6140,11 @@ static PENDING_REPAIR_SUPERSEDED: std::sync::Mutex<std::collections::BTreeSet<[u
 /// change of it, but the change counts as applied here (`guard`), so nothing
 /// is restored: logged so that a heal the guards skip is visible.
 fn report_superseded(frame: u64, filter: &[u8], request: &[u8; 32], guard: &'static str) {
-    if PENDING_REPAIR_SUPERSEDED.lock().unwrap_or_else(|e| e.into_inner()).insert(*request) {
+    if PENDING_REPAIR_SUPERSEDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(*request)
+    {
         tracing::info!(
             frame,
             filter = hex::encode(filter),
@@ -4760,7 +6158,8 @@ fn report_superseded(frame: u64, filter: &[u8], request: &[u8; 32], guard: &'sta
 }
 
 static PENDING_REPAIR_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PENDING_REPAIR_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PENDING_REPAIR_FAILING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// How many scans of the pending-change repair hit a store error in this
 /// process, for tests and diagnostics.
@@ -4771,7 +6170,10 @@ pub fn pending_repair_failures() -> u64 {
 /// End the failure report once a scan completes again.
 fn report_repair_recovered(frame: u64) {
     if PENDING_REPAIR_FAILING.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        tracing::info!(frame, "shard grid repair: the check for lost pending splits and merges completes again");
+        tracing::info!(
+            frame,
+            "shard grid repair: the check for lost pending splits and merges completes again"
+        );
     }
 }
 
@@ -4812,7 +6214,9 @@ pub struct LocalShardGrid {
 
 /// The live filters of grid `rows`, spelled as `GetAppShards` readers build
 /// them.
-fn grid_filters<'a>(rows: impl Iterator<Item = &'a ShardInfo>) -> std::collections::BTreeSet<Vec<u8>> {
+fn grid_filters<'a>(
+    rows: impl Iterator<Item = &'a ShardInfo>,
+) -> std::collections::BTreeSet<Vec<u8>> {
     rows.filter(|row| row.shard_key.len() >= 35)
         .map(|row| quil_forest::shard_prefix_to_filter(&row.shard_key[3..35], &row.prefix))
         .filter(|filter| !filter.is_empty())
@@ -4835,16 +6239,23 @@ pub fn local_shard_grid(store: &dyn ShardsStore) -> Result<LocalShardGrid> {
     let rows = store.range_app_shards()?;
     let digest = filter_list_digest(&grid_filters(rows.iter()));
     let quil = crate::domains::QUIL_TOKEN;
-    let mut quil_key = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3).to_vec();
+    let mut quil_key =
+        quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3).to_vec();
     quil_key.extend_from_slice(&quil);
     let quil_rows = rows.iter().filter(|row| row.shard_key == quil_key).count();
-    let quil_digest = filter_list_digest(&grid_filters(rows.iter().filter(|row| row.shard_key == quil_key)));
+    let quil_digest = filter_list_digest(&grid_filters(
+        rows.iter().filter(|row| row.shard_key == quil_key),
+    ));
     let mut pending = store.all_pending_shard_changes()?;
     for change in &mut pending {
         change.children.sort();
     }
     pending.sort_by(|a, b| {
-        (a.effective_epoch, &a.parent, a.proposed_frame).cmp(&(b.effective_epoch, &b.parent, b.proposed_frame))
+        (a.effective_epoch, &a.parent, a.proposed_frame).cmp(&(
+            b.effective_epoch,
+            &b.parent,
+            b.proposed_frame,
+        ))
     });
     let mut hasher = Sha256::new();
     for change in &pending {
@@ -4860,7 +6271,14 @@ pub fn local_shard_grid(store: &dyn ShardsStore) -> Result<LocalShardGrid> {
         }
     }
     let pending_digest = hex::encode(&hasher.finalize()[..4]);
-    Ok(LocalShardGrid { rows: rows.len(), pending: pending.len(), digest, pending_digest, quil_rows, quil_digest })
+    Ok(LocalShardGrid {
+        rows: rows.len(),
+        pending: pending.len(),
+        digest,
+        pending_digest,
+        quil_rows,
+        quil_digest,
+    })
 }
 
 /// Log the node's local shard grid (rows, pending changes, digests), at
@@ -4890,7 +6308,9 @@ pub fn log_local_shard_grid(store: &dyn ShardsStore, frame: Option<u64>) {
             "local shard grid: rows, pending splits and merges, and digests at startup. quil_digest is \
              computed as the archive-list digest of #816 over the QUIL grid"
         ),
-        (Err(error), _) => tracing::warn!(?frame, %error, "local shard grid: the local grid could not be read"),
+        (Err(error), _) => {
+            tracing::warn!(?frame, %error, "local shard grid: the local grid could not be read")
+        }
     }
 }
 
@@ -4929,7 +6349,9 @@ fn shard_filter_is_registered(store: &dyn ShardsStore, filter: &[u8]) -> bool {
 /// afterwards bound a worker to a shard with no session, where it sat for the
 /// rest of a live width run.
 fn grid_admits_filter(store: &dyn ShardsStore, filter: &[u8]) -> Result<bool> {
-    let Some(app) = filter.get(..32) else { return Ok(true) };
+    let Some(app) = filter.get(..32) else {
+        return Ok(true);
+    };
     let mut managed = false;
     for row in store.range_app_shards()? {
         if row.shard_key.get(3..35) != Some(app) {
@@ -4984,23 +6406,77 @@ fn check_leave_confirm_halt_risk(
     Ok(())
 }
 
+/// Whether GLOBAL withholds the reward of an app frame anchored at
+/// `global_frame_number` over a shard of `state_size` bytes for want of a
+/// storage attestation. A KZG epoch's storage frame over committed data must
+/// carry one, except in an epoch whose attestations are paused
+/// (`quil_types::consensus::MAINNET_STORAGE_ATTESTATION_PAUSE`); hash-proof
+/// epochs gate each participant on its own sealed registration instead.
+fn storage_reward_withheld(global_frame_number: u64, state_size: u64, attested: bool) -> bool {
+    let epoch = quil_types::consensus::epoch_for_frame(global_frame_number);
+    global_frame_number > 0
+        && state_size > 0
+        && !attested
+        && !quil_types::consensus::hash_storage_proofs_at(epoch)
+        && !quil_types::consensus::storage_attestation_paused(epoch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_types::crypto::KeyType;
-    use crate::global_schema::{
-        write_field, write_type,
-    };
     use crate::global_intrinsic::addressed_signature::AddressedSignature;
+    use crate::global_schema::{write_field, write_type};
+    use quil_types::crypto::KeyType;
+
+    /// From the required-anchor epoch GLOBAL refuses a shard frame header
+    /// without a GLOBAL anchor, before any verification; an anchored header
+    /// and frames before the epoch are unaffected.
+    #[test]
+    fn an_unanchored_header_is_refused_from_the_required_anchor_epoch() {
+        quil_types::consensus::set_required_anchor_epoch_for_thread(Some(10));
+        let first = 10 * quil_types::consensus::epoch_length_frames();
+        let mut header = crate::global_intrinsic::frame_header::FrameHeader {
+            address: vec![1; 32],
+            frame_number: 7,
+            ..Default::default()
+        };
+        assert!(GlobalIntrinsic::require_global_anchor(first - 1, &header).is_ok());
+        let refused = GlobalIntrinsic::require_global_anchor(first, &header).unwrap_err();
+        assert!(
+            refused.to_string().contains("names no GLOBAL anchor"),
+            "{refused}"
+        );
+        header.global_frame_number = first - 1;
+        assert!(GlobalIntrinsic::require_global_anchor(first, &header).is_ok());
+        quil_types::consensus::set_required_anchor_epoch_for_thread(None);
+    }
 
     struct AcceptAll;
     impl KeyManager for AcceptAll {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> { Ok(true) }
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
+            Ok(true)
+        }
     }
 
     struct RejectAll;
     impl KeyManager for RejectAll {
-        fn validate_signature(&self, _: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> { Ok(false) }
+        fn validate_signature(
+            &self,
+            _: KeyType,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<bool> {
+            Ok(false)
+        }
     }
 
     fn make_prover_tree() -> quil_tries::VectorCommitmentTree {
@@ -5014,7 +6490,13 @@ mod tests {
     fn make_alloc_tree(status: u8) -> quil_tries::VectorCommitmentTree {
         let mut tree = quil_tries::VectorCommitmentTree::new();
         write_type(&mut tree, "allocation:ProverAllocation").unwrap();
-        write_field(&mut tree, "allocation:ProverAllocation", "Status", &[status]).unwrap();
+        write_field(
+            &mut tree,
+            "allocation:ProverAllocation",
+            "Status",
+            &[status],
+        )
+        .unwrap();
         tree
     }
 
@@ -5042,7 +6524,9 @@ mod tests {
         let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
         let pt = make_prover_tree();
         let at = make_alloc_tree(1); // active
-        assert!(gi.validate(1, &pause_bytes(), Some(&pt), Some(&at)).unwrap());
+        assert!(gi
+            .validate(1, &pause_bytes(), Some(&pt), Some(&at))
+            .unwrap());
     }
 
     #[test]
@@ -5050,7 +6534,9 @@ mod tests {
         let gi = GlobalIntrinsic::new(Arc::new(RejectAll));
         let pt = make_prover_tree();
         let at = make_alloc_tree(1);
-        assert!(!gi.validate(1, &pause_bytes(), Some(&pt), Some(&at)).unwrap());
+        assert!(!gi
+            .validate(1, &pause_bytes(), Some(&pt), Some(&at))
+            .unwrap());
     }
 
     #[test]
@@ -5058,7 +6544,159 @@ mod tests {
         let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
         let pt = make_prover_tree();
         let at = make_alloc_tree(2); // paused, not active
-        assert!(gi.validate(1, &pause_bytes(), Some(&pt), Some(&at)).is_err());
+        assert!(gi
+            .validate(1, &pause_bytes(), Some(&pt), Some(&at))
+            .is_err());
+    }
+
+    /// Signed pause, resume, leave and reject operations at `signed`, each
+    /// with the allocation its validation reads (pause: active, resume:
+    /// paused; leave and reject read none here).
+    fn signed_filter_ops(
+        signed: u64,
+    ) -> Vec<(
+        &'static str,
+        Vec<u8>,
+        Option<quil_tries::VectorCommitmentTree>,
+    )> {
+        let sig = || {
+            Some(AddressedSignature {
+                signature: vec![0xBBu8; 666],
+                address: vec![0xCCu8; 32],
+            })
+        };
+        let filter = vec![0xAAu8; 32];
+        vec![
+            (
+                "pause",
+                ProverPause {
+                    filter: filter.clone(),
+                    frame_number: signed,
+                    public_key_signature_bls48581: sig(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+                Some(make_alloc_tree(1)),
+            ),
+            (
+                "resume",
+                ProverResume {
+                    filter: filter.clone(),
+                    frame_number: signed,
+                    public_key_signature_bls48581: sig(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+                Some(make_alloc_tree(2)),
+            ),
+            (
+                "leave",
+                ProverLeave {
+                    filters: vec![filter.clone()],
+                    frame_number: signed,
+                    public_key_signature_bls48581: sig(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+                None,
+            ),
+            (
+                "reject",
+                ProverReject {
+                    frame_number: signed,
+                    public_key_signature_bls48581: sig(),
+                    filters: vec![filter],
+                    ..Default::default()
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+                None,
+            ),
+        ]
+    }
+
+    /// A captured pause, resume, leave or reject used to apply whenever it
+    /// was submitted again. From the replay guard epoch one signed more than
+    /// the freshness window before the including frame, or in an earlier
+    /// epoch, is refused; a fresh one is accepted, and before the epoch an
+    /// old one still is, as on builds without the guard.
+    #[test]
+    fn a_replayed_prover_op_is_refused_from_the_replay_guard_epoch() {
+        let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+        let pt = make_prover_tree();
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let at = 3 * epoch + 30;
+        let window = verify::PROVER_OP_FRESHNESS_WINDOW;
+        let validate = |signed: u64| -> Vec<(&'static str, Result<bool>)> {
+            signed_filter_ops(signed)
+                .into_iter()
+                .map(|(name, bytes, alloc)| {
+                    (name, gi.validate(at, &bytes, Some(&pt), alloc.as_ref()))
+                })
+                .collect()
+        };
+
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(u64::MAX));
+        for (name, result) in validate(at - window - 1) {
+            assert!(result.unwrap(), "{name}: accepted before the epoch");
+        }
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(3));
+        for (name, result) in validate(at - window) {
+            assert!(result.unwrap(), "{name}: a fresh op is accepted");
+        }
+        for signed in [at - window - 1, 3 * epoch - 1, at + 1] {
+            for (name, result) in validate(signed) {
+                assert!(
+                    result.is_err(),
+                    "{name} signed at {signed}: refused at {at}"
+                );
+            }
+        }
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
+    }
+
+    /// Pausing and resuming within the freshness window would let an
+    /// earlier pause apply again: from the replay guard epoch a pause signed
+    /// before the allocation's last resume is refused.
+    #[test]
+    fn a_pause_signed_before_the_last_resume_is_refused_from_the_replay_guard_epoch() {
+        let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+        let pt = make_prover_tree();
+        let epoch = quil_types::consensus::epoch_length_frames();
+        let at = 3 * epoch + 30;
+        let mut resumed = make_alloc_tree(1);
+        write_field(
+            &mut resumed,
+            "allocation:ProverAllocation",
+            "ResumeFrameNumber",
+            &(at - 2).to_be_bytes(),
+        )
+        .unwrap();
+        let pause = |signed: u64| {
+            ProverPause {
+                filter: vec![0xAAu8; 32],
+                frame_number: signed,
+                public_key_signature_bls48581: Some(AddressedSignature {
+                    signature: vec![0xBBu8; 666],
+                    address: vec![0xCCu8; 32],
+                }),
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(3));
+        assert!(gi
+            .validate(at, &pause(at - 5), Some(&pt), Some(&resumed))
+            .is_err());
+        assert!(gi
+            .validate(at, &pause(at - 2), Some(&pt), Some(&resumed))
+            .unwrap());
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(u64::MAX));
+        assert!(gi
+            .validate(at, &pause(at - 5), Some(&pt), Some(&resumed))
+            .unwrap());
+        quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
     }
 
     #[test]
@@ -5073,13 +6711,11 @@ mod tests {
         let join = crate::global_intrinsic::ProverJoin {
             filters: vec![vec![0x01u8; 32]],
             frame_number: 100,
-            public_key_signature_bls48581: Some(
-                crate::global_intrinsic::SignatureWithPop {
-                    signature: vec![0xAAu8; 666],
-                    public_key: Some(vec![0xBBu8; 897]),
-                    pop_signature: vec![0xCCu8; 666],
-                },
-            ),
+            public_key_signature_bls48581: Some(crate::global_intrinsic::SignatureWithPop {
+                signature: vec![0xAAu8; 666],
+                public_key: Some(vec![0xBBu8; 897]),
+                pop_signature: vec![0xCCu8; 666],
+            }),
             delegate_address: vec![],
             merge_targets: vec![],
             proof: vec![0xDDu8; 516],
@@ -5099,7 +6735,14 @@ mod tests {
     fn join_refused_for_an_active_allocation_skips_merge_target_signatures() {
         struct CountsEd448(std::sync::atomic::AtomicUsize);
         impl KeyManager for CountsEd448 {
-            fn validate_signature(&self, key_type: KeyType, _: &[u8], _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+            fn validate_signature(
+                &self,
+                key_type: KeyType,
+                _: &[u8],
+                _: &[u8],
+                _: &[u8],
+                _: &[u8],
+            ) -> Result<bool> {
                 if key_type == KeyType::Ed448 {
                     self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     return Ok(false);
@@ -5119,11 +6762,13 @@ mod tests {
             }),
             delegate_address: vec![],
             merge_targets: (0..3)
-                .map(|n| crate::global_intrinsic::seniority_merge::SeniorityMerge {
-                    signature: vec![n; 114],
-                    key_type: 0,
-                    prover_public_key: vec![n; 57],
-                })
+                .map(
+                    |n| crate::global_intrinsic::seniority_merge::SeniorityMerge {
+                        signature: vec![n; 114],
+                        key_type: 0,
+                        prover_public_key: vec![n; 57],
+                    },
+                )
                 .collect(),
             proof: vec![],
         }
@@ -5136,29 +6781,49 @@ mod tests {
                 Arc::new(quil_tries::ShaInclusionProver),
             ));
             if active {
-                let prover = crate::global_intrinsic::materialize::prover_address_from_pubkey(&public_key).unwrap();
-                let allocation = crate::global_intrinsic::materialize::create_allocation_vertex_tree(&prover, &filter, 90).unwrap();
+                let prover =
+                    crate::global_intrinsic::materialize::prover_address_from_pubkey(&public_key)
+                        .unwrap();
+                let allocation =
+                    crate::global_intrinsic::materialize::create_allocation_vertex_tree(
+                        &prover, &filter, 90,
+                    )
+                    .unwrap();
                 let state = crate::hypergraph_state::HypergraphState::new(crdt.clone());
-                state.set(
-                    &GLOBAL_INTRINSIC_ADDRESS[..],
-                    &crate::global_intrinsic::materialize::allocation_address(&public_key, &filter).unwrap(),
-                    &crate::hypergraph_state::vertex_adds_discriminator().unwrap(),
-                    90,
-                    crate::prover_registry::vertex_tree_to_blob(&allocation),
-                ).unwrap();
+                state
+                    .set(
+                        &GLOBAL_INTRINSIC_ADDRESS[..],
+                        &crate::global_intrinsic::materialize::allocation_address(
+                            &public_key,
+                            &filter,
+                        )
+                        .unwrap(),
+                        &crate::hypergraph_state::vertex_adds_discriminator().unwrap(),
+                        90,
+                        crate::prover_registry::vertex_tree_to_blob(&allocation),
+                    )
+                    .unwrap();
                 state.commit().unwrap();
             }
             let keys = Arc::new(CountsEd448(Default::default()));
-            let verdict = GlobalIntrinsic::new(keys.clone()).with_hypergraph(crdt).validate(105, &join, None, None);
+            let verdict = GlobalIntrinsic::new(keys.clone())
+                .with_hypergraph(crdt)
+                .validate(105, &join, None, None);
             (verdict, keys.0.load(std::sync::atomic::Ordering::SeqCst))
         };
 
         let (verdict, ed448_checks) = validate(true);
-        assert!(verdict.unwrap_err().to_string().contains("existing allocation still active"));
+        assert!(verdict
+            .unwrap_err()
+            .to_string()
+            .contains("existing allocation still active"));
         assert_eq!(ed448_checks, 0);
 
         let (verdict, ed448_checks) = validate(false);
-        assert!(!verdict.unwrap(), "a bad merge target still refuses the join");
+        assert!(
+            !verdict.unwrap(),
+            "a bad merge target still refuses the join"
+        );
         assert_eq!(ed448_checks, 1);
     }
 
@@ -5185,21 +6850,13 @@ mod tests {
         count: usize,
     }
     impl quil_types::consensus::ProverRegistry for ActiveCountRegistry {
-        fn get_prover_info(
-            &self,
-            _: &[u8],
-        ) -> Result<Option<quil_types::consensus::ProverInfo>> {
+        fn get_prover_info(&self, _: &[u8]) -> Result<Option<quil_types::consensus::ProverInfo>> {
             Ok(None)
         }
         fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<u8>> {
             Ok(Vec::new())
         }
-        fn get_ordered_provers(
-            &self,
-            _: &[u8; 32],
-            _: &[u8],
-            _: u64,
-        ) -> Result<Vec<Vec<u8>>> {
+        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> Result<Vec<Vec<u8>>> {
             Ok(Vec::new())
         }
         fn get_active_provers(
@@ -5225,10 +6882,7 @@ mod tests {
         fn get_prover_count(&self, _: &[u8]) -> Result<usize> {
             Ok(self.count)
         }
-        fn get_provers(
-            &self,
-            _: &[u8],
-        ) -> Result<Vec<quil_types::consensus::ProverInfo>> {
+        fn get_provers(&self, _: &[u8]) -> Result<Vec<quil_types::consensus::ProverInfo>> {
             Ok(Vec::new())
         }
         fn get_provers_by_status(
@@ -5278,7 +6932,11 @@ mod tests {
             0,
             false,
         );
-        assert!(result.is_ok(), "healthy shard leave-confirm must pass: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "healthy shard leave-confirm must pass: {:?}",
+            result.err()
+        );
     }
 
     /// Leave-confirm on a shard already at the halt-risk floor + 1
@@ -5298,11 +6956,17 @@ mod tests {
             0,
             false,
         );
-        assert!(result.is_err(),
-            "leave-confirm at floor+1 must be rejected, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "leave-confirm at floor+1 must be rejected, got {:?}",
+            result
+        );
         let msg = format!("{:?}", result.unwrap_err());
-        assert!(msg.contains("halt-risk"),
-            "rejection message should mention halt-risk: {}", msg);
+        assert!(
+            msg.contains("halt-risk"),
+            "rejection message should mention halt-risk: {}",
+            msg
+        );
     }
 
     /// Leave-confirm on a shard already below halt-risk floor (0 or 3
@@ -5311,7 +6975,9 @@ mod tests {
     #[test]
     fn halt_risk_gate_rejects_leave_confirm_below_floor() {
         for active_count in [0, 1, materialize::HALT_RISK_PROVER_COUNT] {
-            let registry = ActiveCountRegistry { count: active_count };
+            let registry = ActiveCountRegistry {
+                count: active_count,
+            };
             let result = super::check_leave_confirm_halt_risk(
                 b"filterX",
                 materialize::STATUS_LEAVING,
@@ -5322,7 +6988,8 @@ mod tests {
             assert!(
                 result.is_err(),
                 "leave-confirm at active={} must be rejected, got {:?}",
-                active_count, result,
+                active_count,
+                result,
             );
         }
     }
@@ -5342,8 +7009,11 @@ mod tests {
             0,
             false,
         );
-        assert!(result.is_ok(),
-            "leave-confirm at floor+2 must pass: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "leave-confirm at floor+2 must pass: {:?}",
+            result.err()
+        );
     }
 
     /// No registry installed — gate degrades open (returns Ok) so
@@ -5358,8 +7028,11 @@ mod tests {
             0,
             false,
         );
-        assert!(result.is_ok(),
-            "gate must degrade open when no registry: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "gate must degrade open when no registry: {:?}",
+            result.err()
+        );
     }
 
     /// Leave-confirm on a shard at/below the halt-risk floor but which
@@ -5371,7 +7044,9 @@ mod tests {
     #[test]
     fn halt_risk_gate_allows_leave_confirm_on_removed_split_parent() {
         for active_count in [0, 1, materialize::HALT_RISK_PROVER_COUNT + 1] {
-            let registry = ActiveCountRegistry { count: active_count };
+            let registry = ActiveCountRegistry {
+                count: active_count,
+            };
             let result = super::check_leave_confirm_halt_risk(
                 b"filterX",
                 materialize::STATUS_LEAVING,
@@ -5382,7 +7057,8 @@ mod tests {
             assert!(
                 result.is_ok(),
                 "removed split-parent leave-confirm at active={} must pass: {:?}",
-                active_count, result.err(),
+                active_count,
+                result.err(),
             );
         }
     }
@@ -5414,32 +7090,48 @@ mod tests {
     mod seniority_merge {
         use super::*;
         use crate::global_intrinsic::materialize::{
-            create_prover_vertex_tree, create_spent_merge_tree,
-            prover_address_from_pubkey, spent_seniority_merge_address,
+            create_prover_vertex_tree, create_spent_merge_tree, prover_address_from_pubkey,
+            spent_seniority_merge_address,
         };
-        use crate::global_intrinsic::prover_ops::{
-            ProverSeniorityMerge as ProverSeniorityMergeOp,
-        };
+        use crate::global_intrinsic::prover_ops::ProverSeniorityMerge as ProverSeniorityMergeOp;
         use crate::global_intrinsic::seniority_merge::SeniorityMerge as SeniorityMergeTarget;
         use crate::global_schema::read_field;
-        use crate::hypergraph_state::{
-            vertex_adds_discriminator, HypergraphState,
-        };
-        use crate::prover_registry::{
-            rebuild_vertex_tree_from_blob, vertex_tree_to_blob,
-        };
+        use crate::hypergraph_state::{vertex_adds_discriminator, HypergraphState};
+        use crate::prover_registry::{rebuild_vertex_tree_from_blob, vertex_tree_to_blob};
         use quil_hypergraph::HypergraphCrdt;
         use quil_types::crypto::{InclusionProver, Multiproof};
 
         struct StubProver;
         impl InclusionProver for StubProver {
-            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-            fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> {
+                Ok(vec![0u8; 64])
+            }
+            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
+                Ok(vec![])
+            }
+            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
+                Ok(true)
+            }
+            fn prove_multiple(
+                &self,
+                _: &[&[u8]],
+                _: &[&[u8]],
+                _: &[u64],
+                _: u64,
+            ) -> Result<Box<dyn Multiproof>> {
                 Err(QuilError::Internal("batch not supported".into()))
             }
-            fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+            fn verify_multiple(
+                &self,
+                _: &[&[u8]],
+                _: &[&[u8]],
+                _: &[u64],
+                _: u64,
+                _: &[u8],
+                _: &[u8],
+            ) -> bool {
+                true
+            }
         }
 
         fn make_state() -> HypergraphState {
@@ -5455,7 +7147,9 @@ mod tests {
             let tree = create_prover_vertex_tree(pubkey, seniority).unwrap();
             let blob = vertex_tree_to_blob(&tree);
             let va_disc = vertex_adds_discriminator().unwrap();
-            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &addr, &va_disc, 1, blob).unwrap();
+            state
+                .set(&GLOBAL_INTRINSIC_ADDRESS[..], &addr, &va_disc, 1, blob)
+                .unwrap();
             addr
         }
 
@@ -5486,12 +7180,12 @@ mod tests {
         /// in `state` at `addr`.
         fn read_seniority(state: &HypergraphState, addr: &[u8; 32]) -> u64 {
             let va_disc = vertex_adds_discriminator().unwrap();
-            let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], addr, &va_disc)
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], addr, &va_disc)
                 .unwrap()
                 .expect("prover vertex");
             let tree = rebuild_vertex_tree_from_blob(&blob);
-            let bytes = read_field(&tree, "prover:Prover", "Seniority")
-                .expect("seniority field");
+            let bytes = read_field(&tree, "prover:Prover", "Seniority").expect("seniority field");
             assert_eq!(bytes.len(), 8);
             u64::from_be_bytes(bytes.try_into().unwrap())
         }
@@ -5503,7 +7197,8 @@ mod tests {
             spent_addr: &[u8; 32],
         ) -> Option<Vec<u8>> {
             let va_disc = vertex_adds_discriminator().unwrap();
-            let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], spent_addr, &va_disc)
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], spent_addr, &va_disc)
                 .ok()
                 .flatten()?;
             if blob.is_empty() {
@@ -5549,10 +7244,7 @@ mod tests {
             let prover_addr = seed_prover(&state, &pk, 100);
 
             // Two Ed448 merge targets (key_type=0, 57-byte pubkey).
-            let targets = vec![
-                (0u32, vec![0x11u8; 57]),
-                (0u32, vec![0x22u8; 57]),
-            ];
+            let targets = vec![(0u32, vec![0x11u8; 57]), (0u32, vec![0x22u8; 57])];
             let pubkeys: Vec<String> = targets
                 .iter()
                 .map(|(_, pk)| ed448_pubkey_to_peer_id_string(pk))
@@ -5562,8 +7254,7 @@ mod tests {
             // on real retro entries — that is, the test passes both
             // when the table returns 0 *and* when it doesn't, as
             // long as the dispatcher uses the SUM path).
-            let expected_merge =
-                crate::seniority_compat::get_aggregated_seniority(&pubkeys);
+            let expected_merge = crate::seniority_compat::get_aggregated_seniority(&pubkeys);
 
             let op = build_op(prover_addr, targets);
             // Deliberately no `with_stores` / ClockStore — the SUM
@@ -5580,6 +7271,52 @@ mod tests {
                 "post-merge seniority must equal existing + SUM-aggregated, \
                  not MAX-of-clock-store-map",
             );
+        }
+
+        /// Validation reads all requests of a bundle against committed
+        /// state before any runs, so each copy of one merge in a bundle
+        /// passed it and added the target's seniority again. From the replay
+        /// guard epoch a copy finding the target's marker in the frame's
+        /// staged state is refused.
+        #[test]
+        fn a_target_merged_earlier_in_the_frame_is_not_credited_again() {
+            let state = make_state();
+            let pk = vec![0xDDu8; 585];
+            let prover_addr = seed_prover(&state, &pk, 100);
+            let op = build_op(prover_addr, vec![(0, vec![0x55u8; 57])]);
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+            let va_disc = vertex_adds_discriminator().unwrap();
+
+            quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(0));
+            gi.invoke_seniority_merge(100, &op, &state, &va_disc)
+                .unwrap();
+            let once = read_seniority(&state, &prover_addr);
+            assert!(
+                gi.invoke_seniority_merge(100, &op, &state, &va_disc)
+                    .is_err(),
+                "the second copy of the merge in the frame is refused"
+            );
+            assert_eq!(read_seniority(&state, &prover_addr), once);
+            quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
+        }
+
+        /// Before the replay guard epoch every copy still runs, as on
+        /// builds without the guard.
+        #[test]
+        fn before_the_replay_guard_epoch_a_repeated_merge_still_runs() {
+            let state = make_state();
+            let pk = vec![0xDEu8; 585];
+            let prover_addr = seed_prover(&state, &pk, 100);
+            let op = build_op(prover_addr, vec![(0, vec![0x56u8; 57])]);
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
+            let va_disc = vertex_adds_discriminator().unwrap();
+
+            quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(Some(u64::MAX));
+            gi.invoke_seniority_merge(100, &op, &state, &va_disc)
+                .unwrap();
+            gi.invoke_seniority_merge(100, &op, &state, &va_disc)
+                .unwrap();
+            quil_types::consensus::set_prover_op_replay_guard_epoch_for_thread(None);
         }
 
         // -------------------------------------------------------------
@@ -5602,7 +7339,8 @@ mod tests {
             let op1 = build_op(claimer_addr, vec![(0, target_pk.clone())]);
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
             let va_disc = vertex_adds_discriminator().unwrap();
-            gi.invoke_seniority_merge(2, &op1, &state, &va_disc).unwrap();
+            gi.invoke_seniority_merge(2, &op1, &state, &va_disc)
+                .unwrap();
             // Persist the changeset into the CRDT so the next call's
             // state.get sees the new marker via the changeset / CRDT.
             let spent_addr = spent_seniority_merge_address(&target_pk).unwrap();
@@ -5615,7 +7353,8 @@ mod tests {
             // Attacker tries to re-run the merge against the same
             // target — must NOT overwrite the marker.
             let op2 = build_op(attacker_addr, vec![(0, target_pk.clone())]);
-            gi.invoke_seniority_merge(3, &op2, &state, &va_disc).unwrap();
+            gi.invoke_seniority_merge(3, &op2, &state, &va_disc)
+                .unwrap();
             assert_eq!(
                 read_marker_prover_addr(&state, &spent_addr).as_deref(),
                 Some(&claimer_addr[..]),
@@ -5645,7 +7384,15 @@ mod tests {
             let empty_marker = quil_tries::VectorCommitmentTree::new();
             let empty_blob = vertex_tree_to_blob(&empty_marker);
             let va_disc = vertex_adds_discriminator().unwrap();
-            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &spent_addr, &va_disc, 1, empty_blob).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &spent_addr,
+                    &va_disc,
+                    1,
+                    empty_blob,
+                )
+                .unwrap();
             assert!(
                 read_marker_prover_addr(&state, &spent_addr).is_none(),
                 "pre-seeded marker must have no ProverAddress",
@@ -5663,9 +7410,7 @@ mod tests {
 
             // Sanity: the alternate "create_spent_merge_tree" helper
             // produces the same payload shape we just wrote.
-            let canonical = vertex_tree_to_blob(
-                &create_spent_merge_tree(&prover_addr).unwrap(),
-            );
+            let canonical = vertex_tree_to_blob(&create_spent_merge_tree(&prover_addr).unwrap());
             assert!(
                 !canonical.is_empty(),
                 "create_spent_merge_tree should produce a non-empty blob",
@@ -5683,32 +7428,52 @@ mod tests {
         use super::*;
         use crate::global_intrinsic::materialize::{
             allocation_address, build_prover_allocation_hyperedge_blob,
-            create_allocation_vertex_tree, create_prover_vertex_tree,
-            prover_address_from_pubkey, STATUS_KICKED,
+            create_allocation_vertex_tree, create_prover_vertex_tree, prover_address_from_pubkey,
+            STATUS_KICKED,
         };
-        use crate::global_intrinsic::prover_ops::ProverKick;
         use crate::global_intrinsic::prover_join::ProverJoin as ProverJoinOp;
-        use crate::global_intrinsic::sig_with_pop::SignatureWithPop;
+        use crate::global_intrinsic::prover_ops::ProverKick;
         use crate::global_intrinsic::seniority_merge::SeniorityMerge as SeniorityMergeTarget;
+        use crate::global_intrinsic::sig_with_pop::SignatureWithPop;
         use crate::global_schema::read_field;
         use crate::hypergraph_state::{
             hyperedge_adds_discriminator, vertex_adds_discriminator, HypergraphState,
         };
-        use crate::prover_registry::{
-            rebuild_vertex_tree_from_blob, vertex_tree_to_blob,
-        };
+        use crate::prover_registry::{rebuild_vertex_tree_from_blob, vertex_tree_to_blob};
         use quil_hypergraph::HypergraphCrdt;
         use quil_types::crypto::{InclusionProver, Multiproof};
 
         struct StubProver;
         impl InclusionProver for StubProver {
-            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-            fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64)
-                -> Result<Box<dyn Multiproof>>
-            { Err(QuilError::Internal("batch not supported".into())) }
-            fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> {
+                Ok(vec![0u8; 64])
+            }
+            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
+                Ok(vec![])
+            }
+            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
+                Ok(true)
+            }
+            fn prove_multiple(
+                &self,
+                _: &[&[u8]],
+                _: &[&[u8]],
+                _: &[u64],
+                _: u64,
+            ) -> Result<Box<dyn Multiproof>> {
+                Err(QuilError::Internal("batch not supported".into()))
+            }
+            fn verify_multiple(
+                &self,
+                _: &[&[u8]],
+                _: &[&[u8]],
+                _: &[u64],
+                _: u64,
+                _: &[u8],
+                _: &[u8],
+            ) -> bool {
+                true
+            }
         }
 
         fn make_state() -> HypergraphState {
@@ -5719,26 +7484,31 @@ mod tests {
 
         fn read_status(state: &HypergraphState, addr: &[u8; 32], cls: &str) -> Option<u8> {
             let va_disc = vertex_adds_discriminator().unwrap();
-            let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], addr, &va_disc)
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], addr, &va_disc)
                 .ok()
                 .flatten()?;
             if blob.is_empty() {
                 return None;
             }
             let tree = rebuild_vertex_tree_from_blob(&blob);
-            read_field(&tree, cls, "Status")
-                .and_then(|b| b.first().copied())
+            read_field(&tree, cls, "Status").and_then(|b| b.first().copied())
         }
 
         fn read_kick_frame(state: &HypergraphState, addr: &[u8; 32], cls: &str) -> Option<u64> {
             let va_disc = vertex_adds_discriminator().unwrap();
-            let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], addr, &va_disc)
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], addr, &va_disc)
                 .ok()
                 .flatten()?;
-            if blob.is_empty() { return None; }
+            if blob.is_empty() {
+                return None;
+            }
             let tree = rebuild_vertex_tree_from_blob(&blob);
             let bytes = read_field(&tree, cls, "KickFrameNumber")?;
-            if bytes.len() != 8 { return None; }
+            if bytes.len() != 8 {
+                return None;
+            }
             Some(u64::from_be_bytes(bytes.try_into().unwrap()))
         }
 
@@ -5757,11 +7527,15 @@ mod tests {
             let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
             let prover_tree = create_prover_vertex_tree(&pubkey, 100).unwrap();
             let va_disc = vertex_adds_discriminator().unwrap();
-            state.set(
-                &GLOBAL_INTRINSIC_ADDRESS[..],
-                &prover_addr, &va_disc, 1,
-                vertex_tree_to_blob(&prover_tree),
-            ).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &prover_addr,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&prover_tree),
+                )
+                .unwrap();
 
             // Two allocations.
             let filter_a = vec![0x11u8; 32];
@@ -5770,17 +7544,38 @@ mod tests {
             let alloc_b_addr = allocation_address(&pubkey, &filter_b).unwrap();
             let alloc_a_tree = create_allocation_vertex_tree(&prover_addr, &filter_a, 1).unwrap();
             let alloc_b_tree = create_allocation_vertex_tree(&prover_addr, &filter_b, 1).unwrap();
-            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_a_addr, &va_disc, 1, vertex_tree_to_blob(&alloc_a_tree)).unwrap();
-            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_b_addr, &va_disc, 1, vertex_tree_to_blob(&alloc_b_tree)).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &alloc_a_addr,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&alloc_a_tree),
+                )
+                .unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &alloc_b_addr,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&alloc_b_tree),
+                )
+                .unwrap();
 
             // Hyperedge linking prover → both allocations.
-            let allocs = vec![
-                (alloc_a_addr, &alloc_a_tree),
-                (alloc_b_addr, &alloc_b_tree),
-            ];
+            let allocs = vec![(alloc_a_addr, &alloc_a_tree), (alloc_b_addr, &alloc_b_tree)];
             let blob = build_prover_allocation_hyperedge_blob(&prover_addr, &allocs).unwrap();
             let ha_disc = hyperedge_adds_discriminator().unwrap();
-            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &ha_disc, 1, blob).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &prover_addr,
+                    &ha_disc,
+                    1,
+                    blob,
+                )
+                .unwrap();
 
             // Kick.
             let op = ProverKick {
@@ -5848,22 +7643,87 @@ mod tests {
                 path_proofs: vec![],
                 commitment: vec![0u8; 74],
                 value: vec![0u8; 32],
-                proof: vec![0u8; 74],
+                // A valid G1 point per member, so the openings aggregate to a
+                // root the header can certify.
+                proof: <quil_crypto::KzgInclusionProver as quil_types::crypto::InclusionProver>::commit_raw(
+                    &quil_crypto::KzgInclusionProver,
+                    &[member[0] | 1; 64],
+                    16,
+                )
+                .unwrap(),
             }
         }
 
+        /// A header carrying `att` and certifying its root, as its producer
+        /// computes it (empty bitmask, ρ_N of an anchor this test's clock
+        /// store does not hold).
         fn frame_header_with_attestation(
             filter: &[u8],
             global_frame_number: u64,
             att: &quil_types::proto::global::StorageAttestation,
         ) -> crate::global_intrinsic::frame_header::FrameHeader {
+            let openings: Vec<quil_crypto::porep::StorageOpening> = att
+                .openings
+                .iter()
+                .map(quil_crypto::porep::StorageOpening::from_proto)
+                .collect();
+            let rho_n = quil_crypto::porep::derive_storage_beacon(global_frame_number, &[]);
             crate::global_intrinsic::frame_header::FrameHeader {
                 address: filter.to_vec(),
                 frame_number: 5,
                 global_frame_number,
                 storage_attestation: prost::Message::encode_to_vec(att),
+                storage_attestation_root: quil_crypto::porep::compute_storage_attestation_root(
+                    &openings,
+                    5,
+                    &rho_n,
+                    &[],
+                    quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+                ),
                 ..Default::default()
             }
+        }
+
+        /// The attestation body travels beside the certified header: a body
+        /// swapped in relay (its openings do not aggregate to the certified
+        /// root) must get no one kicked.
+        #[test]
+        fn storage_audit_ignores_a_body_the_header_does_not_certify() {
+            quil_crypto::init();
+            let state = make_state();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let victim_pubkey = vec![0xD4u8; 897];
+            let victim_addr = prover_address_from_pubkey(&victim_pubkey).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &victim_addr,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&create_prover_vertex_tree(&victim_pubkey, 100).unwrap()),
+                )
+                .unwrap();
+
+            let filter = vec![0x55u8; 32];
+            let shard = vec![0x07u8; 32];
+            let certified = quil_types::proto::global::StorageAttestation {
+                openings: vec![storage_opening_proto(&[0xE5u8; 32], &shard, 1)],
+            };
+            let mut op = frame_header_with_attestation(&filter, 1_000, &certified);
+            let swapped = quil_types::proto::global::StorageAttestation {
+                openings: vec![storage_opening_proto(&victim_addr, &shard, 1)],
+            };
+            op.storage_attestation = prost::Message::encode_to_vec(&swapped);
+
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
+            gi.audit_storage_attestation(1_001, &op, &[], &state, &va_disc)
+                .unwrap();
+            assert_ne!(
+                read_status(&state, &victim_addr, "prover:Prover"),
+                Some(STATUS_KICKED),
+                "a body the header does not certify must get no one kicked",
+            );
         }
 
         #[test]
@@ -5876,31 +7736,46 @@ mod tests {
             // leaf-root registration → registry cross-check fails → evicted.
             let bad_pubkey = vec![0xA1u8; 897];
             let bad_addr = prover_address_from_pubkey(&bad_pubkey).unwrap();
-            state.set(
-                &GLOBAL_INTRINSIC_ADDRESS[..],
-                &bad_addr, &va_disc, 1,
-                vertex_tree_to_blob(&create_prover_vertex_tree(&bad_pubkey, 100).unwrap()),
-            ).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &bad_addr,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&create_prover_vertex_tree(&bad_pubkey, 100).unwrap()),
+                )
+                .unwrap();
 
             // Bystander prover: never named in the attestation → untouched.
             let other_pubkey = vec![0xB2u8; 897];
             let other_addr = prover_address_from_pubkey(&other_pubkey).unwrap();
-            state.set(
-                &GLOBAL_INTRINSIC_ADDRESS[..],
-                &other_addr, &va_disc, 1,
-                vertex_tree_to_blob(&create_prover_vertex_tree(&other_pubkey, 100).unwrap()),
-            ).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &other_addr,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&create_prover_vertex_tree(&other_pubkey, 100).unwrap()),
+                )
+                .unwrap();
 
             let filter = vec![0x55u8; 32];
+            // The openings a producer attaches for one leaf: one per query.
             let att = quil_types::proto::global::StorageAttestation {
-                openings: vec![storage_opening_proto(&bad_addr, &vec![0x07u8; 32], 1)],
+                openings: (0..quil_types::consensus::STORAGE_QUERIES_PER_LEAF)
+                    .map(|query| quil_types::proto::global::StorageOpening {
+                        query,
+                        ..storage_opening_proto(&bad_addr, &[0x07u8; 32], 1)
+                    })
+                    .collect(),
             };
             let op = frame_header_with_attestation(&filter, 1_000, &att);
 
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
                 .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
             // In lockstep: anchor 1000 == frame_number 1001 - 1.
-            gi.audit_storage_attestation(1_001, &op, &[], &state, &va_disc).unwrap();
+            gi.audit_storage_attestation(1_001, &op, &[], &state, &va_disc)
+                .unwrap();
 
             assert_eq!(
                 read_status(&state, &bad_addr, "prover:Prover"),
@@ -5921,11 +7796,15 @@ mod tests {
             let va_disc = vertex_adds_discriminator().unwrap();
             let bad_pubkey = vec![0xC3u8; 897];
             let bad_addr = prover_address_from_pubkey(&bad_pubkey).unwrap();
-            state.set(
-                &GLOBAL_INTRINSIC_ADDRESS[..],
-                &bad_addr, &va_disc, 1,
-                vertex_tree_to_blob(&create_prover_vertex_tree(&bad_pubkey, 100).unwrap()),
-            ).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &bad_addr,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&create_prover_vertex_tree(&bad_pubkey, 100).unwrap()),
+                )
+                .unwrap();
             let filter = vec![0x55u8; 32];
             let att = quil_types::proto::global::StorageAttestation {
                 openings: vec![storage_opening_proto(&bad_addr, &vec![0x07u8; 32], 0)],
@@ -5935,7 +7814,8 @@ mod tests {
 
             // No global anchor (genesis / legacy-VDF frame, gfn == 0): no audit.
             let pre = frame_header_with_attestation(&filter, 0, &att);
-            gi.audit_storage_attestation(7, &pre, &[], &state, &va_disc).unwrap();
+            gi.audit_storage_attestation(7, &pre, &[], &state, &va_disc)
+                .unwrap();
             assert_ne!(
                 read_status(&state, &bad_addr, "prover:Prover"),
                 Some(STATUS_KICKED),
@@ -5950,7 +7830,8 @@ mod tests {
                 storage_attestation: Vec::new(),
                 ..Default::default()
             };
-            gi.audit_storage_attestation(1_001, &empty, &[], &state, &va_disc).unwrap();
+            gi.audit_storage_attestation(1_001, &empty, &[], &state, &va_disc)
+                .unwrap();
             assert_ne!(
                 read_status(&state, &bad_addr, "prover:Prover"),
                 Some(STATUS_KICKED),
@@ -6001,6 +7882,193 @@ mod tests {
                 .expect("anchor at the oldest edge of the window is in lockstep");
         }
 
+        /// The attestation body travels beside the header, which certifies
+        /// only the body's root. A relayer that keeps a certified header but
+        /// rewrites its openings' members must not get those members kicked.
+        #[test]
+        fn reproduces_uncertified_attestation_body_kick() {
+            quil_crypto::init();
+            let state = make_state();
+            let va_disc = vertex_adds_discriminator().unwrap();
+
+            // Two registered, active provers the committee never named.
+            let victims: Vec<[u8; 32]> = [0xD5u8, 0xD6]
+                .iter()
+                .map(|b| {
+                    let pubkey = vec![*b; 897];
+                    let addr = prover_address_from_pubkey(&pubkey).unwrap();
+                    state
+                        .set(
+                            &GLOBAL_INTRINSIC_ADDRESS[..],
+                            &addr,
+                            &va_disc,
+                            1,
+                            vertex_tree_to_blob(&create_prover_vertex_tree(&pubkey, 100).unwrap()),
+                        )
+                        .unwrap();
+                    addr
+                })
+                .collect();
+
+            // An opening with a valid G1 proof point, so a body of them
+            // aggregates to a root a header can certify.
+            let shard = vec![0x07u8; 32];
+            let opening = |member: &[u8], seed: u8| quil_types::proto::global::StorageOpening {
+                shard_id: shard.clone(),
+                epoch: 1,
+                member_id: member.to_vec(),
+                query: 0,
+                leaf_root: vec![0u8; 74],
+                num_blocks: 1,
+                path_commits: vec![],
+                path_proofs: vec![],
+                commitment: vec![0u8; 74],
+                value: vec![0u8; 32],
+                proof: quil_crypto::KzgInclusionProver
+                    .commit_raw(&[seed; 64], 16)
+                    .unwrap(),
+            };
+
+            // The committee attests two other members; the header certifies
+            // that body's root as its producer computes it (empty bitmask, ρ_N
+            // of anchor 1000, whose output this test's clock store lacks).
+            let certified: Vec<quil_crypto::porep::StorageOpening> =
+                [opening(&[0xE5u8; 32], 0x11), opening(&[0xE6u8; 32], 0x23)]
+                    .iter()
+                    .map(quil_crypto::porep::StorageOpening::from_proto)
+                    .collect();
+            let storage_attestation_root = quil_crypto::porep::compute_storage_attestation_root(
+                &certified,
+                5,
+                &quil_crypto::porep::derive_storage_beacon(1_000, &[]),
+                &[],
+                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+            );
+            assert!(
+                !storage_attestation_root.is_empty(),
+                "the certified openings must aggregate to a root"
+            );
+
+            // The relayed header keeps that root and the openings' proofs, but
+            // its body names the victims instead.
+            let substituted = quil_types::proto::global::StorageAttestation {
+                openings: vec![opening(&victims[0], 0x11), opening(&victims[1], 0x23)],
+            };
+            let op = crate::global_intrinsic::frame_header::FrameHeader {
+                address: vec![0x55u8; 32],
+                frame_number: 5,
+                global_frame_number: 1_000,
+                storage_attestation_root,
+                storage_attestation: prost::Message::encode_to_vec(&substituted),
+                ..Default::default()
+            };
+
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
+            gi.audit_storage_attestation(1_001, &op, &[], &state, &va_disc)
+                .unwrap();
+
+            for victim in &victims {
+                assert_ne!(
+                    read_status(&state, victim, "prover:Prover"),
+                    Some(STATUS_KICKED),
+                    "GLOBAL kicked prover {} (status 4), named only in a substituted \
+                     attestation body that the header's certified root does not cover",
+                    hex::encode(victim),
+                );
+            }
+        }
+
+        /// A single opening aggregates to its own proof point (`γ^0 = 1`), so
+        /// a one-opening body whose proof is the certified root matches that
+        /// root whatever member it names. Such a body must get no one kicked.
+        #[test]
+        fn reproduces_single_opening_body_matching_certified_root_kick() {
+            quil_crypto::init();
+            let state = make_state();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let victim_pubkey = vec![0xD7u8; 897];
+            let victim = prover_address_from_pubkey(&victim_pubkey).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &victim,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&create_prover_vertex_tree(&victim_pubkey, 100).unwrap()),
+                )
+                .unwrap();
+
+            let shard = vec![0x07u8; 32];
+            let opening =
+                |member: &[u8], proof: Vec<u8>| quil_types::proto::global::StorageOpening {
+                    shard_id: shard.clone(),
+                    epoch: 1,
+                    member_id: member.to_vec(),
+                    query: 0,
+                    leaf_root: vec![0u8; 74],
+                    num_blocks: 1,
+                    path_commits: vec![],
+                    path_proofs: vec![],
+                    commitment: vec![0u8; 74],
+                    value: vec![0u8; 32],
+                    proof,
+                };
+            let proof = |seed: u8| {
+                quil_crypto::KzgInclusionProver
+                    .commit_raw(&[seed; 64], 16)
+                    .unwrap()
+            };
+
+            // The header certifies the root of a two-member body.
+            let rho_n = quil_crypto::porep::derive_storage_beacon(1_000, &[]);
+            let certified: Vec<quil_crypto::porep::StorageOpening> = [
+                opening(&[0xE5u8; 32], proof(0x11)),
+                opening(&[0xE6u8; 32], proof(0x23)),
+            ]
+            .iter()
+            .map(quil_crypto::porep::StorageOpening::from_proto)
+            .collect();
+            let storage_attestation_root = quil_crypto::porep::compute_storage_attestation_root(
+                &certified,
+                5,
+                &rho_n,
+                &[],
+                quil_types::consensus::STORAGE_BLOCK_POLY_SIZE,
+            );
+            assert!(
+                !storage_attestation_root.is_empty(),
+                "the certified openings must aggregate to a root"
+            );
+
+            // The relayed body: one opening naming the victim, whose proof is
+            // the certified root itself.
+            let substituted = quil_types::proto::global::StorageAttestation {
+                openings: vec![opening(&victim, storage_attestation_root.clone())],
+            };
+            let op = crate::global_intrinsic::frame_header::FrameHeader {
+                address: vec![0x55u8; 32],
+                frame_number: 5,
+                global_frame_number: 1_000,
+                storage_attestation_root,
+                storage_attestation: prost::Message::encode_to_vec(&substituted),
+                ..Default::default()
+            };
+
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
+                .with_clock_store(Arc::new(quil_store::testing::InMemoryClockStore::new()));
+            gi.audit_storage_attestation(1_001, &op, &[], &state, &va_disc)
+                .unwrap();
+
+            assert_ne!(
+                read_status(&state, &victim, "prover:Prover"),
+                Some(STATUS_KICKED),
+                "GLOBAL kicked prover {} (status 4), named only in a substituted one-opening \
+                 attestation body whose proof is the header's certified root",
+                hex::encode(victim),
+            );
+        }
+
         // -------------------------------------------------------------
         // ProverJoin must write a hyperedge linking the new
         // prover vertex to its initial allocations. Without this, the
@@ -6036,7 +8104,8 @@ mod tests {
 
             // The hyperedge must exist and enumerate both allocation IDs.
             let ha_disc = hyperedge_adds_discriminator().unwrap();
-            let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &ha_disc)
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &ha_disc)
                 .unwrap()
                 .expect("join must write a hyperedge for the prover");
             assert!(!blob.is_empty(), "hyperedge blob must be populated");
@@ -6047,9 +8116,14 @@ mod tests {
             let leaves = tree.leaves();
             let alloc_a_addr = allocation_address(&pubkey, &filter_a).unwrap();
             let alloc_b_addr = allocation_address(&pubkey, &filter_b).unwrap();
-            let mut keys: Vec<[u8; 64]> = leaves.iter()
+            let mut keys: Vec<[u8; 64]> = leaves
+                .iter()
                 .filter(|(k, _)| k.len() == 64)
-                .map(|(k, _)| { let mut a = [0u8; 64]; a.copy_from_slice(k); a })
+                .map(|(k, _)| {
+                    let mut a = [0u8; 64];
+                    a.copy_from_slice(k);
+                    a
+                })
                 .collect();
             keys.sort();
 
@@ -6068,7 +8142,10 @@ mod tests {
                 },
             ];
             expected.sort();
-            assert_eq!(keys, expected, "hyperedge must enumerate exactly the join's allocations");
+            assert_eq!(
+                keys, expected,
+                "hyperedge must enumerate exactly the join's allocations"
+            );
         }
 
         /// A prover with one allocation on `filter_a`, marked with `status`.
@@ -6084,15 +8161,49 @@ mod tests {
             let prover_addr = prover_address_from_pubkey(pubkey).unwrap();
             let mut prover_tree = create_prover_vertex_tree(pubkey, 100).unwrap();
             write_field(&mut prover_tree, "prover:Prover", "Status", &[status]).unwrap();
-            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &va_disc, 1, vertex_tree_to_blob(&prover_tree)).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &prover_addr,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&prover_tree),
+                )
+                .unwrap();
             let alloc_addr = allocation_address(pubkey, filter).unwrap();
             let mut alloc_tree = create_allocation_vertex_tree(&prover_addr, filter, 1).unwrap();
-            write_field(&mut alloc_tree, "allocation:ProverAllocation", "Status", &[status]).unwrap();
-            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc, 1, vertex_tree_to_blob(&alloc_tree)).unwrap();
+            write_field(
+                &mut alloc_tree,
+                "allocation:ProverAllocation",
+                "Status",
+                &[status],
+            )
+            .unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &alloc_addr,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&alloc_tree),
+                )
+                .unwrap();
             if link {
-                let blob = build_prover_allocation_hyperedge_blob(&prover_addr, &[(alloc_addr, &alloc_tree)]).unwrap();
+                let blob = build_prover_allocation_hyperedge_blob(
+                    &prover_addr,
+                    &[(alloc_addr, &alloc_tree)],
+                )
+                .unwrap();
                 let ha_disc = hyperedge_adds_discriminator().unwrap();
-                state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &ha_disc, 1, blob).unwrap();
+                state
+                    .set(
+                        &GLOBAL_INTRINSIC_ADDRESS[..],
+                        &prover_addr,
+                        &ha_disc,
+                        1,
+                        blob,
+                    )
+                    .unwrap();
             }
             (prover_addr, alloc_addr)
         }
@@ -6114,17 +8225,24 @@ mod tests {
 
         fn linked(state: &HypergraphState, prover_addr: &[u8; 32]) -> Vec<[u8; 32]> {
             let ha_disc = hyperedge_adds_discriminator().unwrap();
-            let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], prover_addr, &ha_disc).unwrap().unwrap_or_default();
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], prover_addr, &ha_disc)
+                .unwrap()
+                .unwrap_or_default();
             let mut out = materialize::hyperedge_allocation_addresses(&blob).unwrap();
             out.sort();
             out
         }
 
-        fn signed_by(prover_addr: &[u8; 32]) -> Option<crate::global_intrinsic::addressed_signature::AddressedSignature> {
-            Some(crate::global_intrinsic::addressed_signature::AddressedSignature {
-                signature: vec![0xABu8; 666],
-                address: prover_addr.to_vec(),
-            })
+        fn signed_by(
+            prover_addr: &[u8; 32],
+        ) -> Option<crate::global_intrinsic::addressed_signature::AddressedSignature> {
+            Some(
+                crate::global_intrinsic::addressed_signature::AddressedSignature {
+                    signature: vec![0xABu8; 666],
+                    address: prover_addr.to_vec(),
+                },
+            )
         }
 
         // A member registered only for its old shard would, once a split or
@@ -6133,7 +8251,9 @@ mod tests {
         #[cfg(feature = "confidential-tokens")]
         #[test]
         fn a_confirm_before_a_topology_change_registers_the_shards_it_creates() {
-            use crate::global_intrinsic::leaf_root_registration::{ConfirmLeafRoots, LeafRootEntry};
+            use crate::global_intrinsic::leaf_root_registration::{
+                ConfirmLeafRoots, LeafRootEntry,
+            };
             use crate::token_intrinsic::global_commit::set_relay_activation_frame_for_thread;
             use quil_types::store::{KvDb as _, PendingShardChange, ShardChangeKind, ShardsStore};
             let confirm_frame = quil_types::consensus::EPOCH_LENGTH_FRAMES * 7 + 5;
@@ -6144,51 +8264,524 @@ mod tests {
             let named = [&parent, &children[0], &children[1], &unrelated];
             // Which of `named` hold a registration for the next epoch after a
             // confirm of `confirmed` that carries leaves for every one of them.
-            let registrations = |kind, confirmed: &Vec<u8>, effective_epoch, activation| -> Vec<bool> {
-                set_relay_activation_frame_for_thread(Some(activation));
-                let state = make_state();
-                let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
-                let shards: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(db.inner()));
-                let txn = db.new_batch(false).unwrap();
-                shards.put_pending_shard_change(txn.as_ref(), &PendingShardChange {
-                    kind, parent: parent.clone(), children: children.clone(), effective_epoch, proposed_frame: 1,
-                }).unwrap();
-                txn.commit().unwrap();
-                let pubkey = vec![0xC4u8; 897];
-                let (prover_addr, _) = seed_prover(&state, &pubkey, confirmed, 1, true);
-                let gi = GlobalIntrinsic::new(Arc::new(AcceptAll)).with_shards_store(shards);
-                let confirm = ProverConfirm {
-                    filter: vec![],
-                    frame_number: confirm_frame,
-                    public_key_signature_bls48581: signed_by(&prover_addr),
-                    filters: vec![confirmed.clone()],
-                    leaf_roots: named.iter().map(|filter| ConfirmLeafRoots {
-                        filter: (*filter).clone(),
-                        entries: vec![LeafRootEntry { prefix: vec![1], leaf_root: vec![0x11; 74], num_blocks: 4 }],
-                    }).collect(),
-                    release: None,
+            let registrations =
+                |kind, confirmed: &Vec<u8>, effective_epoch, activation| -> Vec<bool> {
+                    set_relay_activation_frame_for_thread(Some(activation));
+                    let state = make_state();
+                    let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+                    let shards: Arc<dyn ShardsStore> =
+                        Arc::new(quil_store::RocksShardsStore::new(db.inner()));
+                    let txn = db.new_batch(false).unwrap();
+                    shards
+                        .put_pending_shard_change(
+                            txn.as_ref(),
+                            &PendingShardChange {
+                                kind,
+                                parent: parent.clone(),
+                                children: children.clone(),
+                                effective_epoch,
+                                proposed_frame: 1,
+                            },
+                        )
+                        .unwrap();
+                    txn.commit().unwrap();
+                    let pubkey = vec![0xC4u8; 897];
+                    let (prover_addr, _) = seed_prover(&state, &pubkey, confirmed, 1, true);
+                    let gi = GlobalIntrinsic::new(Arc::new(AcceptAll)).with_shards_store(shards);
+                    let confirm = ProverConfirm {
+                        filter: vec![],
+                        frame_number: confirm_frame,
+                        public_key_signature_bls48581: signed_by(&prover_addr),
+                        filters: vec![confirmed.clone()],
+                        leaf_roots: named
+                            .iter()
+                            .map(|filter| ConfirmLeafRoots {
+                                filter: (*filter).clone(),
+                                entries: vec![LeafRootEntry {
+                                    prefix: vec![1],
+                                    leaf_root: vec![0x11; 74],
+                                    num_blocks: 4,
+                                }],
+                            })
+                            .collect(),
+                        release: None,
+                    };
+                    gi.invoke_step(
+                        confirm_frame,
+                        &confirm.to_canonical_bytes().unwrap(),
+                        &state,
+                    )
+                    .unwrap();
+                    set_relay_activation_frame_for_thread(None);
+                    let va_disc = vertex_adds_discriminator().unwrap();
+                    named
+                        .iter()
+                        .map(|filter| {
+                            let address = materialize::leaf_root_address(
+                                &prover_addr,
+                                &crate::global_intrinsic::leaf_id_bytes(filter, &[1]),
+                            )
+                            .unwrap();
+                            state
+                                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc)
+                                .unwrap()
+                                .filter(|blob| !blob.is_empty())
+                                .and_then(|blob| {
+                                    materialize::leaf_root_registration_for_epoch(
+                                        &rebuild_vertex_tree_from_blob(&blob),
+                                        registered,
+                                    )
+                                })
+                                .is_some()
+                        })
+                        .collect()
                 };
-                gi.invoke_step(confirm_frame, &confirm.to_canonical_bytes().unwrap(), &state).unwrap();
-                set_relay_activation_frame_for_thread(None);
-                let va_disc = vertex_adds_discriminator().unwrap();
-                named.iter().map(|filter| {
-                    let address = materialize::leaf_root_address(&prover_addr, &crate::global_intrinsic::leaf_id_bytes(filter, &[1])).unwrap();
-                    state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc).unwrap()
-                        .filter(|blob| !blob.is_empty())
-                        .and_then(|blob| materialize::leaf_root_registration_for_epoch(
-                            &rebuild_vertex_tree_from_blob(&blob), registered))
-                        .is_some()
-                }).collect()
-            };
 
-            assert_eq!(registrations(ShardChangeKind::Split, &parent, registered, 0), [true, true, true, false],
-                "a split's parent registers every child");
-            assert_eq!(registrations(ShardChangeKind::Merge, &children[1], registered, 0), [true, false, true, false],
-                "a merge source registers the target");
-            assert_eq!(registrations(ShardChangeKind::Split, &parent, registered + 1, 0), [true, false, false, false],
-                "a change applying later is not registered ahead");
-            assert_eq!(registrations(ShardChangeKind::Split, &parent, registered, u64::MAX), [true, false, false, false],
-                "nothing before the release activates");
+            assert_eq!(
+                registrations(ShardChangeKind::Split, &parent, registered, 0),
+                [true, true, true, false],
+                "a split's parent registers every child"
+            );
+            assert_eq!(
+                registrations(ShardChangeKind::Merge, &children[1], registered, 0),
+                [true, false, true, false],
+                "a merge source registers the target"
+            );
+            assert_eq!(
+                registrations(ShardChangeKind::Split, &parent, registered + 1, 0),
+                [true, false, false, false],
+                "a change applying later is not registered ahead"
+            );
+            assert_eq!(
+                registrations(ShardChangeKind::Split, &parent, registered, u64::MAX),
+                [true, false, false, false],
+                "nothing before the release activates"
+            );
+        }
+
+        /// Hash storage proofs: a confirm registers `comm_D ‖ comm_C ‖ comm_R`
+        /// for the next epoch on the member's seat, which counts only once an
+        /// epoch proof sealing it — answering the beacon of the frame after
+        /// the registration — is accepted before that epoch begins, once. In
+        /// the epoch, the rewards held for the roots it committed are paid
+        /// when a proof of those roots settles it, inside its window.
+        #[test]
+        fn a_seat_is_sealed_and_settled_by_epoch_proofs() {
+            use crate::global_intrinsic::leaf_root_registration::{
+                ConfirmLeafRoots, LeafRootEntry,
+            };
+            use crate::global_intrinsic::storage_epoch_proof::{
+                self as epoch_proof, CommittedFrame, EpochClaim, StorageEpochProof,
+            };
+            use crate::global_intrinsic::storage_seat;
+            use crate::global_intrinsic::{storage_binding, storage_snapshot};
+            use quil_crypto::storage_proof;
+            let epoch_frames = quil_types::consensus::EPOCH_LENGTH_FRAMES;
+            let confirm_frame = epoch_frames * 7 + 5;
+            let epoch = quil_types::consensus::epoch_for_frame(confirm_frame) + 1;
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch));
+            let app = [0x81u8; 32];
+            let filter = app.to_vec();
+            let state = make_state();
+            let (member, _) = seed_prover(&state, &[0xC4u8; 897], &filter, 1, true);
+            // The shard's state at its snapshot: a few vertices in an app tree.
+            let forest = quil_forest::Forest::in_memory();
+            let mut entries: Vec<storage_binding::Entry> = (0u8..9)
+                .map(|i| storage_binding::Entry {
+                    phase: 0,
+                    address: [i.wrapping_mul(29); 32],
+                    value: vec![i; 90 + i as usize],
+                })
+                .collect();
+            entries.sort_by(|a, b| a.address.cmp(&b.address));
+            let leaves: Vec<(Vec<u8>, Vec<u8>)> = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.address.to_vec(),
+                        quil_tries::vertex_leaf_value(&entry.value).unwrap(),
+                    )
+                })
+                .collect();
+            forest
+                .commit_app_shards(
+                    &app,
+                    1,
+                    0,
+                    [(Vec::new(), [leaves, Vec::new(), Vec::new(), Vec::new()])].into(),
+                )
+                .unwrap();
+            let mut roots = [[0u8; 32]; 4];
+            for (phase, root) in quil_forest::PHASES.iter().zip(roots.iter_mut()) {
+                *root = forest.app_subtree_root(&app, *phase, 1, &[]).unwrap();
+            }
+            let snapshot = quil_types::consensus::StorageSnapshotRoots {
+                epoch,
+                frame: 50,
+                anchor: confirm_frame - 3,
+                roots,
+            };
+            let prefix = vec![quil_forest::BIT_PATH_PREFIX_SENTINEL];
+            let leaf_id = crate::global_intrinsic::leaf_id_bytes(&filter, &prefix);
+            let params = quil_crypto::sdr::SdrParams::default();
+            let data = storage_binding::leaf_data(&filter, &prefix, &entries);
+            let encoded = storage_proof::encode_leaf(
+                &data,
+                &quil_crypto::sdr::replica_key(&member, &leaf_id, epoch),
+                &params,
+            );
+            let confirm = |leaf_root: Vec<u8>, num_blocks| ProverConfirm {
+                filter: vec![],
+                frame_number: confirm_frame,
+                public_key_signature_bls48581: signed_by(&member),
+                filters: vec![filter.clone()],
+                leaf_roots: vec![ConfirmLeafRoots {
+                    filter: filter.clone(),
+                    entries: vec![LeafRootEntry {
+                        prefix: prefix.clone(),
+                        leaf_root,
+                        num_blocks,
+                    }],
+                }],
+                release: None,
+            };
+            let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
+            let output = vec![0x5Au8; 516];
+            clock.seed_frame(quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: confirm_frame + 1,
+                    output: output.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let gi = GlobalIntrinsic::new(Arc::new(AcceptAll)).with_clock_store(clock.clone());
+
+            assert!(
+                gi.invoke_step(
+                    confirm_frame,
+                    &confirm(vec![0x11; 74], 4).to_canonical_bytes().unwrap(),
+                    &state
+                )
+                .is_err(),
+                "a KZG root does not register a hash-proof epoch"
+            );
+            gi.invoke_step(
+                confirm_frame,
+                &confirm(encoded.registration_root(), encoded.n)
+                    .to_canonical_bytes()
+                    .unwrap(),
+                &state,
+            )
+            .unwrap();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let address = materialize::leaf_root_address(&member, &leaf_id).unwrap();
+            let registration = || {
+                rebuild_vertex_tree_from_blob(
+                    &state
+                        .get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc)
+                        .unwrap()
+                        .unwrap(),
+                )
+            };
+            assert_eq!(
+                materialize::leaf_root_registration_for_epoch(&registration(), epoch),
+                None,
+                "unsealed"
+            );
+            let seat = || {
+                storage_seat::read(&state, &member, &filter)
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(seat().slot(epoch).unwrap().leaves, vec![prefix.clone()]);
+            assert!(!seat().sealed_for(epoch));
+
+            // The seal: an epoch proof two epochs before the registration's.
+            let registered =
+                storage_proof::parse_registration_root(&encoded.registration_root()).unwrap();
+            let claim = EpochClaim {
+                member,
+                seats: vec![epoch_proof::SeatClaim {
+                    seal_epoch: epoch,
+                    seals: vec![epoch_proof::SealedLeaf {
+                        leaf_id: leaf_id.clone(),
+                        n: encoded.n,
+                        registered,
+                        beacon: quil_crypto::porep::derive_storage_beacon(
+                            confirm_frame + 1,
+                            &output,
+                        ),
+                    }],
+                    settle_epoch: epoch - 2,
+                    ..Default::default()
+                }],
+            };
+            let seal_beacon = quil_crypto::porep::derive_storage_beacon(confirm_frame + 1, &output);
+            let leaf_claim = |comm_d, n| storage_binding::LeafClaim {
+                filter: &filter,
+                prefix: &prefix,
+                leaf_id: &leaf_id,
+                member: &member,
+                epoch,
+                beacon: &seal_beacon,
+                bits: Vec::new(),
+                sources: vec![(Vec::new(), roots)],
+                comm_d,
+                n,
+            };
+            let proof_of = |phase: u8, address: &[u8; 32]| {
+                if quil_forest::subtree_proof::same_root(
+                    &roots[phase as usize],
+                    &quil_forest::subtree_proof::EMPTY_ROOT,
+                ) {
+                    return Ok(quil_forest::subtree_proof::CompactProof {
+                        leaf: None,
+                        siblings: Vec::new(),
+                    });
+                }
+                forest
+                    .shard_phase_get_with_proof_raw(
+                        &app,
+                        quil_forest::PHASES[phase as usize],
+                        1,
+                        address,
+                    )
+                    .map(|(_, proof)| quil_forest::subtree_proof::CompactProof::of(&proof))
+                    .map_err(|e| e.to_string())
+            };
+            let binding = storage_binding::prove(
+                &leaf_claim(registered.comm_d, encoded.n),
+                &entries,
+                &proof_of,
+            )
+            .unwrap();
+            let witness =
+                epoch_proof::prepare(&member, &claim.seats[0], &[&encoded.replica], &[]).unwrap();
+            let sealing = StorageEpochProof {
+                member,
+                seats: vec![epoch_proof::SeatProof {
+                    shard_filter: filter.clone(),
+                    epoch: epoch - 2,
+                    seals: true,
+                    bindings: vec![binding],
+                    ..Default::default()
+                }],
+                proof: epoch_proof::prove(&claim, &[witness]).unwrap(),
+            };
+            let rebind = |bindings: Vec<storage_binding::LeafBinding>| {
+                let mut proof = sealing.clone();
+                proof.seats[0].bindings = bindings;
+                proof
+            };
+            let bytes = sealing.to_canonical_bytes();
+            assert!(
+                gi.invoke_step(confirm_frame + 2, &bytes, &state).is_err(),
+                "no snapshot recorded for the shard"
+            );
+            let snapshot_address = storage_snapshot::snapshot_address(epoch, &filter).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &snapshot_address,
+                    &vertex_adds_discriminator().unwrap(),
+                    300,
+                    vertex_tree_to_blob(&storage_snapshot::to_tree(&filter, &snapshot).unwrap()),
+                )
+                .unwrap();
+            let unbound = rebind(Vec::new());
+            assert!(
+                gi.invoke_step(confirm_frame + 2, &unbound.to_canonical_bytes(), &state)
+                    .is_err(),
+                "no binding"
+            );
+            // The binding of data other than the snapshot's.
+            let mut others = entries.clone();
+            others[3].value[0] ^= 1;
+            let other_data =
+                storage_proof::data_nodes(&storage_binding::leaf_data(&filter, &prefix, &others));
+            let other_tree = storage_proof::MerkleTree::from_nodes(&other_data).unwrap();
+            let other_binding = storage_binding::prove(
+                &leaf_claim(other_tree.commitment(storage_proof::Tree::Data), encoded.n),
+                &others,
+                &proof_of,
+            )
+            .unwrap();
+            let rebound = rebind(vec![other_binding]);
+            assert!(
+                gi.invoke_step(confirm_frame + 2, &rebound.to_canonical_bytes(), &state)
+                    .is_err(),
+                "a binding of other data"
+            );
+            assert!(
+                gi.invoke_step(confirm_frame + 1, &bytes, &state).is_err(),
+                "before its beacon frame is past"
+            );
+            assert!(
+                gi.invoke_step(epoch * epoch_frames, &bytes, &state)
+                    .is_err(),
+                "once its epoch has begun"
+            );
+            let other = StorageEpochProof {
+                member: [0x77; 32],
+                ..sealing.clone()
+            };
+            assert!(
+                gi.invoke_step(confirm_frame + 2, &other.to_canonical_bytes(), &state)
+                    .is_err(),
+                "another member"
+            );
+            let mut tampered = sealing.clone();
+            tampered.proof[100] ^= 1;
+            assert!(
+                gi.invoke_step(confirm_frame + 2, &tampered.to_canonical_bytes(), &state)
+                    .is_err(),
+                "a tampered proof"
+            );
+
+            gi.invoke_step(confirm_frame + 2, &bytes, &state).unwrap();
+            assert_eq!(
+                materialize::leaf_root_registration_for_epoch(&registration(), epoch),
+                Some((encoded.registration_root(), encoded.n))
+            );
+            assert!(seat().sealed_for(epoch));
+            gi.invoke_step(confirm_frame + 2, &bytes, &state)
+                .expect("the same frame applied again");
+            assert!(
+                gi.invoke_step(confirm_frame + 3, &bytes, &state).is_err(),
+                "sealed once"
+            );
+
+            // In the epoch: two committed frames, eight held rewards of a
+            // four-member committee (two proposals expected). GLOBAL executed
+            // the first root 20 s after its beacon, the second 90 s after.
+            let held = vec![epoch_proof::HeldLeaf {
+                leaf_id: leaf_id.clone(),
+                n: encoded.n,
+                comm_r: registered.comm_r,
+            }];
+            let replicas = [epoch_proof::HeldReplica {
+                replica: &encoded.replica,
+                cap: &encoded.replica_cap,
+            }];
+            let mut frames = Vec::new();
+            let mut updated = seat();
+            let (first, second) = (epoch * epoch_frames + 3, epoch * epoch_frames + 6);
+            let execution = [
+                (40u64, [0x21u8; 32], first, first + 2),
+                (43, [0x22; 32], second, second + 9),
+            ];
+            for (frame_number, rho, beacon, executed) in execution {
+                let opened =
+                    epoch_proof::frame_openings(&member, epoch, &held, &replicas, &rho).unwrap();
+                let root = epoch_proof::openings_root(frame_number, &opened).unwrap();
+                assert!(updated.commit(epoch, frame_number, beacon, executed, &rho, &root));
+                frames.push(CommittedFrame {
+                    frame_number,
+                    rho_n: rho,
+                    root,
+                });
+            }
+            let at = |frame_number: u64, timestamp: i64| quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number,
+                    timestamp,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let start = 1_800_000_000_000i64;
+            for (frame_number, timestamp) in [
+                (first, start),
+                (first + 2, start + 20_000),
+                (second, start + 30_000),
+            ] {
+                clock.seed_frame(at(frame_number, timestamp));
+            }
+            for frame in 0..8 {
+                assert!(updated.hold(
+                    epoch,
+                    epoch * epoch_frames + 10 + frame,
+                    40 + frame,
+                    &num_bigint::BigInt::from(125),
+                    4
+                ));
+            }
+            storage_seat::write(&state, epoch * epoch_frames + 20, &updated).unwrap();
+
+            let seat_claim = epoch_proof::SeatClaim {
+                settle_epoch: epoch,
+                held,
+                frames: frames.clone(),
+                seal_epoch: epoch + 2,
+                ..Default::default()
+            };
+            let witness = epoch_proof::prepare(&member, &seat_claim, &[], &replicas).unwrap();
+            let claim = EpochClaim {
+                member,
+                seats: vec![seat_claim],
+            };
+            let settling = StorageEpochProof {
+                member,
+                seats: vec![epoch_proof::SeatProof {
+                    shard_filter: filter.clone(),
+                    epoch,
+                    settles: true,
+                    frames: frames.clone(),
+                    ..Default::default()
+                }],
+                proof: epoch_proof::prove(&claim, &[witness]).unwrap(),
+            };
+            let (from, until) = storage_seat::settlement_window(epoch);
+            let bytes = settling.to_canonical_bytes();
+            assert!(
+                gi.invoke_step(from - 1, &bytes, &state).is_err(),
+                "frames anchored in the epoch may still arrive"
+            );
+            assert!(
+                gi.invoke_step(until, &bytes, &state).is_err(),
+                "past its window"
+            );
+            let mut missing = settling.clone();
+            missing.seats[0].frames.truncate(1);
+            assert!(
+                gi.invoke_step(from, &missing.to_canonical_bytes(), &state)
+                    .is_err(),
+                "a frame left out"
+            );
+            let balance = || {
+                let address = materialize::reward_address(&member).unwrap();
+                state
+                    .get(&GLOBAL_INTRINSIC_ADDRESS[..], &address, &va_disc)
+                    .unwrap()
+                    .map(|blob| {
+                        materialize::read_reward_balance(&rebuild_vertex_tree_from_blob(&blob))
+                    })
+                    .map_or(num_bigint::BigInt::from(0), |bytes| {
+                        num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes)
+                    })
+            };
+            let before = balance();
+            assert!(
+                gi.invoke_step(from, &bytes, &state).is_err(),
+                "a root's executing frame is not here: wait"
+            );
+            clock.seed_frame(at(second + 9, start + 120_000));
+            gi.invoke_step(from, &bytes, &state).unwrap();
+            assert_eq!(
+                balance() - before,
+                num_bigint::BigInt::from(500),
+                "one of two proposals answered in time: half"
+            );
+            assert_eq!(
+                seat().slot(epoch).unwrap().outcome,
+                storage_seat::Outcome::Settled(from)
+            );
+            assert!(
+                gi.invoke_step(from + 1, &bytes, &state).is_err(),
+                "settled once"
+            );
+            quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
         }
 
         // A live width run: every regular joined the QUIL root after it had
@@ -6199,20 +8792,34 @@ mod tests {
             use quil_types::store::{KvDb as _, ShardInfo, ShardsStore};
             let state = make_state();
             let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
-            let shards: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(db.inner()));
+            let shards: Arc<dyn ShardsStore> =
+                Arc::new(quil_store::RocksShardsStore::new(db.inner()));
             let app = [0x71u8; 32];
-            let mut grid = quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
+            let mut grid =
+                quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
             grid.extend_from_slice(&app);
             // The grid after the root split: its two children only.
-            let children: Vec<Vec<u8>> = [false, true].iter().map(|&bit| {
-                let prefix = quil_forest::bit_path_to_prefix(&[bit]);
-                let txn = db.new_batch(false).unwrap();
-                shards.put_app_shard(txn.as_ref(), &ShardInfo {
-                    shard_key: grid.clone(), prefix: prefix.clone(), size: vec![], data_shards: 0, commitment: vec![],
-                }).unwrap();
-                txn.commit().unwrap();
-                quil_forest::shard_prefix_to_filter(&app, &prefix)
-            }).collect();
+            let children: Vec<Vec<u8>> = [false, true]
+                .iter()
+                .map(|&bit| {
+                    let prefix = quil_forest::bit_path_to_prefix(&[bit]);
+                    let txn = db.new_batch(false).unwrap();
+                    shards
+                        .put_app_shard(
+                            txn.as_ref(),
+                            &ShardInfo {
+                                shard_key: grid.clone(),
+                                prefix: prefix.clone(),
+                                size: vec![],
+                                data_shards: 0,
+                                commitment: vec![],
+                            },
+                        )
+                        .unwrap();
+                    txn.commit().unwrap();
+                    quil_forest::shard_prefix_to_filter(&app, &prefix)
+                })
+                .collect();
             let root = app.to_vec();
             let ungridded = vec![0x72u8; 32];
             let pubkey = vec![0xC3u8; 897];
@@ -6220,11 +8827,23 @@ mod tests {
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll)).with_shards_store(shards.clone());
             let va_disc = vertex_adds_discriminator().unwrap();
 
-            let refused = gi.invoke_join(10, &join_op(&pubkey, &root, 10), &state, &va_disc).unwrap_err();
-            assert!(refused.to_string().contains("not a current shard"), "{refused}");
-            assert!(state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &allocation_address(&pubkey, &root).unwrap(), &va_disc)
-                .unwrap().is_none());
-            gi.invoke_join(10, &join_op(&pubkey, &children[1], 10), &state, &va_disc).unwrap();
+            let refused = gi
+                .invoke_join(10, &join_op(&pubkey, &root, 10), &state, &va_disc)
+                .unwrap_err();
+            assert!(
+                refused.to_string().contains("not a current shard"),
+                "{refused}"
+            );
+            assert!(state
+                .get(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &allocation_address(&pubkey, &root).unwrap(),
+                    &va_disc
+                )
+                .unwrap()
+                .is_none());
+            gi.invoke_join(10, &join_op(&pubkey, &children[1], 10), &state, &va_disc)
+                .unwrap();
             gi.invoke_join(10, &join_op(&pubkey, &ungridded, 10), &state, &va_disc)
                 .expect("an application without grid rows is not grid-managed");
 
@@ -6232,8 +8851,22 @@ mod tests {
             // flip) is not confirmed; the confirm's other filters are.
             let stale = allocation_address(&pubkey, &root).unwrap();
             let mut stale_tree = create_allocation_vertex_tree(&prover_addr, &root, 10).unwrap();
-            write_field(&mut stale_tree, "allocation:ProverAllocation", "Status", &[materialize::STATUS_JOINING]).unwrap();
-            state.set(&GLOBAL_INTRINSIC_ADDRESS[..], &stale, &va_disc, 10, vertex_tree_to_blob(&stale_tree)).unwrap();
+            write_field(
+                &mut stale_tree,
+                "allocation:ProverAllocation",
+                "Status",
+                &[materialize::STATUS_JOINING],
+            )
+            .unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &stale,
+                    &va_disc,
+                    10,
+                    vertex_tree_to_blob(&stale_tree),
+                )
+                .unwrap();
             let confirm_frame = quil_types::consensus::EPOCH_LENGTH_FRAMES + 5;
             let confirm = ProverConfirm {
                 filter: vec![],
@@ -6243,10 +8876,21 @@ mod tests {
                 leaf_roots: Vec::new(),
                 release: None,
             };
-            gi.invoke_step(confirm_frame, &confirm.to_canonical_bytes().unwrap(), &state).unwrap();
-            assert_eq!(read_status(&state, &stale, "allocation:ProverAllocation"), Some(materialize::STATUS_JOINING));
+            gi.invoke_step(
+                confirm_frame,
+                &confirm.to_canonical_bytes().unwrap(),
+                &state,
+            )
+            .unwrap();
+            assert_eq!(
+                read_status(&state, &stale, "allocation:ProverAllocation"),
+                Some(materialize::STATUS_JOINING)
+            );
             let child = allocation_address(&pubkey, &children[1]).unwrap();
-            assert_eq!(read_status(&state, &child, "allocation:ProverAllocation"), Some(materialize::STATUS_ACTIVE));
+            assert_eq!(
+                read_status(&state, &child, "allocation:ProverAllocation"),
+                Some(materialize::STATUS_ACTIVE)
+            );
         }
 
         /// A confirm signed from the release frame records its release on each
@@ -6254,16 +8898,27 @@ mod tests {
         /// bytes it carries, as an older build ignores them.
         #[test]
         fn a_confirm_records_its_release_only_when_signed_from_the_release_frame() {
-            use crate::global_intrinsic::prover_release::{read_release, set_confirm_release_frame_for_thread, Release};
-            let release = Release { version: [2, 1, 0], patch: 25, subpatch: 92 };
+            use crate::global_intrinsic::prover_release::{
+                read_release, set_confirm_release_frame_for_thread, Release,
+            };
+            let release = Release {
+                version: [2, 1, 0],
+                patch: 25,
+                subpatch: 92,
+            };
             let confirm_frame = quil_types::consensus::EPOCH_LENGTH_FRAMES + 5;
             let filter = vec![0x73u8; 32];
             let pubkey = vec![0xC5u8; 897];
             let va_disc = vertex_adds_discriminator().unwrap();
-            for (release_frame, recorded) in [(None, None), (Some(confirm_frame + 1), None), (Some(confirm_frame), Some(release))] {
+            for (release_frame, recorded) in [
+                (None, None),
+                (Some(confirm_frame + 1), None),
+                (Some(confirm_frame), Some(release)),
+            ] {
                 set_confirm_release_frame_for_thread(release_frame);
                 let state = make_state();
-                let (prover_addr, alloc_addr) = seed_prover(&state, &pubkey, &filter, materialize::STATUS_JOINING, true);
+                let (prover_addr, alloc_addr) =
+                    seed_prover(&state, &pubkey, &filter, materialize::STATUS_JOINING, true);
                 let confirm = ProverConfirm {
                     filter: vec![],
                     frame_number: confirm_frame,
@@ -6273,11 +8928,26 @@ mod tests {
                     release: Some(release),
                 };
                 let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
-                gi.invoke_step(confirm_frame, &confirm.to_canonical_bytes().unwrap(), &state).unwrap();
-                assert_eq!(read_status(&state, &alloc_addr, "allocation:ProverAllocation"), Some(materialize::STATUS_ACTIVE));
-                let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc).unwrap().unwrap();
+                gi.invoke_step(
+                    confirm_frame,
+                    &confirm.to_canonical_bytes().unwrap(),
+                    &state,
+                )
+                .unwrap();
+                assert_eq!(
+                    read_status(&state, &alloc_addr, "allocation:ProverAllocation"),
+                    Some(materialize::STATUS_ACTIVE)
+                );
+                let blob = state
+                    .get(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc)
+                    .unwrap()
+                    .unwrap();
                 let tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&blob);
-                assert_eq!(read_release(&tree), recorded, "release frame {release_frame:?}");
+                assert_eq!(
+                    read_release(&tree),
+                    recorded,
+                    "release frame {release_frame:?}"
+                );
             }
             set_confirm_release_frame_for_thread(None);
         }
@@ -6290,18 +8960,23 @@ mod tests {
             let pubkey = vec![0xABu8; 897];
             let prover_addr = prover_address_from_pubkey(&pubkey).unwrap();
             let prover_tree = create_prover_vertex_tree(&pubkey, 100).unwrap();
-            state.set(
-                &GLOBAL_INTRINSIC_ADDRESS[..],
-                &prover_addr,
-                &va_disc,
-                1,
-                vertex_tree_to_blob(&prover_tree),
-            ).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &prover_addr,
+                    &va_disc,
+                    1,
+                    vertex_tree_to_blob(&prover_tree),
+                )
+                .unwrap();
 
             let filters = vec![vec![0x31u8; 32], vec![0x32u8; 32]];
             let expected_statuses = [STATUS_KICKED, materialize::STATUS_ACTIVE];
             let mut addresses = Vec::new();
-            for (filter, status) in filters.iter().zip([materialize::STATUS_JOINING, materialize::STATUS_LEAVING]) {
+            for (filter, status) in filters
+                .iter()
+                .zip([materialize::STATUS_JOINING, materialize::STATUS_LEAVING])
+            {
                 let address = allocation_address(&pubkey, filter).unwrap();
                 let mut allocation =
                     create_allocation_vertex_tree(&prover_addr, filter, 1).unwrap();
@@ -6310,14 +8985,17 @@ mod tests {
                     "allocation:ProverAllocation",
                     "Status",
                     &[status],
-                ).unwrap();
-                state.set(
-                    &GLOBAL_INTRINSIC_ADDRESS[..],
-                    &address,
-                    &va_disc,
-                    1,
-                    vertex_tree_to_blob(&allocation),
-                ).unwrap();
+                )
+                .unwrap();
+                state
+                    .set(
+                        &GLOBAL_INTRINSIC_ADDRESS[..],
+                        &address,
+                        &va_disc,
+                        1,
+                        vertex_tree_to_blob(&allocation),
+                    )
+                    .unwrap();
                 addresses.push(address);
             }
 
@@ -6333,7 +9011,8 @@ mod tests {
                 filters,
             };
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
-            gi.invoke_step(777, &op.to_canonical_bytes().unwrap(), &state).unwrap();
+            gi.invoke_step(777, &op.to_canonical_bytes().unwrap(), &state)
+                .unwrap();
 
             for (address, expected_status) in addresses.into_iter().zip(expected_statuses) {
                 assert_eq!(
@@ -6357,7 +9036,8 @@ mod tests {
             let (prover_addr, alloc_a) = seed_prover(&state, &pubkey, &filter_a, 1, true);
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
             let va_disc = vertex_adds_discriminator().unwrap();
-            gi.invoke_join(20, &join_op(&pubkey, &filter_b, 20), &state, &va_disc).unwrap();
+            gi.invoke_join(20, &join_op(&pubkey, &filter_b, 20), &state, &va_disc)
+                .unwrap();
             let alloc_b = allocation_address(&pubkey, &filter_b).unwrap();
 
             let reject = ProverReject {
@@ -6366,10 +9046,17 @@ mod tests {
                 public_key_signature_bls48581: signed_by(&prover_addr),
                 filters: vec![filter_b.clone()],
             };
-            gi.invoke_step(21, &reject.to_canonical_bytes().unwrap(), &state).unwrap();
+            gi.invoke_step(21, &reject.to_canonical_bytes().unwrap(), &state)
+                .unwrap();
 
-            assert_eq!(read_status(&state, &alloc_b, "allocation:ProverAllocation"), Some(STATUS_KICKED));
-            assert_eq!(read_status(&state, &alloc_a, "allocation:ProverAllocation"), Some(1));
+            assert_eq!(
+                read_status(&state, &alloc_b, "allocation:ProverAllocation"),
+                Some(STATUS_KICKED)
+            );
+            assert_eq!(
+                read_status(&state, &alloc_a, "allocation:ProverAllocation"),
+                Some(1)
+            );
             assert_eq!(
                 read_status(&state, &prover_addr, "prover:Prover"),
                 Some(1),
@@ -6388,7 +9075,8 @@ mod tests {
             let (prover_addr, alloc_a) = seed_prover(&state, &pubkey, &filter_a, 1, true);
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
             let va_disc = vertex_adds_discriminator().unwrap();
-            gi.invoke_join(20, &join_op(&pubkey, &filter_b, 20), &state, &va_disc).unwrap();
+            gi.invoke_join(20, &join_op(&pubkey, &filter_b, 20), &state, &va_disc)
+                .unwrap();
             let alloc_b = allocation_address(&pubkey, &filter_b).unwrap();
 
             let mut expected = vec![alloc_a, alloc_b];
@@ -6410,8 +9098,14 @@ mod tests {
                 traversal_proof: vec![],
             };
             gi.invoke_kick(30, &kick, &state, &va_disc).unwrap();
-            assert_eq!(read_status(&state, &alloc_a, "allocation:ProverAllocation"), Some(STATUS_KICKED));
-            assert_eq!(read_status(&state, &alloc_b, "allocation:ProverAllocation"), Some(STATUS_KICKED));
+            assert_eq!(
+                read_status(&state, &alloc_a, "allocation:ProverAllocation"),
+                Some(STATUS_KICKED)
+            );
+            assert_eq!(
+                read_status(&state, &alloc_b, "allocation:ProverAllocation"),
+                Some(STATUS_KICKED)
+            );
         }
 
         // Stores written before the rejoin fix can lack earlier allocations
@@ -6430,10 +9124,14 @@ mod tests {
                 frame_number: 40,
                 public_key_signature_bls48581: signed_by(&prover_addr),
             };
-            gi.invoke_step(40, &pause.to_canonical_bytes().unwrap(), &state).unwrap();
+            gi.invoke_step(40, &pause.to_canonical_bytes().unwrap(), &state)
+                .unwrap();
 
             assert_eq!(linked(&state, &prover_addr), vec![alloc_a]);
-            assert_eq!(read_status(&state, &alloc_a, "allocation:ProverAllocation"), Some(2));
+            assert_eq!(
+                read_status(&state, &alloc_a, "allocation:ProverAllocation"),
+                Some(2)
+            );
             assert_eq!(read_status(&state, &prover_addr, "prover:Prover"), Some(2));
         }
 
@@ -6492,9 +9190,11 @@ mod tests {
 
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll));
             let va_disc = vertex_adds_discriminator().unwrap();
-            gi.invoke_join(frame_number, &join, &state, &va_disc).unwrap();
+            gi.invoke_join(frame_number, &join, &state, &va_disc)
+                .unwrap();
 
-            let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &va_disc)
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &va_disc)
                 .unwrap()
                 .expect("join must create a prover vertex");
             let tree = rebuild_vertex_tree_from_blob(&blob);
@@ -6529,18 +9229,43 @@ mod tests {
 
         struct StubProver;
         impl InclusionProver for StubProver {
-            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-            fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> {
+                Ok(vec![0u8; 64])
+            }
+            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
+                Ok(vec![])
+            }
+            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
+                Ok(true)
+            }
+            fn prove_multiple(
+                &self,
+                _: &[&[u8]],
+                _: &[&[u8]],
+                _: &[u64],
+                _: u64,
+            ) -> Result<Box<dyn Multiproof>> {
                 Err(QuilError::Internal("batch not supported".into()))
             }
-            fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+            fn verify_multiple(
+                &self,
+                _: &[&[u8]],
+                _: &[&[u8]],
+                _: &[u64],
+                _: u64,
+                _: &[u8],
+                _: &[u8],
+            ) -> bool {
+                true
+            }
         }
         fn make_state(db: &quil_store::RocksDb) -> HypergraphState {
             let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
             let crdt = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
-            crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                db.inner(),
+                quil_store::FOREST_NAMESPACE,
+            ));
             HypergraphState::new(crdt)
         }
 
@@ -6552,37 +9277,66 @@ mod tests {
         fn the_replacement_frame_finds_orphans_left_by_earlier_splits() {
             use crate::token_intrinsic::{coin_blocks, global_commit};
             let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
-            let shards: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(db.inner()));
+            let shards: Arc<dyn ShardsStore> =
+                Arc::new(quil_store::RocksShardsStore::new(db.inner()));
             let state = make_state(&db);
             let app = [0x33; 32];
-            let mut grid = quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
+            let mut grid =
+                quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
             grid.extend_from_slice(&app);
             // The region 000000 has been split to seven bits.
             let txn = db.new_batch(false).unwrap();
             for last in [false, true] {
                 let mut bits = vec![false; 6];
                 bits.push(last);
-                shards.put_app_shard(txn.as_ref(), &ShardInfo {
-                    shard_key: grid.clone(), prefix: quil_forest::bit_path_to_prefix(&bits),
-                    size: vec![], data_shards: 0, commitment: vec![],
-                }).unwrap();
+                shards
+                    .put_app_shard(
+                        txn.as_ref(),
+                        &ShardInfo {
+                            shard_key: grid.clone(),
+                            prefix: quil_forest::bit_path_to_prefix(&bits),
+                            size: vec![],
+                            data_shards: 0,
+                            commitment: vec![],
+                        },
+                    )
+                    .unwrap();
             }
             txn.commit().unwrap();
             // An output committed while the region was six bits wide, never delivered.
             let entry = global_commit::SpendEntry {
-                kind: 0x0512, tx_id: [1; 32], source_frame: 3, context: [8; 32], root_digest: None,
-                consumptions: vec![[2; 32]], outputs: vec![[0; 32]], escrow_create: None, escrow_claim: None,
-                fee: 1, settlement: None,
+                kind: 0x0512,
+                tx_id: [1; 32],
+                source_frame: 3,
+                context: [8; 32],
+                root_digest: None,
+                consumptions: vec![[2; 32]],
+                outputs: vec![[0; 32]],
+                escrow_create: None,
+                escrow_claim: None,
+                fee: 1,
+                settlement: None,
             };
             let six = quil_types::execution::ShardPath::from_bits(&[false; 6]);
-            assert!(matches!(global_commit::commit_entry(&state, 4, &app, &entry, six).unwrap(),
-                global_commit::Outcome::Committed { .. }));
+            assert!(matches!(
+                global_commit::commit_entry(&state, 4, &app, &entry, six).unwrap(),
+                global_commit::Outcome::Committed { .. }
+            ));
             let block = coin_blocks::block_id(6, 0).unwrap();
-            assert_eq!(global_commit::block_sequence(&state, &app, block).unwrap(), 1);
+            assert_eq!(
+                global_commit::block_sequence(&state, &app, block).unwrap(),
+                1
+            );
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
-                .with_shards_store(shards.clone()).with_shards_db(db.clone());
+                .with_shards_store(shards.clone())
+                .with_shards_db(db.clone());
             gi.apply_due_shard_changes(9, &state).unwrap();
-            assert!(global_commit::orphan(&state, &app, block).unwrap().is_none(), "before the frame nothing changes");
+            assert!(
+                global_commit::orphan(&state, &app, block)
+                    .unwrap()
+                    .is_none(),
+                "before the frame nothing changes"
+            );
             global_commit::set_orphan_replacement_frame_for_test(Some(10));
             gi.apply_due_shard_changes(10, &state).unwrap();
             global_commit::set_orphan_replacement_frame_for_test(None);
@@ -6594,49 +9348,87 @@ mod tests {
         fn topology_state_and_cursor_retry_and_reopen_together() {
             let directory = tempfile::tempdir().unwrap();
             let app = [0x31; 32];
-            let mut grid = quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
+            let mut grid =
+                quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
             grid.extend_from_slice(&app);
             let frame = 1002 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10;
             let cursor = quil_store::encoding::global_materialized_cursor_key();
             let location = quil_hypergraph::addressing::Location {
-                app_address: GLOBAL_INTRINSIC_ADDRESS, data_address: [9; 32],
+                app_address: GLOBAL_INTRINSIC_ADDRESS,
+                data_address: [9; 32],
             };
             {
                 let db = Arc::new(quil_store::RocksDb::open(directory.path()).unwrap());
-                let shards: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(db.inner()));
+                let shards: Arc<dyn ShardsStore> =
+                    Arc::new(quil_store::RocksShardsStore::new(db.inner()));
                 let hstore = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
                 let crdt = Arc::new(HypergraphCrdt::new(hstore.clone(), Arc::new(StubProver)));
-                crdt.set_forest(quil_forest::Forest::with_namespace(db.inner(), quil_store::FOREST_NAMESPACE));
+                crdt.set_forest(quil_forest::Forest::with_namespace(
+                    db.inner(),
+                    quil_store::FOREST_NAMESPACE,
+                ));
                 let state = HypergraphState::new(crdt.clone());
                 let txn = db.new_batch(false).unwrap();
-                shards.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: grid.clone(),
-                    prefix: vec![], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
-                shards.put_pending_shard_change(txn.as_ref(), &PendingShardChange {
-                    kind: ShardChangeKind::Split, parent: app.to_vec(),
-                    children: [false, true].map(|b| quil_forest::encode_shard_bit_path(&app, &[b])).to_vec(),
-                    effective_epoch: 1002, proposed_frame: 800_000,
-                }).unwrap();
+                shards
+                    .put_app_shard(
+                        txn.as_ref(),
+                        &ShardInfo {
+                            shard_key: grid.clone(),
+                            prefix: vec![],
+                            size: vec![],
+                            data_shards: 0,
+                            commitment: vec![],
+                        },
+                    )
+                    .unwrap();
+                shards
+                    .put_pending_shard_change(
+                        txn.as_ref(),
+                        &PendingShardChange {
+                            kind: ShardChangeKind::Split,
+                            parent: app.to_vec(),
+                            children: [false, true]
+                                .map(|b| quil_forest::encode_shard_bit_path(&app, &[b]))
+                                .to_vec(),
+                            effective_epoch: 1002,
+                            proposed_frame: 800_000,
+                        },
+                    )
+                    .unwrap();
                 txn.commit().unwrap();
                 crdt.add_vertex(&location, b"before").unwrap();
                 crdt.commit_with_global_cursor(1, &cursor).unwrap();
                 let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
-                    .with_shards_store(shards.clone()).with_shards_db(db.clone());
+                    .with_shards_store(shards.clone())
+                    .with_shards_db(db.clone());
 
                 let checkpoint = state.changeset_len();
                 gi.apply_due_shard_changes(frame, &state).unwrap();
-                let view = quil_store::ShardMetadataBatch::new(shards.clone(), state.pending_records());
+                let view =
+                    quil_store::ShardMetadataBatch::new(shards.clone(), state.pending_records());
                 assert_eq!(view.range_app_shards().unwrap().len(), 2);
                 assert!(view.all_pending_shard_changes().unwrap().is_empty());
                 assert_eq!(shards.range_app_shards().unwrap().len(), 1);
                 state.rollback_to(checkpoint);
-                assert!(state.pending_records().is_empty(), "rollback drops the maintenance marker too");
+                assert!(
+                    state.pending_records().is_empty(),
+                    "rollback drops the maintenance marker too"
+                );
 
                 // The same frame must run again after message rollback.
                 gi.apply_due_shard_changes(frame, &state).unwrap();
-                let view = quil_store::ShardMetadataBatch::new(shards.clone(), state.pending_records());
+                let view =
+                    quil_store::ShardMetadataBatch::new(shards.clone(), state.pending_records());
                 assert_eq!(view.range_app_shards().unwrap().len(), 2);
-                state.set(&location.app_address, &location.data_address, &vertex_adds_discriminator().unwrap(),
-                    frame, b"after".to_vec()).unwrap();
+                state
+                    .set(
+                        &location.app_address,
+                        &location.data_address,
+                        &vertex_adds_discriminator().unwrap(),
+                        frame,
+                        b"after".to_vec(),
+                    )
+                    .unwrap();
                 state.commit().unwrap();
                 state.abort();
                 let staged = crdt.staged_records();
@@ -6648,7 +9440,10 @@ mod tests {
                     assert_eq!(shards.all_pending_shard_changes().unwrap().len(), 1);
                     let reader = HypergraphCrdt::new(hstore.clone(), Arc::new(StubProver));
                     assert_eq!(reader.read_frame_cursor(&cursor).unwrap(), 1);
-                    assert_eq!(reader.get_vertex_data_checked(&location).unwrap(), Some(b"before".to_vec()));
+                    assert_eq!(
+                        reader.get_vertex_data_checked(&location).unwrap(),
+                        Some(b"before".to_vec())
+                    );
                 }
                 hstore.fail_commit_for_test(false);
                 // Retry the retained batch, without executing the frame again.
@@ -6661,60 +9456,95 @@ mod tests {
             assert_eq!(shards.range_app_shards().unwrap().len(), 2);
             assert!(shards.all_pending_shard_changes().unwrap().is_empty());
             assert_eq!(reader.crdt().read_frame_cursor(&cursor).unwrap(), frame);
-            assert_eq!(reader.crdt().get_vertex_data_checked(&location).unwrap(), Some(b"after".to_vec()));
+            assert_eq!(
+                reader.crdt().get_vertex_data_checked(&location).unwrap(),
+                Some(b"after".to_vec())
+            );
         }
 
         #[test]
         fn split_and_merge_proposals_follow_message_rollback_and_frame_commit() {
             let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
-            let shards: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(db.inner()));
+            let shards: Arc<dyn ShardsStore> =
+                Arc::new(quil_store::RocksShardsStore::new(db.inner()));
             let state = make_state(&db);
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
-                .with_shards_store(shards.clone()).with_shards_db(db);
+                .with_shards_store(shards.clone())
+                .with_shards_db(db);
             let va = vertex_adds_discriminator().unwrap();
             let signer = materialize::prover_address_from_pubkey(&vec![0xAA; 585]).unwrap();
-            state.set(&GLOBAL_INTRINSIC_ADDRESS, &signer, &va, 1,
-                quil_tries::serialize_go_tree(make_prover_tree().root.as_ref()).unwrap()).unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS,
+                    &signer,
+                    &va,
+                    1,
+                    quil_tries::serialize_go_tree(make_prover_tree().root.as_ref()).unwrap(),
+                )
+                .unwrap();
             state.commit().unwrap();
             state.abort();
             let app = [0x31; 32];
-            let children = [false, true].map(|b| quil_forest::encode_shard_bit_path(&app, &[b])).to_vec();
-            let signature = Some(AddressedSignature { address: signer.to_vec(), signature: vec![1; 74] });
+            let children = [false, true]
+                .map(|b| quil_forest::encode_shard_bit_path(&app, &[b]))
+                .to_vec();
+            let signature = Some(AddressedSignature {
+                address: signer.to_vec(),
+                signature: vec![1; 74],
+            });
             let frame = 800_000;
             let split = super::super::super::prover_ops::ShardSplit {
-                shard_address: app.to_vec(), proposed_shards: children.clone(),
-                frame_number: frame, public_key_signature_bls48581: signature.clone(),
+                shard_address: app.to_vec(),
+                proposed_shards: children.clone(),
+                frame_number: frame,
+                public_key_signature_bls48581: signature.clone(),
             };
             gi.invoke_shard_split(frame, &split, &state, &va).unwrap();
             assert!(shards.all_pending_shard_changes().unwrap().is_empty());
             let view = quil_store::ShardMetadataBatch::new(shards.clone(), state.pending_records());
-            assert!(view.all_pending_shard_changes().unwrap()[0].affects_shard(&children[0]),
-                "later requests in the message must see the join freeze");
+            assert!(
+                view.all_pending_shard_changes().unwrap()[0].affects_shard(&children[0]),
+                "later requests in the message must see the join freeze"
+            );
             state.rollback_to(0);
             assert!(state.pending_records().is_empty());
             gi.invoke_shard_split(frame, &split, &state, &va).unwrap();
             state.commit().unwrap();
             state.abort();
             let view = quil_store::ShardMetadataBatch::new(shards.clone(), state.pending_records());
-            assert_eq!(view.all_pending_shard_changes().unwrap()[0].kind, ShardChangeKind::Split,
-                "later messages in the frame see the staged proposal");
+            assert_eq!(
+                view.all_pending_shard_changes().unwrap()[0].kind,
+                ShardChangeKind::Split,
+                "later messages in the frame see the staged proposal"
+            );
             assert!(shards.all_pending_shard_changes().unwrap().is_empty());
             state.crdt().commit(frame).unwrap();
-            assert_eq!(shards.all_pending_shard_changes().unwrap()[0].kind, ShardChangeKind::Split);
+            assert_eq!(
+                shards.all_pending_shard_changes().unwrap()[0].kind,
+                ShardChangeKind::Split
+            );
 
             let merge = super::super::super::prover_ops::ShardMerge {
-                parent_address: app.to_vec(), shard_addresses: children, frame_number: frame,
+                parent_address: app.to_vec(),
+                shard_addresses: children,
+                frame_number: frame,
                 public_key_signature_bls48581: signature,
             };
             gi.invoke_shard_merge(frame, &merge, &state, &va).unwrap();
-            assert_eq!(shards.all_pending_shard_changes().unwrap()[0].kind, ShardChangeKind::Split);
+            assert_eq!(
+                shards.all_pending_shard_changes().unwrap()[0].kind,
+                ShardChangeKind::Split
+            );
             state.rollback_to(0);
             assert!(state.pending_records().is_empty());
             gi.invoke_shard_merge(frame, &merge, &state, &va).unwrap();
             state.commit().unwrap();
             state.abort();
             state.crdt().commit(frame + 1).unwrap();
-            assert_eq!(shards.all_pending_shard_changes().unwrap()[0].kind, ShardChangeKind::Merge);
+            assert_eq!(
+                shards.all_pending_shard_changes().unwrap()[0].kind,
+                ShardChangeKind::Merge
+            );
         }
 
         #[test]
@@ -6820,7 +9650,10 @@ mod tests {
             state.crdt().commit(frame_e2).unwrap();
             let after_e2 = prefixes(&store);
             println!("grid after E+2 apply: {after_e2:?}");
-            assert!(after_e2.contains(&p_0) && after_e2.contains(&p_1), "E+2 children present");
+            assert!(
+                after_e2.contains(&p_0) && after_e2.contains(&p_1),
+                "E+2 children present"
+            );
             assert!(!after_e2.contains(&p_root), "root removed by the split");
             assert!(!after_e2.contains(&p_00), "no deeper children yet");
 
@@ -6836,8 +9669,14 @@ mod tests {
             // FIXED: the apply-side guard sees the parent is no longer in the grid
             // (already split at E+2) and SKIPS the stale duplicate — so the grid is
             // unchanged, no overlapping [0,0]/[0,1] on top of [0]. No double coverage.
-            assert_eq!(after_e3, after_e2, "stale E+3 split skipped → grid unchanged from E+2");
-            assert!(after_e3.contains(&p_0) && after_e3.contains(&p_1), "the real E+2 children remain");
+            assert_eq!(
+                after_e3, after_e2,
+                "stale E+3 split skipped → grid unchanged from E+2"
+            );
+            assert!(
+                after_e3.contains(&p_0) && after_e3.contains(&p_1),
+                "the real E+2 children remain"
+            );
             assert!(
                 !after_e3.contains(&p_00) && !after_e3.contains(&p_01),
                 "E+3's deeper children NOT registered — no overlapping shards",
@@ -6925,22 +9764,35 @@ mod tests {
             if two_splits {
                 let mut second_parent = app.to_vec();
                 second_parent.push(1);
-                store.put_pending_shard_change(txn.as_ref(), &PendingShardChange {
-                    kind: ShardChangeKind::Split, parent: second_parent,
-                    children: vec![child("0000010"), child("0000011")],
-                    effective_epoch: 1002, proposed_frame: 800_000,
-                }).unwrap();
+                store
+                    .put_pending_shard_change(
+                        txn.as_ref(),
+                        &PendingShardChange {
+                            kind: ShardChangeKind::Split,
+                            parent: second_parent,
+                            children: vec![child("0000010"), child("0000011")],
+                            effective_epoch: 1002,
+                            proposed_frame: 800_000,
+                        },
+                    )
+                    .unwrap();
             }
             txn.commit().unwrap();
 
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
                 .with_shards_store(store.clone())
                 .with_shards_db(shards_db.clone());
-            gi.apply_due_shard_changes(1002 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10, &state)
-                .unwrap();
+            gi.apply_due_shard_changes(
+                1002 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10,
+                &state,
+            )
+            .unwrap();
             state.commit().unwrap();
             state.abort();
-            state.crdt().commit(1002 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10).unwrap();
+            state
+                .crdt()
+                .commit(1002 * quil_types::consensus::EPOCH_LENGTH_FRAMES + 10)
+                .unwrap();
 
             // The split APPLIED (was NOT skipped as stale): children present in
             // canonical bits, and the parent 000000 is GONE — not left as a phantom.
@@ -6972,12 +9824,19 @@ mod tests {
             );
             if two_splits {
                 assert!(present.contains(&bits("0000010")) && present.contains(&bits("0000011")));
-                assert_eq!(present.len(), 66, "two splits add one net leaf each, without restoring either parent");
+                assert_eq!(
+                    present.len(),
+                    66,
+                    "two splits add one net leaf each, without restoring either parent"
+                );
             } else {
                 assert!(present.contains(&bits("000001")));
                 assert_eq!(present.len(), 65);
             }
-            assert!(store.all_pending_shard_changes().unwrap().is_empty(), "pending consumed");
+            assert!(
+                store.all_pending_shard_changes().unwrap().is_empty(),
+                "pending consumed"
+            );
         }
     }
 
@@ -6996,8 +9855,8 @@ mod tests {
         };
         use crate::global_schema::read_field;
         use crate::hypergraph_state::{
-            hyperedge_adds_discriminator, vertex_adds_discriminator,
-            vertex_removes_discriminator, HypergraphState,
+            hyperedge_adds_discriminator, vertex_adds_discriminator, vertex_removes_discriminator,
+            HypergraphState,
         };
         use crate::prover_registry::{rebuild_vertex_tree_from_blob, vertex_tree_to_blob};
         use quil_hypergraph::HypergraphCrdt;
@@ -7005,13 +9864,35 @@ mod tests {
 
         struct StubProver;
         impl InclusionProver for StubProver {
-            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-            fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> {
+                Ok(vec![0u8; 64])
+            }
+            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
+                Ok(vec![])
+            }
+            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
+                Ok(true)
+            }
+            fn prove_multiple(
+                &self,
+                _: &[&[u8]],
+                _: &[&[u8]],
+                _: &[u64],
+                _: u64,
+            ) -> Result<Box<dyn Multiproof>> {
                 Err(QuilError::Internal("batch not supported".into()))
             }
-            fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+            fn verify_multiple(
+                &self,
+                _: &[&[u8]],
+                _: &[&[u8]],
+                _: &[u64],
+                _: u64,
+                _: &[u8],
+                _: &[u8],
+            ) -> bool {
+                true
+            }
         }
 
         /// Read the allocation Status byte at `addr` from committed state (via the
@@ -7019,12 +9900,15 @@ mod tests {
         /// would surface here as `None`, a Historic retirement as `Some(6)`.
         fn status_at(state: &HypergraphState, addr: &[u8; 32]) -> Option<u8> {
             let va = vertex_adds_discriminator().unwrap();
-            let blob = state.get(&GLOBAL_INTRINSIC_ADDRESS[..], addr, &va).unwrap()?;
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], addr, &va)
+                .unwrap()?;
             if blob.is_empty() {
                 return None;
             }
             let tree = rebuild_vertex_tree_from_blob(&blob);
-            read_field(&tree, "allocation:ProverAllocation", "Status").and_then(|b| b.first().copied())
+            read_field(&tree, "allocation:ProverAllocation", "Status")
+                .and_then(|b| b.first().copied())
         }
 
         #[test]
@@ -7048,14 +9932,25 @@ mod tests {
             let filter_b = quil_forest::encode_shard_bit_path(&app, &[false; 7]);
             let addr_a = allocation_address(&pubkey, &filter_a).unwrap();
             let addr_b = allocation_address(&pubkey, &filter_b).unwrap();
-            assert_ne!(addr_a, addr_b, "distinct filters ⇒ distinct addresses (no poseidon collision)");
+            assert_ne!(
+                addr_a, addr_b,
+                "distinct filters ⇒ distinct addresses (no poseidon collision)"
+            );
 
             // Seed prover + one Active allocation on A, commit into the CRDT.
             state
-                .set(&GLOBAL_INTRINSIC_ADDRESS[..], &prover_addr, &va, 1, vertex_tree_to_blob(&create_prover_vertex_tree(&pubkey, 100).unwrap()))
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS[..],
+                    &prover_addr,
+                    &va,
+                    1,
+                    vertex_tree_to_blob(&create_prover_vertex_tree(&pubkey, 100).unwrap()),
+                )
                 .unwrap();
             let a_active = reassignment::set_allocation_status(
-                &vertex_tree_to_blob(&create_allocation_vertex_tree(&prover_addr, &filter_a, 1).unwrap()),
+                &vertex_tree_to_blob(
+                    &create_allocation_vertex_tree(&prover_addr, &filter_a, 1).unwrap(),
+                ),
                 STATUS_ACTIVE,
             )
             .unwrap();
@@ -7064,16 +9959,34 @@ mod tests {
                 .unwrap();
             state.commit().unwrap();
             crdt.commit(1).unwrap();
-            assert_eq!(status_at(&state, &addr_a), Some(STATUS_ACTIVE), "seeded Active on A");
+            assert_eq!(
+                status_at(&state, &addr_a),
+                Some(STATUS_ACTIVE),
+                "seeded Active on A"
+            );
 
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll)).with_hypergraph(crdt.clone());
 
             // SPLIT: reassign A → B.
-            gi.rekey_allocation(&state, &va, &vr, &ha, &pubkey, &prover_addr, &filter_a, &filter_b, 10)
-                .unwrap();
+            gi.rekey_allocation(
+                &state,
+                &va,
+                &vr,
+                &ha,
+                &pubkey,
+                &prover_addr,
+                &filter_a,
+                &filter_b,
+                10,
+            )
+            .unwrap();
             state.commit().unwrap();
             crdt.commit(2).unwrap();
-            assert_eq!(status_at(&state, &addr_b), Some(STATUS_ACTIVE), "B Active after split");
+            assert_eq!(
+                status_at(&state, &addr_b),
+                Some(STATUS_ACTIVE),
+                "B Active after split"
+            );
             // The crux: A is RETAINED as Historic — a live vertex, not a tombstone.
             assert_eq!(
                 status_at(&state, &addr_a),
@@ -7083,8 +9996,18 @@ mod tests {
 
             // MERGE BACK: reassign B → A. A hard delete would have tombstoned addr_a
             // permanently; delete-free retention lets this reactivate the SAME slot.
-            gi.rekey_allocation(&state, &va, &vr, &ha, &pubkey, &prover_addr, &filter_b, &filter_a, 20)
-                .unwrap();
+            gi.rekey_allocation(
+                &state,
+                &va,
+                &vr,
+                &ha,
+                &pubkey,
+                &prover_addr,
+                &filter_b,
+                &filter_a,
+                20,
+            )
+            .unwrap();
             state.commit().unwrap();
             crdt.commit(3).unwrap();
             assert_eq!(
@@ -7092,7 +10015,11 @@ mod tests {
                 Some(STATUS_ACTIVE),
                 "A REACTIVATED on merge-back — impossible had it been deleted"
             );
-            assert_eq!(status_at(&state, &addr_b), Some(STATUS_HISTORIC), "B retired to Historic after merge-back");
+            assert_eq!(
+                status_at(&state, &addr_b),
+                Some(STATUS_HISTORIC),
+                "B retired to Historic after merge-back"
+            );
         }
     }
 
@@ -7109,16 +10036,44 @@ mod tests {
 
         struct StubProver;
         impl InclusionProver for StubProver {
-            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> { Ok(vec![0u8; 64]) }
-            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> { Ok(vec![]) }
-            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> { Ok(true) }
-            fn prove_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64) -> Result<Box<dyn Multiproof>> {
+            fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> {
+                Ok(vec![0u8; 64])
+            }
+            fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
+                Ok(vec![])
+            }
+            fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
+                Ok(true)
+            }
+            fn prove_multiple(
+                &self,
+                _: &[&[u8]],
+                _: &[&[u8]],
+                _: &[u64],
+                _: u64,
+            ) -> Result<Box<dyn Multiproof>> {
                 Err(QuilError::Internal("batch not supported".into()))
             }
-            fn verify_multiple(&self, _: &[&[u8]], _: &[&[u8]], _: &[u64], _: u64, _: &[u8], _: &[u8]) -> bool { true }
+            fn verify_multiple(
+                &self,
+                _: &[&[u8]],
+                _: &[&[u8]],
+                _: &[u64],
+                _: u64,
+                _: &[u8],
+                _: &[u8],
+            ) -> bool {
+                true
+            }
         }
 
-        fn setup() -> (Arc<dyn ShardsStore>, Arc<dyn KvDb>, GlobalIntrinsic, HypergraphState, Vec<u8>) {
+        fn setup() -> (
+            Arc<dyn ShardsStore>,
+            Arc<dyn KvDb>,
+            GlobalIntrinsic,
+            HypergraphState,
+            Vec<u8>,
+        ) {
             let quil = crate::domains::QUIL_TOKEN;
             let grid_key = {
                 let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil, 256, 3);
@@ -7127,20 +10082,36 @@ mod tests {
                 k
             };
             let shdb = quil_store::RocksDb::open_in_memory().unwrap();
-            let store: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let store: Arc<dyn ShardsStore> =
+                Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
             let hstore = Arc::new(quil_store::RocksHypergraphStore::new(shdb.inner()));
             let crdt = Arc::new(HypergraphCrdt::new(hstore, Arc::new(StubProver)));
-            crdt.set_forest(quil_forest::Forest::with_namespace(shdb.inner(), quil_store::FOREST_NAMESPACE));
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                shdb.inner(),
+                quil_store::FOREST_NAMESPACE,
+            ));
             let state = HypergraphState::new(crdt.clone());
             let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
             // Seed a legacy BYTE-SUFFIX 64-way genesis grid.
             let txn = shards_db.new_batch(false).unwrap();
             for i in 0..64u32 {
-                store.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: grid_key.clone(), prefix: vec![i], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+                store
+                    .put_app_shard(
+                        txn.as_ref(),
+                        &ShardInfo {
+                            shard_key: grid_key.clone(),
+                            prefix: vec![i],
+                            size: vec![],
+                            data_shards: 0,
+                            commitment: vec![],
+                        },
+                    )
+                    .unwrap();
             }
             txn.commit().unwrap();
 
-            let byte_suffix_genesis: Arc<Vec<Vec<u32>>> = Arc::new((0..64u32).map(|i| vec![i]).collect());
+            let byte_suffix_genesis: Arc<Vec<Vec<u32>>> =
+                Arc::new((0..64u32).map(|i| vec![i]).collect());
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
                 .with_shards_store(store.clone())
                 .with_shards_db(shards_db.clone())
@@ -7151,7 +10122,12 @@ mod tests {
         }
 
         fn quil_grid(store: &Arc<dyn ShardsStore>, gk: &[u8]) -> Vec<quil_types::store::ShardInfo> {
-            store.range_app_shards().unwrap().into_iter().filter(|s| s.shard_key == gk).collect()
+            store
+                .range_app_shards()
+                .unwrap()
+                .into_iter()
+                .filter(|s| s.shard_key == gk)
+                .collect()
         }
 
         #[test]
@@ -7170,21 +10146,37 @@ mod tests {
                 k
             };
             let shdb = quil_store::RocksDb::open_in_memory().unwrap();
-            let store: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let store: Arc<dyn ShardsStore> =
+                Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
             let hstore = Arc::new(quil_store::RocksHypergraphStore::new(shdb.inner()));
             let crdt = Arc::new(HypergraphCrdt::new(hstore, Arc::new(StubProver)));
-            crdt.set_forest(quil_forest::Forest::with_namespace(shdb.inner(), quil_store::FOREST_NAMESPACE));
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                shdb.inner(),
+                quil_store::FOREST_NAMESPACE,
+            ));
             let state = HypergraphState::new(crdt.clone());
             let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
             // Pre-state: a mixed grid (as mainnet had pre-v5), to be replaced.
             let txn = shards_db.new_batch(false).unwrap();
             for i in 0..10u32 {
-                store.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: grid_key.clone(), prefix: vec![i], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+                store
+                    .put_app_shard(
+                        txn.as_ref(),
+                        &ShardInfo {
+                            shard_key: grid_key.clone(),
+                            prefix: vec![i],
+                            size: vec![],
+                            data_shards: 0,
+                            commitment: vec![],
+                        },
+                    )
+                    .unwrap();
             }
             txn.commit().unwrap();
 
             // REAL mainnet reset config: canonical sentinel genesis.
-            let mainnet_genesis: Arc<Vec<Vec<u32>>> = Arc::new(quil_forest::genesis_grid_prefixes(0));
+            let mainnet_genesis: Arc<Vec<Vec<u32>>> =
+                Arc::new(quil_forest::genesis_grid_prefixes(0));
             let gi = GlobalIntrinsic::new(Arc::new(AcceptAll))
                 .with_shards_store(store.clone())
                 .with_shards_db(shards_db.clone())
@@ -7193,20 +10185,28 @@ mod tests {
                 .with_reset_genesis_prefixes(mainnet_genesis);
 
             let v5 = crate::global_intrinsic::materialize::quil_prover_reset_v5_frame();
-            assert!(gi.maybe_apply_split_reset(v5, &state).unwrap(), "v5 grid reset ran");
+            assert!(
+                gi.maybe_apply_split_reset(v5, &state).unwrap(),
+                "v5 grid reset ran"
+            );
             state.commit().unwrap();
             state.abort();
             state.crdt().commit(v5).unwrap();
             let rows = quil_grid(&store, &grid_key);
             assert_eq!(rows.len(), 64, "v5 must leave a NON-EMPTY 64-way grid");
             assert!(
-                rows.iter().all(|s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_some()),
+                rows.iter()
+                    .all(|s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_some()),
                 "every v5 genesis shard is SENTINEL"
             );
             // And a prover can derive a joinable 35B filter from every row.
             for s in &rows {
                 let f = quil_forest::shard_prefix_to_filter(&s.shard_key[3..35], &s.prefix);
-                assert_eq!(f.len(), 35, "each grid row yields a 35B sentinel join filter");
+                assert_eq!(
+                    f.len(),
+                    35,
+                    "each grid row yields a 35B sentinel join filter"
+                );
             }
         }
 
@@ -7214,11 +10214,22 @@ mod tests {
         fn v4_reset_seeds_sentinel_genesis_grid() {
             let (store, _db, gi, state, gk) = setup();
             let v4 = crate::global_intrinsic::materialize::quil_prover_reset_v4_frame();
-            assert!(gi.maybe_apply_split_reset(v4, &state).unwrap(), "v4 grid reset ran");
-            assert!(quil_grid(&store, &gk).iter().all(|row| row.prefix.len() == 1),
-                "the reset must not publish before the frame commits");
-            let staged = quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records());
-            assert!(staged.range_app_shards().unwrap().iter()
+            assert!(
+                gi.maybe_apply_split_reset(v4, &state).unwrap(),
+                "v4 grid reset ran"
+            );
+            assert!(
+                quil_grid(&store, &gk)
+                    .iter()
+                    .all(|row| row.prefix.len() == 1),
+                "the reset must not publish before the frame commits"
+            );
+            let staged =
+                quil_store::ShardMetadataBatch::new(store.clone(), state.pending_records());
+            assert!(staged
+                .range_app_shards()
+                .unwrap()
+                .iter()
                 .all(|row| quil_forest::shard_bit_path_from_prefix(&row.prefix).is_some()));
             state.abort();
             assert!(state.pending_records().is_empty());
@@ -7230,7 +10241,8 @@ mod tests {
             let rows = quil_grid(&store, &gk);
             assert_eq!(rows.len(), 64, "64 genesis shards");
             assert!(
-                rows.iter().all(|s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_some()),
+                rows.iter()
+                    .all(|s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_some()),
                 "v4 seeds every genesis shard in SENTINEL form — NO byte-suffix"
             );
             // The grid filter a prover joins is `shard_prefix_to_filter` = the canonical
@@ -7243,7 +10255,11 @@ mod tests {
                 let bits = quil_forest::shard_bit_path_from_prefix(&s.prefix).unwrap();
                 assert_eq!(f, quil_forest::encode_shard_bit_path(&quil, &bits));
                 // And it is NOT the legacy byte-suffix `quil‖[i]`.
-                assert_ne!(f, { let mut b = quil.to_vec(); b.push(s.prefix[1] as u8); b });
+                assert_ne!(f, {
+                    let mut b = quil.to_vec();
+                    b.push(s.prefix[1] as u8);
+                    b
+                });
             }
         }
 
@@ -7274,7 +10290,10 @@ mod tests {
 
             // Before the first deep split the grid is byte-suffix → the byte-suffix
             // allocation is a valid shard address (aligned; proofs accepted).
-            assert!(valid(&store).contains(&alloc_byte_suffix), "aligned before migrate");
+            assert!(
+                valid(&store).contains(&alloc_byte_suffix),
+                "aligned before migrate"
+            );
 
             // The first deep split of ANY shard runs `migrate` → the WHOLE grid flips
             // to sentinel, but this prover's allocation was never re-keyed.
@@ -7316,7 +10335,10 @@ mod tests {
             let rows = quil_grid(&store, &gk);
             assert_eq!(rows.len(), 64);
             assert!(
-                rows.iter().all(|s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_none() && s.prefix.len() == 1),
+                rows.iter().all(
+                    |s| quil_forest::shard_bit_path_from_prefix(&s.prefix).is_none()
+                        && s.prefix.len() == 1
+                ),
                 "v3 keeps byte-suffix genesis (single-element prefix, not sentinel)"
             );
         }
@@ -7336,14 +10358,29 @@ mod tests {
                 k
             };
             let shdb = quil_store::RocksDb::open_in_memory().unwrap();
-            let store: Arc<dyn ShardsStore> = Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
+            let store: Arc<dyn ShardsStore> =
+                Arc::new(quil_store::RocksShardsStore::new(shdb.inner()));
             let hstore = Arc::new(quil_store::RocksHypergraphStore::new(shdb.inner()));
             let crdt = Arc::new(HypergraphCrdt::new(hstore, Arc::new(StubProver)));
-            crdt.set_forest(quil_forest::Forest::with_namespace(shdb.inner(), quil_store::FOREST_NAMESPACE));
+            crdt.set_forest(quil_forest::Forest::with_namespace(
+                shdb.inner(),
+                quil_store::FOREST_NAMESPACE,
+            ));
             let state = HypergraphState::new(crdt.clone());
             let shards_db: Arc<dyn KvDb> = Arc::new(shdb);
             let txn = shards_db.new_batch(false).unwrap();
-            store.put_app_shard(txn.as_ref(), &ShardInfo { shard_key: gk.clone(), prefix: vec![], size: vec![], data_shards: 0, commitment: vec![] }).unwrap();
+            store
+                .put_app_shard(
+                    txn.as_ref(),
+                    &ShardInfo {
+                        shard_key: gk.clone(),
+                        prefix: vec![],
+                        size: vec![],
+                        data_shards: 0,
+                        commitment: vec![],
+                    },
+                )
+                .unwrap();
             txn.commit().unwrap();
 
             let root_genesis: Arc<Vec<Vec<u32>>> = Arc::new(vec![vec![]]);
@@ -7361,10 +10398,90 @@ mod tests {
             state.crdt().commit(v4).unwrap();
             let rows = quil_grid(&store, &gk);
             assert_eq!(rows.len(), 1);
-            assert!(rows[0].prefix.is_empty(), "root stays byte-suffix [] (not sentinel-encoded)");
+            assert!(
+                rows[0].prefix.is_empty(),
+                "root stays byte-suffix [] (not sentinel-encoded)"
+            );
             // The grid filter equals the bare app — exactly a root prover's filter.
-            assert_eq!(quil_forest::shard_prefix_to_filter(&quil, &rows[0].prefix), quil.to_vec());
+            assert_eq!(
+                quil_forest::shard_prefix_to_filter(&quil, &rows[0].prefix),
+                quil.to_vec()
+            );
         }
     }
+}
 
+#[cfg(test)]
+mod storage_attestation_pause_tests {
+    use super::storage_reward_withheld;
+
+    /// The first GLOBAL frame of mainnet `epoch`, with mainnet's hash epoch
+    /// and attestation pause set for the calling thread.
+    fn mainnet_frame(epoch: u64) -> u64 {
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(
+            quil_types::consensus::MAINNET_HASH_STORAGE_PROOF_EPOCH,
+        );
+        quil_types::consensus::set_storage_attestation_pause_for_thread(
+            quil_types::consensus::MAINNET_STORAGE_ATTESTATION_PAUSE,
+        );
+        epoch * quil_types::consensus::epoch_length_frames()
+    }
+
+    fn reset() {
+        quil_types::consensus::set_storage_attestation_pause_for_thread(None);
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// GLOBAL pays an unattested frame over committed data anchored in
+    /// mainnet epochs 1311–1313, which a proposer leaves unattested there.
+    #[test]
+    fn an_unattested_frame_of_epoch_1312_keeps_its_reward() {
+        let anchors = [
+            mainnet_frame(1311),
+            mainnet_frame(1312),
+            mainnet_frame(1312) + 360,
+            mainnet_frame(1314) - 1,
+        ];
+        let withheld = anchors.map(|anchor| storage_reward_withheld(anchor, 1 << 20, false));
+        reset();
+        assert_eq!(withheld, [false; 4]);
+    }
+
+    /// Outside the pause GLOBAL withholds exactly as before: an unattested
+    /// KZG frame over committed data up to epoch 1310, nothing from the hash
+    /// epoch 1314 on.
+    #[test]
+    fn rewards_of_epochs_1310_and_1314_are_withheld_as_before() {
+        let anchors = [
+            0,
+            mainnet_frame(1309),
+            mainnet_frame(1310),
+            mainnet_frame(1311) - 1,
+            mainnet_frame(1314),
+            mainnet_frame(1315),
+        ];
+        let mut before = Vec::new();
+        let mut now = Vec::new();
+        for anchor in anchors {
+            let epoch = quil_types::consensus::epoch_for_frame(anchor);
+            let hash = quil_types::consensus::hash_storage_proofs_at(epoch);
+            for (state_size, attested) in [(1 << 20, false), (1 << 20, true), (0, false)] {
+                // The rule before the pause existed.
+                let withheld = !hash && anchor > 0 && state_size > 0 && !attested;
+                before.push((anchor, state_size, attested, withheld));
+                let withheld = storage_reward_withheld(anchor, state_size, attested);
+                now.push((anchor, state_size, attested, withheld));
+            }
+        }
+        reset();
+        assert_eq!(now, before);
+        let e1310 = mainnet_frame(1310);
+        let e1314 = mainnet_frame(1314);
+        let withheld = [
+            storage_reward_withheld(e1310, 1 << 20, false),
+            storage_reward_withheld(e1314, 1 << 20, false),
+        ];
+        reset();
+        assert_eq!(withheld, [true, false]);
+    }
 }

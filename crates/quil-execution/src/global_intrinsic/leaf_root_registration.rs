@@ -26,9 +26,9 @@
 //! [u32 BE sig_len] [sig_len bytes BLS48581SignatureWithProofOfPossession]
 //! ```
 
-use quil_types::error::{QuilError, Result};
-use crate::canonical_cursor::{put_u32, put_u64, read_u32, read_u64, read_bytes};
 use super::sig_with_pop::SignatureWithPop;
+use crate::canonical_cursor::{put_u32, put_u64, read_bytes, read_u32, read_u64};
+use quil_types::error::{QuilError, Result};
 
 pub const TYPE_LEAF_ROOT_REGISTRATION: u32 = 0x0320;
 
@@ -37,6 +37,9 @@ const MAX_SHARD_FILTER_LEN: u32 = 64;
 /// few levels deep, but bound generously.
 const MAX_PREFIX_LEN: u32 = 256;
 const MAX_LEAF_ROOT_LEN: u32 = 128;
+/// The most leaf-root groups (shards) one confirm registers; a confirm with
+/// more does not decode, so a sender splits its seats across confirms.
+pub const MAX_CONFIRM_LEAF_ROOT_GROUPS: usize = MAX_PREFIX_LEN as usize;
 // Falcon-512 `SignatureWithProofOfPossession` envelope:
 // 4 type + (4+666) sig + (4+901) wrapped-pubkey + (4+666) pop = 2249.
 const MAX_SIG_LEN: u32 = 2249;
@@ -99,14 +102,16 @@ impl LeafRootRegistration {
         let tp = read_u32(data, &mut c)?;
         if tp != TYPE_LEAF_ROOT_REGISTRATION {
             return Err(QuilError::InvalidArgument(format!(
-                "LeafRootRegistration: invalid type prefix 0x{:08x}", tp
+                "LeafRootRegistration: invalid type prefix 0x{:08x}",
+                tp
             )));
         }
 
         let sfl = read_u32(data, &mut c)?;
         if sfl > MAX_SHARD_FILTER_LEN {
             return Err(QuilError::InvalidArgument(format!(
-                "LeafRootRegistration: invalid shard_filter length {}", sfl
+                "LeafRootRegistration: invalid shard_filter length {}",
+                sfl
             )));
         }
         let shard_filter = read_bytes(data, &mut c, sfl as usize)?;
@@ -114,7 +119,8 @@ impl LeafRootRegistration {
         let pc = read_u32(data, &mut c)?;
         if pc > MAX_PREFIX_LEN {
             return Err(QuilError::InvalidArgument(format!(
-                "LeafRootRegistration: invalid prefix length {}", pc
+                "LeafRootRegistration: invalid prefix length {}",
+                pc
             )));
         }
         let mut prefix = Vec::with_capacity(pc as usize);
@@ -127,7 +133,8 @@ impl LeafRootRegistration {
         let lrl = read_u32(data, &mut c)?;
         if lrl > MAX_LEAF_ROOT_LEN {
             return Err(QuilError::InvalidArgument(format!(
-                "LeafRootRegistration: invalid leaf_root length {}", lrl
+                "LeafRootRegistration: invalid leaf_root length {}",
+                lrl
             )));
         }
         let leaf_root = read_bytes(data, &mut c, lrl as usize)?;
@@ -138,7 +145,8 @@ impl LeafRootRegistration {
         let sl = read_u32(data, &mut c)?;
         if sl > MAX_SIG_LEN {
             return Err(QuilError::InvalidArgument(format!(
-                "LeafRootRegistration: invalid signature length {}", sl
+                "LeafRootRegistration: invalid signature length {}",
+                sl
             )));
         }
         let public_key_signature_bls48581 = if sl > 0 {
@@ -211,37 +219,90 @@ pub fn append_confirm_leaf_roots(out: &mut Vec<u8>, groups: &[ConfirmLeafRoots])
     }
 }
 
+/// Whether `groups` fit one confirm every node decodes: at most
+/// [`MAX_CONFIRM_LEAF_ROOT_GROUPS`] groups, each within the limits
+/// [`read_confirm_leaf_roots`] enforces. The error names the limit exceeded,
+/// so a sender can leave out the seat whose groups these are instead of
+/// sending a confirm every node refuses.
+pub fn check_confirm_leaf_roots(groups: &[ConfirmLeafRoots]) -> Result<()> {
+    if groups.len() > MAX_CONFIRM_LEAF_ROOT_GROUPS {
+        return Err(QuilError::InvalidArgument(format!(
+            "{} leaf-root groups (at most {MAX_CONFIRM_LEAF_ROOT_GROUPS} per confirm)",
+            groups.len()
+        )));
+    }
+    for group in groups {
+        let exceeded = if group.filter.len() > MAX_SHARD_FILTER_LEN as usize {
+            format!(
+                "filter of {} bytes (at most {MAX_SHARD_FILTER_LEN})",
+                group.filter.len()
+            )
+        } else if group.entries.len() > MAX_PREFIX_LEN as usize {
+            format!("{} entries (at most {MAX_PREFIX_LEN})", group.entries.len())
+        } else if let Some(entry) = group
+            .entries
+            .iter()
+            .find(|e| e.prefix.len() > MAX_PREFIX_LEN as usize)
+        {
+            format!(
+                "a prefix of {} nibbles (at most {MAX_PREFIX_LEN})",
+                entry.prefix.len()
+            )
+        } else if let Some(entry) = group
+            .entries
+            .iter()
+            .find(|e| e.leaf_root.len() > MAX_LEAF_ROOT_LEN as usize)
+        {
+            format!(
+                "a leaf root of {} bytes (at most {MAX_LEAF_ROOT_LEN})",
+                entry.leaf_root.len()
+            )
+        } else {
+            continue;
+        };
+        return Err(QuilError::InvalidArgument(format!(
+            "leaf-root group {}: {exceeded}",
+            hex::encode(&group.filter)
+        )));
+    }
+    Ok(())
+}
+
 /// Read a confirm's leaf-root set written by [`append_confirm_leaf_roots`].
 /// Absence (cursor at end) yields an empty set (back-compat).
-pub fn read_confirm_leaf_roots(
-    data: &[u8],
-    cursor: &mut usize,
-) -> Result<Vec<ConfirmLeafRoots>> {
+pub fn read_confirm_leaf_roots(data: &[u8], cursor: &mut usize) -> Result<Vec<ConfirmLeafRoots>> {
     if *cursor >= data.len() {
         return Ok(Vec::new());
     }
     let n = read_u32(data, cursor)?;
-    if n > MAX_PREFIX_LEN {
+    if n > MAX_CONFIRM_LEAF_ROOT_GROUPS as u32 {
         return Err(QuilError::InvalidArgument(format!(
-            "ConfirmLeafRoots: too many groups {}", n
+            "ConfirmLeafRoots: too many groups {}",
+            n
         )));
     }
     let mut groups = Vec::with_capacity(n as usize);
     for _ in 0..n {
         let fl = read_u32(data, cursor)?;
         if fl > MAX_SHARD_FILTER_LEN {
-            return Err(QuilError::InvalidArgument("ConfirmLeafRoots: filter too long".into()));
+            return Err(QuilError::InvalidArgument(
+                "ConfirmLeafRoots: filter too long".into(),
+            ));
         }
         let filter = read_bytes(data, cursor, fl as usize)?;
         let ec = read_u32(data, cursor)?;
         if ec > MAX_PREFIX_LEN {
-            return Err(QuilError::InvalidArgument("ConfirmLeafRoots: too many entries".into()));
+            return Err(QuilError::InvalidArgument(
+                "ConfirmLeafRoots: too many entries".into(),
+            ));
         }
         let mut entries = Vec::with_capacity(ec as usize);
         for _ in 0..ec {
             let pc = read_u32(data, cursor)?;
             if pc > MAX_PREFIX_LEN {
-                return Err(QuilError::InvalidArgument("ConfirmLeafRoots: prefix too long".into()));
+                return Err(QuilError::InvalidArgument(
+                    "ConfirmLeafRoots: prefix too long".into(),
+                ));
             }
             let mut prefix = Vec::with_capacity(pc as usize);
             for _ in 0..pc {
@@ -249,11 +310,17 @@ pub fn read_confirm_leaf_roots(
             }
             let lrl = read_u32(data, cursor)?;
             if lrl > MAX_LEAF_ROOT_LEN {
-                return Err(QuilError::InvalidArgument("ConfirmLeafRoots: leaf_root too long".into()));
+                return Err(QuilError::InvalidArgument(
+                    "ConfirmLeafRoots: leaf_root too long".into(),
+                ));
             }
             let leaf_root = read_bytes(data, cursor, lrl as usize)?;
             let num_blocks = read_u64(data, cursor)?;
-            entries.push(LeafRootEntry { prefix, leaf_root, num_blocks });
+            entries.push(LeafRootEntry {
+                prefix,
+                leaf_root,
+                num_blocks,
+            });
         }
         groups.push(ConfirmLeafRoots { filter, entries });
     }
@@ -305,7 +372,10 @@ fn pre_registration_override(network: u8, setting: Option<&str>) -> Option<u64> 
 /// return it. The first call decides.
 pub fn init_pre_registration_frame(network: u8) -> Option<u64> {
     *PRE_REGISTRATION_OVERRIDE.get_or_init(|| {
-        pre_registration_override(network, std::env::var("QUIL_PRE_REGISTRATION_FRAME").ok().as_deref())
+        pre_registration_override(
+            network,
+            std::env::var("QUIL_PRE_REGISTRATION_FRAME").ok().as_deref(),
+        )
     })
 }
 
@@ -328,7 +398,9 @@ pub fn pre_registration_targets(
         .filter(|change| change.effective_epoch == epoch)
         .flat_map(|change| match change.kind {
             ShardChangeKind::Split if confirmed.contains(&change.parent) => change.children.clone(),
-            ShardChangeKind::Merge if change.children.iter().any(|c| confirmed.contains(c)) => vec![change.parent.clone()],
+            ShardChangeKind::Merge if change.children.iter().any(|c| confirmed.contains(c)) => {
+                vec![change.parent.clone()]
+            }
             _ => Vec::new(),
         })
         .filter(|target| !target.is_empty() && !confirmed.contains(target))
@@ -344,10 +416,17 @@ mod tests {
 
     #[test]
     fn only_a_test_network_overrides_the_pre_registration_frame() {
-        assert_eq!(pre_registration_override(1, Some("18446744073709551615")), Some(u64::MAX));
+        assert_eq!(
+            pre_registration_override(1, Some("18446744073709551615")),
+            Some(u64::MAX)
+        );
         assert_eq!(pre_registration_override(1, Some("bad")), None);
         assert_eq!(pre_registration_override(1, None), None);
-        assert_eq!(pre_registration_override(0, Some("5")), None, "mainnet ignores it");
+        assert_eq!(
+            pre_registration_override(0, Some("5")),
+            None,
+            "mainnet ignores it"
+        );
     }
 
     #[test]
@@ -365,13 +444,80 @@ mod tests {
             change(ShardChangeKind::Merge, 2, &[20, 21], 8),
             change(ShardChangeKind::Split, 3, &[30, 31], 9),
         ];
-        assert_eq!(pre_registration_targets(&changes, &[vec![1]], 8), vec![vec![10], vec![11]], "every child of a split");
-        assert_eq!(pre_registration_targets(&changes, &[vec![21]], 8), vec![vec![2]], "a merge's target");
-        assert!(pre_registration_targets(&changes, &[vec![3]], 8).is_empty(), "a change applying at another epoch");
-        assert!(pre_registration_targets(&changes, &[vec![10], vec![20]], 8) == vec![vec![2]],
-            "a split child is no source; a merge source is");
-        assert!(pre_registration_targets(&changes, &[vec![1], vec![10], vec![11]], 8).is_empty(),
-            "filters already confirmed are not repeated");
+        assert_eq!(
+            pre_registration_targets(&changes, &[vec![1]], 8),
+            vec![vec![10], vec![11]],
+            "every child of a split"
+        );
+        assert_eq!(
+            pre_registration_targets(&changes, &[vec![21]], 8),
+            vec![vec![2]],
+            "a merge's target"
+        );
+        assert!(
+            pre_registration_targets(&changes, &[vec![3]], 8).is_empty(),
+            "a change applying at another epoch"
+        );
+        assert!(
+            pre_registration_targets(&changes, &[vec![10], vec![20]], 8) == vec![vec![2]],
+            "a split child is no source; a merge source is"
+        );
+        assert!(
+            pre_registration_targets(&changes, &[vec![1], vec![10], vec![11]], 8).is_empty(),
+            "filters already confirmed are not repeated"
+        );
+    }
+
+    /// `check_confirm_leaf_roots` admits exactly the groups a confirm
+    /// decodes: senders leave out a seat by it, so they must not drift apart.
+    #[test]
+    fn check_confirm_leaf_roots_admits_exactly_what_decodes() {
+        let entry = |prefix: usize, root: usize| LeafRootEntry {
+            prefix: vec![1; prefix],
+            leaf_root: vec![2; root],
+            num_blocks: 3,
+        };
+        let group = |filter: usize, entries: Vec<LeafRootEntry>| ConfirmLeafRoots {
+            filter: vec![4; filter],
+            entries,
+        };
+        let decodes = |groups: &[ConfirmLeafRoots]| {
+            let mut bytes = Vec::new();
+            append_confirm_leaf_roots(&mut bytes, groups);
+            read_confirm_leaf_roots(&bytes, &mut 0).is_ok()
+        };
+        let max = MAX_PREFIX_LEN as usize;
+        let at_limits = vec![group(64, vec![entry(max, 128); max])];
+        let cases = [
+            (at_limits, true),
+            (
+                vec![group(32, Vec::new()); MAX_CONFIRM_LEAF_ROOT_GROUPS],
+                true,
+            ),
+            (
+                vec![group(32, Vec::new()); MAX_CONFIRM_LEAF_ROOT_GROUPS + 1],
+                false,
+            ),
+            (vec![group(65, Vec::new())], false),
+            (vec![group(32, vec![entry(1, 1); max + 1])], false),
+            (vec![group(32, vec![entry(max + 1, 1)])], false),
+            (vec![group(32, vec![entry(1, 129)])], false),
+        ];
+        for (index, (groups, fits)) in cases.iter().enumerate() {
+            assert_eq!(
+                check_confirm_leaf_roots(groups).is_ok(),
+                *fits,
+                "case {index}"
+            );
+            assert_eq!(decodes(groups), *fits, "case {index}");
+        }
+        let error = check_confirm_leaf_roots(&[group(1, vec![entry(1, 129)])])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("leaf-root group 04: a leaf root of 129 bytes (at most 128)"),
+            "{error}"
+        );
     }
 
     fn sample(sig: bool) -> LeafRootRegistration {

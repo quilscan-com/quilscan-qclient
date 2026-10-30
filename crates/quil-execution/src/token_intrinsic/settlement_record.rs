@@ -3,9 +3,10 @@
 //!
 //! A settlement executes on the QUIL shard. Its entry rides the next certified
 //! QUIL shard frame header to the global materializer, which writes the record
-//! below into GLOBAL state. The destination application consumes it once, by a
-//! membership proof against a cited canonical global root. Record construction
-//! confers no authority on its own.
+//! below into GLOBAL state: from [`committed_credit_frame`] only when the
+//! global commit commits the settlement's spend. The destination application
+//! consumes it once, by a membership proof against a cited canonical global
+//! root. Record construction confers no authority on its own.
 #[cfg(feature = "confidential-tokens")]
 use quil_lattice_ct::confidential::{settlement::SettlementStatement, transfer::parameter_context};
 use quil_types::error::{QuilError, Result};
@@ -31,6 +32,65 @@ pub const MAX_RELAY_ENTRIES: usize = MAX_ENTRIES_PER_FRAME * RELAY_WINDOW_FRAMES
 
 fn invalid(message: &str) -> QuilError {
     QuilError::InvalidArgument(format!("settlement record: {message}"))
+}
+
+/// From this GLOBAL frame the global commit credits only what it commits. A
+/// settlement record is written only by the commit of the spend that carries
+/// it (`global_commit::commit_entry`, in the same frame and changeset), so a
+/// relayed settlement whose spend is rejected, or never reaches the commit,
+/// records nothing; a header's settlement list is still checked but writes
+/// nothing. A mint claim's fee, paid and credited with the reward mint it
+/// claims, is not credited again when the claim commits. Before it, GLOBAL
+/// records every relayed settlement and credits both fees.
+///
+/// Changes GLOBAL state and reward credit: consensus-affecting for GLOBAL,
+/// and every archive and prover must run a build with it before the frame.
+/// Not scheduled on mainnet; `QUIL_COMMITTED_CREDIT_FRAME` elsewhere, never
+/// by default.
+pub const MAINNET_COMMITTED_CREDIT_FRAME: Option<u64> = Some(0);
+
+static COMMITTED_CREDIT_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static COMMITTED_CREDIT_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn committed_credit_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_COMMITTED_CREDIT_FRAME.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's committed-credit frame from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_committed_credit_frame(network: u8) -> u64 {
+    *COMMITTED_CREDIT_FRAME.get_or_init(|| {
+        committed_credit_frame_for(
+            network,
+            std::env::var("QUIL_COMMITTED_CREDIT_FRAME").ok().as_deref(),
+        )
+    })
+}
+
+pub fn committed_credit_frame() -> u64 {
+    if let Some(frame) = COMMITTED_CREDIT_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    *COMMITTED_CREDIT_FRAME.get_or_init(|| {
+        std::env::var("QUIL_COMMITTED_CREDIT_FRAME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u64::MAX)
+    })
+}
+
+/// Set the committed-credit frame for the calling thread only (tests).
+pub fn set_committed_credit_frame_for_thread(frame: Option<u64>) {
+    COMMITTED_CREDIT_OVERRIDE.with(|cell| cell.set(frame));
 }
 
 /// What the global materializer needs to write one settlement record.
@@ -78,9 +138,14 @@ pub fn payment_address(encoded_recipient_address: &[u8]) -> Result<[u8; 32]> {
 /// Stable identity shared by the QUIL shard, the global materializer, the paying
 /// wallet and the consumer. Content-addressed by the proof-excluding statement.
 pub fn receipt_address(statement: &SettlementStatement) -> Result<[u8; 32]> {
-    let context = statement.context_bytes().map_err(|_| invalid("invalid statement"))?;
+    let context = statement
+        .context_bytes()
+        .map_err(|_| invalid("invalid statement"))?;
     let mut bytes = Vec::from(b"quil/settlement/v1\0".as_slice());
-    bytes.extend_from_slice(&parameter_context(&statement.funding.network, &statement.funding.application));
+    bytes.extend_from_slice(&parameter_context(
+        &statement.funding.network,
+        &statement.funding.application,
+    ));
     bytes.extend_from_slice(&Sha3_256::digest(context));
     quil_crypto::poseidon::hash_bytes_to_32(&bytes)
 }
@@ -89,7 +154,10 @@ pub fn receipt_address(statement: &SettlementStatement) -> Result<[u8; 32]> {
 pub fn entry(statement: &SettlementStatement) -> Result<SettlementEntry> {
     Ok(SettlementEntry {
         receipt: receipt_address(statement)?,
-        parameter_context: parameter_context(&statement.funding.network, &statement.funding.application),
+        parameter_context: parameter_context(
+            &statement.funding.network,
+            &statement.funding.application,
+        ),
         destination: statement.destination,
         context: statement.context,
         settlement: statement.settlement,
@@ -97,7 +165,10 @@ pub fn entry(statement: &SettlementStatement) -> Result<SettlementEntry> {
             Some(payment) => payment_address(&payment.payee.encode())?,
             None => [0; 32],
         },
-        payment: statement.payment.as_ref().map_or(0, |payment| payment.value),
+        payment: statement
+            .payment
+            .as_ref()
+            .map_or(0, |payment| payment.value),
         claimant: match &statement.claimant {
             Some(claimant) => claimant_address(claimant.key_type, &claimant.public_key)?,
             None => [0; 32],
@@ -116,7 +187,8 @@ pub fn operation_entry(bytes: &[u8]) -> Result<Option<SettlementEntry>> {
     }
     let application = super::wire::domain(bytes)?;
     let network: [u8; 32] = bytes[12..44].try_into().unwrap();
-    let settlement = Settlement::decode(bytes, &network, &application).map_err(|_| invalid("invalid settlement"))?;
+    let settlement = Settlement::decode(bytes, &network, &application)
+        .map_err(|_| invalid("invalid settlement"))?;
     entry(&settlement.statement).map(Some)
 }
 
@@ -266,36 +338,92 @@ pub fn create_record(entry: &SettlementEntry) -> Result<Vec<u8>> {
 
 /// Bytes the GLOBAL record adds to world state (priced with the settlement).
 pub fn record_bytes() -> Result<u64> {
-    let entry = SettlementEntry { receipt: [0; 32], parameter_context: [0; 32], destination: [0; 32], context: [0; 32], settlement: 1, payment_address: [0; 32], payment: 0, claimant: [0; 32] };
+    let entry = SettlementEntry {
+        receipt: [0; 32],
+        parameter_context: [0; 32],
+        destination: [0; 32],
+        context: [0; 32],
+        settlement: 1,
+        payment_address: [0; 32],
+        payment: 0,
+        claimant: [0; 32],
+    };
     Ok(create_record(&entry)?.len() as u64)
 }
 
 #[cfg(feature = "confidential-tokens")]
 /// Authenticate a settlement record at `root` (a canonical GLOBAL prover-shard
 /// root). Consumption and the root's canonicity are the caller's duties.
-pub fn verify_membership(network: &[u8; 32], entry: &SettlementEntry, root: &[u8; 32], proof: &[u8]) -> Result<()> {
+pub fn verify_membership(
+    network: &[u8; 32],
+    entry: &SettlementEntry,
+    root: &[u8; 32],
+    proof: &[u8],
+) -> Result<()> {
+    verify_membership_with(network, entry, root, proof, true)
+}
+
+#[cfg(feature = "confidential-tokens")]
+/// [`verify_membership`] under the consensus rule of the claim's anchor:
+/// `bind_values` from `quil_types::consensus::vertex_value_binding_active`.
+pub fn verify_membership_with(
+    network: &[u8; 32],
+    entry: &SettlementEntry,
+    root: &[u8; 32],
+    proof: &[u8],
+    bind_values: bool,
+) -> Result<()> {
     if entry.parameter_context != parameter_context(network, &crate::domains::QUIL_TOKEN) {
         return Err(invalid("settlement belongs to another network"));
     }
     if proof.len() > super::reward_witness::MAX_REWARD_PROOF_BYTES {
         return Err(invalid("oversized proof"));
     }
-    let membership = quil_forest::MembershipProof::from_bytes(proof).map_err(|_| invalid("malformed proof"))?;
+    let membership =
+        quil_forest::MembershipProof::from_bytes(proof).map_err(|_| invalid("malformed proof"))?;
     let mut address = crate::domains::GLOBAL.to_vec();
     address.extend_from_slice(&entry.receipt);
     if membership.inputs.len() != 1 || membership.inputs[0].vertex_address != address {
         return Err(invalid("proof does not address the receipt"));
     }
-    quil_forest::verify_vertex_membership(root, &membership.inputs[0], &fields(entry)?)
-        .map_err(|_| invalid("record not proven at the cited root"))
+    quil_forest::verify_vertex_membership_with(
+        root,
+        &membership.inputs[0],
+        &fields(entry)?,
+        bind_values,
+    )
+    .map_err(|_| invalid("record not proven at the cited root"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn committed_credit_is_unscheduled_on_mainnet_and_never_by_default() {
+        for setting in [None, Some("5"), Some("bad")] {
+            assert_eq!(
+                committed_credit_frame_for(0, setting),
+                MAINNET_COMMITTED_CREDIT_FRAME.unwrap_or(u64::MAX),
+                "no setting moves the mainnet frame"
+            );
+        }
+        assert_eq!(committed_credit_frame_for(1, None), u64::MAX);
+        assert_eq!(committed_credit_frame_for(1, Some("bad")), u64::MAX);
+        assert_eq!(committed_credit_frame_for(1, Some("230")), 230);
+    }
+
     fn entry_with(receipt: u8, settlement: u128) -> SettlementEntry {
-        SettlementEntry { receipt: [receipt; 32], parameter_context: [6; 32], destination: [7; 32], context: [8; 32], settlement, payment_address: [0; 32], payment: 0, claimant: [0; 32] }
+        SettlementEntry {
+            receipt: [receipt; 32],
+            parameter_context: [6; 32],
+            destination: [7; 32],
+            context: [8; 32],
+            settlement,
+            payment_address: [0; 32],
+            payment: 0,
+            claimant: [0; 32],
+        }
     }
 
     #[test]
@@ -304,7 +432,10 @@ mod tests {
         let bytes = encode_entries(&entries).unwrap();
         assert_eq!(bytes.len(), 3 * ENTRY_BYTES);
         let decoded = decode_entries(&bytes).unwrap();
-        assert_eq!(decoded.iter().map(|e| e.receipt[0]).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            decoded.iter().map(|e| e.receipt[0]).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         assert_eq!(encode_entries(&decoded).unwrap(), bytes);
         assert!(encode_entries(&[]).unwrap().is_empty());
         assert!(decode_entries(&[]).unwrap().is_empty());
@@ -314,17 +445,46 @@ mod tests {
         unsorted.extend_from_slice(&bytes[ENTRY_BYTES..2 * ENTRY_BYTES]);
         unsorted.extend_from_slice(&bytes[..ENTRY_BYTES]);
         assert!(decode_entries(&unsorted).is_err());
-        assert!(encode_entries(&[SettlementEntry { settlement: 0, ..entry_with(4, 1) }]).is_err());
+        assert!(encode_entries(&[SettlementEntry {
+            settlement: 0,
+            ..entry_with(4, 1)
+        }])
+        .is_err());
         // A payment amount without a payee (or the reverse) is not canonical.
-        assert!(encode_entries(&[SettlementEntry { payment: 5, ..entry_with(4, 1) }]).is_err());
-        assert!(encode_entries(&[SettlementEntry { payment_address: [1; 32], ..entry_with(4, 1) }]).is_err());
+        assert!(encode_entries(&[SettlementEntry {
+            payment: 5,
+            ..entry_with(4, 1)
+        }])
+        .is_err());
+        assert!(encode_entries(&[SettlementEntry {
+            payment_address: [1; 32],
+            ..entry_with(4, 1)
+        }])
+        .is_err());
         // Both bindings, or neither, is not a settlement entry.
-        assert!(encode_entries(&[SettlementEntry { claimant: [1; 32], ..entry_with(4, 1) }]).is_err());
-        assert!(encode_entries(&[SettlementEntry { context: [0; 32], ..entry_with(4, 1) }]).is_err());
+        assert!(encode_entries(&[SettlementEntry {
+            claimant: [1; 32],
+            ..entry_with(4, 1)
+        }])
+        .is_err());
+        assert!(encode_entries(&[SettlementEntry {
+            context: [0; 32],
+            ..entry_with(4, 1)
+        }])
+        .is_err());
         // A pre-funded entry round-trips.
-        let prefunded = SettlementEntry { context: [0; 32], claimant: [1; 32], ..entry_with(4, 1) };
-        assert_eq!(decode_entries(&encode_entries(&[prefunded]).unwrap()).unwrap(), vec![prefunded]);
-        let too_many: Vec<_> = (0..=MAX_ENTRIES_PER_FRAME as u8).map(|i| entry_with(i, 1)).collect();
+        let prefunded = SettlementEntry {
+            context: [0; 32],
+            claimant: [1; 32],
+            ..entry_with(4, 1)
+        };
+        assert_eq!(
+            decode_entries(&encode_entries(&[prefunded]).unwrap()).unwrap(),
+            vec![prefunded]
+        );
+        let too_many: Vec<_> = (0..=MAX_ENTRIES_PER_FRAME as u8)
+            .map(|i| entry_with(i, 1))
+            .collect();
         assert!(encode_entries(&too_many).is_err());
     }
 
@@ -334,12 +494,22 @@ mod tests {
         assert!(relay_window(1).is_empty());
         assert_eq!(relay_window(2), 1..=1);
         assert_eq!(relay_window(40), 8..=39);
-        let frames = vec![(8, vec![entry_with(2, 5), entry_with(1, 4)]), (39, vec![entry_with(3, 6)])];
+        let frames = vec![
+            (8, vec![entry_with(2, 5), entry_with(1, 4)]),
+            (39, vec![entry_with(3, 6)]),
+        ];
         let bytes = encode_relay(&frames).unwrap();
         assert_eq!(bytes.len(), 3 * RELAY_ENTRY_BYTES);
         let decoded = decode_relay(40, &bytes).unwrap();
         assert_eq!(decoded[0].0, 8);
-        assert_eq!(decoded[0].1.iter().map(|e| e.receipt[0]).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            decoded[0]
+                .1
+                .iter()
+                .map(|e| e.receipt[0])
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         assert_eq!(encode_relay(&decoded).unwrap(), bytes);
         // The same bytes carried by a header whose window excludes a frame fail.
         assert!(decode_relay(41, &bytes).is_err());
@@ -359,20 +529,53 @@ mod tests {
         let a = entry_with(1, 10);
         let fields_a = fields(&a).unwrap();
         for changed in [
-            SettlementEntry { destination: [0; 32], ..a },
-            SettlementEntry { context: [0; 32], ..a },
-            SettlementEntry { settlement: 11, ..a },
-            SettlementEntry { parameter_context: [0; 32], ..a },
-            SettlementEntry { payment_address: [9; 32], payment: 5, ..a },
-            SettlementEntry { payment_address: [9; 32], payment: 6, ..a },
-            SettlementEntry { context: [0; 32], claimant: [9; 32], ..a },
+            SettlementEntry {
+                destination: [0; 32],
+                ..a
+            },
+            SettlementEntry {
+                context: [0; 32],
+                ..a
+            },
+            SettlementEntry {
+                settlement: 11,
+                ..a
+            },
+            SettlementEntry {
+                parameter_context: [0; 32],
+                ..a
+            },
+            SettlementEntry {
+                payment_address: [9; 32],
+                payment: 5,
+                ..a
+            },
+            SettlementEntry {
+                payment_address: [9; 32],
+                payment: 6,
+                ..a
+            },
+            SettlementEntry {
+                context: [0; 32],
+                claimant: [9; 32],
+                ..a
+            },
         ] {
             assert_ne!(fields(&changed).unwrap(), fields_a);
         }
         assert!(record_bytes().unwrap() > 0);
-        assert_ne!(claimant_address(3, &[1; 897]).unwrap(), claimant_address(4, &[1; 897]).unwrap());
-        assert_ne!(claimant_address(3, &[1; 897]).unwrap(), claimant_address(3, &[1; 896]).unwrap());
-        assert_eq!(create_record(&a).unwrap().len() as u64, record_bytes().unwrap());
+        assert_ne!(
+            claimant_address(3, &[1; 897]).unwrap(),
+            claimant_address(4, &[1; 897]).unwrap()
+        );
+        assert_ne!(
+            claimant_address(3, &[1; 897]).unwrap(),
+            claimant_address(3, &[1; 896]).unwrap()
+        );
+        assert_eq!(
+            create_record(&a).unwrap().len() as u64,
+            record_bytes().unwrap()
+        );
         // A record of another network is refused before any proof work.
         #[cfg(feature = "confidential-tokens")]
         assert!(verify_membership(&[9; 32], &a, &[0; 32], &[]).is_err());

@@ -197,12 +197,7 @@ impl LowCoverageStreakTracker {
     ///
     /// Should normally be invoked once at startup before any
     /// frame-driven streak updates.
-    pub fn reconstruct(
-        &self,
-        provers: &[ProverInfo],
-        current_frame: u64,
-        halt_threshold: u64,
-    ) {
+    pub fn reconstruct(&self, provers: &[ProverInfo], current_frame: u64, halt_threshold: u64) {
         let mut effective_coverage: HashMap<Vec<u8>, u64> = HashMap::new();
         let mut last_frame: HashMap<Vec<u8>, u64> = HashMap::new();
 
@@ -318,8 +313,8 @@ pub fn compute_shard_halt_durations(
 // CoverageMonitor — async check loop
 // =====================================================================
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use quil_types::consensus::{
     ControlEvent, ControlEventData, ControlEventType, EventDistributor, ProverRegistry,
@@ -355,15 +350,9 @@ pub enum CoverageAction {
         prover_count: usize,
     },
     /// Shard has too few provers and should be merged with its sibling.
-    ShouldMerge {
-        filter: Vec<u8>,
-        sibling: Vec<u8>,
-    },
+    ShouldMerge { filter: Vec<u8>, sibling: Vec<u8> },
     /// Coverage is critically low — halt eviction on this shard.
-    Halt {
-        filter: Vec<u8>,
-        reason: String,
-    },
+    Halt { filter: Vec<u8>, reason: String },
 }
 
 /// Request sent over the mpsc channel to trigger a coverage check.
@@ -408,8 +397,7 @@ pub struct ShardCoverageEntry {
 /// shards with at least one allocation in `filter_cache` and
 /// therefore can't observe zero-prover shards (the gap that
 /// motivated this hook).
-pub type ShardInventoryProvider =
-    Arc<dyn Fn(u64) -> Vec<ShardCoverageEntry> + Send + Sync>;
+pub type ShardInventoryProvider = Arc<dyn Fn(u64) -> Vec<ShardCoverageEntry> + Send + Sync>;
 
 pub struct CoverageMonitor {
     prover_registry: Arc<dyn ProverRegistry>,
@@ -472,8 +460,7 @@ pub struct CoverageMonitor {
     /// a LATER effective epoch (E+3), which conflicts with the E+2 one on apply
     /// (overlapping grid children). Consulting committed pending state makes
     /// emission idempotent. Unset ⇒ no suppression (legacy / no shards store).
-    pending_change_provider:
-        std::sync::RwLock<Option<PendingChangeProvider>>,
+    pending_change_provider: std::sync::RwLock<Option<PendingChangeProvider>>,
 }
 
 /// See [`CoverageMonitor::split_feasibility`]: `(filter, factor) →` per-child
@@ -487,8 +474,7 @@ pub type SplitProposalProvider = Arc<dyn Fn(&[u8]) -> Option<Vec<Vec<u8>>> + Sen
 
 /// See [`CoverageMonitor::pending_change_provider`]: `() →` the set of shard
 /// parents (`ShardInfo`/filter bytes) that already have a staged pending change.
-pub type PendingChangeProvider =
-    Arc<dyn Fn() -> std::collections::HashSet<Vec<u8>> + Send + Sync>;
+pub type PendingChangeProvider = Arc<dyn Fn() -> std::collections::HashSet<Vec<u8>> + Send + Sync>;
 
 /// Frames to wait before re-proposing a split/merge for the same shard.
 const REBALANCE_COOLDOWN_FRAMES: u64 = 30;
@@ -510,7 +496,63 @@ pub fn build_shard_inventory(
     frame_number: u64,
     sizes: &std::sync::Arc<crate::shard_info::CommittedShardSizes>,
 ) -> Vec<ShardCoverageEntry> {
-    let get_sizes = crate::shard_info::local_app_shard_get_sizes(crdt, shards_store.clone(), sizes.clone());
+    let get_sizes =
+        crate::shard_info::local_app_shard_get_sizes(crdt, shards_store.clone(), sizes.clone());
+    shard_inventory(
+        shards_store.as_ref(),
+        prover_registry,
+        frame_number,
+        get_sizes,
+    )
+}
+
+/// The coverage monitor's inventory for this node. An archive's grid follows
+/// every split, and its latent shards report committed deliveries, so it
+/// sizes them with `sizes`. A regular node's grid stays the 64-way genesis
+/// grid: a row with no live shard beneath it covers only latent shards, and
+/// an output committed anywhere in it gave the row a nominal size with no
+/// provers, whose halt stopped every app shard of the node. A regular node
+/// sizes its rows by its own data only.
+pub fn shard_inventory_provider(
+    crdt: std::sync::Arc<quil_hypergraph::HypergraphCrdt>,
+    shards_store: std::sync::Arc<dyn quil_types::store::ShardsStore>,
+    prover_registry: Arc<dyn ProverRegistry>,
+    sizes: std::sync::Arc<crate::shard_info::CommittedShardSizes>,
+    archive_mode: bool,
+) -> ShardInventoryProvider {
+    Arc::new(move |frame_number: u64| {
+        if archive_mode {
+            build_shard_inventory(
+                crdt.clone(),
+                shards_store.clone(),
+                prover_registry.as_ref(),
+                frame_number,
+                &sizes,
+            )
+        } else {
+            let get_sizes = crate::shard_info::local_app_shard_measured_sizes(
+                crdt.clone(),
+                shards_store.clone(),
+            );
+            shard_inventory(
+                shards_store.as_ref(),
+                prover_registry.as_ref(),
+                frame_number,
+                get_sizes,
+            )
+        }
+    })
+}
+
+fn shard_inventory(
+    shards_store: &dyn quil_types::store::ShardsStore,
+    prover_registry: &dyn ProverRegistry,
+    frame_number: u64,
+    get_sizes: impl Fn(
+        &[u8],
+        &quil_types::store::ShardInfo,
+    ) -> quil_types::error::Result<Vec<crate::shard_info::ShardSizeEntry>>,
+) -> Vec<ShardCoverageEntry> {
     let mut out: Vec<ShardCoverageEntry> = Vec::new();
     let Ok(shards) = shards_store.range_app_shards() else {
         return out;
@@ -547,7 +589,12 @@ pub fn build_shard_inventory(
                 .get_provers_by_status(&filter, ProverStatus::Joining)
                 .map(|v| v.len() as u64)
                 .unwrap_or(0);
-            out.push(ShardCoverageEntry { filter, size: bytes, active_count: active, joining_count: joining });
+            out.push(ShardCoverageEntry {
+                filter,
+                size: bytes,
+                active_count: active,
+                joining_count: joining,
+            });
         }
     }
     let live: Vec<Vec<u8>> = prover_registry
@@ -693,13 +740,15 @@ impl CoverageMonitor {
         if frame_number <= last {
             return HashMap::new();
         }
-        self.last_checked_frame.store(frame_number, Ordering::Relaxed);
+        self.last_checked_frame
+            .store(frame_number, Ordering::Relaxed);
 
         // Get per-shard summaries from the prover registry.
         // Pass the current frame so expired Joining/Leaving allocs
         // are dropped from `status_counts` — without that, a shard
         // whose pending joiners all timed out still looks healthy.
-        let summaries = self.prover_registry
+        let summaries = self
+            .prover_registry
             .get_prover_shard_summaries(frame_number)
             .unwrap_or_default();
 
@@ -724,38 +773,36 @@ impl CoverageMonitor {
         // When the provider is installed, we use it for the
         // detection sweep. When absent, we fall back to summaries
         // only (legacy behavior).
-        let inventory: Vec<ShardCoverageEntry> = match self
-            .shard_inventory_provider
-            .read()
-            .unwrap()
-            .as_ref()
-        {
-            Some(provider) => provider(frame_number),
-            None => summaries
-                .iter()
-                .map(|s| ShardCoverageEntry {
-                    filter: s.filter.clone(),
-                    // Size unknown from registry — pass `u64::MAX`
-                    // so the size==0 skip below doesn't false-skip.
-                    // This is the legacy behavior: every summary
-                    // entry is evaluated for halt regardless of
-                    // actual data size.
-                    size: u64::MAX,
-                    active_count: s.status_counts
-                        .get(&ProverStatus::Active)
-                        .copied()
-                        .unwrap_or(0) as u64,
-                    joining_count: s.status_counts
-                        .get(&ProverStatus::Joining)
-                        .copied()
-                        .unwrap_or(0) as u64,
-                })
-                .collect(),
-        };
+        let inventory: Vec<ShardCoverageEntry> =
+            match self.shard_inventory_provider.read().unwrap().as_ref() {
+                Some(provider) => provider(frame_number),
+                None => summaries
+                    .iter()
+                    .map(|s| ShardCoverageEntry {
+                        filter: s.filter.clone(),
+                        // Size unknown from registry — pass `u64::MAX`
+                        // so the size==0 skip below doesn't false-skip.
+                        // This is the legacy behavior: every summary
+                        // entry is evaluated for halt regardless of
+                        // actual data size.
+                        size: u64::MAX,
+                        active_count: s
+                            .status_counts
+                            .get(&ProverStatus::Active)
+                            .copied()
+                            .unwrap_or(0) as u64,
+                        joining_count: s
+                            .status_counts
+                            .get(&ProverStatus::Joining)
+                            .copied()
+                            .unwrap_or(0) as u64,
+                    })
+                    .collect(),
+            };
 
         let mut any_halted = false;
-        let mut currently_halted: std::collections::HashSet<Vec<u8>> =
-            std::collections::HashSet::new();
+        // Halted filter -> (active, size, streak), for the transition log.
+        let mut currently_halted: HashMap<Vec<u8>, (u64, u64, u64)> = HashMap::new();
 
         for entry in &inventory {
             // Zero-size shards have no data to protect — no halt
@@ -782,23 +829,15 @@ impl CoverageMonitor {
                 // Mainnet extended-enrollment window: before frame
                 // 262_700 (FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 360),
                 // grant an additional 720 grace frames before halting.
-                let effective_grace = if frame_number
-                    < EXTENDED_ENROLL_HALT_GRACE_END
-                {
+                let effective_grace = if frame_number < EXTENDED_ENROLL_HALT_GRACE_END {
                     self.thresholds.halt_grace_frames + 720
                 } else {
                     self.thresholds.halt_grace_frames
                 };
                 if streak.count >= effective_grace {
                     any_halted = true;
-                    currently_halted.insert(entry.filter.clone());
-                    tracing::debug!(
-                        filter = hex::encode(&entry.filter),
-                        active,
-                        size = entry.size,
-                        streak = streak.count,
-                        "COVERAGE HALT — shard below threshold"
-                    );
+                    currently_halted
+                        .insert(entry.filter.clone(), (active, entry.size, streak.count));
                 }
             } else {
                 // Recovered — clear streak
@@ -821,8 +860,19 @@ impl CoverageMonitor {
         {
             let mut emitted = self.emitted_halted.lock().unwrap();
             // Newly-halted filters.
-            for filter in &currently_halted {
+            for (filter, (active, size, streak)) in &currently_halted {
                 if !emitted.contains(filter) {
+                    tracing::warn!(
+                        filter = hex::encode(filter),
+                        active,
+                        halt_threshold = self.thresholds.halt_threshold,
+                        size,
+                        streak,
+                        frame = frame_number,
+                        "coverage halt: in this node's coverage view the shard holds data \
+                         with too few active provers for the whole grace window; this node's \
+                         app shards stop producing until it recovers"
+                    );
                     self.event_distributor.publish(ControlEvent {
                         event_type: ControlEventType::CoverageHalt,
                         data: ControlEventData::Coverage {
@@ -837,10 +887,15 @@ impl CoverageMonitor {
             // Filters that were halted but no longer are.
             let cleared: Vec<Vec<u8>> = emitted
                 .iter()
-                .filter(|f| !currently_halted.contains(*f))
+                .filter(|f| !currently_halted.contains_key(*f))
                 .cloned()
                 .collect();
             for filter in cleared {
+                tracing::info!(
+                    filter = hex::encode(&filter),
+                    frame = frame_number,
+                    "coverage halt cleared; this node's app shards resume"
+                );
                 self.event_distributor.publish(ControlEvent {
                     event_type: ControlEventType::CoverageResume,
                     data: ControlEventData::Coverage {
@@ -872,7 +927,8 @@ impl CoverageMonitor {
     /// frame or `last_checked_frame` if you want point-in-time
     /// consistency with the last `check()` call.
     pub fn current_halt_durations(&self, frame_number: u64) -> HashMap<Vec<u8>, u64> {
-        let summaries = self.prover_registry
+        let summaries = self
+            .prover_registry
             .get_prover_shard_summaries(frame_number)
             .unwrap_or_default();
         compute_shard_halt_durations(&self.streaks, &summaries, &self.thresholds)
@@ -896,20 +952,25 @@ impl CoverageMonitor {
                 message: message.to_string(),
             },
         });
-        tracing::error!(message, "GLOBAL ALERT — hard halt activated, all frame production stopped");
+        tracing::error!(
+            message,
+            "GLOBAL ALERT — hard halt activated, all frame production stopped"
+        );
     }
 
     /// Check for shards that need splitting (too many provers) or
     /// merging (too few provers). Returns proposed actions.
     pub fn check_split_merge(&self, frame_number: u64) -> Vec<ShardAction> {
-        let summaries = self.prover_registry
+        let summaries = self
+            .prover_registry
             .get_prover_shard_summaries(frame_number)
             .unwrap_or_default();
 
         let mut actions = Vec::new();
 
         for summary in &summaries {
-            let active = summary.status_counts
+            let active = summary
+                .status_counts
                 .get(&ProverStatus::Active)
                 .copied()
                 .unwrap_or(0) as u64;
@@ -992,7 +1053,10 @@ impl CoverageMonitor {
             // counted them as a split and never split again.
             if crate::provers::lifecycle::is_split_parent(
                 filter,
-                summaries.iter().filter(|s| crate::provers::lifecycle::has_live_allocation(s)).map(|s| &s.filter),
+                summaries
+                    .iter()
+                    .filter(|s| crate::provers::lifecycle::has_live_allocation(s))
+                    .map(|s| &s.filter),
             ) {
                 continue;
             }
@@ -1200,11 +1264,7 @@ impl CoverageMonitor {
         }
     }
 
-    pub fn propose_merge_rebalance(
-        &self,
-        frame_number: u64,
-        inventory: &[ShardCoverageEntry],
-    ) {
+    pub fn propose_merge_rebalance(&self, frame_number: u64, inventory: &[ShardCoverageEntry]) {
         use std::collections::{HashMap, HashSet};
         let by_filter: HashMap<&[u8], &ShardCoverageEntry> =
             inventory.iter().map(|e| (e.filter.as_slice(), e)).collect();
@@ -1234,8 +1294,7 @@ impl CoverageMonitor {
             if pending_parents.contains(parent.as_slice()) {
                 continue;
             }
-            let (Some(e0), Some(e1)) =
-                (by_filter.get(c0.as_slice()), by_filter.get(c1.as_slice()))
+            let (Some(e0), Some(e1)) = (by_filter.get(c0.as_slice()), by_filter.get(c1.as_slice()))
             else {
                 continue;
             };
@@ -1305,15 +1364,8 @@ impl CoverageMonitor {
     /// prover count via the registry, updates the streak tracker, and
     /// returns a [`CoverageAction`] describing what (if anything) should
     /// happen.
-    pub fn check_shard_coverage(
-        &self,
-        filter: &[u8],
-        frame_number: u64,
-    ) -> CoverageAction {
-        let active = self
-            .prover_registry
-            .get_prover_count(filter)
-            .unwrap_or(0);
+    pub fn check_shard_coverage(&self, filter: &[u8], frame_number: u64) -> CoverageAction {
+        let active = self.prover_registry.get_prover_count(filter).unwrap_or(0);
 
         // --- Halt: critically low coverage ---
         // Network-aware: mainnet=3, testnet=0 or 1 depending on
@@ -1482,10 +1534,7 @@ impl CoverageMonitor {
                         },
                     });
                 }
-                CoverageAction::ShouldMerge {
-                    filter: f,
-                    sibling,
-                } => {
+                CoverageAction::ShouldMerge { filter: f, sibling } => {
                     tracing::info!(
                         filter = hex::encode(f),
                         sibling = hex::encode(sibling),
@@ -1596,8 +1645,16 @@ mod tests {
             summary_with_active_size(b"real-data", 2, 5_000), // below threshold, HAS data
         ];
         let out = compute_shard_halt_durations(&t, &summaries, &thresholds);
-        assert_eq!(out.get(&b"stale-offgrid".to_vec()), None, "zero-size shard must not halt");
-        assert_eq!(out.get(&b"real-data".to_vec()), Some(&u64::MAX), "real shard still halts");
+        assert_eq!(
+            out.get(&b"stale-offgrid".to_vec()),
+            None,
+            "zero-size shard must not halt"
+        );
+        assert_eq!(
+            out.get(&b"real-data".to_vec()),
+            Some(&u64::MAX),
+            "real shard still halts"
+        );
     }
 
     fn alloc(
@@ -1703,8 +1760,7 @@ mod tests {
     fn halt_grace_covers_full_leave_confirm_join_confirm_cycle() {
         // Imported via path so this test stays a tripwire if
         // CONFIRM_WINDOW moves in the lifecycle crate.
-        const CONFIRM_WINDOW: u64 =
-            crate::provers::lifecycle::DEFAULT_CONFIRM_WINDOW_FRAMES;
+        const CONFIRM_WINDOW: u64 = crate::provers::lifecycle::DEFAULT_CONFIRM_WINDOW_FRAMES;
         const MIGRATION_CYCLE_FRAMES: u64 = 2 * CONFIRM_WINDOW;
         // Headroom budget: a full second migration cycle (the retry)
         // plus one confirm window of slack for cadence/cooldown/sync
@@ -1746,7 +1802,10 @@ mod tests {
                 "streak {} reached halt grace {} at frame {} (offset {}) — \
                  coverage halt would fire mid-migration, before the join \
                  cycle could complete",
-                streak.count, DEFAULT_HALT_GRACE_FRAMES, frame, offset,
+                streak.count,
+                DEFAULT_HALT_GRACE_FRAMES,
+                frame,
+                offset,
             );
         }
 
@@ -1764,15 +1823,15 @@ mod tests {
             "only {} frames of headroom after one migration cycle — too \
              tight to absorb a full retry ({} frames) + slack ({} frames) \
              if the first attempt's bundle gets dropped",
-            headroom, RETRY_CYCLE_FRAMES, SLACK_HEADROOM,
+            headroom,
+            RETRY_CYCLE_FRAMES,
+            SLACK_HEADROOM,
         );
 
         // Continue simulating through the retry cycle. The streak
         // must still stay below the halt grace all the way through
         // the second attempt.
-        for offset in MIGRATION_CYCLE_FRAMES
-            ..(MIGRATION_CYCLE_FRAMES + RETRY_CYCLE_FRAMES)
-        {
+        for offset in MIGRATION_CYCLE_FRAMES..(MIGRATION_CYCLE_FRAMES + RETRY_CYCLE_FRAMES) {
             let frame = migration_start + offset;
             let streak = tracker.bump(&shard_x, frame);
             assert!(
@@ -1780,7 +1839,10 @@ mod tests {
                 "streak {} reached halt grace {} during retry at frame {} \
                  (offset {}) — coverage halt would fire before the retry \
                  could complete",
-                streak.count, DEFAULT_HALT_GRACE_FRAMES, frame, offset,
+                streak.count,
+                DEFAULT_HALT_GRACE_FRAMES,
+                frame,
+                offset,
             );
         }
 
@@ -1802,9 +1864,7 @@ mod tests {
         fn get_prover_info(
             &self,
             _: &[u8],
-        ) -> quil_types::error::Result<
-            Option<quil_types::consensus::ProverInfo>,
-        > {
+        ) -> quil_types::error::Result<Option<quil_types::consensus::ProverInfo>> {
             Ok(None)
         }
         fn get_next_prover(
@@ -1858,9 +1918,7 @@ mod tests {
     /// a Receiver from a fresh channel (sender dropped immediately,
     /// so recv yields None) — coverage monitor only uses `publish`
     /// in `check`.
-    struct CapturingDistributor(
-        std::sync::Mutex<Vec<quil_types::consensus::ControlEvent>>,
-    );
+    struct CapturingDistributor(std::sync::Mutex<Vec<quil_types::consensus::ControlEvent>>);
     impl quil_types::consensus::EventDistributor for CapturingDistributor {
         fn subscribe(
             &self,
@@ -1878,12 +1936,9 @@ mod tests {
     fn build_monitor_with_inventory(
         provider: ShardInventoryProvider,
     ) -> (CoverageMonitor, Arc<CapturingDistributor>) {
-        let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
-            Arc::new(EmptyRegistry);
-        let dist =
-            Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
-        let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> =
-            dist.clone();
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> = Arc::new(EmptyRegistry);
+        let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
+        let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
         let monitor = CoverageMonitor::new(
             registry,
             dist_arc,
@@ -1901,14 +1956,55 @@ mod tests {
         active: u32,
     }
     impl quil_types::consensus::ProverRegistry for HotShardRegistry {
-        fn get_prover_info(&self, _: &[u8]) -> quil_types::error::Result<Option<quil_types::consensus::ProverInfo>> { Ok(None) }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> quil_types::error::Result<Vec<u8>> { Ok(Vec::new()) }
-        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> quil_types::error::Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
-        fn get_active_provers(&self, _: &[u8], _: u64) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
-        fn get_prover_count(&self, _: &[u8]) -> quil_types::error::Result<usize> { Ok(0) }
-        fn get_provers(&self, _: &[u8]) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
-        fn get_provers_by_status(&self, _: &[u8], _: quil_types::consensus::ProverStatus) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
-        fn get_prover_shard_summaries(&self, _: u64) -> quil_types::error::Result<Vec<quil_types::consensus::ProverShardSummary>> {
+        fn get_prover_info(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<Option<quil_types::consensus::ProverInfo>> {
+            Ok(None)
+        }
+        fn get_next_prover(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn get_ordered_provers(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<Vec<Vec<u8>>> {
+            Ok(Vec::new())
+        }
+        fn get_active_provers(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_prover_count(&self, _: &[u8]) -> quil_types::error::Result<usize> {
+            Ok(0)
+        }
+        fn get_provers(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_provers_by_status(
+            &self,
+            _: &[u8],
+            _: quil_types::consensus::ProverStatus,
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_prover_shard_summaries(
+            &self,
+            _: u64,
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverShardSummary>> {
             let mut status_counts = std::collections::HashMap::new();
             status_counts.insert(quil_types::consensus::ProverStatus::Active, self.active);
             Ok(vec![quil_types::consensus::ProverShardSummary {
@@ -1924,8 +2020,10 @@ mod tests {
         // 33-byte depth-1 QUIL-style filter, 40 active provers (> mainnet max 32).
         let mut filter = vec![0x11u8; 32];
         filter.push(0x05);
-        let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
-            Arc::new(HotShardRegistry { filter: filter.clone(), active: 40 });
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> = Arc::new(HotShardRegistry {
+            filter: filter.clone(),
+            active: 40,
+        });
         let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
         let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
         let monitor = CoverageMonitor::new(
@@ -1945,7 +2043,10 @@ mod tests {
                 quil_types::consensus::ControlEventType::ShardSplitEligible
             ));
             match &events[0].data {
-                quil_types::consensus::ControlEventData::ShardSplit { filter: f, proposed } => {
+                quil_types::consensus::ControlEventData::ShardSplit {
+                    filter: f,
+                    proposed,
+                } => {
                     assert_eq!(f, &filter);
                     assert!(proposed.len() >= 2, "must propose >= 2 children");
                     for child in proposed {
@@ -1959,29 +2060,86 @@ mod tests {
 
         // Within cooldown: suppressed.
         monitor.propose_split_rebalance(1005);
-        assert_eq!(dist.0.lock().unwrap().len(), 1, "cooldown must suppress re-emit");
+        assert_eq!(
+            dist.0.lock().unwrap().len(),
+            1,
+            "cooldown must suppress re-emit"
+        );
 
         // After cooldown: emits again.
         monitor.propose_split_rebalance(1000 + REBALANCE_COOLDOWN_FRAMES + 1);
-        assert_eq!(dist.0.lock().unwrap().len(), 2, "should re-emit after cooldown");
+        assert_eq!(
+            dist.0.lock().unwrap().len(),
+            2,
+            "should re-emit after cooldown"
+        );
     }
 
     /// Several shards, each with a fixed count of allocations in one status.
     struct ShardsRegistry(Vec<(Vec<u8>, quil_types::consensus::ProverStatus, u32)>);
     impl quil_types::consensus::ProverRegistry for ShardsRegistry {
-        fn get_prover_info(&self, _: &[u8]) -> quil_types::error::Result<Option<quil_types::consensus::ProverInfo>> { Ok(None) }
-        fn get_next_prover(&self, _: &[u8; 32], _: &[u8], _: u64) -> quil_types::error::Result<Vec<u8>> { Ok(Vec::new()) }
-        fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _: u64) -> quil_types::error::Result<Vec<Vec<u8>>> { Ok(Vec::new()) }
-        fn get_active_provers(&self, _: &[u8], _: u64) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
-        fn get_prover_count(&self, _: &[u8]) -> quil_types::error::Result<usize> { Ok(0) }
-        fn get_provers(&self, _: &[u8]) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
-        fn get_provers_by_status(&self, _: &[u8], _: quil_types::consensus::ProverStatus) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> { Ok(Vec::new()) }
-        fn get_prover_shard_summaries(&self, _: u64) -> quil_types::error::Result<Vec<quil_types::consensus::ProverShardSummary>> {
-            Ok(self.0.iter().map(|(filter, status, count)| {
-                let mut status_counts = std::collections::HashMap::new();
-                status_counts.insert(*status, *count);
-                quil_types::consensus::ProverShardSummary { filter: filter.clone(), status_counts, total_size: 0 }
-            }).collect())
+        fn get_prover_info(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<Option<quil_types::consensus::ProverInfo>> {
+            Ok(None)
+        }
+        fn get_next_prover(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn get_ordered_provers(
+            &self,
+            _: &[u8; 32],
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<Vec<Vec<u8>>> {
+            Ok(Vec::new())
+        }
+        fn get_active_provers(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_prover_count(&self, _: &[u8]) -> quil_types::error::Result<usize> {
+            Ok(0)
+        }
+        fn get_provers(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_provers_by_status(
+            &self,
+            _: &[u8],
+            _: quil_types::consensus::ProverStatus,
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverInfo>> {
+            Ok(Vec::new())
+        }
+        fn get_prover_shard_summaries(
+            &self,
+            _: u64,
+        ) -> quil_types::error::Result<Vec<quil_types::consensus::ProverShardSummary>> {
+            Ok(self
+                .0
+                .iter()
+                .map(|(filter, status, count)| {
+                    let mut status_counts = std::collections::HashMap::new();
+                    status_counts.insert(*status, *count);
+                    quil_types::consensus::ProverShardSummary {
+                        filter: filter.clone(),
+                        status_counts,
+                        total_size: 0,
+                    }
+                })
+                .collect())
         }
     }
 
@@ -2005,19 +2163,36 @@ mod tests {
             );
             monitor.propose_split_rebalance(1000);
             let events = dist.0.lock().unwrap();
-            events.iter().filter_map(|e| match &e.data {
-                quil_types::consensus::ControlEventData::ShardSplit { filter, .. } => Some(filter.clone()),
-                _ => None,
-            }).collect::<Vec<_>>()
+            events
+                .iter()
+                .filter_map(|e| match &e.data {
+                    quil_types::consensus::ControlEventData::ShardSplit { filter, .. } => {
+                        Some(filter.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
         };
-        assert_eq!(proposals(vec![(parent.clone(), Active, 40)]), vec![parent.clone()],
-            "a crowded unsplit shard is proposed");
-        assert!(proposals(vec![(parent.clone(), Active, 40), (child.clone(), Active, 4)]).is_empty(),
-            "a crowded parent with a registered child is not proposed again");
+        assert_eq!(
+            proposals(vec![(parent.clone(), Active, 40)]),
+            vec![parent.clone()],
+            "a crowded unsplit shard is proposed"
+        );
+        assert!(
+            proposals(vec![
+                (parent.clone(), Active, 40),
+                (child.clone(), Active, 4)
+            ])
+            .is_empty(),
+            "a crowded parent with a registered child is not proposed again"
+        );
         // After a legacy merge, the merged parent held 8 members over a
         // split threshold of 7, and no split was ever proposed.
-        assert_eq!(proposals(vec![(parent.clone(), Active, 40), (child, Historic, 4)]), vec![parent],
-            "a merged parent whose retired child holds only Historic slots splits again");
+        assert_eq!(
+            proposals(vec![(parent.clone(), Active, 40), (child, Historic, 4)]),
+            vec![parent],
+            "a merged parent whose retired child holds only Historic slots splits again"
+        );
     }
 
     #[test]
@@ -2025,8 +2200,10 @@ mod tests {
         // Over-crowded shard (40 > 32) — normally a proposal.
         let mut filter = vec![0x11u8; 32];
         filter.push(0x05);
-        let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
-            Arc::new(HotShardRegistry { filter: filter.clone(), active: 40 });
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> = Arc::new(HotShardRegistry {
+            filter: filter.clone(),
+            active: 40,
+        });
         let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
         let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
         let monitor = CoverageMonitor::new(
@@ -2068,8 +2245,10 @@ mod tests {
     fn empty_split_guard_suppresses_one_sided_split() {
         let mut filter = vec![0x11u8; 32];
         filter.push(0x05);
-        let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
-            Arc::new(HotShardRegistry { filter: filter.clone(), active: 40 });
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> = Arc::new(HotShardRegistry {
+            filter: filter.clone(),
+            active: 40,
+        });
         let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
         let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
         let monitor = CoverageMonitor::new(
@@ -2119,7 +2298,10 @@ mod tests {
         // (active provers, per-child leaf counts) → number of split events.
         let round = |active: u32, counts: Vec<u64>| -> usize {
             let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
-                Arc::new(HotShardRegistry { filter: filter.clone(), active });
+                Arc::new(HotShardRegistry {
+                    filter: filter.clone(),
+                    active,
+                });
             let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
             let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
             let monitor = CoverageMonitor::new(
@@ -2139,12 +2321,24 @@ mod tests {
         };
 
         // (1) NOT over-crowded (20 ≤ 32), even though divisible → NO split.
-        assert_eq!(round(20, vec![5, 5]), 0, "not over-crowded → no split even if divisible");
+        assert_eq!(
+            round(20, vec![5, 5]),
+            0,
+            "not over-crowded → no split even if divisible"
+        );
         // (2) Over-crowded (40 > 32) but INDIVISIBLE (all data on one side) → NO
         // split (the divisibility precondition fails; the guard defers).
-        assert_eq!(round(40, vec![10, 0]), 0, "over-crowded but indivisible → deferred");
+        assert_eq!(
+            round(40, vec![10, 0]),
+            0,
+            "over-crowded but indivisible → deferred"
+        );
         // BOTH: over-crowded AND divisible → split.
-        assert_eq!(round(40, vec![5, 5]), 1, "over-crowded AND divisible → split");
+        assert_eq!(
+            round(40, vec![5, 5]),
+            1,
+            "over-crowded AND divisible → split"
+        );
     }
 
     /// Deep-bifurcation: when a `split_proposer` is wired
@@ -2156,8 +2350,10 @@ mod tests {
         use quil_types::consensus::ControlEventData;
         let mut filter = vec![0x11u8; 32];
         filter.push(0x05);
-        let registry: Arc<dyn quil_types::consensus::ProverRegistry> =
-            Arc::new(HotShardRegistry { filter: filter.clone(), active: 40 });
+        let registry: Arc<dyn quil_types::consensus::ProverRegistry> = Arc::new(HotShardRegistry {
+            filter: filter.clone(),
+            active: 40,
+        });
         let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
         let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
         // Prover-count trigger (active 40 > mainnet max 32); no data trigger.
@@ -2173,7 +2369,9 @@ mod tests {
         let c0 = vec![0xAAu8; 40];
         let c1 = vec![0xBBu8; 41];
         let (p0, p1) = (c0.clone(), c1.clone());
-        monitor.set_split_proposer(Arc::new(move |_f: &[u8]| Some(vec![p0.clone(), p1.clone()])));
+        monitor.set_split_proposer(Arc::new(move |_f: &[u8]| {
+            Some(vec![p0.clone(), p1.clone()])
+        }));
         monitor.propose_split_rebalance(1000);
         {
             let events = dist.0.lock().unwrap();
@@ -2195,7 +2393,10 @@ mod tests {
         let mut filter2 = vec![0x22u8; 32];
         filter2.push(0x07);
         let registry2: Arc<dyn quil_types::consensus::ProverRegistry> =
-            Arc::new(HotShardRegistry { filter: filter2.clone(), active: 40 });
+            Arc::new(HotShardRegistry {
+                filter: filter2.clone(),
+                active: 40,
+            });
         let dist2 = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
         let dist2_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist2.clone();
         let monitor2 = CoverageMonitor::new(
@@ -2225,7 +2426,9 @@ mod tests {
             vec![ShardCoverageEntry {
                 filter: target_for_provider.clone(),
                 size: 1024, // 1 KB of data on this shard
-                active_count: 0, joining_count: 0 }]
+                active_count: 0,
+                joining_count: 0,
+            }]
         });
         let (monitor, dist) = build_monitor_with_inventory(provider);
 
@@ -2246,7 +2449,10 @@ mod tests {
                 ) if filter == &target_filter
             )
         });
-        assert!(target_halt, "no CoverageHalt fired for the zero-prover non-zero-size shard");
+        assert!(
+            target_halt,
+            "no CoverageHalt fired for the zero-prover non-zero-size shard"
+        );
     }
 
     /// Symmetric to the above: a zero-size shard MUST NOT trigger a
@@ -2262,13 +2468,27 @@ mod tests {
         let root = app.to_vec();
         let child = quil_forest::encode_shard_bit_path(&app, &[false]);
         let entry = |filter: &Vec<u8>, size: u64, active: u64| ShardCoverageEntry {
-            filter: filter.clone(), size, active_count: active, joining_count: 0,
+            filter: filter.clone(),
+            size,
+            active_count: active,
+            joining_count: 0,
         };
         let inventory = || vec![entry(&root, 4096, 0), entry(&child, 64, 2)];
         let kept = super::drop_split_away(inventory(), &[child.clone()]);
-        assert_eq!(kept.iter().map(|e| e.filter.clone()).collect::<Vec<_>>(), vec![child.clone()]);
-        assert_eq!(super::drop_split_away(inventory(), &[]).len(), 2, "without a live descendant the root stays");
-        assert_eq!(super::drop_split_away(inventory(), &[root.clone()]).len(), 2, "a merged parent is a shard again");
+        assert_eq!(
+            kept.iter().map(|e| e.filter.clone()).collect::<Vec<_>>(),
+            vec![child.clone()]
+        );
+        assert_eq!(
+            super::drop_split_away(inventory(), &[]).len(),
+            2,
+            "without a live descendant the root stays"
+        );
+        assert_eq!(
+            super::drop_split_away(inventory(), &[root.clone()]).len(),
+            2,
+            "a merged parent is a shard again"
+        );
     }
 
     #[test]
@@ -2279,7 +2499,9 @@ mod tests {
             vec![ShardCoverageEntry {
                 filter: target_for_provider.clone(),
                 size: 0, // no data — must skip
-                active_count: 0, joining_count: 0 }]
+                active_count: 0,
+                joining_count: 0,
+            }]
         });
         let (monitor, dist) = build_monitor_with_inventory(provider);
 
@@ -2315,7 +2537,12 @@ mod tests {
     }
 
     fn entry(filter: Vec<u8>, size: u64, active: u64) -> ShardCoverageEntry {
-        ShardCoverageEntry { filter, size, active_count: active, joining_count: 0 }
+        ShardCoverageEntry {
+            filter,
+            size,
+            active_count: active,
+            joining_count: 0,
+        }
     }
 
     fn child(parent: &[u8], suffix: u8) -> Vec<u8> {
@@ -2353,12 +2580,19 @@ mod tests {
         inv[0].joining_count = 6;
         let (monitor, dist) = build_merge_monitor();
         monitor.propose_merge_rebalance(100, &inv);
-        assert!(merge_events(&dist).is_empty(), "six provers joining are not starvation");
+        assert!(
+            merge_events(&dist).is_empty(),
+            "six provers joining are not starvation"
+        );
 
         inv[0].joining_count = 1;
         let (monitor, dist) = build_merge_monitor();
         monitor.propose_merge_rebalance(100, &inv);
-        assert_eq!(merge_events(&dist).len(), 1, "one joining prover leaves the pair starved");
+        assert_eq!(
+            merge_events(&dist).len(),
+            1,
+            "one joining prover leaves the pair starved"
+        );
     }
 
     #[test]
@@ -2420,7 +2654,11 @@ mod tests {
         let events = merge_events(&dist);
         assert_eq!(events.len(), 1, "deep bit-path merge fires");
         let (filters, parent) = &events[0];
-        assert_eq!(parent, &encode_shard_bit_path(&app, &[false, false, false]), "parent = branch (drop last bit)");
+        assert_eq!(
+            parent,
+            &encode_shard_bit_path(&app, &[false, false, false]),
+            "parent = branch (drop last bit)"
+        );
         assert_eq!(filters, &vec![c0, c1]);
 
         // Two EMPTY siblings (size 0) are latent spine placeholders → NOT merged.
@@ -2429,7 +2667,11 @@ mod tests {
         let e0 = encode_shard_bit_path(&app, &[false, false, false, false]);
         let e1 = encode_shard_bit_path(&app, &[false, false, false, true]);
         monitor_e.propose_merge_rebalance(100, &[entry(e0, 0, 0), entry(e1, 0, 0)]);
-        assert_eq!(merge_events(&dist_e).len(), 0, "two empty siblings are not merged");
+        assert_eq!(
+            merge_events(&dist_e).len(),
+            0,
+            "two empty siblings are not merged"
+        );
 
         // Merge-to-root: [0]/[1] → parent = the BARE app address (root shard).
         let (monitor2, dist2) = build_merge_monitor();
@@ -2462,7 +2704,10 @@ mod tests {
         ];
         let (monitor, dist) = build_merge_monitor();
         monitor.propose_merge_rebalance(100, &inv);
-        assert!(merge_events(&dist).is_empty(), "16GiB gate must block the merge");
+        assert!(
+            merge_events(&dist).is_empty(),
+            "16GiB gate must block the merge"
+        );
     }
 
     #[test]
@@ -2475,7 +2720,11 @@ mod tests {
         ];
         let (monitor, dist) = build_merge_monitor();
         monitor.propose_merge_rebalance(100, &inv);
-        assert_eq!(merge_events(&dist).len(), 1, "exactly-16GiB merge is allowed");
+        assert_eq!(
+            merge_events(&dist).len(),
+            1,
+            "exactly-16GiB merge is allowed"
+        );
     }
 
     #[test]
@@ -2488,7 +2737,10 @@ mod tests {
         ];
         let (monitor, dist) = build_merge_monitor();
         monitor.propose_merge_rebalance(100, &inv);
-        assert!(merge_events(&dist).is_empty(), "a healthy half must block the merge");
+        assert!(
+            merge_events(&dist).is_empty(),
+            "a healthy half must block the merge"
+        );
     }
 
     #[test]
@@ -2503,7 +2755,10 @@ mod tests {
         ];
         let (monitor, dist) = build_merge_monitor();
         monitor.propose_merge_rebalance(100, &inv);
-        assert!(merge_events(&dist).is_empty(), "factor-4 group must not partial-merge");
+        assert!(
+            merge_events(&dist).is_empty(),
+            "factor-4 group must not partial-merge"
+        );
     }
 
     #[test]
@@ -2516,9 +2771,17 @@ mod tests {
         let (monitor, dist) = build_merge_monitor();
         monitor.propose_merge_rebalance(100, &inv);
         monitor.propose_merge_rebalance(100 + 5, &inv); // within cooldown window
-        assert_eq!(merge_events(&dist).len(), 1, "cooldown blocks the second proposal");
+        assert_eq!(
+            merge_events(&dist).len(),
+            1,
+            "cooldown blocks the second proposal"
+        );
         monitor.propose_merge_rebalance(100 + REBALANCE_COOLDOWN_FRAMES, &inv);
-        assert_eq!(merge_events(&dist).len(), 2, "proposal allowed after cooldown");
+        assert_eq!(
+            merge_events(&dist).len(),
+            2,
+            "proposal allowed after cooldown"
+        );
     }
 
     #[test]
@@ -2612,9 +2875,7 @@ mod tests {
         // last_active is far in the past (staleness > 1) → seeded.
         let t = LowCoverageStreakTracker::new();
         let provers: Vec<ProverInfo> = (0..4)
-            .map(|i| {
-                prover_with(vec![alloc(b"shard-r", ProverStatus::Active, 50 + i as u64)])
-            })
+            .map(|i| prover_with(vec![alloc(b"shard-r", ProverStatus::Active, 50 + i as u64)]))
             .collect();
         t.reconstruct(&provers, 200, 3);
         let s = t.get(b"shard-r").expect("streak present");
@@ -2695,7 +2956,7 @@ mod tests {
         let t = LowCoverageStreakTracker::new();
         let thresholds = CoverageThresholds::mainnet(); // halt_threshold=3
         let summaries = vec![
-            summary_with_active(b"shard-a", 2), // below threshold
+            summary_with_active(b"shard-a", 2),  // below threshold
             summary_with_active(b"shard-b", 10), // above threshold
         ];
         let out = compute_shard_halt_durations(&t, &summaries, &thresholds);
@@ -2749,5 +3010,162 @@ mod tests {
         let thresholds = CoverageThresholds::mainnet();
         let out = compute_shard_halt_durations(&t, &[], &thresholds);
         assert_eq!(out.get(&b"shard-ghost".to_vec()), Some(&1));
+    }
+
+    // =================================================================
+    // A regular node's frozen genesis grid
+    // =================================================================
+
+    /// The mainnet 64-row genesis grid of one application, as a regular node
+    /// keeps it, with one output committed by GLOBAL into a block of row
+    /// `111111`, beneath which no shard is live. The registry's only live
+    /// shard is a 7-bit child of row `000000`.
+    struct GenesisGrid {
+        _dbs: [quil_store::RocksDb; 2],
+        crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+        shards: Arc<dyn quil_types::store::ShardsStore>,
+        registry: Arc<dyn ProverRegistry>,
+        row_with_delivery: Vec<u8>,
+    }
+
+    fn genesis_grid() -> GenesisGrid {
+        use quil_execution::hypergraph_state::HypergraphState;
+        use quil_execution::token_intrinsic::global_commit::{commit_entry, Outcome, SpendEntry};
+        use quil_types::store::{KvDb, ShardsStore};
+
+        let app = [7u8; 32];
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        let mut output = [9u8; 32];
+        output[0] = 0b1111_1100;
+        let entry = SpendEntry {
+            kind: 0x0512,
+            tx_id: [1; 32],
+            source_frame: 40,
+            context: [8; 32],
+            root_digest: None,
+            consumptions: vec![[2; 32]],
+            outputs: vec![output],
+            escrow_create: None,
+            escrow_claim: None,
+            fee: 5,
+            settlement: None,
+        };
+        let state = HypergraphState::new(crdt.clone());
+        let outcome = commit_entry(
+            &state,
+            5,
+            &app,
+            &entry,
+            quil_types::execution::ShardPath::WHOLE,
+        )
+        .unwrap();
+        assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
+        state.commit().unwrap();
+
+        let grid_db = quil_store::RocksDb::open_in_memory().unwrap();
+        let shards: Arc<dyn ShardsStore> =
+            Arc::new(quil_store::RocksShardsStore::new(grid_db.inner()));
+        let mut shard_key =
+            quil_hypergraph::addressing::get_bloom_filter_indices(&app, 256, 3).to_vec();
+        shard_key.extend_from_slice(&app);
+        let txn = grid_db.new_batch(false).unwrap();
+        for prefix in quil_forest::genesis_grid_prefixes(0) {
+            shards
+                .put_app_shard(
+                    txn.as_ref(),
+                    &quil_types::store::ShardInfo {
+                        shard_key: shard_key.clone(),
+                        prefix,
+                        size: vec![],
+                        data_shards: 0,
+                        commitment: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        GenesisGrid {
+            _dbs: [db, grid_db],
+            crdt,
+            shards,
+            registry: Arc::new(HotShardRegistry {
+                filter: quil_forest::encode_shard_bit_path(&app, &[false; 7]),
+                active: 4,
+            }),
+            row_with_delivery: quil_forest::encode_shard_bit_path(&app, &[true; 6]),
+        }
+    }
+
+    /// The filters a monitor fed by `provider` halts over a full grace window.
+    fn coverage_halts(grid: &GenesisGrid, provider: ShardInventoryProvider) -> Vec<Vec<u8>> {
+        let dist = Arc::new(CapturingDistributor(std::sync::Mutex::new(Vec::new())));
+        let dist_arc: Arc<dyn quil_types::consensus::EventDistributor> = dist.clone();
+        let monitor = CoverageMonitor::new(
+            grid.registry.clone(),
+            dist_arc,
+            CoverageThresholds::mainnet(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        monitor.set_shard_inventory_provider(provider);
+        for offset in 0..=DEFAULT_HALT_GRACE_FRAMES {
+            monitor.check(1_000_000 + offset);
+        }
+        let events = dist.0.lock().unwrap();
+        let halts = events
+            .iter()
+            .filter_map(|e| match (&e.event_type, &e.data) {
+                (
+                    quil_types::consensus::ControlEventType::CoverageHalt,
+                    quil_types::consensus::ControlEventData::Coverage { filter, .. },
+                ) => Some(filter.clone()),
+                _ => None,
+            })
+            .collect();
+        halts
+    }
+
+    // An output committed into a latent region gave a regular node's genesis
+    // row a nominal size with no provers; its halt stopped every app shard of
+    // every regular node.
+    #[test]
+    fn a_regular_node_does_not_halt_on_a_delivery_into_its_genesis_grid() {
+        let grid = genesis_grid();
+        let halts = coverage_halts(&grid, installed_inventory(&grid, false));
+        assert!(
+            halts.is_empty(),
+            "a regular node entered a coverage halt, stopping its app shards, on \
+             genesis rows {:?} (the row holding the committed delivery is {})",
+            halts.iter().map(hex::encode).collect::<Vec<_>>(),
+            hex::encode(&grid.row_with_delivery),
+        );
+    }
+
+    #[test]
+    fn an_archive_still_halts_on_a_delivery_into_an_unstaffed_shard() {
+        let grid = genesis_grid();
+        assert_eq!(
+            coverage_halts(&grid, installed_inventory(&grid, true)),
+            vec![grid.row_with_delivery.clone()],
+        );
+    }
+
+    /// The inventory `master_node` installs, given the node's archive mode.
+    fn installed_inventory(grid: &GenesisGrid, archive_mode: bool) -> ShardInventoryProvider {
+        super::shard_inventory_provider(
+            grid.crdt.clone(),
+            grid.shards.clone(),
+            grid.registry.clone(),
+            Arc::new(crate::shard_info::CommittedShardSizes::default()),
+            archive_mode,
+        )
     }
 }

@@ -110,6 +110,7 @@ mod rpc_proto;
 mod subscription_filter;
 mod time_cache;
 mod topic;
+mod traffic;
 mod transform;
 mod types;
 
@@ -120,16 +121,19 @@ pub use self::{
     behaviour::{Behaviour, Event, MessageAuthenticity},
     config::{Config, ConfigBuilder, ValidationMode, Version},
     error::{ConfigBuilderError, PublishError, SubscriptionError, ValidationError},
+    mcache::MessageCacheStats,
     peer_score::{
         score_parameter_decay, score_parameter_decay_with_base, PeerScoreParams,
         PeerScoreThresholds, TopicScoreParams,
     },
+    protocol::{RejectedRpcStats, RpcEntry, RpcRejection},
     subscription_filter::{
         AllowAllSubscriptionFilter, CallbackSubscriptionFilter, CombinedSubscriptionFilters,
         MaxCountSubscriptionFilter, RegexSubscriptionFilter, TopicSubscriptionFilter,
         WhitelistSubscriptionFilter,
     },
     topic::{Hasher, Topic, TopicHash},
+    traffic::{TrafficKind, TrafficObserver},
     transform::{DataTransform, IdentityTransform},
     types::{FailedMessages, Message, MessageAcceptance, MessageId, RawMessage},
 };

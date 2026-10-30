@@ -1,10 +1,7 @@
 //! Bounded QUIL reward witnesses checked against a canonical global frame.
 #[cfg(test)]
 use crate::hypergraph_state::vertex_adds_discriminator;
-use crate::{
-    domains, global_schema,
-    hypergraph_state::HypergraphState,
-};
+use crate::{domains, global_schema, hypergraph_state::HypergraphState};
 use quil_types::{
     error::{QuilError, Result},
     store::{ClockStore, RewardWitnessData},
@@ -23,6 +20,19 @@ pub fn verify_reward_membership(
     value: u128,
     root: &[u8; 32],
     bytes: &[u8],
+) -> Result<()> {
+    verify_reward_membership_with(owner, value, root, bytes, true)
+}
+
+/// [`verify_reward_membership`] under the consensus rule of the mint's
+/// anchor: `bind_values` from
+/// `quil_types::consensus::vertex_value_binding_active`.
+pub fn verify_reward_membership_with(
+    owner: &[u8; 32],
+    value: u128,
+    root: &[u8; 32],
+    bytes: &[u8],
+    bind_values: bool,
 ) -> Result<()> {
     if value == 0
         || bytes.len() > MAX_REWARD_PROOF_BYTES
@@ -61,7 +71,7 @@ pub fn verify_reward_membership(
             balance.to_vec(),
         ),
     ];
-    quil_forest::verify_vertex_membership(root, &proof.inputs[0], &expected)
+    quil_forest::verify_vertex_membership_with(root, &proof.inputs[0], &expected, bind_values)
         .map_err(|_| QuilError::InvalidArgument("reward witness root or fields mismatch".into()))
 }
 
@@ -92,7 +102,11 @@ pub fn newest_retained_global_root(
         let header = if number == latest.frame_number {
             latest.clone()
         } else {
-            match clock.get_global_clock_frame(number).ok().and_then(|frame| frame.header) {
+            match clock
+                .get_global_clock_frame(number)
+                .ok()
+                .and_then(|frame| frame.header)
+            {
                 Some(header) => header,
                 None => continue,
             }
@@ -302,7 +316,10 @@ mod tests {
 pub fn derive_pomw_addressing(
     tx_domain: &[u8],
     owner_prover_address: &[u8],
-) -> Result<(/* prover_root_domain */ [u8; 32], /* leaf_owner_address */ [u8; 32])> {
+) -> Result<(
+    /* prover_root_domain */ [u8; 32],
+    /* leaf_owner_address */ [u8; 32],
+)> {
     if tx_domain.len() != 32 {
         return Err(QuilError::InvalidArgument(format!(
             "pomw: tx domain must be 32 bytes, got {}",

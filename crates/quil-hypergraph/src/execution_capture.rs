@@ -53,6 +53,40 @@ impl HypergraphCrdt {
         self.store.backing_store_identity()
     }
 
+    /// The capture point an execution capture of this CRDT would record now
+    /// ([`quil_forest::CoordinatedDb::current_capture_point`]), without
+    /// capturing. `None` for a forest over no watching database, or while the
+    /// forest is being replaced: this never waits on the forest lock.
+    pub fn current_capture_point(&self) -> Option<quil_types::store::CapturePoint> {
+        let forest = self.forest.try_read().ok()?;
+        forest.db()?.current_capture_point().ok()?
+    }
+
+    /// The watched keys written to database instance `database` after
+    /// `sequence` ([`quil_forest::CoordinatedDb::watched_writes_since`]).
+    /// `None` when they cannot all be listed, this forest is over another
+    /// database or none, or the forest is being replaced.
+    pub fn watched_writes_since(&self, database: u64, sequence: u64) -> Option<Vec<Vec<u8>>> {
+        let forest = self.forest.try_read().ok()?;
+        let db = forest.db().filter(|db| db.instance() == database)?;
+        db.watched_writes_since(sequence).ok()?
+    }
+
+    /// Start the watched-write journal of this forest's database now
+    /// ([`quil_forest::CoordinatedDb::enable_watched_journal`]); a no-op for
+    /// a forest over no database.
+    pub fn enable_watched_journal(&self) {
+        if let Some(db) = self
+            .forest
+            .read()
+            .ok()
+            .as_ref()
+            .and_then(|forest| forest.db())
+        {
+            let _ = db.enable_watched_journal();
+        }
+    }
+
     pub fn lock_execution_capture(&self) -> Result<ExecutionCapture<'_>> {
         let forest = self.forest_write_lock.lock().map_err(|_| {
             QuilError::ExecutionUnavailable("execution capture forest lock poisoned".into())
@@ -314,6 +348,7 @@ impl ExecutionCapture<'_> {
                 ),
                 sub_meta: RwLock::new(sizes.iter().map(|(k, v)| (k.clone(), *v)).collect()),
                 sizes_warmed: AtomicBool::new(true),
+                exact_sizes: AtomicBool::new(source.exact_sizes.load(Ordering::Acquire)),
                 size_warm_lock: std::sync::Mutex::new(()),
                 snapshot_mgr: SnapshotManager::new(),
                 local_vertex_observer: RwLock::new(None),

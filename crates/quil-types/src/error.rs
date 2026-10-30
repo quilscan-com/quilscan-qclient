@@ -22,6 +22,13 @@ pub enum QuilError {
     #[error("execution unavailable: {0}")]
     ExecutionUnavailable(String),
 
+    /// A seat's leaf snapshot for the epoch its renewal registers is not
+    /// encoded yet: execution unavailable like [`Self::ExecutionUnavailable`],
+    /// and a renewal leaves the seat out and retries it while the others go
+    /// ahead.
+    #[error("execution unavailable: {0}")]
+    StorageSnapshotPending(String),
+
     #[error("serialization error: {0}")]
     Serialization(String),
 
@@ -119,7 +126,13 @@ impl QuilError {
     /// A local infrastructure/backend failure is not evidence against the
     /// transaction. Callers must propagate it before advancing frame state.
     pub fn is_execution_unavailable(&self) -> bool {
-        matches!(self, Self::Store(_) | Self::Io(_) | Self::ExecutionUnavailable(_))
+        matches!(
+            self,
+            Self::Store(_)
+                | Self::Io(_)
+                | Self::ExecutionUnavailable(_)
+                | Self::StorageSnapshotPending(_)
+        )
     }
 
     pub fn is_no_vote(&self) -> bool {

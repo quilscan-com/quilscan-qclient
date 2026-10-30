@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use quil_types::error::Result;
 
-use crate::adapters::{digest_from_identity, BlockStore, Digest, GlobalProposer, Liveness, ProposalContext, Step};
+use crate::adapters::{
+    digest_from_identity, BlockStore, Digest, GlobalProposer, Liveness, ProposalContext, Step,
+};
 
 use super::{Checkpoint, Seal, Session};
 
@@ -33,7 +35,8 @@ pub type ParentReader = Arc<dyn Fn(ProposalContext) -> Result<AuthorizedParent> 
 /// Reconstruct a seal's data checkpoint through bounded private execution.
 /// The reader must authenticate the current session and closing request and
 /// derive state and history locally; the supplied roots are never trusted.
-pub type CheckpointReader = Arc<dyn Fn(ProposalContext, &Checkpoint) -> Result<AuthorizedParent> + Send + Sync>;
+pub type CheckpointReader =
+    Arc<dyn Fn(ProposalContext, &Checkpoint) -> Result<AuthorizedParent> + Send + Sync>;
 
 pub struct HandoffProposer {
     inner: Arc<dyn GlobalProposer>,
@@ -56,18 +59,44 @@ pub struct HandoffProposer {
     /// Told, for each seal of this close it verifies, whether the seal's
     /// state roots equal its own ([`Self::with_checkpoint_votes`]).
     checkpoint_votes: Option<CheckpointVotes>,
+    /// Asked why no closing request authorizes a seal
+    /// ([`Self::with_closing_probe`]).
+    closing_probe: Option<ClosingProbe>,
 }
 
 /// Called with `true` when a verified seal's checkpoint equals this member's,
 /// and `false` when it differs only in its state roots.
 pub type CheckpointVotes = Arc<dyn Fn(bool) + Send + Sync>;
 
+/// Why this member's authorized parent names no closing request, asked when a
+/// seal of its session arrives ([`HandoffProposer::with_closing_probe`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosingAbsence {
+    /// The missing input, for the refusal: the request absent from the
+    /// committed GLOBAL view at its frame, or present while the checkpoint is
+    /// not yet sealable.
+    pub detail: String,
+    /// The committed GLOBAL view is behind the GLOBAL head and a refresh that
+    /// can land within the vote's patience is on its way, so a later check
+    /// can find the request.
+    pub refreshing: bool,
+}
+
+pub type ClosingProbe = Arc<dyn Fn() -> ClosingAbsence + Send + Sync>;
+
+/// How long a seal waits before it is checked again while this member's
+/// committed GLOBAL view is being refreshed.
+pub const CLOSING_REQUEST_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Why no authorized parent was found: a short reason and its specifics.
 type Unauthorized = (&'static str, String);
 
 /// The first bytes of a digest, in hex.
 fn short(digest: &[u8; 32]) -> String {
-    digest[..4].iter().map(|byte| format!("{byte:02x}")).collect()
+    digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// A new view opens when its parent is notarized; the leader materializes that
@@ -94,6 +123,7 @@ impl HandoffProposer {
             liveness: None,
             seal_parents: None,
             checkpoint_votes: None,
+            closing_probe: None,
         })
     }
 
@@ -108,14 +138,54 @@ impl HandoffProposer {
         self
     }
 
+    /// Name what a refused seal of this session lacked, and let it wait while
+    /// this member's committed GLOBAL view is behind and a refresh can land
+    /// (the probe says when: on a regular node, for its in-process workers).
+    /// Such a node refreshes that view from an archive, so at an epoch
+    /// boundary a leader whose view was fresher proposed seals its members
+    /// refused, losing views until most of them had refreshed. Each later
+    /// check is the complete verification, so waiting never accepts a seal
+    /// that a current view refuses.
+    pub fn with_closing_probe(mut self, probe: Option<ClosingProbe>) -> Self {
+        self.closing_probe = probe;
+        self
+    }
+
+    /// The wait for a seal of this session whose closing request the
+    /// committed GLOBAL view does not hold while a refresh is on its way.
+    fn closing_wait(&self, context: ProposalContext, bytes: &[u8]) -> Option<std::time::Duration> {
+        let probe = self.closing_probe.as_ref()?;
+        Seal::decode(bytes)
+            .ok()
+            .filter(|seal| seal.session == self.session_id)?;
+        let absence = probe();
+        if !absence.refreshing {
+            return None;
+        }
+        // Counted only if the view ends before the request arrives.
+        self.note(
+            Step::Verify,
+            context,
+            "seal while no closing request",
+            absence.detail,
+        );
+        Some(CLOSING_REQUEST_WAIT)
+    }
+
     /// `proposed` against this member's `local` checkpoint: agreement, or a
     /// difference in the state roots alone. Anything else says nothing about
     /// this member's state.
     fn vote_roots(&self, proposed: &Checkpoint, local: &Checkpoint) {
-        let Some(vote) = self.checkpoint_votes.as_ref() else { return };
+        let Some(vote) = self.checkpoint_votes.as_ref() else {
+            return;
+        };
         if proposed == local {
             vote(true);
-        } else if (Checkpoint { state_roots: local.state_roots, ..proposed.clone() }) == *local {
+        } else if (Checkpoint {
+            state_roots: local.state_roots,
+            ..proposed.clone()
+        }) == *local
+        {
             vote(false);
         }
     }
@@ -177,7 +247,11 @@ impl HandoffProposer {
 
     /// The committed parent, else, when allowed, a private execution of it;
     /// and whether it is the committed one.
-    fn parent_or_private(&self, context: ProposalContext, private: bool) -> std::result::Result<(AuthorizedParent, bool), Unauthorized> {
+    fn parent_or_private(
+        &self,
+        context: ProposalContext,
+        private: bool,
+    ) -> std::result::Result<(AuthorizedParent, bool), Unauthorized> {
         match self.checked_parent(context, &self.read_parent) {
             Ok(parent) => Ok((parent, true)),
             Err((reason, committed)) => {
@@ -186,27 +260,49 @@ impl HandoffProposer {
                 };
                 self.checked_parent(context, reader)
                     .map(|parent| (parent, false))
-                    .map_err(|(reason, private)| (reason, format!("{committed}; unfinalized: {private}")))
+                    .map_err(|(reason, private)| {
+                        (reason, format!("{committed}; unfinalized: {private}"))
+                    })
             }
         }
     }
 
-    fn checked_parent(&self, context: ProposalContext, reader: &ParentReader) -> std::result::Result<AuthorizedParent, Unauthorized> {
+    fn checked_parent(
+        &self,
+        context: ProposalContext,
+        reader: &ParentReader,
+    ) -> std::result::Result<AuthorizedParent, Unauthorized> {
         if context.epoch != self.session.generation {
-            return Err(("epoch is not the session's generation",
-                format!("epoch {}, generation {}", context.epoch, self.session.generation)));
+            return Err((
+                "epoch is not the session's generation",
+                format!(
+                    "epoch {}, generation {}",
+                    context.epoch, self.session.generation
+                ),
+            ));
         }
         if context.view <= context.parent_view {
-            return Err(("view not above its parent's",
-                format!("view {}, parent view {}", context.view, context.parent_view)));
+            return Err((
+                "view not above its parent's",
+                format!("view {}, parent view {}", context.view, context.parent_view),
+            ));
         }
-        let parent = (reader)(context).map_err(|error| ("parent unavailable", error.to_string()))?;
+        let parent =
+            (reader)(context).map_err(|error| ("parent unavailable", error.to_string()))?;
         let checkpoint = &parent.checkpoint;
-        let differs = |what: &str| ("parent differs from the authorized checkpoint", format!(
-            "{what}: checkpoint frame {} view {} {}, selected view {} {}",
-            checkpoint.frame, checkpoint.view, short(&checkpoint.digest),
-            context.parent_view, short(&context.parent.0),
-        ));
+        let differs = |what: &str| {
+            (
+                "parent differs from the authorized checkpoint",
+                format!(
+                    "{what}: checkpoint frame {} view {} {}, selected view {} {}",
+                    checkpoint.frame,
+                    checkpoint.view,
+                    short(&checkpoint.digest),
+                    context.parent_view,
+                    short(&context.parent.0),
+                ),
+            )
+        };
         if checkpoint.view != context.parent_view || checkpoint.digest != context.parent.0 {
             return Err(differs("selection"));
         }
@@ -217,7 +313,9 @@ impl HandoffProposer {
             // Generation zero's base is the registered legacy tip: a certified
             // frame at its own view, not a virtual genesis at view zero.
             let virtual_genesis = self.session.generation != 0;
-            if (virtual_genesis && checkpoint.view != 0) || checkpoint.digest != self.session.genesis {
+            if (virtual_genesis && checkpoint.view != 0)
+                || checkpoint.digest != self.session.genesis
+            {
                 return Err(differs("not the session genesis"));
             }
         } else if checkpoint.view == 0 {
@@ -234,7 +332,9 @@ impl HandoffProposer {
             return None;
         }
         // The digest names these exact bytes: the notarized block at the view.
-        Seal::decode(&bytes).ok().filter(|seal| seal.digest() == context.parent.0)
+        Seal::decode(&bytes)
+            .ok()
+            .filter(|seal| seal.digest() == context.parent.0)
     }
 
     /// The selected parent, when it is the seal of this member's own tip
@@ -268,7 +368,13 @@ impl HandoffProposer {
     }
 
     /// Above a seal only its re-seal: nothing else continues a closed session.
-    fn verify_reseal(&self, context: ProposalContext, parent: &Seal, digest: Digest, bytes: &[u8]) -> bool {
+    fn verify_reseal(
+        &self,
+        context: ProposalContext,
+        parent: &Seal,
+        digest: Digest,
+        bytes: &[u8],
+    ) -> bool {
         let expected = match self.reseal(context, parent, true) {
             Ok(seal) => seal,
             Err((reason, detail)) => {
@@ -277,18 +383,32 @@ impl HandoffProposer {
             }
         };
         if !Seal::is_encoding(bytes) {
-            self.note(Step::Verify, context, "data frame above a terminal seal", String::new());
+            self.note(
+                Step::Verify,
+                context,
+                "data frame above a terminal seal",
+                String::new(),
+            );
             return false;
         }
         let decoded = Seal::decode(bytes).ok();
-        if let Some(seal) = decoded.as_ref().filter(|seal| seal.request == expected.request && seal.session == expected.session) {
+        if let Some(seal) = decoded
+            .as_ref()
+            .filter(|seal| seal.request == expected.request && seal.session == expected.session)
+        {
             self.vote_roots(&seal.checkpoint, &expected.checkpoint);
         }
         let valid = decoded.is_some_and(|seal| seal == expected) && expected.digest() == digest.0;
         if !valid {
-            self.note(Step::Verify, context, "re-seal differs from the local checkpoint", format!(
-                "local frame {}, parent view {}", expected.checkpoint.frame, expected.checkpoint.view,
-            ));
+            self.note(
+                Step::Verify,
+                context,
+                "re-seal differs from the local checkpoint",
+                format!(
+                    "local frame {}, parent view {}",
+                    expected.checkpoint.frame, expected.checkpoint.view,
+                ),
+            );
         }
         valid
     }
@@ -298,17 +418,37 @@ impl HandoffProposer {
     /// checkpoint, at this view, with `checkpoint.view` naming the parent's.
     /// When `voting`, a parent seal differing from the tip in its state roots
     /// alone counts as a disagreement ([`Self::with_checkpoint_votes`]).
-    fn reseal(&self, context: ProposalContext, parent: &Seal, voting: bool) -> std::result::Result<Seal, Unauthorized> {
-        let refused = |what: &str| ("seal parent differs from the authorized checkpoint", format!(
-            "{what}: seal parent view {} frame {} {}", parent.view, parent.checkpoint.frame, short(&parent.checkpoint.digest),
-        ));
+    fn reseal(
+        &self,
+        context: ProposalContext,
+        parent: &Seal,
+        voting: bool,
+    ) -> std::result::Result<Seal, Unauthorized> {
+        let refused = |what: &str| {
+            (
+                "seal parent differs from the authorized checkpoint",
+                format!(
+                    "{what}: seal parent view {} frame {} {}",
+                    parent.view,
+                    parent.checkpoint.frame,
+                    short(&parent.checkpoint.digest),
+                ),
+            )
+        };
         if context.epoch != self.session.generation {
-            return Err(("epoch is not the session's generation",
-                format!("epoch {}, generation {}", context.epoch, self.session.generation)));
+            return Err((
+                "epoch is not the session's generation",
+                format!(
+                    "epoch {}, generation {}",
+                    context.epoch, self.session.generation
+                ),
+            ));
         }
         if context.view <= context.parent_view {
-            return Err(("view not above its parent's",
-                format!("view {}, parent view {}", context.view, context.parent_view)));
+            return Err((
+                "view not above its parent's",
+                format!("view {}, parent view {}", context.view, context.parent_view),
+            ));
         }
         if parent.session != self.session_id || parent.view != context.parent_view {
             return Err(refused("another session or view"));
@@ -316,7 +456,8 @@ impl HandoffProposer {
         let Some((_, read_tip)) = self.seal_parents.as_ref() else {
             return Err(("selected parent is a terminal seal", String::new()));
         };
-        let mut tip = read_tip(context).map_err(|error| ("parent unavailable", error.to_string()))?;
+        let mut tip =
+            read_tip(context).map_err(|error| ("parent unavailable", error.to_string()))?;
         // A seal can be built above privately executed data that is notarized
         // but not finalized. Requiring that data to materialize before its
         // seal can finalize leaves every later view unable to extend it.
@@ -341,24 +482,40 @@ impl HandoffProposer {
             || parent.checkpoint.history_root != checkpoint.history_root
         {
             if voting {
-                self.vote_roots(&Checkpoint { view: checkpoint.view, ..parent.checkpoint.clone() }, checkpoint);
+                self.vote_roots(
+                    &Checkpoint {
+                        view: checkpoint.view,
+                        ..parent.checkpoint.clone()
+                    },
+                    checkpoint,
+                );
             }
             // The local frame tells a member behind the checkpoint from one
             // whose state differs at it.
-            return Err(refused(&format!("checkpoint (local frame {} {})", checkpoint.frame, short(&checkpoint.digest))));
+            return Err(refused(&format!(
+                "checkpoint (local frame {} {})",
+                checkpoint.frame,
+                short(&checkpoint.digest)
+            )));
         }
         // A seal at the base names the genesis at view zero; its re-seal names
         // the genesis at the seal's view, which GLOBAL accepts only from its
         // seal recovery frame (`Seal::validate_with`). Generation zero never
         // seals at its base (a certified legacy frame).
         if checkpoint.frame <= self.session.base_frame && self.session.generation == 0 {
-            return Err(("a seal at the session base cannot be re-sealed", String::new()));
+            return Err((
+                "a seal at the session base cannot be re-sealed",
+                String::new(),
+            ));
         }
         Ok(Seal {
             request,
             session: self.session_id,
             view: context.view,
-            checkpoint: Checkpoint { view: context.parent_view, ..checkpoint.clone() },
+            checkpoint: Checkpoint {
+                view: context.parent_view,
+                ..checkpoint.clone()
+            },
         })
     }
 
@@ -366,7 +523,11 @@ impl HandoffProposer {
     fn decline(&self, context: ProposalContext, reason: &'static str, detail: String) {
         self.note(Step::Propose, context, reason, detail);
         let mut waits = self.parent_waits.lock().unwrap();
-        *waits = if waits.0 == context.view { (context.view, waits.1 + 1) } else { (context.view, 1) };
+        *waits = if waits.0 == context.view {
+            (context.view, waits.1 + 1)
+        } else {
+            (context.view, 1)
+        };
     }
 }
 
@@ -437,12 +598,22 @@ impl GlobalProposer for HandoffProposer {
                 };
                 return Some((digest_from_identity(seal.digest()), seal.encode()));
             }
-            self.note(Step::Propose, context, "seal waits for a finalized checkpoint; proposing data", String::new());
+            self.note(
+                Step::Propose,
+                context,
+                "seal waits for a finalized checkpoint; proposing data",
+                String::new(),
+            );
         }
         let (digest, bytes) = self.inner.propose_with_context(context)?;
         // The data proposer cannot originate a seal outside the authorized path.
         if Seal::is_encoding(&bytes) {
-            self.note(Step::Propose, context, "data proposer built a seal", String::new());
+            self.note(
+                Step::Propose,
+                context,
+                "data proposer built a seal",
+                String::new(),
+            );
             return None;
         }
         Some((digest, bytes))
@@ -450,16 +621,25 @@ impl GlobalProposer for HandoffProposer {
 
     /// A data frame waits as the data proposer says (its GLOBAL anchor just
     /// ahead of this node); without this a member that receives the anchor
-    /// moments after the leader refuses the proposal outright. A seal is
+    /// moments after the leader refuses the proposal outright. A seal waits
+    /// for its checkpoint to finalize here, and for a closing request this
+    /// member's refreshing GLOBAL view does not hold yet; otherwise it is
     /// checked at once.
     fn verify_delay(&self, context: ProposalContext, bytes: &[u8]) -> Option<std::time::Duration> {
         if Seal::is_encoding(bytes) {
-            // A seal's checkpoint must have finalized here first (see
-            // `propose_with_context`); it does moments after the view opens.
-            let unfinalized = self.selected_seal(context).is_none()
-                && self.checked_parent(context, &self.read_parent).is_err()
-                && self.recognised_seal(context).is_none();
-            return unfinalized.then_some(std::time::Duration::from_millis(250));
+            if self.selected_seal(context).is_some() {
+                return None;
+            }
+            return match self.checked_parent(context, &self.read_parent) {
+                // A seal's checkpoint must have finalized here first (see
+                // `propose_with_context`); it does moments after the view opens.
+                Err(_) => self
+                    .recognised_seal(context)
+                    .is_none()
+                    .then_some(std::time::Duration::from_millis(250)),
+                Ok(parent) if parent.closing_request.is_none() => self.closing_wait(context, bytes),
+                Ok(_) => None,
+            };
         }
         self.inner.verify_delay(context, bytes)
     }
@@ -491,7 +671,21 @@ impl GlobalProposer for HandoffProposer {
         };
         if Seal::is_encoding(&bytes) {
             let Some(request) = parent.closing_request else {
-                self.note(Step::Verify, context, "seal while no closing request", String::new());
+                // Only a seal of this session asks this member's view, which
+                // may request a refresh of it.
+                let ours = Seal::decode(&bytes).is_ok_and(|seal| seal.session == self.session_id);
+                let detail = self
+                    .closing_probe
+                    .as_ref()
+                    .filter(|_| ours)
+                    .map(|probe| probe().detail)
+                    .unwrap_or_default();
+                self.note(
+                    Step::Verify,
+                    context,
+                    "seal while no closing request",
+                    detail,
+                );
                 return false;
             };
             let Ok(seal) = Seal::decode(&bytes) else {
@@ -520,18 +714,32 @@ impl GlobalProposer for HandoffProposer {
                     proposed_history = %digest_from_identity(seal.checkpoint.history_root),
                     local_history = %digest_from_identity(parent.checkpoint.history_root),
                     "handoff verify: seal differs from the authorized local checkpoint");
-                self.note(Step::Verify, context, "seal differs from the local checkpoint", format!(
-                    "proposed frame {} view {}, local frame {} view {}, state roots match {}",
-                    seal.checkpoint.frame, seal.checkpoint.view, parent.checkpoint.frame, parent.checkpoint.view,
-                    seal.checkpoint.state_roots == parent.checkpoint.state_roots,
-                ));
+                self.note(
+                    Step::Verify,
+                    context,
+                    "seal differs from the local checkpoint",
+                    format!(
+                        "proposed frame {} view {}, local frame {} view {}, state roots match {}",
+                        seal.checkpoint.frame,
+                        seal.checkpoint.view,
+                        parent.checkpoint.frame,
+                        parent.checkpoint.view,
+                        seal.checkpoint.state_roots == parent.checkpoint.state_roots,
+                    ),
+                );
             }
             // A seal of a checkpoint that has not finalized here would finalize
             // it with no certificate of its own (see `propose_with_context`).
             if valid && !committed {
-                self.note(Step::Verify, context, "seal of a checkpoint not finalized", format!(
-                    "checkpoint frame {} view {}", parent.checkpoint.frame, parent.checkpoint.view,
-                ));
+                self.note(
+                    Step::Verify,
+                    context,
+                    "seal of a checkpoint not finalized",
+                    format!(
+                        "checkpoint frame {} view {}",
+                        parent.checkpoint.frame, parent.checkpoint.view,
+                    ),
+                );
                 return false;
             }
             return valid;

@@ -4,3 +4,26 @@
 target/
 crates/quil-client/build/
 /docs/
+
+# Keep independent tests, fixtures and benchmarks local.
+**/test/
+**/tests/
+**/testdata/
+**/fixtures/
+**/bench/
+**/benches/
+*_test.go
+*_tests.rs
+*_test.rs
+test_*.rs
+test.rs
+tests.rs
+testing.rs
+test_helpers.go
+test_helpers.rs
+test_utils.rs
+testutils.rs
+*.test.js
+*.test.mjs
+*.spec.js
+*.spec.ts

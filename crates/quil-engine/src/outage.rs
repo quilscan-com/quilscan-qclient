@@ -42,6 +42,7 @@ struct Failing {
 #[derive(Debug)]
 pub struct Outage {
     begin_after: u64,
+    log_every: Duration,
     failing: Option<Failing>,
 }
 
@@ -55,7 +56,17 @@ impl Default for Outage {
 impl Outage {
     /// An outage that begins after `failures` consecutive failed attempts.
     pub fn begin_after(failures: u64) -> Self {
-        Self { begin_after: failures.max(1), failing: None }
+        Self::begin_after_repeating(failures, OUTAGE_LOG_EVERY)
+    }
+
+    /// An outage that begins after `failures` consecutive failed attempts and
+    /// repeats every `every` instead of [`OUTAGE_LOG_EVERY`].
+    pub fn begin_after_repeating(failures: u64, every: Duration) -> Self {
+        Self {
+            begin_after: failures.max(1),
+            log_every: every,
+            failing: None,
+        }
     }
 
     /// Record one attempt's outcome at `now`; returns the transition to log.
@@ -67,7 +78,12 @@ impl Outage {
                 failures: f.failures,
             });
         }
-        let f = self.failing.get_or_insert(Failing { since: now, logged: now, failures: 0, began: false });
+        let f = self.failing.get_or_insert(Failing {
+            since: now,
+            logged: now,
+            failures: 0,
+            began: false,
+        });
         f.failures += 1;
         match f.began {
             false if f.failures >= self.begin_after => {
@@ -77,7 +93,7 @@ impl Outage {
             }
             false => None,
             true => {
-                if now.duration_since(f.logged) < OUTAGE_LOG_EVERY {
+                if now.duration_since(f.logged) < self.log_every {
                     return None;
                 }
                 f.logged = now;
@@ -147,9 +163,21 @@ mod tests {
         assert_eq!(outage.observe(at(10), false), Some(OutageEvent::Began));
         assert_eq!(outage.observe(at(20), false), None);
         assert_eq!(outage.observe(at(609), false), None);
-        assert_eq!(outage.observe(at(610), false), Some(OutageEvent::Continues { secs: 600, failures: 4 }));
+        assert_eq!(
+            outage.observe(at(610), false),
+            Some(OutageEvent::Continues {
+                secs: 600,
+                failures: 4
+            })
+        );
         assert_eq!(outage.observe(at(900), false), None);
-        assert_eq!(outage.observe(at(905), true), Some(OutageEvent::Ended { secs: 895, failures: 5 }));
+        assert_eq!(
+            outage.observe(at(905), true),
+            Some(OutageEvent::Ended {
+                secs: 895,
+                failures: 5
+            })
+        );
         assert_eq!(outage.observe(at(915), true), None);
         assert_eq!(outage.observe(at(920), false), Some(OutageEvent::Began));
     }
@@ -169,7 +197,19 @@ mod tests {
         assert_eq!(outage.observe(at(40), false), None);
         assert_eq!(outage.observe(at(50), false), Some(OutageEvent::Began));
         assert_eq!(outage.observe(at(649), false), None);
-        assert_eq!(outage.observe(at(650), false), Some(OutageEvent::Continues { secs: 620, failures: 5 }));
-        assert_eq!(outage.observe(at(660), true), Some(OutageEvent::Ended { secs: 630, failures: 5 }));
+        assert_eq!(
+            outage.observe(at(650), false),
+            Some(OutageEvent::Continues {
+                secs: 620,
+                failures: 5
+            })
+        );
+        assert_eq!(
+            outage.observe(at(660), true),
+            Some(OutageEvent::Ended {
+                secs: 630,
+                failures: 5
+            })
+        );
     }
 }
