@@ -25,6 +25,10 @@ cargo test -p quil-client
 
 The binary is written to `target/release/qclient`.
 
+Independent tests, fixtures and benchmarks are kept local. The default build
+keeps the official no-op registry hook inline; enabling the optional
+`test-hooks` feature additionally requires the local fault-injection source.
+
 ## Prover commands
 
 ```sh

@@ -21,7 +21,15 @@ pub mod prover_registry;
 pub mod seniority_compat;
 pub mod seniority_penalty_log;
 pub mod step_timing;
+#[cfg(feature = "test-hooks")]
 pub mod test_hooks;
+// The published default build does not ship fault-injection test sources.
+// Match the official feature-off implementation without requiring that file.
+#[cfg(not(feature = "test-hooks"))]
+pub mod test_hooks {
+    #[inline(always)]
+    pub fn registry_load_delay() {}
+}
 #[cfg(any(test, feature = "testing-stubs"))]
 pub mod testing;
 pub mod token_engine;
