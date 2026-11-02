@@ -67,9 +67,20 @@ ARG GMP_SHA256=a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898
 # will only ever run on hosts that have it. Without cross-compile
 # mode, GMP's ABI probe SIGILLs on the build machine and configure
 # aborts with "program does not run".
-RUN wget https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz && \
-    echo "${GMP_SHA256}  gmp-${GMP_VERSION}.tar.xz" | sha256sum -c - && \
-    tar -xf gmp-${GMP_VERSION}.tar.xz && \
+RUN gmp_archive="gmp-${GMP_VERSION}.tar.xz" && \
+    for gmp_base_url in \
+        https://mirrors.kernel.org/gnu/gmp \
+        https://mirrors.ocf.berkeley.edu/gnu/gmp \
+        https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/gmp \
+        https://ftp.gnu.org/gnu/gmp; do \
+      if wget --timeout=20 --tries=2 -O "${gmp_archive}" "${gmp_base_url}/${gmp_archive}"; then \
+        break; \
+      fi; \
+      rm -f "${gmp_archive}"; \
+    done && \
+    test -s "${gmp_archive}" && \
+    echo "${GMP_SHA256}  ${gmp_archive}" | sha256sum -c - && \
+    tar -xf "${gmp_archive}" && \
     cd gmp-${GMP_VERSION} && \
     ./configure \
         --prefix=/usr/local \
