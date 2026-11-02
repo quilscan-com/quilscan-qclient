@@ -645,6 +645,14 @@ pub(crate) trait ShardRecoveryTarget: Send + Sync {
     /// A sync installed the predecessor's sealed state at the checkpoint
     /// `frame`, where the worker's cursor is.
     fn sealed_state_installed(&self, _frame: u64) {}
+    /// Retries materializing the frame after the worker's cursor when its
+    /// last attempt stopped to wait for this node's proof verification, the
+    /// frame committed and kept: that frame while it still waits; `None`
+    /// when none waits, or it materialized now
+    /// (`app_engine::AppConsensusEngine::retry_proof_wait`).
+    async fn retry_proof_wait(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[async_trait]
@@ -712,6 +720,9 @@ impl ShardRecoveryTarget for crate::app_engine::AppEngineHandle {
         self.send(crate::app_engine::AppEngineMessage::ShardSyncCompleted {
             synced_to_frame: frame,
         });
+    }
+    async fn retry_proof_wait(&self) -> Option<u64> {
+        crate::app_engine::AppEngineHandle::retry_proof_wait(self).await
     }
 }
 
@@ -967,7 +978,7 @@ pub(crate) async fn recover_shard_from_latest(
                 .map(|anchor| (from, anchor)),
         };
         let replay = loop {
-            let (replay, last) = replay_shard_from(
+            let replayed = replay_shard_from(
                 syncer,
                 filter,
                 local.clone(),
@@ -994,7 +1005,19 @@ pub(crate) async fn recover_shard_from_latest(
                     advanced
                 },
             )
-            .await?;
+            .await;
+            // The frame is authenticated and committed, and materializes
+            // once its proofs verify: no failure of the recovery.
+            let (replay, last) = match replayed {
+                Err(error)
+                    if crate::worker_execution::waits_for_proof_verification(
+                        &error.to_string(),
+                    ) =>
+                {
+                    return Ok(ShardRecoveryProgress::Deferred(PROOF_VERIFICATION_WAIT));
+                }
+                replayed => replayed?,
+            };
             known = last;
             batches += 1;
             if replay.materialized >= replay.target
@@ -1019,10 +1042,37 @@ pub(crate) async fn recover_shard_from_latest(
             turn,
         });
     }
-    let anchors = target.origin_anchors().await.unwrap_or_else(|error| {
-        tracing::warn!(filter = %hex::encode(filter), %error, "origin anchors unavailable; bootstrap unpinned");
-        Vec::new()
-    });
+    // The origins' sealed state, read from committed GLOBAL state, which
+    // this node's own GLOBAL state sync withholds while it installs: waited
+    // out like the anchor's validation below. Read as "no origins", it
+    // bootstrapped without them, and its anchor fallback, which needs the
+    // frame GLOBAL committed, failed the attempt as the archive's
+    // checkpoint (38 to 40 failures in a row on 4 shards of a node
+    // restarted into its GLOBAL sync, 2026-10-29).
+    let anchors = match waiting_out_global_sync(
+        sync_wait,
+        target,
+        filter,
+        target.materialized(),
+        "origin state lookup",
+        || target.origin_anchors(),
+    )
+    .await
+    {
+        Ok(anchors) => anchors,
+        Err(error)
+            if quil_execution::global_intrinsic::handoff::global_sync_in_progress(&error) =>
+        {
+            return Ok(ShardRecoveryProgress::NotReady(
+                crate::worker_execution::GLOBAL_SYNC_STILL_INSTALLING,
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(core_id = target.core_id(), filter = %hex::encode(filter), %error,
+                "origin anchors unavailable; bootstrap unpinned");
+            Vec::new()
+        }
+    };
     let committed_tip = target.committed_tip().await;
     recovery_phase("fetching_checkpoint");
     let synced = sync_shard_from_latest_attested(
@@ -1075,6 +1125,13 @@ pub(crate) async fn recover_shard_from_latest(
         Ok(ShardSyncResult::NotReady(reason)) => Ok(ShardRecoveryProgress::NotReady(reason)),
     }
 }
+
+/// Why a recovery defers: the frame after the worker's cursor is
+/// authenticated and committed, and its materialization waits for this
+/// node's proof verification; it ends when the verdicts are in
+/// (`app_engine::AppConsensusEngine::retry_proof_wait`).
+pub(crate) const PROOF_VERIFICATION_WAIT: &str =
+    "the frame after this worker's cursor is committed and waits for this node's proof verification";
 
 /// Why an install of a predecessor's sealed state over other local state
 /// failed ([`install_sealed_state`]).
@@ -1190,6 +1247,17 @@ pub(crate) async fn recover_in_turns(
             tracing::debug!(core, filter = %hex::encode(filter), reason = ARCHIVE_GAP_HELD,
                 "archive recovery held back");
             return Ok(ShardRecoveryProgress::Deferred(ARCHIVE_GAP_HELD));
+        }
+        // Fetched and validated again, the frame would only wait for the
+        // same proofs: on a regular node all 15 workers did so at every
+        // attempt for 10 hours, each attempt counted a failure (2026-10-31).
+        if let Some(frame) = target.retry_proof_wait().await {
+            if let Some(ticket) = ticket {
+                execution.keep_replay_ticket(filter, ticket);
+            }
+            tracing::debug!(core, filter = %hex::encode(filter), frame, reason = PROOF_VERIFICATION_WAIT,
+                "archive recovery deferred");
+            return Ok(ShardRecoveryProgress::Deferred(PROOF_VERIFICATION_WAIT));
         }
         let local = lineage().inspect_err(|error| {
             tracing::warn!(core, filter = %hex::encode(filter), %error,
@@ -3001,7 +3069,9 @@ mod tests {
         };
         let held = turns.acquire(claim(9)).await;
         // The worker on core 1 queues for its shard, another worker's replay
-        // behind it; then core 1's engine stops.
+        // behind it; then core 1's engine stops. The second arm hands out
+        // the other worker's task, awaited below.
+        #[allow(clippy::async_yields_async)]
         let (withdrawn, other) = tokio::join!(
             recover_in_turns(
                 turns,
@@ -6109,7 +6179,9 @@ mod tests {
 
     /// An install that does not finish within the attempt's budget fails the
     /// attempt with its wait, as before, once the budget is spent: the turn
-    /// is held no longer than [`GLOBAL_SYNC_WAIT_BUDGET`].
+    /// is held no longer than [`GLOBAL_SYNC_WAIT_BUDGET`]. The failure is
+    /// this node's expected wait, classed as such, and counts toward no
+    /// failure streak.
     #[tokio::test(start_paused = true)]
     async fn a_global_sync_install_past_the_budget_fails_the_attempt() {
         use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
@@ -6141,7 +6213,331 @@ mod tests {
         );
         assert_eq!(target.materialized(), 129);
         let recovery = worker.snapshot().recovery.unwrap();
-        assert_eq!(recovery.consecutive_failures, 1);
+        assert_eq!(recovery.consecutive_failures, 0);
+        assert_eq!(
+            recovery.failures_by_class.get("global_sync").copied(),
+            Some(1)
+        );
+    }
+
+    /// Answers its first `refusals` origin lookups with a GLOBAL state
+    /// sync's wait, as an engine does while its master installs the GLOBAL
+    /// prover tree, then names no origins; otherwise `Target`.
+    struct OriginsWithheld {
+        inner: Target,
+        refusals: std::sync::atomic::AtomicUsize,
+        refused: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ShardRecoveryTarget for OriginsWithheld {
+        fn materialized(&self) -> u64 {
+            self.inner.materialized()
+        }
+        async fn replay(
+            &self,
+            frame: AppShardFrame,
+            descendants: Vec<AppShardFrame>,
+        ) -> Result<u64> {
+            self.inner.replay(frame, descendants).await
+        }
+        async fn validate(
+            &self,
+            anchor: AppShardFrame,
+            predecessor: Option<AppShardFrame>,
+        ) -> Result<bool> {
+            self.inner.validate(anchor, predecessor).await
+        }
+        async fn install(
+            &self,
+            anchor: AppShardFrame,
+            predecessor: Option<AppShardFrame>,
+        ) -> Result<()> {
+            self.inner.install(anchor, predecessor).await
+        }
+        fn inherited(&self) {
+            panic!("a certified archive tip must never use unanchored inheritance")
+        }
+        async fn origin_anchors(&self) -> Result<Vec<(Vec<u8>, [[u8; 32]; 4])>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.refusals.load(SeqCst) > 0 {
+                self.refusals.fetch_sub(1, SeqCst);
+                self.refused.fetch_add(1, SeqCst);
+                return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                    quil_execution::global_intrinsic::handoff::GLOBAL_SYNC_IN_PROGRESS.into(),
+                ));
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    fn withholding_origins(calls: &Arc<Mutex<Vec<String>>>, refusals: usize) -> OriginsWithheld {
+        OriginsWithheld {
+            inner: Target {
+                calls: calls.clone(),
+                cursor: 0.into(),
+                valid: true,
+                install_ok: true,
+                blocked: false.into(),
+                unblock_at: 0,
+            },
+            refusals: refusals.into(),
+            refused: 0.into(),
+        }
+    }
+
+    /// A worker with no frame of its own looks up its origins' sealed state
+    /// in committed GLOBAL state, which this node's GLOBAL state sync
+    /// withholds while it installs: the lookup waits the install out within
+    /// the attempt, then anchors, counting no failure. Read as "no
+    /// origins", the attempt failed as "the archive checkpoint failed
+    /// validation", 38 to 40 times in a row on 4 shards of a node restarted
+    /// into its GLOBAL sync (2026-10-29).
+    #[tokio::test(start_paused = true)]
+    async fn an_origin_lookup_waits_out_a_global_sync_install_before_any_archive_read() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let target = withholding_origins(&calls, 4);
+        let worker = crate::worker_execution::SharedWorkerExecution::default();
+        let started = tokio::time::Instant::now();
+        let result = worker
+            .recovering(
+                &[5; 32],
+                recover_shard_from_latest(&archive, &[5; 32], None, &target, &[], None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, ShardRecoveryProgress::Anchored { frame: 500 });
+        assert_eq!(target.refused.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                "fetch 0",
+                "fetch 499",
+                "validate 500",
+                "sync 244",
+                "install 500"
+            ]
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= 4 * GLOBAL_SYNC_POLL && waited < GLOBAL_SYNC_WAIT_BUDGET,
+            "{waited:?}"
+        );
+        let recovery = worker.snapshot().recovery.unwrap();
+        assert_eq!(
+            (recovery.consecutive_failures, recovery.last_error_unix_ms),
+            (0, 0)
+        );
+        assert!(recovery.failures_by_class.is_empty());
+    }
+
+    /// Past the attempt's budget, the lookup gives up without reading any
+    /// archive: the attempt is not ready for this node's GLOBAL state sync,
+    /// named so and classed as this node's expected wait, not the archive's
+    /// failure, and counts toward no failure streak.
+    #[tokio::test(start_paused = true)]
+    async fn an_origin_lookup_past_the_budget_names_this_nodes_global_sync() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let archive = Archive {
+            latest: Some(frame(500)),
+            calls: calls.clone(),
+        };
+        let target = withholding_origins(&calls, usize::MAX);
+        let worker = crate::worker_execution::SharedWorkerExecution::default();
+        let started = tokio::time::Instant::now();
+        let result = worker
+            .recovering(
+                &[5; 32],
+                recover_shard_from_latest(&archive, &[5; 32], None, &target, &[], None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            ShardRecoveryProgress::NotReady(crate::worker_execution::GLOBAL_SYNC_STILL_INSTALLING)
+        );
+        let read = calls.lock().unwrap().clone();
+        assert!(read.is_empty(), "{read:?}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= GLOBAL_SYNC_WAIT_BUDGET - GLOBAL_SYNC_POLL
+                && waited <= GLOBAL_SYNC_WAIT_BUDGET + GLOBAL_SYNC_POLL,
+            "{waited:?}"
+        );
+        let recovery = worker.snapshot().recovery.unwrap();
+        assert_eq!(
+            crate::worker_execution::failure_class(&recovery.last_error),
+            "global_sync"
+        );
+        assert_eq!(recovery.consecutive_failures, 0);
+        assert_eq!(
+            recovery.failures_by_class.get("global_sync").copied(),
+            Some(1)
+        );
+    }
+
+    /// An archive serving the shard's certified frames through `tip`; each
+    /// frame number read is recorded (0: its tip).
+    struct ServingArchive {
+        tip: u64,
+        reads: Mutex<Vec<u64>>,
+    }
+
+    #[async_trait]
+    impl ProverTreeSyncer for ServingArchive {
+        async fn sync_prover_tree(&self, _: &[Vec<u8>]) -> Result<bool> {
+            unreachable!()
+        }
+        async fn get_app_shard_frame(
+            &self,
+            _: &[u8],
+            number: u64,
+        ) -> Result<Option<AppShardFrame>> {
+            self.reads.lock().unwrap().push(number);
+            Ok(Some(frame(if number == 0 { self.tip } else { number })))
+        }
+    }
+
+    /// A worker materialized through `cursor` whose engine, as
+    /// `AppConsensusEngine` does, keeps frame `held` once a replay
+    /// authenticated and committed it, while its proofs verify: until
+    /// `verdict`, a replay of it reports the wait, and `retry_proof_wait`
+    /// names it; once in, `retry_proof_wait` materializes it. Records the
+    /// frames replayed.
+    struct ProofWaitTarget {
+        cursor: AtomicU64,
+        held: u64,
+        verdict: AtomicBool,
+        kept: AtomicBool,
+        replays: Mutex<Vec<u64>>,
+    }
+
+    #[async_trait]
+    impl ShardRecoveryTarget for ProofWaitTarget {
+        fn materialized(&self) -> u64 {
+            self.cursor.load(Ordering::SeqCst)
+        }
+        async fn replay(&self, frame: AppShardFrame, _: Vec<AppShardFrame>) -> Result<u64> {
+            let number = frame.header.unwrap().frame_number;
+            assert_eq!(number, self.materialized() + 1);
+            self.replays.lock().unwrap().push(number);
+            if number == self.held && !self.verdict.load(Ordering::SeqCst) {
+                self.kept.store(true, Ordering::SeqCst);
+                return Err(quil_types::error::QuilError::ExecutionUnavailable(format!(
+                    "archive replay of frame {number} waits for this node's proof verification ({})",
+                    quil_execution::token_intrinsic::PROOF_VERIFICATION_PENDING
+                )));
+            }
+            self.cursor.store(number, Ordering::SeqCst);
+            Ok(number)
+        }
+        async fn validate(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<bool> {
+            unreachable!("a worker with a lineage replays")
+        }
+        async fn install(&self, _: AppShardFrame, _: Option<AppShardFrame>) -> Result<()> {
+            unreachable!("a worker with a lineage replays")
+        }
+        fn inherited(&self) {
+            unreachable!("a worker with a lineage replays")
+        }
+        async fn retry_proof_wait(&self) -> Option<u64> {
+            let next = self.materialized() + 1;
+            if next != self.held || !self.kept.load(Ordering::SeqCst) {
+                return None;
+            }
+            if self.verdict.load(Ordering::SeqCst) {
+                self.cursor.store(next, Ordering::SeqCst);
+                return None;
+            }
+            Some(next)
+        }
+    }
+
+    /// A replay that meets a frame waiting for this node's proof
+    /// verification defers its recovery, counting no failure; the next
+    /// recoveries, while it still waits, fetch and replay nothing (a
+    /// regular node's 15 workers refetched and revalidated such a frame at
+    /// every attempt for 10 hours, 2026-10-31); once its verdicts are in,
+    /// the frame materializes in place and the replay goes on after it,
+    /// never fetching it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_waiting_for_its_proofs_defers_and_resumes_without_a_refetch() {
+        use crate::recovery_turns::RecoveryTurns;
+        let turns: &'static RecoveryTurns = Box::leak(Box::new(RecoveryTurns::new(1)));
+        let archive = ServingArchive {
+            tip: 140,
+            reads: Mutex::new(Vec::new()),
+        };
+        let target = ProofWaitTarget {
+            cursor: 100.into(),
+            held: 101,
+            verdict: false.into(),
+            kept: false.into(),
+            replays: Mutex::new(Vec::new()),
+        };
+        let execution = crate::worker_execution::SharedWorkerExecution::default();
+        let recover = || {
+            recover_in_turns(
+                turns,
+                &archive,
+                &[5; 32],
+                1,
+                &target,
+                &execution,
+                || Ok(Some(frame(target.materialized()))),
+                || false,
+            )
+        };
+        for attempt in 0..20 {
+            assert_eq!(
+                recover().await.unwrap(),
+                ShardRecoveryProgress::Deferred(PROOF_VERIFICATION_WAIT),
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(
+            *target.replays.lock().unwrap(),
+            vec![101],
+            "the waiting frame is replayed once, then retried in place"
+        );
+        let reads = archive.reads.lock().unwrap().clone();
+        assert_eq!(
+            reads.iter().filter(|&&number| number == 101).count(),
+            1,
+            "fetched once: {reads:?}"
+        );
+        let recorded = execution.snapshot().recovery;
+        assert!(
+            recorded.as_ref().is_none_or(|r| r.consecutive_failures == 0
+                && r.failures_by_class.is_empty()
+                && r.attempts == 0),
+            "a wait is no recovery failure: {recorded:?}"
+        );
+        target.verdict.store(true, Ordering::SeqCst);
+        let result = recover().await.unwrap();
+        assert!(
+            matches!(result, ShardRecoveryProgress::Replayed { materialized, .. } if materialized > 101),
+            "{result:?}"
+        );
+        let replays = target.replays.lock().unwrap().clone();
+        assert_eq!(replays[0], 101);
+        assert_eq!(
+            replays[1], 102,
+            "the replay goes on after the frame: {replays:?}"
+        );
+        assert_eq!(replays.iter().filter(|&&number| number == 101).count(), 1);
+        let reads = archive.reads.lock().unwrap().clone();
+        assert_eq!(
+            reads.iter().filter(|&&number| number == 101).count(),
+            1,
+            "never fetched again: {reads:?}"
+        );
+        let recorded = execution.snapshot().recovery.unwrap();
+        assert_eq!((recorded.attempts, recorded.consecutive_failures), (1, 0));
     }
 
     /// An archive serving the shard's frames through `tip` except

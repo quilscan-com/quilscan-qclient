@@ -17,12 +17,27 @@ contraction settings and enabled assertions. ARM64 compilation requires the
 crypto extensions. Linux ARM64 native ABI and candidate tests also pass through the Taskfile.
 Full Linux proving and x86-64 execution remain untested; the x86 configuration
 uses SIMDe's portable path. Build configuration is not evidence of proving
-support on those platforms.
+support on those platforms. `QUIL_LATTICE_X86_NATIVE=1` instead compiles the
+reference AVX-512 code natively for whatever the C compiler targets (set it
+with `CFLAGS`; plain x86-64 is SSE2); SIMDe lowers instructions the target
+lacks. `QUIL_LATTICE_X86_NATIVE=avx512` does the same and fails the build
+unless the target has AVX-512 F/BW/DQ/VL. `docker/Dockerfile.source` sets `1` (its
+amd64 binaries stay baseline x86-64); `docker/Dockerfile.sourceavx512` sets `avx512`
+with `-march=skylake-avx512`. Local builds without the variable keep SIMDe's
+portable path, the reference the native builds must cross-verify against.
+`adapter/target_features.c` records the x86 features the C compiler targeted
+(less RDRAND, RDSEED and SHA, emitted only by intrinsics the backend never uses);
+quil-node, qclient and the amount-proof worker refuse to start on a CPU that
+lacks any of them (`cpu::required_cpu_features_missing`) rather than die with
+SIGILL mid-proof.
 
 The raw ABI is unsafe and uses process-global key state. Callers must serialize
 all native contexts using `NATIVE_STATE` for their entire lifetime, including
 cleanup. The opt-in `native-proof` adapter in `quil-lattice-ct`
-holds this lock and frees contexts on submission errors. Native allocation/assertion failures can abort, private
+holds this lock and frees contexts on submission errors. LNP's input-witness
+check (Labradoodle's amortized witness has no rejection bound) fails on some
+attempts (about 1 in 10 for a small test relation); the adapter retries with fresh randomness up to 8 times,
+logs each failed attempt to stderr and returns status 8 if all fail. Native allocation/assertion failures can abort, private
 buffers do not yet have complete erasure guarantees, reference logging remains,
 and symbol isolation, sampling/timing/security bounds and production resource
 limits require further work. This is not a production-approved verifier.

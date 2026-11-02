@@ -36,6 +36,7 @@ mod execution_checkpoint;
 pub use execution_checkpoint::{GlobalExecutionCheckpoint, UnfinishedExecution};
 #[path = "frame_materializer_selected_parent.rs"]
 mod selected_parent;
+pub(crate) use selected_parent::ParentStateDifference;
 pub use selected_parent::{
     GlobalFinalizationAttempt, GlobalParentExecutor, GlobalParentLimits, MAX_GLOBAL_FRAME_BYTES,
 };
@@ -460,6 +461,7 @@ impl FrameMaterializer {
             .as_ref()
             .ok_or_else(|| QuilError::InvalidArgument("frame has no header".into()))?;
         let frame_number = header.frame_number;
+        quil_types::consensus::note_frame_time_head(frame_number);
 
         // 1. Idempotency check
         self.ensure_no_pending_execution()?;
@@ -1119,7 +1121,11 @@ impl FrameMaterializer {
             }
         }
         let sections = sections.finish();
-        if execution_started.elapsed() >= crate::stage_clock::SLOW_EXECUTION {
+        let executed = execution_started.elapsed();
+        if executed >= crate::stage_clock::SLOW_EXECUTION {
+            crate::stage_clock::note_slow("GLOBAL message execution", executed);
+        }
+        if executed >= crate::stage_clock::WARN_AFTER {
             let ms = |us: u64| us / 1000;
             let mut by_kind: Vec<_> = execution_us.into_iter().collect();
             by_kind.sort_by(|a, b| (b.1 .1 + b.1 .2).cmp(&(a.1 .1 + a.1 .2)));

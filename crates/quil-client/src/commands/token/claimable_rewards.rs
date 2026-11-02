@@ -19,7 +19,7 @@ pub(super) async fn run(tc: &TokenCtx, max_pages: usize, max_coins: usize) -> an
             return Ok(None);
         }
         let client = tc.connect().await?;
-        legacy::unshielded(tc, &client, &quil_execution::domains::QUIL_TOKEN).await
+        legacy::unshielded(tc, &client, &quil_execution::domains::QUIL_TOKEN, &mut 0).await
     };
     let confidential = async {
         let client = tc.connect().await?;
@@ -27,7 +27,12 @@ pub(super) async fn run(tc: &TokenCtx, max_pages: usize, max_coins: usize) -> an
             quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
         let wallet = RecipientWallet::load(tc, &network, &quil_execution::domains::QUIL_TOKEN)?;
         match Arc::new(wallet)
-            .scan_unspent_or_rootless(&client, max_pages, max_coins)
+            .scan_unspent_or_rootless(
+                &client,
+                max_pages,
+                max_coins,
+                &mut super::wallet::ScanReport::default(),
+            )
             .await?
         {
             Some(coins) => coins

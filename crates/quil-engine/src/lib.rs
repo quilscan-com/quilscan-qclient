@@ -1,9 +1,11 @@
+pub mod admission_verify;
 pub mod app_engine;
 pub mod app_glue;
 pub mod app_handoff;
 mod app_history_recovery;
 pub mod app_shard_cache;
 pub mod app_shard_metadata;
+mod app_stall;
 pub mod app_types;
 pub mod archive_ingest;
 pub mod archive_preverify;
@@ -72,12 +74,14 @@ pub mod storage_labels;
 pub mod storage_snapshot;
 pub mod thread_worker;
 pub mod time_reel;
+mod unheld_finalization;
 pub mod worker;
 pub mod worker_allocator;
 pub mod worker_consensus_storage;
 pub mod worker_execution;
 pub mod worker_node;
 pub mod worker_payload_eviction;
+mod worker_pinning;
 pub mod worker_stall;
 
 /// Test support mocks (TestProverRegistry, TestWorkerManager).
@@ -85,6 +89,10 @@ pub mod worker_stall;
 /// docs since these are not part of the production API.
 #[doc(hidden)]
 pub mod test_support;
+
+/// Per-thread heap accounting for this crate's unit tests.
+#[cfg(test)]
+mod test_alloc;
 
 pub use app_engine::AppConsensusEngine;
 pub use app_shard_cache::AppShardCache;
@@ -586,4 +594,5 @@ pub mod bitmasks {
 }
 pub mod shard_drain;
 pub(crate) mod stage_clock;
+pub(crate) mod storage_registration_landed;
 pub(crate) mod submission_attempts;

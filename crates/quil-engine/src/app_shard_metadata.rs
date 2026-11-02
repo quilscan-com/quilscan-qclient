@@ -432,6 +432,7 @@ pub fn retire_unchallengeable_replicas(
     if keep_from <= previous {
         return false;
     }
+    crate::storage_snapshot::note_replica_eviction(current_epoch);
     match replica_store.evict_below_epoch(keep_from) {
         Ok(()) => {
             retired_below.fetch_max(keep_from, Ordering::AcqRel);
@@ -613,6 +614,17 @@ pub fn request_storage_snapshots(
     Ok(())
 }
 
+/// Whether this is the first renewal of `member`'s seat on `filter` for
+/// `epoch` without a storage registration: a renewal is retried until it
+/// publishes, and says so once. Two epochs are kept.
+fn first_unregistered_renewal(member: &[u8], filter: &[u8], epoch: u64) -> bool {
+    static LOGGED: std::sync::Mutex<std::collections::BTreeSet<(Vec<u8>, Vec<u8>, u64)>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    logged.retain(|(_, _, logged)| logged.saturating_add(2) >= epoch);
+    logged.insert((member.to_vec(), filter.to_vec(), epoch))
+}
+
 /// A hash-proof epoch's registrations: the leaves the member's snapshot for
 /// `epoch` encoded (`crate::storage_snapshot`), never the live data, which has
 /// moved on from the state archives commit to. A snapshot not encoded yet is
@@ -663,9 +675,27 @@ fn snapshot_storage_confirm(
                     ),
                 ));
             }
-            tracing::warn!(frame = frame_number, epoch, filter = %hex::encode(filter),
-                "no leaf snapshot for the epoch: renewing without a storage registration; this seat's frames carry \
-                 no storage attestation that epoch");
+            // A renewal is retried until it publishes: say it once a seat.
+            if first_unregistered_renewal(member, filter, epoch) {
+                if given_up {
+                    tracing::info!(frame = frame_number, epoch, filter = %hex::encode(filter),
+                        scope = "local", action = "no action needed here: the give-up was warned \
+                        when it happened ('storage snapshot given up')",
+                        "renewing a seat without a storage registration: its snapshot was given up");
+                } else {
+                    let reason = if frame_number >= grace_frame {
+                        "the snapshot did not finish by the renewal's grace frame"
+                    } else {
+                        "no snapshot sources known for a shard a recorded change creates"
+                    };
+                    tracing::warn!(frame = frame_number, epoch, filter = %hex::encode(filter),
+                        grace_frame, scope = "local", reason,
+                        action = "check this node's CPU and disk load and how many seats it labels \
+                                  at once; the next epoch's snapshot starts again",
+                        "renewing a seat without a storage registration: this seat's frames carry no \
+                         storage attestation and earn no storage share this epoch");
+                }
+            }
             all.push(ConfirmLeafRoots {
                 filter: filter.clone(),
                 entries: Vec::new(),
@@ -675,17 +705,17 @@ fn snapshot_storage_confirm(
         let mut entries = Vec::with_capacity(prefixes.len());
         for prefix in prefixes {
             let lid = leaf_id_bytes(filter, &prefix);
-            let stored = replica_store.get_hash(epoch, &lid)?.ok_or_else(|| {
+            // The record beside the nodes: a renewal reads no replica.
+            let stored = replica_store.get_hash_leaf(epoch, &lid)?.ok_or_else(|| {
                 unavailable(format!(
                     "leaf {} of the epoch {epoch} snapshot has no replica",
                     hex::encode(&lid)
                 ))
             })?;
-            let nodes = (stored.replica.len() / quil_crypto::storage_proof::NODE_BYTES) as u64;
             entries.push(LeafRootEntry {
                 prefix,
-                leaf_root: stored.registration_root,
-                num_blocks: nodes,
+                leaf_root: stored.registration_root.clone(),
+                num_blocks: stored.n,
             });
         }
         all.push(ConfirmLeafRoots {
@@ -896,6 +926,25 @@ pub fn partition_shard_leaves(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// A renewal retried every frame without a storage registration says
+    /// so once per seat and epoch (132 lines a day for 86 seats on a
+    /// regular node), and again for another seat or a later epoch.
+    #[test]
+    fn a_renewal_without_a_registration_is_logged_once_per_seat_and_epoch() {
+        let member = b"test member: unregistered renewal".to_vec();
+        let (a, b) = (vec![0xa1; 32], vec![0xb2; 32]);
+        assert!(first_unregistered_renewal(&member, &a, 40));
+        for _ in 0..5 {
+            assert!(!first_unregistered_renewal(&member, &a, 40), "a retry");
+        }
+        assert!(first_unregistered_renewal(&member, &b, 40), "another seat");
+        assert!(first_unregistered_renewal(&member, &a, 41), "a later epoch");
+        assert!(!first_unregistered_renewal(&member, &a, 41));
+        // Epochs more than two back are forgotten, so the set stays small.
+        assert!(first_unregistered_renewal(&member, &a, 44));
+        assert!(first_unregistered_renewal(&member, &a, 40));
+    }
 
     use quil_hypergraph::testing::{MemStore, StubProver};
     use quil_hypergraph::Location;

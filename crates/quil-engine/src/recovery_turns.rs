@@ -66,7 +66,9 @@ pub(crate) const MAX_TURN_HOLD: Duration = Duration::from_secs(10 * 60);
 /// committee's quorum may need. A longer catch-up or a checkpoint install
 /// waits while any kept seat waits: on an operator's node every turn for
 /// 2.5 hours went to departing seats installing 0.2 to 2.5 million leaves
-/// while the one seat it kept waited.
+/// while the one seat it kept waited. A thread worker holding no frame of
+/// a departing seat's shard installs none of it
+/// (`WorkerAllocator::departing_install`).
 pub(crate) const DEPARTING_GAP_FILL_FRAMES: u64 = 32;
 
 /// How long a worker waits for a turn before the queue counts as saturated.
@@ -80,13 +82,14 @@ const SATURATION_TICK: Duration = Duration::from_secs(60);
 
 /// How long a withdrawn claim's place waits for its worker's next claim of
 /// the shard ([`State::keep_place`]): an epoch of wall time from its first
-/// withdrawal since the place last got a turn. An engine restarts within
+/// withdrawal since the place last got a turn, at the GLOBAL frame interval
+/// of this process's latest GLOBAL frame. An engine restarts within
 /// seconds to minutes; on an operator's node the engine of a seat it kept
 /// restarted seven times in 81 minutes while its recovery waited.
 fn place_kept_for() -> Duration {
     Duration::from_millis(
         quil_types::consensus::epoch_length_frames()
-            .saturating_mul(crate::difficulty::IDEAL_FRAME_TIME.unsigned_abs()),
+            .saturating_mul(quil_types::consensus::ideal_frame_time_ms()),
     )
 }
 

@@ -756,6 +756,30 @@ impl TokenExecutionEngine {
         counts
     }
 
+    /// Byte sizes of the confidential operations in `bundles` whose verdicts
+    /// `policy` has not cached yet: what executing them would still verify.
+    #[cfg(feature = "native-proof")]
+    pub fn unverified_operation_sizes(
+        policy: &crate::token_intrinsic::dispatch::TokenPolicy,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+    ) -> Vec<usize> {
+        Self::confidential_operations(bundles)
+            .into_iter()
+            .filter(|(address, bytes, tp)| !policy.verdict_cached(address, bytes, *tp))
+            .map(|(_, bytes, _)| bytes.len())
+            .collect()
+    }
+
+    /// The per-frame verification budget, in worker-seconds (budget seconds
+    /// times the worker's concurrency); `None` without a configured worker.
+    #[cfg(feature = "native-proof")]
+    pub fn verification_budget(&self) -> Option<f64> {
+        self.token_worker.as_ref().map(|worker| {
+            crate::token_intrinsic::dispatch::verification_budget_secs()
+                * worker.concurrency().max(1) as f64
+        })
+    }
+
     /// Confidential operations a proposal may schedule under the verification
     /// budget; unbounded without a configured worker.
     #[cfg(feature = "native-proof")]
@@ -1076,6 +1100,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         self.clock_store.as_ref(),
                         _address,
                         inner_bytes,
+                        self.shard_store(),
                     );
                 }
                 if crate::token_intrinsic::dispatch::is_confidential_type(inner_tp) {
@@ -1857,6 +1882,16 @@ impl TokenExecutionEngine {
     /// The venue this engine executes in.
     pub fn mode(&self) -> ExecutionMode {
         self.mode
+    }
+
+    /// Whether this engine's store holds only the shard whose frames it
+    /// executes: a worker's own store. Workers configure the application
+    /// venue (`with_application_venue`); a manager built without the global
+    /// engine starts there too. A manager in the global venue (the master's:
+    /// GLOBAL, and an archive replaying every shard into one store) holds the
+    /// whole application, whatever venue a frame's context names.
+    pub fn shard_store(&self) -> bool {
+        self.mode == ExecutionMode::Application
     }
 
     /// Read canonical global frames (reward mint and mint-claim citations)

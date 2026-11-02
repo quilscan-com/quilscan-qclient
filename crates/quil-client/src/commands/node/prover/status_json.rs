@@ -297,6 +297,34 @@ mod tests {
     }
 
     #[test]
+    fn status_json_forwards_new_and_future_recovery_class_map_entries() {
+        let (node, mut workers) = fixture();
+        let classes = [
+            "GLOBAL_SYNC",
+            "PROOF_VERIFICATION",
+            "ENGINE_BUSY",
+            "future_class",
+        ];
+        let recovery = workers[0]
+            .execution
+            .as_mut()
+            .unwrap()
+            .recovery
+            .as_mut()
+            .unwrap();
+        for class in classes {
+            recovery.failures_by_class.insert(class.into(), u32::MAX);
+        }
+        let value = snapshot(&node, Ok(&workers));
+        for class in classes {
+            assert_eq!(
+                value["workers"][0]["execution"]["recovery"]["failures_by_class"][class],
+                u32::MAX
+            );
+        }
+    }
+
+    #[test]
     fn status_json_preserves_decimal_counters_and_all_execution_fields() {
         let (node, workers) = fixture();
         let value = snapshot(&node, Ok(&workers));

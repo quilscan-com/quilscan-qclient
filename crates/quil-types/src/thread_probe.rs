@@ -64,6 +64,7 @@ sections! {
     EngineCleanupTimer => "cleanup timer",
     EngineDeliveryTimer => "delivery source timer",
     EngineRetryTimer => "consensus retry timer",
+    EngineHistoryWalk => "outgoing history walk batch",
     EngineUpkeep => "loop upkeep",
     // Synchronous sections.
     CommitLockWait => "CRDT commit lock wait",
@@ -87,6 +88,12 @@ sections! {
     FrameStoreCleanup => "frame store cleanup",
     PreStateHeal => "pre-state heal check",
     GenesisSupersededCheck => "adopted genesis check",
+    LegacyHistoryCheck => "legacy history discard check",
+    EvictedLineageCheck => "evicted lineage check",
+    StorageEpochProofCheck => "storage epoch proof check",
+    HeldFrameCheck => "held frame re-check",
+    LaggingVoterCheck => "lagging voter check",
+    SessionStatusCheck => "committee session status check",
     // Master tasks.
     MessageLoop => "message loop",
     ArchivePoller => "archive frame poller",

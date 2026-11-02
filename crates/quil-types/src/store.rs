@@ -43,11 +43,31 @@ pub trait LocalVertexCommitObserver: Send + Sync {
 /// Low-level key-value database interface (Pebble in Go, RocksDB in Rust).
 pub trait KvDb: Send + Sync {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    /// Show `key`'s value to `read` where the store keeps it, without
+    /// copying it out where the store allows (RocksDB pins it); whether the
+    /// key exists. For values too large to copy.
+    fn get_with(&self, key: &[u8], read: &mut dyn FnMut(&[u8])) -> Result<bool> {
+        Ok(self.get(key)?.map(|value| read(&value)).is_some())
+    }
     fn set(&self, key: &[u8], value: &[u8]) -> Result<()>;
     fn delete(&self, key: &[u8]) -> Result<()>;
     fn new_batch(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
     fn new_iter(&self, lower: &[u8], upper: &[u8]) -> Result<Box<dyn Iterator>>;
     fn compact(&self, start: &[u8], end: &[u8], parallelize: bool) -> Result<()>;
+    /// Compact `[start, end)` through the bottommost level, without holding
+    /// off automatic compactions, when a live file overlapping it is at
+    /// least `min_file_bytes`: deleted values there stop taking space and
+    /// stop being read by lookups of keys beside them. Whether it ran.
+    fn compact_reclaiming(&self, start: &[u8], end: &[u8], min_file_bytes: u64) -> Result<bool> {
+        let _ = min_file_bytes;
+        self.compact(start, end, false).map(|()| true)
+    }
+    /// Whether [`Self::compact_reclaiming`] would compact: a live file
+    /// overlapping `[start, end)` is at least `min_file_bytes`.
+    fn holds_file_of(&self, start: &[u8], end: &[u8], min_file_bytes: u64) -> Result<bool> {
+        let _ = (start, end, min_file_bytes);
+        Ok(true)
+    }
     fn compact_all(&self) -> Result<()>;
     fn close(&self) -> Result<()>;
     fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()>;
@@ -814,6 +834,23 @@ pub struct MintAuthorizationWitnessData {
     pub global_root: Vec<u8>,
 }
 
+/// Where a mint authorization stands on this node; see
+/// `GetMintAuthorizationStatusResponse` for each field.
+#[derive(Debug, Clone, Default)]
+pub struct MintAuthorizationStatusData {
+    pub state: crate::proto::node::MintAuthorizationState,
+    pub found: bool,
+    pub inclusion_frame: u64,
+    pub inclusion_frame_earliest: u64,
+    pub claim_cap: u64,
+    pub cap_from_shard_anchor: bool,
+    pub head_frame: u64,
+    pub searched_frame: u64,
+    pub cited_frame: u64,
+    pub first_root_frame: u64,
+    pub reason: String,
+}
+
 /// Coin witness transport data, independent of lattice implementation types.
 pub struct CoinWitnessData {
     pub address: [u8; 32],
@@ -928,6 +965,16 @@ pub trait CoinWitnessProvider: Send + Sync {
             "mint authorization witnesses unavailable".into(),
         ))
     }
+
+    fn mint_authorization_status(
+        &self,
+        _receipt: &[u8; 32],
+    ) -> Result<MintAuthorizationStatusData> {
+        Err(crate::error::QuilError::ExecutionUnavailable(
+            "mint authorization status unavailable".into(),
+        ))
+    }
+
     fn coin_page(
         &self,
         _domain: &[u8; 32],
@@ -993,6 +1040,44 @@ pub enum LargeVertexIndexState {
     Building { rows_walked: u64 },
     /// Every large row has an entry.
     Complete,
+}
+
+/// A retention plan read without the commit lock
+/// ([`HypergraphStore::retention_plan`]): where a pass should look, not what
+/// it may delete.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionScan {
+    /// `(shard id, phase index, watermark)` of each tree the index let be
+    /// pruned when read.
+    pub trees: Vec<(Vec<u8>, usize, u64)>,
+    /// Blob keyspaces every tree of which had a watermark when read.
+    pub keyspaces: Vec<RetentionKeyspace>,
+    /// Root-version index entries read.
+    pub index_entries: usize,
+}
+
+/// One blob keyspace of a [`RetentionScan`]: the `(set, phase)` bytes and
+/// application its keys share, and the least watermark of its trees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionKeyspace {
+    pub set: u8,
+    pub phase: u8,
+    pub application: [u8; 32],
+    pub watermark: u64,
+}
+
+/// The retention plan of the trees under one `(set, phase, scope)`, read
+/// from the live index under the commit lock
+/// ([`HypergraphStore::retention_replan`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionLive {
+    /// `(shard id, phase index, watermark)` of each prunable tree.
+    pub trees: Vec<(Vec<u8>, usize, u64)>,
+    /// Index entries below their tree's watermark.
+    pub delete_roots: Vec<Vec<u8>>,
+    /// The watermark of the blob keyspace `scope` names, when `scope` is an
+    /// application every tree of which has one.
+    pub keyspace: Option<u64>,
 }
 
 pub trait HypergraphStore: Send + Sync {
@@ -1317,19 +1402,64 @@ pub trait HypergraphStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Like [`prune_versioned`](Self::prune_versioned), but each tree keeps the
-    /// last `retain_frames` of its own indexed frames, and at most
-    /// `max_blob_deletes` blob versions are deleted per call. `head` gives a
-    /// tree's current version, `(shard id, phase index)`. Trees whose versions
-    /// restart are left untouched; with a head known, a tree whose frames fall
-    /// while its versions rise is pruned conservatively.
-    fn prune_versioned_retaining(
+    /// The retention plan of the whole index, read without any lock: each
+    /// tree keeps the last `retain_frames` of its own indexed frames. `head`
+    /// gives a tree's current version, `(shard id, phase index)`. Trees whose
+    /// versions restart are left untouched; with a head known, a tree whose
+    /// frames fall while its versions rise is pruned conservatively. Nothing
+    /// is deleted: the plan only says where to look, and every deletion is
+    /// decided again from the live index ([`Self::retention_replan`]).
+    fn retention_plan(
         &self,
         _retain_frames: u64,
-        _max_blob_deletes: usize,
         _head: &dyn Fn(&[u8], usize) -> Option<u64>,
-    ) -> Result<Vec<(Vec<u8>, usize, u64)>> {
-        Ok(Vec::new())
+    ) -> Result<RetentionScan> {
+        Ok(RetentionScan::default())
+    }
+
+    /// The vertices of one blob keyspace of a [`Self::retention_plan`] that
+    /// hold a version below their newest one at or below `watermark`, read
+    /// without any lock, until about `budget` such versions are found
+    /// (decremented). Returns them in key order and the keys read.
+    fn retention_blob_candidates(
+        &self,
+        _keyspace: &RetentionKeyspace,
+        _budget: &mut usize,
+    ) -> Result<(Vec<Vec<u8>>, usize)> {
+        Ok((Vec::new(), 0))
+    }
+
+    /// The live retention plan of the trees indexed under `(set, phase,
+    /// scope)` (`scope`: an application, or a shorter tree id), for a caller
+    /// holding the commit lock, so that no commit, reset or sync interleaves
+    /// with the deletions it decides.
+    fn retention_replan(
+        &self,
+        _retain_frames: u64,
+        _set: u8,
+        _phase: u8,
+        _scope: &[u8],
+        _head: &dyn Fn(&[u8], usize) -> Option<u64>,
+    ) -> Result<RetentionLive> {
+        Ok(RetentionLive::default())
+    }
+
+    /// Stage into `txn` the deletion of each of `vertices`' blob versions in
+    /// `keyspace` below its newest one at or below the keyspace's watermark,
+    /// as the store holds them now, at most `budget` (decremented). The
+    /// watermark must come from a [`Self::retention_replan`] under the same
+    /// commit lock. Once `stop` says so, checked after each vertex (at least
+    /// one is judged), the rest are left for a later call. Returns the number
+    /// staged and the number of `vertices` judged.
+    fn retention_prune_vertices(
+        &self,
+        _txn: &dyn Transaction,
+        _keyspace: &RetentionKeyspace,
+        vertices: &[Vec<u8>],
+        _budget: &mut usize,
+        _stop: &dyn Fn() -> bool,
+    ) -> Result<(usize, usize)> {
+        Ok((0, vertices.len()))
     }
 
     fn apply_snapshot(&self, db_path: &str) -> Result<()>;

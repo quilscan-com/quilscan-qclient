@@ -14,7 +14,10 @@ use crate::engines::*;
 
 #[path = "execution_branch.rs"]
 mod execution_branch;
-pub use execution_branch::{ExecutionBranch, ExecutionBranchLimits, ExecutionPublicationGuard};
+pub use execution_branch::{
+    busy_unavailable, lock_unavailable, source_busy, ExecutionBranch, ExecutionBranchLimits,
+    ExecutionPublicationGuard,
+};
 
 /// State-dependent providers for a separate execution manager. The caller must
 /// construct them over the same committed checkpoint and serialize capture
@@ -68,6 +71,19 @@ fn executing_filter(application: &[u8; 32], shard: &[bool]) -> Vec<u8> {
         return application.to_vec();
     }
     quil_forest::encode_shard_bit_path(application, shard)
+}
+
+/// What a read of a shard's pending deliveries found
+/// ([`ExecutionEngineManager::pending_delivery_sources`]): their source
+/// frames, without repeats, and the scale of the read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeliverySourceScan {
+    /// `(executing filter, frame number)` of each source frame.
+    pub sources: Vec<(Vec<u8>, u64)>,
+    /// Pending deliveries read.
+    pub pending: usize,
+    /// Owned blocks read.
+    pub blocks: usize,
 }
 
 /// What a proof pre-verification pass ([`ExecutionEngineManager::preverify_bundles`])
@@ -359,24 +375,91 @@ impl ExecutionEngineManager {
         }
     }
 
-    /// Confidential operations a proposal may schedule per frame under the
-    /// configured verification budget (unbounded without a worker).
-    pub fn token_verification_capacity(&self) -> usize {
+    /// Byte sizes of the confidential token operations in `bundles` whose
+    /// verdicts are not cached yet: what materializing them would still
+    /// verify. Empty when every proof is verified, and without a worker.
+    pub fn unverified_confidential_operations(&self, bundles: &[(Vec<u8>, Vec<u8>)]) -> Vec<usize> {
         #[cfg(feature = "native-proof")]
         {
-            let engines = match self.engines.read() {
-                Ok(engines) => engines,
-                Err(_) => return usize::MAX,
+            let routed: Vec<(Vec<u8>, Vec<u8>)> = bundles
+                .iter()
+                .filter(|(address, _)| {
+                    self.select_engine(address)
+                        .map(|name| name == "token")
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if routed.is_empty() {
+                return Vec::new();
+            }
+            let policy = match self.engines.read() {
+                Ok(engines) => engines
+                    .get("token")
+                    .and_then(|e| e.as_any())
+                    .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
+                    .and_then(TokenExecutionEngine::token_verifier)
+                    .map(|(policy, _)| policy),
+                Err(_) => None,
             };
+            match policy {
+                Some(policy) => TokenExecutionEngine::unverified_operation_sizes(&policy, &routed),
+                None => Vec::new(),
+            }
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = bundles;
+            Vec::new()
+        }
+    }
+
+    /// The per-frame proof-verification budget in worker-seconds; `None`
+    /// (unbounded) without a worker.
+    pub fn token_verification_budget(&self) -> Option<f64> {
+        #[cfg(feature = "native-proof")]
+        {
+            let engines = self.engines.read().ok()?;
             return engines
                 .get("token")
                 .and_then(|e| e.as_any())
                 .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
-                .map(|token| token.verification_capacity())
-                .unwrap_or(usize::MAX);
+                .and_then(|token| token.verification_budget());
         }
         #[cfg(not(feature = "native-proof"))]
-        usize::MAX
+        None
+    }
+
+    /// Whether verifying one confidential operation of `operation_bytes`
+    /// bytes is known to take at most `budget_secs` on this node: its size
+    /// class was measured and fits. Always without the native prover.
+    pub fn verification_known_to_fit(operation_bytes: usize, budget_secs: f64) -> bool {
+        #[cfg(feature = "native-proof")]
+        {
+            return crate::token_intrinsic::dispatch::verification_known_to_fit(
+                operation_bytes,
+                budget_secs,
+            );
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = (operation_bytes, budget_secs);
+            true
+        }
+    }
+
+    /// Estimated wall time of verifying one confidential operation of
+    /// `operation_bytes` bytes on this node (measured per size class).
+    pub fn estimated_verify_secs(operation_bytes: usize) -> f64 {
+        #[cfg(feature = "native-proof")]
+        {
+            return crate::token_intrinsic::dispatch::estimated_verify_secs(operation_bytes);
+        }
+        #[cfg(not(feature = "native-proof"))]
+        {
+            let _ = operation_bytes;
+            0.0
+        }
     }
 
     /// Number of confidential token operations in a canonical bundle
@@ -472,6 +555,12 @@ impl ExecutionEngineManager {
     /// crypto-less fallback. Production callers MUST supply real
     /// implementations; tests can wire noop stubs from
     /// `crate::testing::NoopExecutionCrypto`.
+    ///
+    /// `include_global = false` also starts every engine in the application
+    /// venue, as [`Self::with_application_venue`] sets the token engine: the
+    /// store is then taken to hold only the shard it executes, and a missing
+    /// coin summary is rebuilt from that shard's blocks
+    /// ([`TokenExecutionEngine::shard_store`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         inclusion_prover: Arc<dyn InclusionProver>,
@@ -694,6 +783,28 @@ impl ExecutionEngineManager {
     /// which applies pulled state into this same CRDT (coordinated versions).
     pub fn crdt(&self) -> Arc<quil_hypergraph::HypergraphCrdt> {
         self.crdt.clone()
+    }
+
+    /// Reads the engines until the returned guard drops, as a gossip
+    /// validation or an RPC cost query does.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn hold_engines_for_test(&self) -> impl Sized + '_ {
+        self.engines.read().unwrap()
+    }
+
+    /// Poisons the engine lock: a thread panics while it writes them.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn poison_engines_for_test(&self) {
+        std::thread::scope(|scope| {
+            let panicked = scope
+                .spawn(|| {
+                    let _engines = self.engines.write().unwrap();
+                    panic!("a test panics while it writes the execution engines");
+                })
+                .join();
+            assert!(panicked.is_err());
+        });
+        assert!(self.engines.is_poisoned());
     }
 
     /// Shard metadata bound to this manager's execution state.
@@ -1444,32 +1555,37 @@ impl ExecutionEngineManager {
         &self,
         global: Arc<quil_hypergraph::HypergraphCrdt>,
         filter: &[u8],
-    ) -> Result<Vec<(Vec<u8>, u64)>> {
+    ) -> Result<DeliverySourceScan> {
         #[cfg(not(feature = "native-proof"))]
         {
             let _ = (global, filter);
-            Ok(Vec::new())
+            Ok(DeliverySourceScan::default())
         }
         #[cfg(feature = "native-proof")]
         {
             let Some((application, _)) = quil_forest::decode_shard_filter_or_root(filter, 32)
             else {
-                return Ok(Vec::new());
+                return Ok(DeliverySourceScan::default());
             };
             let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else {
-                return Ok(Vec::new());
+                return Ok(DeliverySourceScan::default());
             };
-            let mut sources: Vec<(Vec<u8>, u64)> = Vec::new();
-            for item in self.pending_deliveries(global, filter)? {
+            let (pending, blocks) = self.pending_deliveries_counted(global, filter)?;
+            let mut scan = DeliverySourceScan {
+                pending: pending.len(),
+                blocks,
+                ..DeliverySourceScan::default()
+            };
+            for item in pending {
                 let Some(bits) = item.source_shard.bits() else {
                     continue;
                 };
                 let source = (executing_filter(&application, &bits), item.source_frame);
-                if !sources.contains(&source) {
-                    sources.push(source);
+                if !scan.sources.contains(&source) {
+                    scan.sources.push(source);
                 }
             }
-            Ok(sources)
+            Ok(scan)
         }
     }
 
@@ -1479,20 +1595,34 @@ impl ExecutionEngineManager {
         global: Arc<quil_hypergraph::HypergraphCrdt>,
         filter: &[u8],
     ) -> Result<Vec<crate::token_intrinsic::delivery::PendingDelivery>> {
+        self.pending_deliveries_counted(global, filter)
+            .map(|(pending, _)| pending)
+    }
+
+    /// [`Self::pending_deliveries`] and how many owned blocks it read.
+    #[cfg(feature = "native-proof")]
+    fn pending_deliveries_counted(
+        &self,
+        global: Arc<quil_hypergraph::HypergraphCrdt>,
+        filter: &[u8],
+    ) -> Result<(
+        Vec<crate::token_intrinsic::delivery::PendingDelivery>,
+        usize,
+    )> {
         use crate::token_intrinsic::{delivery, dispatch::TokenPolicy};
         let Some((application, shard)) = quil_forest::decode_shard_filter_or_root(filter, 32)
         else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
         let Ok(application) = <[u8; 32]>::try_from(application.as_slice()) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
         let network =
             quil_lattice_ct::confidential::transfer::network_identifier(self.pricing_network());
         let limits = TokenPolicy::for_network(self.pricing_network()).snapshots;
         let global = crate::hypergraph_state::HypergraphState::new(global);
         let local = crate::hypergraph_state::HypergraphState::new(self.crdt());
-        delivery::pending_deliveries(
+        delivery::pending_deliveries_counted(
             &global,
             &local,
             &network,

@@ -125,15 +125,125 @@ pub struct GlobalSeamProposer {
     /// Without it, the vote-time check halts on the fork but the reconcile never
     /// hears about it → permanent stall. `None` in tests / non-archive nodes.
     on_prover_fork: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    /// Proposals declaring a parent state other than this node's own
+    /// execution of it ([`Self::note_own_parent_state`]).
+    own_state_differs: Mutex<crate::bounded_warn::WarnLimiter<()>>,
     /// The view this node is letting a finalized parent publish in, and since
     /// when ([`Self::yield_to_publication`]), and how long it may.
     publication_wait: Mutex<Option<(u64, std::time::Instant)>>,
     publication_priority: std::time::Duration,
+    /// Why this node's votes on recent views waited ([`Self::defer_vote`]).
+    vote_waits: Mutex<std::collections::BTreeMap<u64, VoteWait>>,
+    /// Proposal retries that found an execution source in use
+    /// ([`Self::note_proposal_prepare`]).
+    proposal_busy: Mutex<ProposalBusy>,
+    /// This archive's wait for its finalized frames to publish
+    /// ([`Self::await_sequenced_publication`]).
+    sequenced_wait: Mutex<SequencedWait>,
+    /// The finalizer, which hands finalizations reported without their body
+    /// to publication once the body arrives ([`Self::await_unheld_parent`]).
+    finalizer: Option<Arc<GlobalSeamFinalizer>>,
+    unheld_patience: std::time::Duration,
 }
 
 /// Longest a proposal or vote waits per view for this node to publish its
-/// finalized parent rather than execute it privately.
+/// finalized parent rather than execute it privately, where executing it
+/// privately gives the same state ([`GlobalSeamProposer::yield_to_publication`]).
+/// An archive waits until publication instead
+/// ([`GlobalSeamProposer::await_sequenced_publication`]).
 const PUBLICATION_PRIORITY: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How often an archive still waiting for its finalized frames to publish is
+/// logged again.
+const SEQUENCED_WAIT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// An archive's wait for its finalized GLOBAL frames to publish, as one
+/// outage: its start, a repeat at most every [`SEQUENCED_WAIT_LOG_EVERY`] and
+/// its end.
+struct SequencedWait {
+    outage: crate::outage::Outage,
+    /// The published and highest finalized frame when last seen waiting.
+    published: u64,
+    finalized: u64,
+}
+
+impl Default for SequencedWait {
+    fn default() -> Self {
+        Self {
+            outage: crate::outage::Outage::begin_after_repeating(1, SEQUENCED_WAIT_LOG_EVERY),
+            published: 0,
+            finalized: 0,
+        }
+    }
+}
+
+/// How long a vote this node cannot check yet waits before it asks again.
+const VOTE_DEFER: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Recent views whose vote waits are remembered; an older view's vote was
+/// decided long ago.
+const VOTE_WAIT_VIEWS: u64 = 16;
+
+/// How often a proposal that keeps finding a source in use is logged again.
+/// A view's proposal retries each second for up to 20 s.
+const PROPOSAL_BUSY_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a vote waited for last in one view.
+struct VoteWait {
+    cause: String,
+    /// What the operator checks if the vote is declined for it.
+    check: &'static str,
+    /// The view's first deferral on a source in use is logged; later ones
+    /// are not.
+    source_logged: bool,
+    /// The wait was for an expected event that ends it, not an overrun.
+    expected: bool,
+}
+
+/// Why a vote is deferred.
+enum Deferral<'a> {
+    /// This node's own GLOBAL execution holds the lease or frame lock.
+    OwnExecution,
+    /// The finalized parent is publishing ([`GlobalSeamProposer::yield_to_publication`]).
+    Publication,
+    /// This archive's finalized frames wait to publish
+    /// ([`GlobalSeamProposer::await_sequenced_publication`]).
+    SequencedPublication {
+        parent: u64,
+        published: u64,
+        finalized: u64,
+    },
+    /// The parent descends from a finalization reported without its body
+    /// ([`GlobalSeamProposer::await_unheld_parent`]).
+    UnheldParent { finalized_view: u64 },
+    /// The capture found a source in use ([`quil_execution::source_busy`]).
+    BusySource {
+        parent: u64,
+        error: &'a quil_types::error::QuilError,
+    },
+}
+
+/// A proposal whose retries keep finding an execution source in use, as one
+/// outage per view: its start, a repeat at most every
+/// [`PROPOSAL_BUSY_LOG_EVERY`], and its end, instead of a warn per retry.
+struct ProposalBusy {
+    outage: crate::outage::Outage,
+    view: u64,
+    parent: u64,
+    /// The latest busy retry, while the outage lasts.
+    last: Option<std::time::Instant>,
+}
+
+impl Default for ProposalBusy {
+    fn default() -> Self {
+        Self {
+            outage: crate::outage::Outage::begin_after_repeating(1, PROPOSAL_BUSY_LOG_EVERY),
+            view: 0,
+            parent: 0,
+            last: None,
+        }
+    }
+}
 
 impl GlobalSeamProposer {
     pub fn new(
@@ -152,8 +262,133 @@ impl GlobalSeamProposer {
             block_store: None,
             selected_execution: None,
             on_prover_fork,
+            own_state_differs: Mutex::new(crate::bounded_warn::WarnLimiter::new()),
             publication_wait: Mutex::new(None),
             publication_priority: PUBLICATION_PRIORITY,
+            vote_waits: Mutex::default(),
+            proposal_busy: Mutex::default(),
+            sequenced_wait: Mutex::default(),
+            finalizer: None,
+            unheld_patience: crate::unheld_finalization::UNHELD_PATIENCE,
+        }
+    }
+
+    /// Defer `view`'s vote for `why`, remembering it for
+    /// [`GlobalProposer::verify_patience_ran_out`]. The view's first deferral
+    /// on a source in use is logged; the adapter asks again every
+    /// [`VOTE_DEFER`], and those repeats are not.
+    fn defer_vote(&self, view: u64, why: Deferral<'_>) -> std::time::Duration {
+        let Ok(mut waits) = self.vote_waits.lock() else {
+            return VOTE_DEFER;
+        };
+        let floor = view.saturating_sub(VOTE_WAIT_VIEWS);
+        waits.retain(|waited, _| *waited > floor);
+        let wait = waits.entry(view).or_insert_with(|| VoteWait {
+            cause: String::new(),
+            check: "",
+            source_logged: false,
+            expected: false,
+        });
+        wait.expected = matches!(
+            why,
+            Deferral::SequencedPublication { .. } | Deferral::UnheldParent { .. }
+        );
+        match why {
+            Deferral::OwnExecution => {
+                wait.cause = "this node's own GLOBAL execution (lease or frame lock)".into();
+                wait.check = "this node's execution outlasted the patience; check its slow execution and publication lines";
+            }
+            Deferral::Publication => {
+                wait.cause = "publication of the finalized parent".into();
+                wait.check = "this node's parent publication outlasted the patience; check its publication lines";
+            }
+            Deferral::SequencedPublication {
+                parent,
+                published,
+                finalized,
+            } => {
+                wait.cause = format!(
+                    "parent {parent} is above this archive's published frame {published} while finalized frames through {finalized} wait to publish"
+                );
+                wait.check = "expected while finalization ingests the application frames those frames sequence; it ends when they publish";
+            }
+            Deferral::UnheldParent { finalized_view } => {
+                wait.cause = format!(
+                    "the parent descends from the frame finalized at view {finalized_view}, whose body this node does not hold"
+                );
+                wait.check = "expected: it ends when that body arrives or the archive poller publishes the frame, at most 10 s after its finalization";
+            }
+            Deferral::BusySource { parent, error } => {
+                wait.cause = error.to_string();
+                wait.check = "another holder (a gossip validation, an RPC query or this node's own execution) kept the source past the patience; check this node's RPC and gossip load";
+                if !wait.source_logged {
+                    wait.source_logged = true;
+                    tracing::info!(
+                        view,
+                        parent,
+                        lock = %wait.cause,
+                        waits_up_to_s = quil_cw_consensus::adapters::VERIFY_PATIENCE.as_secs(),
+                        "GLOBAL vote deferred: an execution source is in use elsewhere; the vote waits up to waits_up_to_s for it, then declines"
+                    );
+                }
+            }
+        }
+        VOTE_DEFER
+    }
+
+    /// Record one proposal attempt at `now` on `view`'s parent `parent`:
+    /// `busy` is its prepare error if that only found a source in use. Logs
+    /// the busy outage's start, bounded repeats and end; a new view ends the
+    /// last view's outage at its last busy retry.
+    pub(crate) fn note_proposal_prepare(
+        &self,
+        view: u64,
+        parent: u64,
+        busy: Option<&quil_types::error::QuilError>,
+        now: std::time::Instant,
+    ) {
+        use crate::outage::OutageEvent;
+        let Ok(mut state) = self.proposal_busy.lock() else {
+            return;
+        };
+        let state = &mut *state;
+        if state.view != view {
+            if let Some(last) = state.last.take() {
+                if let Some(OutageEvent::Ended { secs, failures }) =
+                    state.outage.observe(last, true)
+                {
+                    tracing::info!(view = state.view, parent = state.parent, busy_s = secs, retries = failures,
+                        "GLOBAL proposal stopped waiting for a busy execution source: its view ended");
+                }
+            }
+            state.view = view;
+        }
+        state.parent = parent;
+        let Some(error) = busy else {
+            if state.last.take().is_some() {
+                if let Some(OutageEvent::Ended { secs, failures }) = state.outage.observe(now, true)
+                {
+                    tracing::info!(
+                        view,
+                        parent,
+                        busy_s = secs,
+                        retries = failures,
+                        "GLOBAL proposal no longer waits for a busy execution source"
+                    );
+                }
+            }
+            return;
+        };
+        state.last = Some(now);
+        match state.outage.observe(now, false) {
+            Some(OutageEvent::Began) => tracing::info!(view, parent, lock = %error,
+                retry_every_s = 1,
+                "GLOBAL proposal waits for an execution source in use elsewhere; it retries while the view lasts"),
+            Some(OutageEvent::Continues { secs, failures }) => tracing::warn!(view, parent,
+                lock = %error, busy_s = secs, retries = failures, scope = "local", action = "check",
+                check = "another holder (a gossip validation, an RPC query or this node's own execution) keeps the source; check this node's RPC and gossip load",
+                "GLOBAL proposal still waits for an execution source in use elsewhere"),
+            _ => {}
         }
     }
 
@@ -161,6 +396,61 @@ impl GlobalSeamProposer {
     pub(crate) fn with_publication_priority(mut self, priority: std::time::Duration) -> Self {
         self.publication_priority = priority;
         self
+    }
+
+    /// [`crate::frame_materializer::GlobalParentExecutor::sequenced_publication_wait`]
+    /// for `view`'s parent `number`: `Some((published, finalized))` while the
+    /// proposal or vote waits for this archive's finalized frames to publish.
+    /// Not bounded per view: the proposal retries and the vote defers while
+    /// the view lasts, and the views after it wait the same way until those
+    /// frames publish, which needs nothing from consensus. Logs the wait's
+    /// start, a repeat every [`SEQUENCED_WAIT_LOG_EVERY`] and its end.
+    fn await_sequenced_publication(
+        &self,
+        executor: &crate::frame_materializer::GlobalParentExecutor,
+        view: u64,
+        number: u64,
+    ) -> Option<(u64, u64)> {
+        use crate::outage::OutageEvent;
+        let wait = executor.sequenced_publication_wait(number);
+        let Ok(mut state) = self.sequenced_wait.lock() else {
+            return wait;
+        };
+        if let Some((published, finalized)) = wait {
+            state.published = published;
+            state.finalized = finalized;
+        }
+        let (published, finalized) = (state.published, state.finalized);
+        match state.outage.observe(std::time::Instant::now(), wait.is_none()) {
+            Some(OutageEvent::Began) => tracing::info!(
+                view,
+                parent = number,
+                published,
+                finalized,
+                "GLOBAL proposals and votes wait for this archive's finalized frames to publish: executing them \
+                 first would miss the application frames their finalization ingests; the wait ends when they publish"
+            ),
+            Some(OutageEvent::Continues { secs, .. }) => tracing::warn!(
+                view,
+                parent = number,
+                published,
+                finalized,
+                waited_s = secs,
+                scope = "local",
+                action = "wait",
+                check = "finalization of the frame after the published one is still ingesting its application frames; its sequenced pass and ingest lines show progress",
+                "GLOBAL proposals and votes still wait for this archive's finalized frames to publish"
+            ),
+            Some(OutageEvent::Ended { secs, .. }) => tracing::info!(
+                view,
+                parent = number,
+                through = finalized,
+                waited_s = secs,
+                "GLOBAL proposals and votes no longer wait: this archive published its finalized frames"
+            ),
+            _ => {}
+        }
+        wait
     }
 
     /// Let the finalized parent `number` publish before executing it
@@ -229,6 +519,51 @@ impl GlobalSeamProposer {
     ) -> Self {
         self.selected_execution = Some(execution);
         self
+    }
+
+    /// Hand finalizations `finalizer` received without their body to it once
+    /// the body arrives, and wait for them ([`Self::await_unheld_parent`]).
+    pub fn with_finalizer(mut self, finalizer: Arc<GlobalSeamFinalizer>) -> Self {
+        self.finalizer = Some(finalizer);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_unheld_patience(mut self, patience: std::time::Duration) -> Self {
+        self.unheld_patience = patience;
+        self
+    }
+
+    /// [`GlobalSeamFinalizer::await_unheld`] for `context`: `Some((view,
+    /// since))` while its parent descends from the frame finalized at `view`
+    /// without its body here, reported `since` ago. Only an archive whose
+    /// publication ingests application frames first waits: elsewhere a private
+    /// execution of the parent reproduces the published one. Bounded by the
+    /// unheld patience after each such finalization, then the proposal or vote
+    /// proceeds as before. A body that arrives is queued to publish, and
+    /// [`Self::await_sequenced_publication`] then waits for it.
+    fn await_unheld_parent(
+        &self,
+        executor: &crate::frame_materializer::GlobalParentExecutor,
+        context: ProposalContext,
+    ) -> Option<(u64, std::time::Duration)> {
+        let finalizer = self.finalizer.as_ref()?;
+        if !executor.sequences_with_ingest() {
+            return None;
+        }
+        let max_bytes = executor.max_frame_bytes();
+        finalizer.await_unheld(
+            context,
+            || {
+                self.clock_store
+                    .get_global_clock_frame(executor.published_frame())
+                    .ok()
+                    .and_then(|frame| frame.header)
+                    .map_or(0, |header| header.rank)
+            },
+            |digest| self.block_store.as_ref()?.get_bounded(digest, max_bytes),
+            self.unheld_patience,
+        )
     }
 
     fn selected_parent_number(&self, digest: Digest) -> Option<u64> {
@@ -424,6 +759,76 @@ impl GlobalSeamProposer {
         Ok(recovered)
     }
 
+    /// Warn, bounded, while proposals declare a parent state other than this
+    /// node's own execution of that parent. This node keeps its executed
+    /// state, so it refuses every such proposal. Two causes: a proposer that
+    /// executed its finalized parent privately before that parent published
+    /// (an archive missing the parent's body, 2026-10-31), which ends at the
+    /// next proposal; or GLOBAL provers on builds with other activation
+    /// constants, which nothing reconciles and which halts GLOBAL when they
+    /// split. One line when it starts, a repeat at most every ten minutes,
+    /// and one when a proposal for a later frame agrees: in a split,
+    /// proposers on this node's side still agree at the refused frame, and
+    /// GLOBAL has not moved past it.
+    pub(crate) fn note_own_parent_state(
+        &self,
+        view: u64,
+        frame: u64,
+        proposer: Option<[u8; 32]>,
+        agrees: bool,
+        difference: Option<crate::frame_materializer::ParentStateDifference>,
+    ) {
+        let now = std::time::Instant::now();
+        let mut limiter = self
+            .own_state_differs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(difference) = difference else {
+            if agrees {
+                if let Some(crate::bounded_warn::Report::Recovered { attempts, duration }) =
+                    limiter.succeeded_at(&(), frame.saturating_sub(1), now)
+                {
+                    tracing::info!(
+                        view,
+                        frame,
+                        refusals = attempts,
+                        secs = duration.as_secs(),
+                        "GLOBAL proposals agree with this node's own execution of their parent again"
+                    );
+                }
+            }
+            return;
+        };
+        if let Some(crate::bounded_warn::Report::Failing { attempts, duration }) =
+            limiter.failed_at(&(), frame, now)
+        {
+            tracing::warn!(
+                view,
+                frame,
+                parent_frame = frame.saturating_sub(1),
+                own_prover_root = %hex::encode(&difference.own_prover_root),
+                proposed_prover_root = %hex::encode(&difference.proposed_prover_root),
+                auxiliary_roots_differ = difference.auxiliary_roots_differ,
+                refusals = attempts,
+                since_secs = duration.as_secs(),
+                proposer = %proposer.map_or_else(
+                    || "unknown".to_string(),
+                    |address| crate::global_stall::tail(&hex::encode(address))
+                ),
+                scope = "the proposer, or this node if it refuses every proposer",
+                action = "check",
+                check = "if the line saying GLOBAL proposals agree again (refusals ended) follows \
+                         within a few views, the proposer executed its parent before that parent published \
+                         (it lacked the parent's body) and nothing is needed; if refusals continue across \
+                         frames, GLOBAL provers run builds with different activation constants (such as \
+                         MAINNET_EARLY_FENCE_FRAME), which does not resolve by itself: upgrade the provers on \
+                         the other build, then stop each and replace its state for this frame \
+                         (--adopt-prover-root from an upgraded prover, or a store resync)",
+                "GLOBAL proposal declares a parent state other than this node's own execution of its parent frame; refusing it"
+            );
+        }
+    }
+
     fn persist_candidate(&self, frame: &GlobalFrame) -> bool {
         self.clock_store.put_global_clock_frame_candidate(frame, &NoopTxn)
             .inspect_err(|error| tracing::warn!(%error, "cw global: could not persist proposal body; abstaining"))
@@ -439,18 +844,32 @@ impl GlobalProposer for GlobalSeamProposer {
         if !executor.accepts_context(context) || !executor.binds_clock(self.clock_store.as_ref()) {
             return None;
         }
-        let number = self.selected_parent_number(context.parent)?;
-        if self.yield_to_publication(executor, context.view, number) {
+        if self.await_unheld_parent(executor, context).is_some() {
             return None; // retried by `propose_retry`
         }
-        let prepared = match executor.prepare(
+        let number = self.selected_parent_number(context.parent)?;
+        if self
+            .await_sequenced_publication(executor, context.view, number)
+            .is_some()
+            || self.yield_to_publication(executor, context.view, number)
+        {
+            return None; // retried by `propose_retry`
+        }
+        let prepared = executor.prepare(
             context,
             number,
             self.block_store.as_ref()?,
             &self.verifier,
             true,
-        ) {
+        );
+        let busy = prepared
+            .as_ref()
+            .err()
+            .filter(|error| quil_execution::source_busy(error));
+        self.note_proposal_prepare(context.view, number, busy, std::time::Instant::now());
+        let prepared = match prepared {
             Ok(prepared) => prepared,
+            Err(error) if quil_execution::source_busy(&error) => return None, // retried by `propose_retry`
             Err(error) => {
                 tracing::warn!(view = context.view, parent = number, %error, "selected GLOBAL parent execution unavailable");
                 return None;
@@ -510,15 +929,16 @@ impl GlobalProposer for GlobalSeamProposer {
     }
 
     /// Defers only while this node's own execution is busy (publishing the
-    /// previous frame, proposing, or checking another proposal). Answering then
-    /// nullified valid proposals at once, and a view needs 4 of 5 votes.
+    /// previous frame, proposing, or checking another proposal) or a source
+    /// its capture takes is in use by a reader. Answering then nullified valid
+    /// proposals at once, and a view needs 4 of 5 votes. A source poisoned by
+    /// a panic is refused at once.
     fn verify_or_defer(
         &self,
         context: ProposalContext,
         digest: Digest,
         bytes: Option<Vec<u8>>,
     ) -> Result<bool, std::time::Duration> {
-        const DEFER: std::time::Duration = std::time::Duration::from_millis(200);
         let Some(executor) = self.selected_execution.as_ref() else {
             return Ok(self.verify(context.view, context.parent, digest, bytes));
         };
@@ -526,7 +946,7 @@ impl GlobalProposer for GlobalSeamProposer {
             return Ok(false);
         }
         if executor.busy() {
-            return Err(DEFER);
+            return Err(self.defer_vote(context.view, Deferral::OwnExecution));
         }
         let Some(bytes) = bytes.filter(|b| b.len() <= executor.max_frame_bytes()) else {
             return Ok(false);
@@ -547,23 +967,60 @@ impl GlobalProposer for GlobalSeamProposer {
         {
             return Ok(false);
         }
+        if let Some((finalized_view, _)) = self.await_unheld_parent(executor, context) {
+            return Err(self.defer_vote(context.view, Deferral::UnheldParent { finalized_view }));
+        }
         let Some(number) = self.selected_parent_number(context.parent) else {
             return Ok(false);
         };
+        if let Some((published, finalized)) =
+            self.await_sequenced_publication(executor, context.view, number)
+        {
+            return Err(self.defer_vote(
+                context.view,
+                Deferral::SequencedPublication {
+                    parent: number,
+                    published,
+                    finalized,
+                },
+            ));
+        }
         if self.yield_to_publication(executor, context.view, number) {
-            return Err(DEFER);
+            return Err(self.defer_vote(context.view, Deferral::Publication));
         }
         let Some(blocks) = self.block_store.as_ref() else {
             return Ok(false);
         };
         let prepared = match executor.prepare(context, number, blocks, &self.verifier, false) {
             Ok(prepared) => prepared,
-            Err(_) if executor.busy() => return Err(DEFER),
+            // A gossip validation or RPC cost query can hold a source (the
+            // engines) after `busy()` read false. Like the lease, it clears
+            // without anything from the network; the adapter's patience
+            // bounds the wait.
+            Err(error) if quil_execution::source_busy(&error) => {
+                return Err(self.defer_vote(
+                    context.view,
+                    Deferral::BusySource {
+                        parent: number,
+                        error: &error,
+                    },
+                ))
+            }
+            Err(_) if executor.busy() => {
+                return Err(self.defer_vote(context.view, Deferral::OwnExecution))
+            }
             Err(error) => {
                 tracing::warn!(view = context.view, parent = number, %error, "selected GLOBAL verification parent unavailable");
                 return Ok(false);
             }
         };
+        self.note_own_parent_state(
+            context.view,
+            header.frame_number,
+            context.leader,
+            prepared.matches_child(header),
+            prepared.own_parent_state_differs(header),
+        );
         if !prepared.matches_child(header) {
             // A re-synced or unreceipted member that disagrees with the
             // proposers' parent state routes the fork to the prover-tree
@@ -597,6 +1054,44 @@ impl GlobalProposer for GlobalSeamProposer {
         Ok(true)
     }
 
+    /// One warn per declined vote, with what it waited for.
+    fn verify_patience_ran_out(&self, context: ProposalContext, waited: std::time::Duration) {
+        let wait = self.vote_waits.lock().ok().and_then(|waits| {
+            waits
+                .get(&context.view)
+                .map(|wait| (wait.cause.clone(), wait.check, wait.expected))
+        });
+        let (cause, check, expected) = wait.map_or(
+            (
+                "unrecorded".to_string(),
+                "no deferral was recorded for this view; report this line",
+                false,
+            ),
+            |wait| wait,
+        );
+        if expected {
+            tracing::info!(
+                view = context.view,
+                waited_s = waited.as_secs(),
+                cause = %cause,
+                scope = "local",
+                action = "wait",
+                check,
+                "GLOBAL vote declined: still deferred when the verify patience ran out"
+            );
+            return;
+        }
+        tracing::warn!(
+            view = context.view,
+            waited_s = waited.as_secs(),
+            cause = %cause,
+            scope = "local",
+            action = "check",
+            check,
+            "GLOBAL vote declined: still deferred when the verify patience ran out"
+        );
+    }
+
     fn propose_retry(&self) -> Option<std::time::Duration> {
         // Missing parents and materialization lag can clear during this view.
         // Avoid creating journals at network speed while every leader waits.
@@ -616,7 +1111,9 @@ impl GlobalProposer for GlobalSeamProposer {
             .unwrap_or_default()
             .as_millis() as i64;
         Some(crate::leader_provider::proposal_pacing_wait(
-            timestamp, now_ms,
+            number.saturating_add(1),
+            timestamp,
+            now_ms,
         ))
         .filter(|wait| !wait.is_zero())
     }
@@ -908,6 +1405,9 @@ pub struct GlobalSeamFinalizer {
     /// Atomic mode: keep the certified body as a durable candidate and queue
     /// it; the worker publishes clock and execution state together.
     pipeline: Option<Arc<crate::global_finalization::GlobalFinalizationPipeline>>,
+    /// Finalizations reported without their body
+    /// ([`Self::await_unheld`]).
+    unheld: Mutex<crate::unheld_finalization::UnheldFinalizations>,
 }
 
 impl GlobalSeamFinalizer {
@@ -927,6 +1427,7 @@ impl GlobalSeamFinalizer {
                 local_prover_address,
             ),
             pipeline: None,
+            unheld: Mutex::default(),
         }
     }
 
@@ -985,18 +1486,37 @@ impl FrameFinalizer for GlobalSeamFinalizer {
                 view,
                 "cw finalize: finalized block body not held locally; relying on peers"
             );
+            // Proposals and votes above it wait for its body or publication.
+            if let Ok(mut unheld) = self.unheld.lock() {
+                unheld.note(view, digest, cert, std::time::Instant::now());
+            }
             return;
         };
-        let Ok(mut frame) = decode_global_frame(&bytes) else {
+        self.finalize_body(view, digest, &bytes, cert);
+    }
+}
+
+impl GlobalSeamFinalizer {
+    /// Take the finalized body `bytes` of `digest` at `view`: queue it for
+    /// atomic publication or write it canonically. False when it is refused
+    /// (it does not decode or does not match the finalized proposal).
+    fn finalize_body(
+        &self,
+        view: u64,
+        digest: Digest,
+        bytes: &[u8],
+        cert: Option<Vec<u8>>,
+    ) -> bool {
+        let Ok(mut frame) = decode_global_frame(bytes) else {
             tracing::warn!(view, "cw finalize: finalized block body does not decode");
-            return;
+            return false;
         };
         let Some(header) = frame.header.as_ref() else {
-            return;
+            return false;
         };
         if header.rank != view || frame_digest(header) != Some(digest) {
             tracing::warn!(view, "cw finalize: frame differs from finalized proposal");
-            return;
+            return false;
         }
         // Re-bind the body to the header at FINALIZE, not just at verify. The
         // block bytes are re-read from the shared (overwrite-able) BlockStore by
@@ -1010,7 +1530,7 @@ impl FrameFinalizer for GlobalSeamFinalizer {
                     frame = h.frame_number,
                     "cw finalize: request body does not match certified requests_root — dropping"
                 );
-                return;
+                return false;
             }
         }
         // Attach the simplex FINALIZATION cert to the frame header so followers
@@ -1034,7 +1554,7 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         }
         let frame_number = match frame.header.as_ref() {
             Some(h) => h.frame_number,
-            None => return,
+            None => return false,
         };
         // Beyond the admission window (a stalled worker), keep the legacy
         // order so the unresolved-candidate tail stays bounded for restarts.
@@ -1051,7 +1571,7 @@ impl FrameFinalizer for GlobalSeamFinalizer {
             }
             pipeline.offer(frame.clone());
             let _ = self.mat_job_tx.send((frame, frame_number));
-            return;
+            return true;
         }
         // A journal replay after a restart finalizes again the frames the
         // canonical clock already holds (every restart re-finalized the head).
@@ -1072,7 +1592,7 @@ impl FrameFinalizer for GlobalSeamFinalizer {
                     "finalized GLOBAL frame is already canonical (journal replay)"
                 );
                 let _ = self.mat_job_tx.send((frame, frame_number));
-                return;
+                return true;
             }
             tracing::error!(frame = frame_number, view,
                 "finalized GLOBAL frame differs from the canonical record at its height; replacing the record");
@@ -1088,10 +1608,115 @@ impl FrameFinalizer for GlobalSeamFinalizer {
         // materializes in finalize order).
         if let Err(e) = self.clock_store.put_global_clock_frame(&frame, &NoopTxn) {
             tracing::warn!(error = %e, "put finalized frame failed");
-            return;
+            return false;
         }
         self.announcer.announce(&frame);
         let _ = self.mat_job_tx.send((frame, frame_number));
+        true
+    }
+}
+
+impl GlobalSeamFinalizer {
+    /// Before a proposal or vote for `context` executes its parent, on an
+    /// archive whose publication ingests application frames first: hand each
+    /// finalization below the parent that was reported without its body, and
+    /// whose body `body` now reads, to publication, and say whether to wait
+    /// for one still unheld. `published` reads the rank of the published GLOBAL
+    /// head. `Some((view, since))` while the proposal or vote waits for the
+    /// finalization at `view`, reported `since` ago, at most `patience`; then
+    /// it proceeds as before ([`crate::unheld_finalization`]).
+    pub(crate) fn await_unheld(
+        &self,
+        context: ProposalContext,
+        published: impl FnOnce() -> u64,
+        body: impl Fn(&Digest) -> Option<Vec<u8>>,
+        patience: std::time::Duration,
+    ) -> Option<(u64, std::time::Duration)> {
+        use crate::unheld_finalization::Decision;
+        let now = std::time::Instant::now();
+        let (published_ended, arrived) = {
+            let mut unheld = self.unheld.lock().ok()?;
+            if unheld.is_empty() {
+                return None;
+            }
+            let ended = unheld.published_through(published(), now);
+            (ended, unheld.arrived(context.parent_view, body))
+        };
+        // Publication takes the pipeline and clock locks: never under this one.
+        let outcomes: Vec<_> = arrived
+            .into_iter()
+            .map(|(arrived, bytes)| {
+                let taken = self.finalize_body(arrived.view, arrived.digest, &bytes, arrived.cert);
+                (arrived.view, taken, bytes)
+            })
+            .collect();
+        let mut unheld = self.unheld.lock().ok()?;
+        let mut ended: Vec<_> = published_ended
+            .into_iter()
+            .map(|ended| (ended, "it published"))
+            .collect();
+        for (view, taken, bytes) in outcomes {
+            if taken {
+                ended.extend(
+                    unheld
+                        .taken(view, now)
+                        .map(|ended| (ended, "its body arrived and was queued to publish")),
+                );
+            } else {
+                unheld.refused(view, &bytes);
+            }
+        }
+        let (decision, overran) = unheld.decide(context.parent_view, patience, now);
+        drop(unheld);
+        for (ended, how) in ended {
+            if let Some(waited) = ended.waited {
+                tracing::info!(
+                    view = context.view,
+                    finalized_view = ended.view,
+                    waited_ms = waited.as_millis() as u64,
+                    past_patience = ended.overran,
+                    "GLOBAL proposals and votes no longer wait for a finalized frame this node held only \
+                     the certificate of: {how}"
+                );
+            }
+        }
+        for (finalized_view, since) in overran {
+            tracing::warn!(
+                view = context.view,
+                parent_view = context.parent_view,
+                finalized_view,
+                waited_s = since.as_secs(),
+                scope = "local",
+                action = "check",
+                check = "this node received the frame's body neither from the block channel nor from the \
+                         archive poller; it now proposes and votes on its private execution of the parent, \
+                         which other archives may refuse until the frame publishes; check this node's \
+                         archive poller lines and its block deliveries from the other GLOBAL provers",
+                "GLOBAL proposals and votes stop waiting for a finalized frame this node holds only the certificate of"
+            );
+        }
+        match decision {
+            Decision::Proceed => None,
+            Decision::Wait {
+                view: finalized_view,
+                since,
+                began,
+            } => {
+                if began {
+                    tracing::info!(
+                        view = context.view,
+                        parent_view = context.parent_view,
+                        finalized_view,
+                        patience_s = patience.as_secs(),
+                        "GLOBAL proposals and votes wait for a finalized frame this node holds only the \
+                         certificate of: executing above it first would miss the application frames its \
+                         publication ingests; the wait ends when its body arrives or the archive poller \
+                         publishes it, at most patience_s after its finalization"
+                    );
+                }
+                Some((finalized_view, since))
+            }
+        }
     }
 }
 
@@ -1224,6 +1849,18 @@ pub fn activate_global_consensus_cw(
         "GLOBAL",
     );
 
+    // The finalizer is built first: the proposer hands it the bodies of
+    // finalizations reported without them once they arrive.
+    let finalizer = Arc::new(
+        GlobalSeamFinalizer::new(
+            clock_store.clone(),
+            mat_job_tx,
+            head_hook,
+            global_frame_publisher,
+            local_prover_address,
+        )
+        .with_pipeline(pipeline),
+    );
     // Seams over real state. The proposer keeps a clock-store handle so it can
     // recover the parent frame number from the latest committed head when the
     // in-memory block map misses it after a restart.
@@ -1235,7 +1872,8 @@ pub fn activate_global_consensus_cw(
         on_prover_fork,
     )
     .with_block_store(store.clone())
-    .with_selected_execution(selected_execution);
+    .with_selected_execution(selected_execution)
+    .with_finalizer(finalizer.clone());
     let proposer = Arc::new(proposer);
     // Seed the parent map so the FIRST proposal resolves the genesis parent's
     // frame number (block_meta is otherwise empty → prior_frame_number 0).
@@ -1245,16 +1883,6 @@ pub fn activate_global_consensus_cw(
     tracing::info!(
         candidates = recovered.len(),
         "restored GLOBAL consensus bodies before journal replay"
-    );
-    let finalizer = Arc::new(
-        GlobalSeamFinalizer::new(
-            clock_store.clone(),
-            mat_job_tx,
-            head_hook,
-            global_frame_publisher,
-            local_prover_address,
-        )
-        .with_pipeline(pipeline),
     );
 
     // Rebuild a failed host only after it joins. The transport routes, fixed

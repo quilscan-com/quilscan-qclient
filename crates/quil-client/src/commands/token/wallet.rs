@@ -165,6 +165,32 @@ pub(super) struct CoinScan {
     /// The node answered that the application has no coin root yet.
     rootless: bool,
 }
+
+/// What a balance scan read, for the line `token balance` ends it with.
+#[derive(Default)]
+pub(super) struct ScanReport {
+    pages: usize,
+    coins: usize,
+    /// Coins whose memo the wallet tried to open.
+    opened: usize,
+    /// Spent-marker reads for coins that opened as ours.
+    spent_checks: usize,
+}
+
+impl ScanReport {
+    pub(super) fn line(&self, elapsed: std::time::Duration) -> String {
+        format!(
+            "confidential scan: {} pages (≈{:.1} coins/page, asked {}) in {:.1} s; {} opened, {} spent checks",
+            self.pages,
+            self.coins as f64 / self.pages.max(1) as f64,
+            SCAN_PAGE_ENTRIES,
+            elapsed.as_secs_f64(),
+            self.opened,
+            self.spent_checks
+        )
+    }
+}
+
 impl CoinScan {
     pub(super) fn new(max_pages: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(max_pages > 0, "scan page budget must be positive");
@@ -688,6 +714,14 @@ impl RecipientWallet {
             &self.application,
         )
         .map_err(|e| anyhow::anyhow!("invalid original mint: {e:?}"))?;
+        // The saved authorization carries the claimed rewards and the fee in
+        // the clear: the amount being claimed needs no decryption.
+        if let Ok(reward) = mint.statement.total() {
+            println!(
+                "{}",
+                mint_amounts_line("Claiming", reward, mint.statement.fee)
+            );
+        }
         let receipt = receipt_address(&mint.statement)?;
         let response = client
             .clone()
@@ -1915,7 +1949,7 @@ impl RecipientWallet {
         max_owned: usize,
     ) -> anyhow::Result<Vec<OwnedCoin>> {
         Ok(self
-            .scan_unspent_or_rootless(client, max_pages, max_owned)
+            .scan_unspent_or_rootless(client, max_pages, max_owned, &mut ScanReport::default())
             .await?
             .unwrap_or_default())
     }
@@ -1929,15 +1963,20 @@ impl RecipientWallet {
         >,
         max_pages: usize,
         max_owned: usize,
+        report: &mut ScanReport,
     ) -> anyhow::Result<Option<Vec<OwnedCoin>>> {
         anyhow::ensure!(max_owned > 0, "owned coin limit must be positive");
         let mut scan = CoinScan::new(max_pages)?;
         let mut unspent = Vec::new();
         while !scan.finished() {
             let page = self.scan_next(client, &mut scan).await?;
+            report.pages += 1;
+            report.coins += page.len();
+            report.opened += page.len();
             let wallet = self.clone();
             let owned = tokio::task::spawn_blocking(move || wallet.recover_page(page)).await??;
             for coin in owned {
+                report.spent_checks += 1;
                 if self.is_unspent_hint(client, &coin.image).await? {
                     anyhow::ensure!(
                         unspent.len() < max_owned,
@@ -2246,20 +2285,28 @@ impl RecipientWallet {
         Ok(coins)
     }
 
+    /// This config's wallet: the `q-onion-key` of its keystore. A keystore
+    /// that predates wallet keys (a pre-2.1 node's) receives one first, as
+    /// the node creates it at startup, so the coins of an identity no 2.1
+    /// node runs can still be shielded into its own wallet.
     pub(super) fn load(
         tc: &TokenCtx,
         network: &[u8; 32],
         application: &[u8; 32],
     ) -> anyhow::Result<Self> {
+        ensure_wallet_key(tc)?;
+        let keystore = || crate::keys::describe_keystore(&tc.node_config, &tc.config_dir);
         let secret = Zeroizing::new(
             tc.key_manager
-                .get_secret_key_bytes_by_id("q-onion-key")
-                .map_err(|e| anyhow::anyhow!("q-onion-key secret: {e}"))?,
+                .get_secret_key_bytes_by_id(WALLET_KEY)
+                .map_err(|e| {
+                    anyhow::anyhow!("{WALLET_KEY} secret in keystore {}: {e}", keystore())
+                })?,
         );
         let public = tc
             .key_manager
-            .get_public_key_bytes_by_id("q-onion-key")
-            .map_err(|e| anyhow::anyhow!("q-onion-key public: {e}"))?;
+            .get_public_key_bytes_by_id(WALLET_KEY)
+            .map_err(|e| anyhow::anyhow!("{WALLET_KEY} public in keystore {}: {e}", keystore()))?;
         Self::from_keys(network, application, &public, secret)
     }
     fn from_keys(
@@ -2507,7 +2554,7 @@ pub(super) async fn quoted_quil_fee_for_cost(
     );
     let charge = checked_quil_fee_quote(&quote, &policy.network, cost)?;
     let fee = with_fee_headroom(charge)?;
-    println!("Estimated fee: {fee} base units for {cost} bytes of state growth (snapshot frame {}; {charge} at the snapshot plus {AUTOMATIC_FEE_HEADROOM_PERCENT}% for fee-vote movement before inclusion).", quote.observed_frame);
+    super::output::line(format!("Estimated fee: {fee} base units for {cost} bytes of state growth (snapshot frame {}; {charge} at the snapshot plus {AUTOMATIC_FEE_HEADROOM_PERCENT}% for fee-vote movement before inclusion).", quote.observed_frame));
     check_automatic_fee("estimated fee", fee, tc.max_fee)?;
     Ok(fee)
 }
@@ -2638,7 +2685,9 @@ async fn refresh_submission_fee(
                 tonic::Code::Unavailable | tonic::Code::Unimplemented
             ) =>
         {
-            println!("Fee refresh unavailable; submitting the supplied fee for node validation.");
+            super::output::line(
+                "Fee refresh unavailable; submitting the supplied fee for node validation.".into(),
+            );
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -2711,6 +2760,43 @@ fn parse_recipient(value: &str, context: &[u8; 32]) -> anyhow::Result<RecipientA
         context,
     )
     .map_err(|e| anyhow::anyhow!("recipient address: {e:?}"))
+}
+
+/// The keystore entry holding a config's wallet key (sntrup761).
+const WALLET_KEY: &str = "q-onion-key";
+
+/// Create the wallet key in a keystore that has none. Only a keystore with
+/// a key that decrypts with the config's `encryptionKey` receives it: a
+/// missing or empty file most likely means a wrong `keyManagerFile.path`,
+/// and a key there would start a wallet nobody backs up. An existing key is
+/// never replaced, even one that does not decrypt.
+fn ensure_wallet_key(tc: &TokenCtx) -> anyhow::Result<()> {
+    if tc
+        .key_manager
+        .public_key_by_id(WALLET_KEY)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let keystore = crate::keys::describe_keystore(&tc.node_config, &tc.config_dir);
+    anyhow::ensure!(
+        crate::keys::keystore_access(&tc.key_manager) == crate::keys::KeystoreAccess::Readable,
+        "keystore {keystore} holds no {WALLET_KEY} wallet key, and no key that decrypts with \
+         key.keyManagerFile.encryptionKey of this config to show it is this config's \
+         keystore; qclient creates a wallet key only there: check key.keyManagerFile.path"
+    );
+    tc.key_manager
+        .create_agreement_key(WALLET_KEY, 9)
+        .map_err(|e| {
+            anyhow::anyhow!("create the {WALLET_KEY} wallet key in keystore {keystore}: {e}")
+        })?;
+    eprintln!(
+        "Created {WALLET_KEY}, the wallet key of this config, in keystore {keystore}, which \
+         predates wallet keys. Coins shielded or sent to this wallet can be spent only with this \
+         keys.yml and that config's encryptionKey: back up both."
+    );
+    Ok(())
 }
 
 /// The keystore Falcon key used as escrow and reward authority.
@@ -2850,27 +2936,36 @@ pub(super) async fn run_balance(
     }
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
-    // An unreachable node or a keystore without wallet keys (a pre-2.1 node's)
-    // fails only the lines that need them; the unreachable node's own error,
-    // which names it and the fix, ends the output.
+    // An unreachable node or an unusable wallet key fails only the lines that
+    // need them; the unreachable node's own error, which names it and the
+    // fix, ends the output.
     let client = tc.connect().await;
     let unreachable = || anyhow::anyhow!("the node did not answer; see the error below");
+    // Each phase's cost goes to stderr: a slow balance shows where it went.
     if quil {
+        let (started, mut pages) = (std::time::Instant::now(), 0);
         let legacy = match &client {
-            Ok(client) => super::legacy::unshielded(tc, client, &application_id).await,
+            Ok(client) => super::legacy::unshielded(tc, client, &application_id, &mut pages).await,
             Err(_) => Err(unreachable()),
         };
+        if pages > 0 {
+            eprintln!(
+                "legacy listing: {pages} pages in {:.1} s",
+                started.elapsed().as_secs_f64()
+            );
+        }
         if legacy.is_err() {
             failed.push("legacy coins");
         }
         println!("{}", super::balance::format_legacy_coins(legacy));
     }
+    let (started, mut report) = (std::time::Instant::now(), ScanReport::default());
     let confidential = match &client {
         Err(_) => Err(unreachable()),
         Ok(client) => match RecipientWallet::load(tc, &network, &application_id) {
             Err(error) => Err(error),
             Ok(wallet) => match std::sync::Arc::new(wallet)
-                .scan_unspent_or_rootless(client, max_pages, max_coins)
+                .scan_unspent_or_rootless(client, max_pages, max_coins, &mut report)
                 .await
             {
                 Ok(Some(coins)) => coins
@@ -2883,6 +2978,9 @@ pub(super) async fn run_balance(
             },
         },
     };
+    if report.pages > 0 {
+        eprintln!("{}", report.line(started.elapsed()));
+    }
     if confidential.is_err() {
         failed.push("confidential coins");
     }
@@ -3157,7 +3255,11 @@ pub(super) async fn run_pay(
             .statement,
     )?;
     wallet
-        .submit(&mut tc.connect_submit().await?, &tc.key_manager, bytes)
+        .submit(
+            &mut tc.connect_submit().await?,
+            &tc.submit_key_manager,
+            bytes,
+        )
         .await?;
     println!(
         "Settlement submitted: {amount} base units to {} (fee {fee}).",
@@ -3607,7 +3709,11 @@ async fn submit_refreshed_operation(
 ) -> anyhow::Result<()> {
     if wallet.application == quil_execution::domains::QUIL_TOKEN {
         return wallet
-            .submit(&mut tc.connect_submit().await?, &tc.key_manager, bytes)
+            .submit(
+                &mut tc.connect_submit().await?,
+                &tc.submit_key_manager,
+                bytes,
+            )
             .await;
     }
     submit_paid_operation(tc, wallet, bytes, None, SETTLEMENT_WAIT).await
@@ -3657,7 +3763,7 @@ async fn submit_paid_operation(
     };
     crate::send::send_to_venue(
         &mut tc.connect_submit().await?,
-        &tc.key_manager,
+        &tc.submit_key_manager,
         domain,
         global_execution,
         bundle,
@@ -4001,6 +4107,18 @@ pub(super) async fn run_pending_create(
     Ok(())
 }
 
+/// The reward, fee and net amount of a reward mint, in QUIL: `verb` is
+/// "Minting" when authorizing and "Claiming" when claiming.
+fn mint_amounts_line(verb: &str, reward: u128, fee: u128) -> String {
+    use super::balance::quil_amount;
+    format!(
+        "{verb} {} QUIL (reward {} QUIL less fee {} QUIL).",
+        quil_amount(reward.saturating_sub(fee)),
+        quil_amount(reward),
+        quil_amount(fee)
+    )
+}
+
 /// Two-stage QUIL reward mint. Without `--claim`, discover this prover's reward,
 /// prove and submit the global authorization, and save its bytes for the claim
 /// stage. With `--claim <file>`, build the application claim from the finalized
@@ -4032,6 +4150,7 @@ pub(super) async fn run_mint(
         .checked_sub(fee)
         .filter(|value| *value > 0)
         .ok_or_else(|| anyhow::anyhow!("claimable reward must exceed the fee"))?;
+    println!("{}", mint_amounts_line("Minting", reward.value, fee));
     let recipient = match recipient {
         Some(recipient) => parse_recipient(recipient, &wallet.context)?,
         None => wallet.address().clone(),
@@ -4144,19 +4263,7 @@ pub(super) fn shield_batches(
 /// a resumed run leaves them for their batch to commit.
 #[cfg(feature = "native-proof")]
 fn recently_shielded(tc: &TokenCtx) -> std::collections::BTreeSet<[u8; 32]> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    std::fs::read_to_string(tc.config_dir.join("legacy-shield-journal.txt"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| {
-            let (at, address) = line.split_once(' ')?;
-            let at: u64 = at.parse().ok()?;
-            let address: [u8; 32] = hex::decode(address).ok()?.try_into().ok()?;
-            (now.saturating_sub(at) < 3_600).then_some(address)
-        })
-        .collect()
+    super::legacy::recently_shielded(&tc.config_dir)
 }
 
 #[cfg(feature = "native-proof")]
@@ -4171,22 +4278,158 @@ fn record_shielded(
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(tc.config_dir.join("legacy-shield-journal.txt"))?;
+        .open(tc.config_dir.join(super::legacy::SHIELD_JOURNAL))?;
     for source in sources {
         writeln!(file, "{now} {}", hex::encode(source.address))?;
     }
     Ok(())
 }
 
-/// Shield every unshielded legacy coin of this identity in batches of at most
-/// `max_per_batch`, one shard per batch, each into one coin of this wallet.
+/// What `token shield-all` reports as it goes. The CLI prints
+/// [`ShieldEvent::cli_line`]; the node manager shows the events itself.
 #[cfg(feature = "native-proof")]
-pub(super) async fn run_shield_all(
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ShieldEvent {
+    /// Nothing to shield; `pending`: some coins submitted within the hour
+    /// await their batch.
+    Nothing { pending: bool },
+    /// Coins no live shard covers, left for a later run.
+    Uncovered(usize),
+    /// Batch `index` (from 1) of `count` is being proved.
+    Proving {
+        index: usize,
+        count: usize,
+        coins: usize,
+    },
+    /// The batch's coins do not cover its fee.
+    Skipped {
+        index: usize,
+        count: usize,
+        coins: usize,
+        total: u128,
+        fee: u128,
+    },
+    /// The batch was delivered; inclusion is not yet confirmed.
+    Submitted {
+        index: usize,
+        count: usize,
+        addresses: Vec<[u8; 32]>,
+        shielded: u128,
+        fee: u128,
+    },
+}
+
+#[cfg(feature = "native-proof")]
+impl ShieldEvent {
+    /// The line `token shield-all` prints for the event, if any.
+    pub(crate) fn cli_line(&self) -> Option<String> {
+        Some(match self {
+            Self::Nothing { pending } => format!(
+                "No unshielded legacy coins to shield{}.",
+                if *pending {
+                    " (some submitted within the last hour are awaiting their batch)"
+                } else {
+                    ""
+                }
+            ),
+            Self::Uncovered(count) => format!(
+                "{count} legacy coins lie in no live shard and are left for a later run."
+            ),
+            Self::Proving { .. } => return None,
+            Self::Skipped {
+                index,
+                count,
+                coins,
+                total,
+                fee,
+            } => format!(
+                "Batch {index}/{count}: {coins} legacy coins worth {total} base units do not cover the fee {fee}; skipped."
+            ),
+            Self::Submitted {
+                index,
+                count,
+                addresses,
+                shielded,
+                fee,
+            } => format!(
+                "Batch {index}/{count}: {} legacy coins, {shielded} base units shielded (fee {fee}). Submitted; finalized inclusion is not yet confirmed.",
+                addresses.len()
+            ),
+        })
+    }
+}
+
+/// `token shield-all`'s batches for this identity, read from its node and
+/// ready to prove: the coins it would shield, the coins it leaves, and what
+/// it signs with.
+#[cfg(feature = "native-proof")]
+pub(crate) struct ShieldAllPlan {
+    pub batches: Vec<Vec<quil_lattice_ct::confidential::shield::ShieldSource>>,
+    pub uncovered: usize,
+    /// Unshielded coins submitted within the hour, left out until their
+    /// batch commits.
+    pub pending: usize,
+    /// Some coin was submitted within the hour (the CLI says so when
+    /// nothing is left to shield).
+    pub journaled: bool,
+    /// Every listed legacy coin, those already shielded, and listings of
+    /// one address under both owner forms beyond the first: with the
+    /// batched, uncovered and pending coins they account for every coin.
+    pub listed: usize,
+    pub shielded: usize,
+    pub duplicates: usize,
+    wallet: std::sync::Arc<RecipientWallet>,
+    owner: std::sync::Arc<dyn quil_types::crypto::Signer>,
+    client:
+        quil_types::proto::node::node_service_client::NodeServiceClient<tonic::transport::Channel>,
+}
+
+#[cfg(feature = "native-proof")]
+impl ShieldAllPlan {
+    /// The wallet address the batches shield into, in hex.
+    pub(crate) fn recipient(&self) -> String {
+        format!("0x{}", hex::encode(self.wallet.address().encode()))
+    }
+
+    /// Coins in all batches and their total in base units.
+    pub(crate) fn totals(&self) -> anyhow::Result<(usize, u128)> {
+        let mut coins = 0;
+        let mut units = 0u128;
+        for source in self.batches.iter().flatten() {
+            coins += 1;
+            units = units
+                .checked_add(source.amount)
+                .ok_or_else(|| anyhow::anyhow!("legacy sources overflow u128"))?;
+        }
+        Ok((coins, units))
+    }
+}
+
+/// The quoted fee of one batch of `coins` legacy coins.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn shield_batch_fee(tc: &TokenCtx, coins: usize) -> anyhow::Result<u128> {
+    quoted_quil_fee(
+        tc,
+        None,
+        quil_execution::token_intrinsic::cost::Shape {
+            coins: 1,
+            markers: coins,
+            escrow: false,
+        },
+        false,
+    )
+    .await
+}
+
+/// Read this identity's unshielded legacy coins and cut them into
+/// `token shield-all`'s batches of at most `max_per_batch`, one shard each.
+/// Fails before any proving when shields are not yet admitted.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn plan_shield_all(
     tc: &TokenCtx,
     application: &str,
     max_per_batch: usize,
-) -> anyhow::Result<()> {
-    use quil_execution::token_intrinsic::cost::Shape;
+) -> anyhow::Result<ShieldAllPlan> {
     use quil_lattice_ct::confidential::shield::MAX_SHIELD_SOURCES;
     anyhow::ensure!(
         (1..=MAX_SHIELD_SOURCES).contains(&max_per_batch),
@@ -4201,56 +4444,82 @@ pub(super) async fn run_shield_all(
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(tc, &network, &application)?);
     let owner = legacy_owner_signer(tc)?;
-    let mut client = tc.connect().await?;
+    let client = tc.connect().await?;
     let pending = recently_shielded(tc);
-    let coins: Vec<([u8; 32], u128)> = super::legacy::list(tc, &client, &application)
-        .await?
-        .into_iter()
+    let listed = super::legacy::list(tc, &client, &application).await?;
+    let shielded = listed.iter().filter(|coin| coin.shielded).count();
+    let waiting = listed
+        .iter()
+        .filter(|coin| !coin.shielded && pending.contains(&coin.address))
+        .count();
+    let coins: Vec<([u8; 32], u128)> = listed
+        .iter()
         .filter(|coin| !coin.shielded && !pending.contains(&coin.address))
         .map(|coin| (coin.address, coin.amount))
         .collect();
+    let mut plan = ShieldAllPlan {
+        batches: Vec::new(),
+        uncovered: 0,
+        pending: waiting,
+        journaled: !pending.is_empty(),
+        listed: listed.len(),
+        shielded,
+        duplicates: 0,
+        wallet,
+        owner,
+        client,
+    };
     if coins.is_empty() {
-        println!(
-            "No unshielded legacy coins to shield{}.",
-            if pending.is_empty() {
-                ""
-            } else {
-                " (some submitted within the last hour are awaiting their batch)"
-            }
-        );
-        return Ok(());
+        return Ok(plan);
     }
-    super::legacy::ensure_shields_active(&client, tc.node_config.p2p.network, true).await?;
-    let shards = super::legacy::live_shard_paths(&client, &application).await?;
+    super::legacy::ensure_shields_active(&plan.client, tc.node_config.p2p.network, true).await?;
+    let shards = super::legacy::live_shard_paths(&plan.client, &application).await?;
+    let candidates = coins.len();
     let (batches, uncovered) = shield_batches(coins, &shards, max_per_batch);
-    if !uncovered.is_empty() {
-        println!(
-            "{} legacy coins lie in no live shard and are left for a later run.",
-            uncovered.len()
-        );
-    }
+    plan.duplicates = candidates - batches.iter().map(Vec::len).sum::<usize>() - uncovered.len();
+    plan.batches = batches;
+    plan.uncovered = uncovered.len();
+    Ok(plan)
+}
+
+/// Prove and submit `plan`'s batches in order, each into one coin of this
+/// wallet less its quoted fee, telling `on_event` as it goes. Stops at the
+/// first error; batches submitted before it stay submitted.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn execute_shield_all(
+    tc: &TokenCtx,
+    plan: ShieldAllPlan,
+    mut on_event: impl FnMut(ShieldEvent),
+) -> anyhow::Result<()> {
+    let ShieldAllPlan {
+        batches,
+        wallet,
+        owner,
+        mut client,
+        ..
+    } = plan;
     let count = batches.len();
     for (index, sources) in batches.into_iter().enumerate() {
         let total = sources
             .iter()
             .try_fold(0u128, |sum, source| sum.checked_add(source.amount))
             .ok_or_else(|| anyhow::anyhow!("legacy sources overflow u128"))?;
-        let fee = quoted_quil_fee(
-            tc,
-            None,
-            Shape {
-                coins: 1,
-                markers: sources.len(),
-                escrow: false,
-            },
-            false,
-        )
-        .await?;
+        let fee = shield_batch_fee(tc, sources.len()).await?;
         if fee >= total {
-            println!("Batch {}/{count}: {} legacy coins worth {total} base units do not cover the fee {fee}; skipped.",
-                index + 1, sources.len());
+            on_event(ShieldEvent::Skipped {
+                index: index + 1,
+                count,
+                coins: sources.len(),
+                total,
+                fee,
+            });
             continue;
         }
+        on_event(ShieldEvent::Proving {
+            index: index + 1,
+            count,
+            coins: sources.len(),
+        });
         let bytes = wallet
             .clone()
             .create_batch_shield(
@@ -4264,10 +4533,57 @@ pub(super) async fn run_shield_all(
             .await?;
         submit_operation(tc, &wallet, &mut client, bytes).await?;
         record_shielded(tc, &sources)?;
-        println!("Batch {}/{count}: {} legacy coins, {} base units shielded (fee {fee}). Submitted; finalized inclusion is not yet confirmed.",
-            index + 1, sources.len(), total - fee);
+        on_event(ShieldEvent::Submitted {
+            index: index + 1,
+            count,
+            addresses: sources.iter().map(|source| source.address).collect(),
+            shielded: total - fee,
+            fee,
+        });
     }
     Ok(())
+}
+
+/// Shield every unshielded legacy coin of this identity in batches of at most
+/// `max_per_batch`, one shard per batch, each into one coin of this wallet.
+#[cfg(feature = "native-proof")]
+pub(super) async fn run_shield_all(
+    tc: &TokenCtx,
+    application: &str,
+    max_per_batch: usize,
+) -> anyhow::Result<()> {
+    use super::action_log::{ActionLog, ShieldRecorder};
+    let print = |event: ShieldEvent| {
+        if let Some(line) = event.cli_line() {
+            println!("{line}");
+        }
+    };
+    // The private action log; a failed write is said once on stderr.
+    let failed = |why: Option<String>| {
+        if let Some(why) = why {
+            eprintln!("Action log: not written ({why}); the shield is unaffected.");
+        }
+    };
+    let plan = plan_shield_all(tc, application, max_per_batch).await?;
+    if plan.batches.is_empty() && plan.uncovered == 0 {
+        print(ShieldEvent::Nothing {
+            pending: plan.journaled,
+        });
+        return Ok(());
+    }
+    if plan.uncovered > 0 {
+        print(ShieldEvent::Uncovered(plan.uncovered));
+    }
+    let mut record = ShieldRecorder::new(ActionLog::enabled(&tc.config_dir, false), "cli");
+    failed(record.start(&plan, tc.max_fee));
+    let result = execute_shield_all(tc, plan, |event| {
+        failed(record.event(&event));
+        print(event);
+    })
+    .await;
+    let outcome = result.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
+    failed(record.outcome(&outcome));
+    result
 }
 
 /// Explicit CLI submission; a successful RPC response is delivery, not finality.
@@ -4562,6 +4878,19 @@ mod tests {
 
     use super::*;
     use quil_lattice_ct::confidential::{memo::create_output, relation::membership::MembershipKey};
+
+    #[test]
+    fn mint_lines_show_the_net_amount_beside_reward_and_fee() {
+        // 12.5 QUIL less 0.25 QUIL (8e9 base units per QUIL).
+        assert_eq!(
+            mint_amounts_line("Minting", 100_000_000_000, 2_000_000_000),
+            "Minting 12.250000000000 QUIL (reward 12.500000000000 QUIL less fee 0.250000000000 QUIL)."
+        );
+        assert_eq!(
+            mint_amounts_line("Claiming", 8, 0),
+            "Claiming 0.000000001000 QUIL (reward 0.000000001000 QUIL less fee 0.000000000000 QUIL)."
+        );
+    }
 
     #[cfg(feature = "native-proof")]
     #[tokio::test]
@@ -6027,5 +6356,104 @@ mod tests {
         );
         let (only_low, left) = shield_batches(coins, &[vec![false]], 96);
         assert_eq!((only_low.len(), left.len()), (1, 4));
+    }
+}
+
+#[cfg(all(test, feature = "native-proof"))]
+mod shield_all_cli_tests {
+    use super::*;
+
+    /// The node manager's Shield plan rows are shield-all's own batches.
+    #[test]
+    fn the_plan_rows_are_the_batches_shield_all_cuts() {
+        use super::super::legacy::{plan_batches, Coin, OwnerForm};
+        let coins: Vec<Coin> = (0u8..=200)
+            .map(|i| Coin {
+                address: [i.wrapping_mul(37); 32],
+                amount: u128::from(i) + 1,
+                shielded: i % 7 == 0,
+                form: OwnerForm::Key,
+            })
+            .collect();
+        // Two halves of the address space, one split further, one not live.
+        let shards = vec![
+            (vec![1], vec![false]),
+            (vec![2], vec![true, false]),
+            (vec![3], vec![true, true, false]),
+        ];
+        let paths: Vec<Vec<bool>> = shards.iter().map(|(_, path)| path.clone()).collect();
+        let unshielded = coins
+            .iter()
+            .filter(|coin| !coin.shielded)
+            .map(|coin| (coin.address, coin.amount))
+            .collect();
+        let (batches, _) = shield_batches(unshielded, &paths, 5);
+        let rows = plan_batches(&coins, &shards, 5);
+        assert!(batches.len() > 3);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.coins, row.units))
+                .collect::<Vec<_>>(),
+            batches
+                .iter()
+                .map(|batch| (batch.len(), batch.iter().map(|s| s.amount).sum::<u128>()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The lines `token shield-all` printed before its events existed, for
+    /// the same inputs: its output must not change.
+    #[test]
+    fn shield_all_prints_what_it_printed_before() {
+        let lines: Vec<Option<String>> = [
+            ShieldEvent::Nothing { pending: false },
+            ShieldEvent::Nothing { pending: true },
+            ShieldEvent::Uncovered(3),
+            ShieldEvent::Proving {
+                index: 1,
+                count: 2,
+                coins: 96,
+            },
+            ShieldEvent::Skipped {
+                index: 1,
+                count: 2,
+                coins: 4,
+                total: 900,
+                fee: 1000,
+            },
+            ShieldEvent::Submitted {
+                index: 2,
+                count: 2,
+                addresses: vec![[1; 32], [2; 32]],
+                shielded: 7_000,
+                fee: 1_000,
+            },
+        ]
+        .iter()
+        .map(ShieldEvent::cli_line)
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                Some("No unshielded legacy coins to shield.".to_string()),
+                Some(
+                    "No unshielded legacy coins to shield (some submitted within the last hour \
+                     are awaiting their batch)."
+                        .to_string()
+                ),
+                Some("3 legacy coins lie in no live shard and are left for a later run.".into()),
+                None,
+                Some(
+                    "Batch 1/2: 4 legacy coins worth 900 base units do not cover the fee 1000; \
+                     skipped."
+                        .into()
+                ),
+                Some(
+                    "Batch 2/2: 2 legacy coins, 7000 base units shielded (fee 1000). Submitted; \
+                     finalized inclusion is not yet confirmed."
+                        .into()
+                ),
+            ]
+        );
     }
 }

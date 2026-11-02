@@ -480,13 +480,14 @@ pub fn label_estimate(nodes: u64) -> std::time::Duration {
 /// The frames left at GLOBAL frame `frame` to the renewal's grace frame for
 /// `epoch` (`crate::app_shard_metadata::storage_snapshot_grace`) when
 /// labelling a leaf of `nodes` nodes now would end past it by its estimate
-/// ([`label_estimate`]), a frame taking `crate::difficulty::IDEAL_FRAME_TIME`;
+/// ([`label_estimate`]), a frame taking the interval at `frame`
+/// ([`quil_types::consensus::ideal_frame_time_ms_at`]) up to the grace frame;
 /// `None` when it would end in time.
 fn misses_grace(epoch: u64, nodes: u64, frame: u64) -> Option<u64> {
     let grace = quil_types::consensus::storage_snapshot_frame(epoch)
         .saturating_add(crate::app_shard_metadata::storage_snapshot_grace());
     let left = grace.saturating_sub(frame);
-    let frame_millis = u128::try_from(crate::difficulty::IDEAL_FRAME_TIME).unwrap_or(1);
+    let frame_millis = u128::from(quil_types::consensus::ideal_frame_time_ms_at(frame));
     (label_estimate(nodes).as_millis() > u128::from(left) * frame_millis).then_some(left)
 }
 
@@ -690,6 +691,8 @@ fn report_long_leaves() {
                 .map_or_else(|| "unknown".to_string(), |e| (e.as_secs() / 60).to_string());
             let (longest, filter) = (seat.longest.as_secs() / 60, hex::encode(&filter));
             let overrun = seat.estimate.is_some_and(|e| seat.longest > e);
+            let grace_frame = quil_types::consensus::storage_snapshot_frame(epoch)
+                .saturating_add(crate::app_shard_metadata::storage_snapshot_grace());
             match work {
                 LeafWork::LabellingAhead if !overrun => info!(epoch, filter = %filter,
                     leaves = seat.leaves, nodes = seat.nodes, longest_minutes = longest,
@@ -701,11 +704,21 @@ fn report_long_leaves() {
                     estimated_minutes = %estimated, work = work.name(), scope = "local",
                     action = "check this node's CPU load: the labelling runs past its estimate",
                     "storage labels for a later epoch's snapshot still being computed ahead, past their estimate"),
+                // Within its estimate (or with none, from labels kept
+                // ahead) this is the expected wait of a renewal.
+                _ if !overrun => info!(epoch, filter = %filter, leaves = seat.leaves,
+                    nodes = seat.nodes, longest_minutes = longest, estimated_minutes = %estimated,
+                    grace_frame, work = work.name(), scope = "local",
+                    action = "no action needed: the seat's renewal registers its storage once \
+                              they end; this warns if they pass their estimate",
+                    "this node is still preparing a seat's storage proof data; its renewal waits for it"),
                 _ => warn!(epoch, filter = %filter, leaves = seat.leaves, nodes = seat.nodes,
-                    longest_minutes = longest, estimated_minutes = %estimated,
+                    longest_minutes = longest, estimated_minutes = %estimated, grace_frame,
                     work = work.name(), scope = "local",
-                    "storage snapshot leaves still encoding: this seat's renewal registers its storage once \
-                     they end, and renews without a storage registration if they have not by the grace frame"),
+                    action = "check this node's CPU and disk load: storage labelling is CPU-bound; \
+                              if the leaves have not ended by the grace frame, the seat renews \
+                              without a storage registration and earns no storage share that epoch",
+                    "this node's storage proof data for a seat runs past its estimate; its renewal waits for it"),
             }
         }
     }
@@ -738,7 +751,8 @@ fn encode_member_with(
 }
 
 /// [`encode_member_with`], given up once `stop` says so: looked at before
-/// each leaf, once it has its memory, and while it is labelled.
+/// each leaf, while it waits for its memory and once it has it, and while it
+/// is labelled.
 fn encode_member_until(
     captured: &Captured,
     member: &[u8],
@@ -756,12 +770,17 @@ fn encode_member_until(
         if stop() {
             return Err(stopped());
         }
-        let mut memory = crate::storage_jobs::reserve(encoding_bytes(data_node_count(
-            estimated_leaf_bytes(captured.leaf_size(prefix)?),
-        )));
-        if stop() {
+        // A leaf whose seat's renewal is past its grace leaves the queue for
+        // memory, where it would hold its place before other seats' leaves.
+        let memory = crate::storage_jobs::reserve_until(
+            encoding_bytes(data_node_count(estimated_leaf_bytes(
+                captured.leaf_size(prefix)?,
+            ))),
+            stop,
+        );
+        let Some(mut memory) = memory.filter(|_| !stop()) else {
             return Err(stopped());
-        }
+        };
         let data = captured.leaf_data(prefix)?;
         let exact = data_node_count(data.len() as u64);
         let ahead = store.and_then(|store| {
@@ -780,10 +799,11 @@ fn encode_member_until(
                     leaf = %hex::encode(&leaf_id), nodes = exact,
                     estimated_minutes = label_estimate(exact).as_secs() / 60, frames_left,
                     global_frame = frame, scope = "local",
-                    "storage snapshot given up: labelling this leaf now would end past the \
-                     renewal's grace frame by its estimate, so this seat renews without a storage \
-                     registration at once and earns no storage share on its shard that epoch; its \
-                     memory goes to other seats' storage work");
+                    action = "check this node's CPU headroom and how many seats it labels at \
+                              once; the next epoch's snapshot starts again",
+                    "storage snapshot given up: this node would finish a seat's storage proof data \
+                     after the renewal's grace frame, so the seat renews without a storage \
+                     registration and earns no storage share on its shard this epoch");
             }
             return Err(stopped());
         }
@@ -961,12 +981,33 @@ static GLOBAL_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// not started ([`misses_grace`]).
 pub fn note_global_frame(frame: u64) {
     GLOBAL_FRAME.fetch_max(frame, std::sync::atomic::Ordering::Relaxed);
+    quil_types::consensus::note_frame_time_head(frame);
 }
 
 /// The latest GLOBAL frame this process saw ([`note_global_frame`]), if any.
 pub fn global_frame() -> Option<u64> {
     let frame = GLOBAL_FRAME.load(std::sync::atomic::Ordering::Relaxed);
     (frame > 0).then_some(frame)
+}
+
+/// Note, before evicting the replicas below
+/// `replica_keep_from(current_epoch)`, that GLOBAL reached `current_epoch`:
+/// an epoch's replicas go only once its settlement window has ended, and a
+/// settlement that finds them gone must see that ([`settlement_closed`]).
+pub fn note_replica_eviction(current_epoch: u64) {
+    note_global_frame(quil_types::consensus::epoch_start_frame(current_epoch));
+}
+
+/// Whether GLOBAL can no longer record a settlement of `epoch`: `frame` or
+/// the latest GLOBAL frame this process saw ([`global_frame`]) is past its
+/// settlement window, which GLOBAL enforces. A seat's slot and the frame a
+/// proof runs from may trail that frame (a GLOBAL stall, a registry view a
+/// pull behind), while the replicas of `epoch` are already evicted
+/// ([`note_replica_eviction`]): a settlement they still show owed can be
+/// neither prepared nor recorded.
+pub fn settlement_closed(epoch: u64, frame: u64) -> bool {
+    let (_, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
+    global_frame().unwrap_or(0).max(frame) >= until
 }
 
 fn keep(captured: Arc<Captured>) {
@@ -1113,6 +1154,24 @@ pub fn claim_epoch_proof(
     Some(attempt)
 }
 
+/// Restart the retry clock of `(member, filter)`'s epoch proof settling
+/// `epoch` at the latest GLOBAL frame this process saw ([`global_frame`]):
+/// its part, or the node's proof carrying it, just went out, and GLOBAL needs
+/// [`seal_retry_frames`] from then to record it. Claimed long before (a seal
+/// relabelling, the node's batch waiting for other seats), a part was sent
+/// again a minute after its proof landed, and GLOBAL refused it as settling
+/// an epoch already settled.
+pub fn note_epoch_proof_published(member: &[u8], filter: &[u8], epoch: u64) {
+    let Some(frame) = global_frame() else {
+        return;
+    };
+    if let Ok(mut attempts) = epoch_proof_attempts().lock() {
+        if let Some((at, _)) = attempts.get_mut(&(member.to_vec(), filter.to_vec(), epoch)) {
+            *at = (*at).max(frame);
+        }
+    }
+}
+
 /// This member's replicas of a seat's registered leaves for `epoch`, as its
 /// commitments open them and its epoch proof proves them.
 pub struct HeldReplicas {
@@ -1184,6 +1243,12 @@ impl HeldReplicas {
 /// anchored GLOBAL frame's beacon is `rho_n`, for its sealed registration
 /// `slot` (hash storage proofs): its replica nodes the beacon chose, hashed in
 /// order. Its epoch proof later proves them.
+///
+/// Every frame the seat proposes runs this, on the proposal path, for every
+/// seat at once: it reads only each opened node's subtree below the cap
+/// (`quil_store::replica_store::CHUNK_NODES` nodes, 32 KiB) and the leaf's
+/// cached cap, never a whole replica, and never waits on another seat's
+/// replica conversion.
 pub fn commitment(
     replicas: &ReplicaStore,
     member: &[u8],
@@ -1194,12 +1259,56 @@ pub fn commitment(
 ) -> Result<[u8; 32]> {
     use quil_execution::global_intrinsic::storage_epoch_proof as epoch_proof;
     use quil_types::error::QuilError;
-    let held = HeldReplicas::load(replicas, filter, slot.epoch, &slot.leaves)?;
-    let opened =
-        epoch_proof::frame_openings(member, slot.epoch, &held.leaves, &held.replicas(), rho_n)
+    let mut stored = Vec::with_capacity(slot.leaves.len());
+    let mut held = Vec::with_capacity(slot.leaves.len());
+    for prefix in &slot.leaves {
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix);
+        let leaf = replicas
+            .try_get_hash_leaf(slot.epoch, &leaf_id)?
             .ok_or_else(|| {
-                QuilError::InvalidArgument("a stored replica is not the registered one".into())
+                QuilError::ExecutionUnavailable(format!(
+                    "no stored replica of leaf {} for epoch {}",
+                    hex::encode(&leaf_id),
+                    slot.epoch
+                ))
             })?;
+        let registered =
+            quil_crypto::storage_proof::parse_registration_root(&leaf.registration_root)
+                .ok_or_else(|| {
+                    QuilError::InvalidArgument(
+                        "a stored replica without a hash registration".into(),
+                    )
+                })?;
+        held.push(epoch_proof::HeldLeaf {
+            leaf_id,
+            n: leaf.cap.n,
+            comm_r: registered.comm_r,
+        });
+        stored.push(leaf);
+    }
+    let caps: Vec<&quil_crypto::storage_proof::MerkleCap> =
+        stored.iter().map(|leaf| &leaf.cap).collect();
+    let mut failed = None;
+    let opened = epoch_proof::frame_openings_from(
+        member,
+        slot.epoch,
+        &held,
+        &caps,
+        rho_n,
+        &mut |i, nodes| match replicas.read_nodes(slot.epoch, &held[i].leaf_id, &stored[i], nodes) {
+            Ok(nodes) => Some(nodes),
+            Err(error) => {
+                failed.get_or_insert(error);
+                None
+            }
+        },
+    );
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    let opened = opened.ok_or_else(|| {
+        QuilError::InvalidArgument("a stored replica is not the registered one".into())
+    })?;
     epoch_proof::openings_root(frame_number, &opened)
         .ok_or_else(|| QuilError::InvalidArgument("a replica node is not canonical".into()))
 }
@@ -1286,12 +1395,21 @@ pub fn prepare_member_seat(
         self as epoch_proof, SeatClaim, SeatProof,
     };
     use quil_types::error::QuilError;
-    let _memory = crate::storage_jobs::reserve(seat_part_bytes(
+    let bytes = seat_part_bytes(
         replicas,
         filter,
         seal.map(|(slot, _, _)| (epoch + 2, slot.leaves.as_slice())),
         settle.map(|(slot, _)| (epoch, slot.leaves.as_slice())),
-    )?);
+    )?;
+    // A settlement alone loads its held replicas for seconds, and never
+    // waits behind seals relabelling: GLOBAL withholds the member's storage
+    // share (before epoch 1342: kicks it) when its roots go unproven by the
+    // window's end.
+    let _memory = if seal.is_none() {
+        crate::storage_jobs::reserve_settlement(bytes)
+    } else {
+        crate::storage_jobs::reserve(bytes)
+    };
     let mut claim = SeatClaim {
         seal_epoch: epoch + 2,
         settle_epoch: epoch,
@@ -1381,7 +1499,7 @@ pub fn prepare_member_seat(
         }
         None => None,
     };
-    let sealed_refs: Vec<&[u8]> = sealed.iter().map(Vec::as_slice).collect();
+    let sealed_refs: Vec<&[u8]> = sealed.iter().map(|replica| &replica[..]).collect();
     let held_refs = held
         .as_ref()
         .map(HeldReplicas::replicas)
@@ -1473,9 +1591,58 @@ pub fn request(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use quil_hypergraph::Location;
+
+    /// A seat of `member` on `app` owing GLOBAL the settlement of `epoch`:
+    /// its replicas encoded into `replicas`, and one root committed in GLOBAL
+    /// frame `frame_number`, chained as GLOBAL chains it, with the beacon of
+    /// GLOBAL frame `anchor` whose output is `output`.
+    pub(crate) fn settlement_owed(
+        replicas: &ReplicaStore,
+        member: &[u8; 32],
+        app: &[u8; 32],
+        epoch: u64,
+        frame_number: u64,
+        anchor: u64,
+        output: &[u8],
+    ) -> quil_types::consensus::StorageSeatSlot {
+        let crdt = test_crdt();
+        for d in 0u8..3 {
+            crdt.add_vertex(
+                &Location {
+                    app_address: *app,
+                    data_address: [d; 32],
+                },
+                &vec![d + 3; 500],
+            )
+            .unwrap();
+        }
+        crdt.commit(1).unwrap();
+        let captured = capture_at(&crdt, app, epoch, &[current_source(&crdt, app, epoch)]).unwrap();
+        encode_member(&captured, member, replicas).unwrap();
+        let mut leaves = captured.prefixes.clone();
+        leaves.sort();
+        let mut slot = quil_types::consensus::StorageSeatSlot {
+            epoch,
+            leaves,
+            registered_at: 1,
+            sealed_at: Some(2),
+            frames: 1,
+            accumulator: [0; 32],
+            chained: vec![(frame_number, anchor)],
+            open: true,
+        };
+        let rho_n: [u8; 32] = quil_crypto::porep::derive_storage_beacon(anchor, output)
+            .try_into()
+            .unwrap();
+        let root = commitment(replicas, member, app, &slot, frame_number, &rho_n).unwrap();
+        slot.accumulator = quil_execution::global_intrinsic::storage_seat::chain(
+            [(frame_number, &rho_n[..], &root)].into_iter(),
+        );
+        slot
+    }
 
     fn test_crdt() -> Arc<HypergraphCrdt> {
         let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
@@ -2295,6 +2462,59 @@ mod tests {
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
+    /// An epoch proof is not sent again until GLOBAL had
+    /// [`seal_retry_frames`] to record it from when it went out: a part
+    /// claimed long before (a seal relabelling, the node's batch waiting)
+    /// was sent again a minute after its proof landed, and GLOBAL refused it
+    /// as settling an epoch already settled.
+    #[test]
+    fn an_epoch_proof_retry_waits_from_when_it_went_out() {
+        let (member, app, epoch) = ([0x7A; 32], [0x7B; 32], 41);
+        let retry = seal_retry_frames();
+        assert_eq!(claim_epoch_proof(&member, &app, epoch, 1000), Some(1));
+        // Its proof goes out just before the claim's clock would run out.
+        note_global_frame(1000 + retry - 1);
+        note_epoch_proof_published(&member, &app, epoch);
+        assert_eq!(
+            claim_epoch_proof(&member, &app, epoch, 1000 + retry),
+            None,
+            "sent again right after its proof went out, timed from its claim"
+        );
+        assert_eq!(
+            claim_epoch_proof(&member, &app, epoch, 1000 + 2 * retry - 2),
+            None
+        );
+        assert_eq!(
+            claim_epoch_proof(&member, &app, epoch, 1000 + 2 * retry - 1),
+            Some(2)
+        );
+        // A seat never claimed here gets no clock.
+        note_epoch_proof_published(&member, &[0x7C; 32], epoch);
+        assert_eq!(epoch_proof_sent_at(&member, &[0x7C; 32], epoch), None);
+    }
+
+    /// An epoch's replicas are evicted only once GLOBAL is past its
+    /// settlement window: a settlement finding them gone finds its window
+    /// closed, and one within it finds them.
+    #[test]
+    fn replicas_are_evicted_only_past_their_settlement_window() {
+        for current in 1..12 {
+            note_replica_eviction(current);
+            let keep_from = crate::app_shard_metadata::replica_keep_from(current);
+            for epoch in 0..keep_from {
+                assert!(
+                    settlement_closed(epoch, 0),
+                    "epoch {epoch} evicted in {current}"
+                );
+            }
+            assert!(
+                !settlement_closed(current - 1, 0),
+                "epoch {} settles during {current}",
+                current - 1
+            );
+        }
+    }
+
     /// How the leaves of `filter` for `epoch` doing `work` ended, in order
     /// ([`LeafProgress::end`]).
     fn outcomes(epoch: u64, filter: &[u8], work: LeafWork) -> Vec<LeafOutcome> {
@@ -2538,23 +2758,55 @@ mod tests {
         (crdt, leaf_id)
     }
 
+    /// Labelling ahead on a thread of its own ([`label_ahead_in_background`]).
+    struct LabellingAhead {
+        done: std::sync::mpsc::Receiver<Result<()>>,
+        thread: std::thread::JoinHandle<()>,
+        /// Handles of the store before the thread took one.
+        held: usize,
+    }
+
+    impl LabellingAhead {
+        /// The labelling's result, once its thread has ended. The thread
+        /// holds the store: a test that returns before it ends lets it close
+        /// the store while the process exits, which aborts the process
+        /// ("pthread lock: Invalid argument"; CI 2026-10-31).
+        fn ended(self, crdt: &Arc<HypergraphCrdt>) -> Result<()> {
+            let result = self
+                .done
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the labelling ahead ends");
+            self.thread.join().expect("the labelling ahead's thread");
+            assert_eq!(
+                Arc::strong_count(crdt),
+                self.held,
+                "the labelling ahead's thread still holds the store"
+            );
+            result
+        }
+    }
+
     /// Label `member`'s leaves of `app` ahead for `epoch` into `store` on a
     /// thread of its own, and return once a leaf of `app` is being labelled
-    /// ahead: the labelling's result, once it ends.
+    /// ahead.
     fn label_ahead_in_background(
         store: &'static crate::storage_labels::LabelStore,
         crdt: &Arc<HypergraphCrdt>,
         member: [u8; 32],
         app: [u8; 32],
         epoch: u64,
-    ) -> std::sync::mpsc::Receiver<Result<()>> {
+    ) -> LabellingAhead {
         use std::time::{Duration, Instant};
         let (done_tx, done) = std::sync::mpsc::channel();
+        let held = Arc::strong_count(crdt);
         let crdt = crdt.clone();
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(epoch - 2));
             let result = crate::storage_labels::precompute(store, &crdt, &member, &app, epoch);
             done_tx.send(result).unwrap();
+            // As a loaded runner may: the test goes on before this thread
+            // drops its handle of the store.
+            std::thread::sleep(Duration::from_millis(50));
         });
         let deadline = Instant::now() + Duration::from_secs(60);
         while !running_leaves()
@@ -2565,7 +2817,7 @@ mod tests {
             assert!(Instant::now() < deadline, "the leaf is labelled ahead");
             std::thread::sleep(Duration::from_millis(5));
         }
-        done
+        LabellingAhead { done, thread, held }
     }
 
     /// A leaf being labelled ahead is given up, leaving no labels, once
@@ -2580,11 +2832,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store: &'static LabelStore =
             Box::leak(Box::new(LabelStore::with_space(dir.clone(), ample_space())));
-        let done = label_ahead_in_background(store, &crdt, member, app, epoch);
+        let labelling = label_ahead_in_background(store, &crdt, member, app, epoch);
         note_global_frame(quil_types::consensus::storage_snapshot_frame(epoch));
-        done.recv_timeout(std::time::Duration::from_secs(60))
-            .expect("the labelling ahead ends")
-            .unwrap();
+        labelling.ended(&crdt).unwrap();
         assert!(
             store.find(epoch, &member, &leaf_id, |_| true).is_none(),
             "the labelling ahead ran on past the epoch's snapshot frame"
@@ -2612,14 +2862,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store: &'static LabelStore =
             Box::leak(Box::new(LabelStore::with_space(dir.clone(), ample_space())));
-        let done = label_ahead_in_background(store, &crdt, member, app, epoch);
+        let labelling = label_ahead_in_background(store, &crdt, member, app, epoch);
         // Granted once the labelling ahead gives its memory back.
         let due = crate::storage_jobs::reserve(u64::MAX / 4);
         note_global_frame(quil_types::consensus::storage_snapshot_frame(epoch));
         drop(due);
-        done.recv_timeout(std::time::Duration::from_secs(60))
-            .expect("the labelling ahead ends")
-            .unwrap();
+        labelling.ended(&crdt).unwrap();
         assert!(
             store.find(epoch, &member, &leaf_id, |_| true).is_none(),
             "the leaf was labelled ahead again past the epoch's snapshot frame"

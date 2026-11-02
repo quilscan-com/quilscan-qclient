@@ -15,13 +15,17 @@ use crate::context::{Context, GlobalArgs};
 use crate::rpc::ConnectOpts;
 
 mod account;
+pub(crate) mod action_log;
 #[cfg(feature = "confidential-tokens")]
 pub(crate) mod balance;
 #[cfg(feature = "confidential-tokens")]
 mod claimable_rewards;
-mod legacy;
+pub(crate) mod legacy;
+pub(crate) mod output;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
+#[cfg(feature = "native-proof")]
+pub(crate) use wallet::{execute_shield_all, plan_shield_all, shield_batch_fee, ShieldEvent};
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
 /// flags).
@@ -31,14 +35,24 @@ pub struct TokenCommonArgs {
     #[arg(long = "public-rpc", global = true, default_value_t = false)]
     pub public_rpc: bool,
     /// Path to the node config directory, the one holding config.yml
-    /// (default: the default node config). A directory without config.yml is
-    /// refused. `token legacy` takes it more than once, after `legacy`.
+    /// (default: the default node config). Its keys own the wallet: they hold
+    /// the coins, pay the fees and sign reward mints with the prover key, and
+    /// they also sign submissions unless --submit-config names another config.
+    /// A directory without config.yml is refused. `token legacy` takes it more
+    /// than once, after `legacy`.
     #[arg(long = "config", global = true, value_name = "DIR", action = clap::ArgAction::Append)]
     pub config: Vec<String>,
+    /// Config directory of the running node to submit through: submissions go
+    /// to its listenGrpcMultiaddr signed with its peer key, the only key that
+    /// node accepts, while the wallet, its fees and the reward-mint prover key
+    /// stay with --config. Fee quotes and, without --read-rpc, wallet reads also
+    /// come from that node.
+    #[arg(long = "submit-config", global = true, value_name = "DIR")]
+    pub submit_config: Option<String>,
     /// Read wallet state (coins, escrows, witnesses) and other applications'
     /// fee quotes from this node's gRPC multiaddr instead of the configured
-    /// node. QUIL fee quotes and submissions still go to the configured node,
-    /// whose peer key authenticates them. Use when the configured node does
+    /// node. QUIL fee quotes and submissions still go to the submitting node
+    /// (--submit-config, else --config), whose peer key authenticates them. Use when the configured node does
     /// not hold the application's state (a regular node's master process does
     /// not serve its workers' shard state). The connection is plaintext: a
     /// host other than this one also needs --insecure-read-rpc.
@@ -220,6 +234,86 @@ fn read_rpc_opts(multiaddr: &str, insecure: bool) -> anyhow::Result<ConnectOpts>
         custom_rpc: String::new(),
         listen_grpc_multiaddr: multiaddr.to_string(),
     })
+}
+
+/// The peer identities a node config holds: its network peer ID (from the
+/// Falcon `q-prover-key`) and, on a node that still carries one, its
+/// pre-migration Ed448 peer ID. A node reports the first as its peer ID.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigIdentity {
+    pub falcon: Option<String>,
+    pub ed448: Option<String>,
+}
+
+impl ConfigIdentity {
+    pub(crate) fn of(config: &Config, key_manager: &FileKeyManager) -> Self {
+        Self {
+            falcon: key_manager
+                .get_public_key_bytes_by_id("q-prover-key")
+                .ok()
+                .map(|public| quil_p2p::peer_id_base58_from_falcon_pubkey(&public)),
+            ed448: Ed448Identity::from_config_hex(&config.p2p.peer_priv_key)
+                .ok()
+                .map(|identity| identity.peer_id_base58()),
+        }
+    }
+
+    /// The peer ID to show: the network identity, else the Ed448 one.
+    pub(crate) fn shown(&self) -> Option<&str> {
+        self.falcon.as_deref().or(self.ed448.as_deref())
+    }
+
+    fn holds(&self, peer: &str) -> bool {
+        self.falcon.as_deref() == Some(peer) || self.ed448.as_deref() == Some(peer)
+    }
+}
+
+/// A peer ID as its last six characters, enough to tell two nodes apart.
+pub(crate) fn short_peer(peer: &str) -> String {
+    let tail: Vec<char> = peer.chars().rev().take(6).collect();
+    format!("\u{2026}{}", tail.into_iter().rev().collect::<String>())
+}
+
+/// The fix `qclient token` offers for a submission signed by another config.
+pub(crate) const SUBMIT_CONFIG_REMEDY: &str =
+    "pass --submit-config <DIR> with the running node's config directory";
+
+/// Why the node at `node` would refuse submissions signed by the config in
+/// `signer_dir`: a node verifies a submission's authentication against its
+/// own peer key, so only its own config can sign one. `None` when the
+/// identities match, or when either side has none to compare (an older node
+/// reports no peer ID; then the node's own check is the only one). `remedy`
+/// is the fix the caller's options offer.
+pub(crate) fn submit_identity_mismatch(
+    node: &str,
+    node_peer: &str,
+    signer_dir: &std::path::Path,
+    signer: &ConfigIdentity,
+    remedy: &str,
+) -> Option<String> {
+    let signer_peer = signer.shown()?;
+    if node_peer.is_empty() || signer.holds(node_peer) {
+        return None;
+    }
+    Some(format!(
+        "the node at {node} is peer {}, but submissions would be signed by {} (peer {}), \
+         and a node accepts only submissions signed with its own peer key; {remedy}",
+        short_peer(node_peer),
+        signer_dir.display(),
+        short_peer(signer_peer)
+    ))
+}
+
+/// The notice for a `./.config` the default config resolution passed over.
+pub(crate) fn local_config_notice(default: &std::path::Path, peer: Option<&str>) -> String {
+    let peer = peer
+        .map(|peer| format!(" (peer {})", short_peer(peer)))
+        .unwrap_or_default();
+    format!(
+        "using the default node config {}{peer}; a node config in ./.config was not used: \
+         pass --config ./.config to use it",
+        default.display()
+    )
 }
 
 #[derive(Debug, Args)]
@@ -465,14 +559,55 @@ pub enum TokenCommand {
     },
 }
 
+impl TokenCommand {
+    /// Whether the command submits through the node's authenticated Send RPC.
+    fn submits(&self) -> bool {
+        match self {
+            TokenCommand::Account
+            | TokenCommand::Balance
+            | TokenCommand::Coins
+            | TokenCommand::Legacy(_)
+            | TokenCommand::ConfidentialAddress => false,
+            #[cfg(feature = "confidential-tokens")]
+            TokenCommand::Escrows { .. } | TokenCommand::ClaimableRewards => false,
+            #[cfg(feature = "native-proof")]
+            TokenCommand::Entitlements { .. }
+            | TokenCommand::PaymentAddress
+            | TokenCommand::Prefunded
+            | TokenCommand::SettlementClaim { .. } => false,
+            TokenCommand::Transfer { .. }
+            | TokenCommand::Merge { .. }
+            | TokenCommand::Split { .. }
+            | TokenCommand::PendingTransfer { .. }
+            | TokenCommand::Accept { .. }
+            | TokenCommand::Reject { .. }
+            | TokenCommand::Mint { .. } => true,
+            #[cfg(feature = "native-proof")]
+            TokenCommand::Shield { .. }
+            | TokenCommand::ShieldAll { .. }
+            | TokenCommand::CustomMint { .. }
+            | TokenCommand::Pay { .. }
+            | TokenCommand::Prefund { .. } => true,
+        }
+    }
+}
+
 /// Resolved per-invocation token context (Go `TokenCmd.PersistentPreRun`).
 pub struct TokenCtx {
     pub node_config: Config,
     pub config_dir: PathBuf,
     pub key_manager: Arc<FileKeyManager>,
     pub connect_opts: ConnectOpts,
-    /// Connection to the configured node for authenticated submissions.
+    /// Connection to the submitting node (`--submit-config`, else
+    /// `--config`) for authenticated submissions and QUIL fee quotes.
     pub submit_opts: ConnectOpts,
+    /// Keys of the submitting node's config; only its peer key is used, to
+    /// sign the Send authentication that node verifies.
+    pub submit_key_manager: Arc<FileKeyManager>,
+    /// The submitting node's config directory.
+    pub submit_config_dir: PathBuf,
+    /// The submitting config's peer identities.
+    pub submit_identity: ConfigIdentity,
     /// The managing peer id bytes (34-byte libp2p multihash) derived from
     /// `config.p2p.peer_priv_key`. EMPTY on a Falcon-only node, which carries
     /// no pre-migration Ed448 key.
@@ -510,14 +645,14 @@ impl TokenCtx {
             source: if read_rpc {
                 NodeSource::ReadRpc
             } else {
-                NodeSource::Config(self.config_dir.clone())
+                NodeSource::Config(self.submit_config_dir.clone())
             },
         }
         .connect(None)
         .await
     }
 
-    /// Connect to the configured node for an authenticated submission.
+    /// Connect to the submitting node for an authenticated submission.
     pub async fn connect_submit(
         &self,
     ) -> anyhow::Result<
@@ -525,16 +660,77 @@ impl TokenCtx {
     > {
         ReadNode {
             opts: self.submit_opts.clone(),
-            source: NodeSource::Config(self.config_dir.clone()),
+            source: NodeSource::Config(self.submit_config_dir.clone()),
         }
         .connect(None)
         .await
     }
 
+    /// Refuse, before anything is built, a submission the submitting node
+    /// would reject: one signed by a config other than that node's own. Says
+    /// nothing when the node cannot be asked or reports no peer ID; the
+    /// submission then meets the node's own check as before.
+    pub(crate) async fn check_submit_identity(&self) -> anyhow::Result<()> {
+        self.check_submit_identity_advising(SUBMIT_CONFIG_REMEDY)
+            .await
+    }
+
+    /// [`Self::check_submit_identity`], with `remedy` as the advice when it
+    /// refuses: a caller without `--submit-config` names its own fix.
+    pub(crate) async fn check_submit_identity_advising(&self, remedy: &str) -> anyhow::Result<()> {
+        if self.submit_opts.is_light_node() {
+            return Ok(());
+        }
+        let Ok(mut client) = crate::rpc::connect_node_service(&self.submit_opts).await else {
+            return Ok(());
+        };
+        let Ok(info) = client
+            .get_node_info(quil_types::proto::node::GetNodeInfoRequest {})
+            .await
+        else {
+            return Ok(());
+        };
+        let node = ReadNode {
+            opts: self.submit_opts.clone(),
+            source: NodeSource::Config(self.submit_config_dir.clone()),
+        };
+        match submit_identity_mismatch(
+            node.multiaddr(),
+            &info.into_inner().peer_id,
+            &self.submit_config_dir,
+            &self.submit_identity,
+            remedy,
+        ) {
+            Some(mismatch) => Err(anyhow::anyhow!(mismatch)),
+            None => Ok(()),
+        }
+    }
+
+    /// The context `qclient token` builds for the default node config and
+    /// no read or public RPC: the node manager's coin actions use it, so
+    /// they read, quote and submit as the CLI does.
+    pub(crate) fn for_manager(global: GlobalArgs, max_fee: u128) -> anyhow::Result<Self> {
+        Self::load(
+            global,
+            &TokenCommonArgs {
+                public_rpc: false,
+                config: Vec::new(),
+                submit_config: None,
+                read_rpc: None,
+                insecure_read_rpc: false,
+                max_fee,
+            },
+        )
+    }
+
     fn load(global: GlobalArgs, common: &TokenCommonArgs) -> anyhow::Result<Self> {
-        let ctx = Context::load(global)?;
-        println!("Loading node config...");
-        let (node_config, config_dir) = ctx.load_node_config(common.single_config()?)?;
+        Self::from_context(&Context::load(global)?, common)
+    }
+
+    fn from_context(ctx: &Context, common: &TokenCommonArgs) -> anyhow::Result<Self> {
+        output::line("Loading node config...".into());
+        let config_arg = common.single_config()?;
+        let (node_config, config_dir) = ctx.load_node_config(config_arg)?;
 
         // The Ed448 identity is kept ONLY for the legacy coin address
         // (`poseidon(ed448 peerId)`, `legacy_address()` below). The peer id we
@@ -547,21 +743,51 @@ impl TokenCtx {
         let identity = Ed448Identity::from_config_hex(&node_config.p2p.peer_priv_key).ok();
 
         let key_manager = ctx.key_manager(&node_config, &config_dir)?;
-        match key_manager.get_public_key_bytes_by_id("q-prover-key") {
-            Ok(falcon_pub) => {
-                println!(
-                    "{}",
-                    quil_p2p::peer_id_base58_from_falcon_pubkey(&falcon_pub)
-                );
-            }
-            // Fall back to the legacy Ed448 peer id only if the Falcon network key
-            // is absent (a pre-migration keystore).
-            Err(_) => match &identity {
-                Some(identity) => println!("{}", identity.peer_id_base58()),
-                None => println!("(no network identity configured)"),
-            },
+        // The legacy Ed448 peer id is shown only if the Falcon network key is
+        // absent (a pre-migration keystore).
+        let config_identity = ConfigIdentity::of(&node_config, &key_manager);
+        match config_identity.shown() {
+            Some(peer) => output::line(peer.to_string()),
+            None => output::line("(no network identity configured)".into()),
         }
-        let submit_opts = ctx.connect_opts(&node_config, common.public_rpc);
+        if config_arg.is_empty() || config_arg == "default" {
+            let unused = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| crate::nodeconfig::unused_local_config(&config_dir, &cwd));
+            if unused.is_some() {
+                output::err_line(local_config_notice(&config_dir, config_identity.shown()));
+            }
+        }
+        let (submit_opts, submit_key_manager, submit_config_dir, submit_identity) =
+            match &common.submit_config {
+                None => (
+                    ctx.connect_opts(&node_config, common.public_rpc),
+                    key_manager.clone(),
+                    config_dir.clone(),
+                    config_identity,
+                ),
+                Some(dir) => {
+                    let (submit_config, submit_dir) = ctx.load_node_config(dir)?;
+                    let opts = ctx.connect_opts(&submit_config, common.public_rpc);
+                    anyhow::ensure!(
+                        !opts.is_light_node(),
+                        "--submit-config names a node to submit through, but submissions go \
+                         to a public RPC (--public-rpc, or publicRpc or customRpc in the \
+                         qclient config); drop one of them"
+                    );
+                    let submit_key_manager = ctx.key_manager(&submit_config, &submit_dir)?;
+                    let identity = ConfigIdentity::of(&submit_config, &submit_key_manager);
+                    println!(
+                        "Submitting through the node of {} (peer {})",
+                        submit_dir.display(),
+                        identity
+                            .shown()
+                            .map(short_peer)
+                            .unwrap_or_else(|| "unknown".into())
+                    );
+                    (opts, submit_key_manager, submit_dir, identity)
+                }
+            };
         let connect_opts = match &common.read_rpc {
             Some(multiaddr) => read_rpc_opts(multiaddr, common.insecure_read_rpc)?,
             None => submit_opts.clone(),
@@ -573,6 +799,9 @@ impl TokenCtx {
             key_manager,
             connect_opts,
             submit_opts,
+            submit_key_manager,
+            submit_config_dir,
+            submit_identity,
             peer_id_bytes: identity
                 .map(|identity| identity.peer_id_bytes)
                 .unwrap_or_default(),
@@ -625,6 +854,7 @@ pub(crate) async fn pay_for_bundle(
     let common = TokenCommonArgs {
         public_rpc: false,
         config: Vec::new(),
+        submit_config: None,
         read_rpc: None,
         insecure_read_rpc: false,
         max_fee: max_fee_from_env()?,
@@ -661,6 +891,11 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
         .unwrap_or_else(|| hex::encode(quil_execution::domains::QUIL_TOKEN));
     let decoded = hex::decode(&application)?;
     anyhow::ensure!(decoded.len() == 32, "application must be exactly 32 bytes");
+    // Before any fee quote or proof: a submission the node would refuse.
+    // Boxed: the gRPC call would otherwise grow every command's future.
+    if args.command.submits() {
+        Box::pin(tc.check_submit_identity()).await?;
+    }
     #[cfg(feature = "confidential-tokens")]
     match &args.command {
         TokenCommand::ClaimableRewards => {
@@ -1324,5 +1559,523 @@ mod tests {
         }
         assert!(TokenCli::try_parse_from(["token", "--legacy", "balance"]).is_err());
         assert!(TokenCli::try_parse_from(["token", "balance", "--legacy"]).is_err());
+    }
+}
+
+/// Node configs on disk for tests that load them as qclient does.
+#[cfg(test)]
+pub(crate) mod test_nodes {
+    use std::path::{Path, PathBuf};
+
+    use super::{TokenCommonArgs, DEFAULT_MAX_AUTOMATIC_FEE};
+    use crate::config::ClientConfig;
+    use crate::context::{Context, GlobalArgs};
+
+    /// A node config written to `dir`: its Ed448 peer key, Falcon network key
+    /// and the peer ID a node running it reports.
+    pub(crate) struct TestNode {
+        pub dir: PathBuf,
+        pub ed448_public: Vec<u8>,
+        pub falcon_public: Vec<u8>,
+        pub peer_id: String,
+    }
+
+    /// Write a node config to `dir` with the Ed448 peer key from `seed`, a
+    /// fresh Falcon `q-prover-key` and `q-onion-key`, listening on `listen`.
+    pub(crate) fn write(dir: &Path, seed: u8, listen: &str) -> TestNode {
+        let mut config = quil_config::Config::default();
+        config.listen_grpc_multiaddr = listen.to_string();
+        config.key.key_store_file.path = dir.join("keys.yml").to_string_lossy().into_owned();
+        config.key.key_store_file.encryption_key = hex::encode([seed; 32]);
+        let ed448_seed = [seed; 57];
+        let ed448_public = quil_crypto::Ed448Signer::derive_public(&ed448_seed)
+            .unwrap()
+            .to_vec();
+        let mut peer_key = ed448_seed.to_vec();
+        peer_key.extend_from_slice(&ed448_public);
+        config.p2p.peer_priv_key = hex::encode(peer_key);
+        quil_config::save_config(dir, &config).unwrap();
+        let key_manager = crate::keys::build_key_manager(&config, dir).unwrap();
+        let falcon_public = key_manager.create_falcon_key("q-prover-key").unwrap();
+        key_manager.create_agreement_key("q-onion-key", 9).unwrap();
+        TestNode {
+            dir: dir.to_path_buf(),
+            peer_id: quil_p2p::peer_id_base58_from_falcon_pubkey(&falcon_public),
+            ed448_public,
+            falcon_public,
+        }
+    }
+
+    /// A qclient context with an in-memory client config.
+    pub(crate) fn context(public_rpc: bool) -> Context {
+        Context {
+            global: GlobalArgs {
+                network: None,
+                yes: true,
+            },
+            client_config: ClientConfig {
+                data_dir: String::new(),
+                symlink_path: String::new(),
+                public_rpc,
+                custom_rpc: String::new(),
+                node_symlink_name: String::new(),
+                no_action_log: false,
+            },
+        }
+    }
+
+    /// `--config <config> [--submit-config <submit>] [--public-rpc]`.
+    pub(crate) fn common(
+        config: &Path,
+        submit: Option<&Path>,
+        public_rpc: bool,
+    ) -> TokenCommonArgs {
+        TokenCommonArgs {
+            public_rpc,
+            config: vec![config.to_string_lossy().into_owned()],
+            submit_config: submit.map(|dir| dir.to_string_lossy().into_owned()),
+            read_rpc: None,
+            insecure_read_rpc: false,
+            max_fee: DEFAULT_MAX_AUTOMATIC_FEE,
+        }
+    }
+}
+
+#[cfg(test)]
+mod submit_tests {
+    use super::*;
+
+    /// A key mismatch names both peers by their last six characters and the
+    /// flag that fixes it; matching keys and absent identities pass.
+    #[test]
+    fn a_key_mismatch_names_both_peers_and_the_fix() {
+        let node = "QmNodePeerAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAnode01";
+        let signer = ConfigIdentity {
+            falcon: Some("QmConfigPeerBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBconf02".into()),
+            ed448: Some("12D3KooWEd448CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCed4483".into()),
+        };
+        let dir = std::path::Path::new("prover").join(".config");
+        let error = submit_identity_mismatch(
+            "/ip4/127.0.0.1/tcp/8337",
+            node,
+            &dir,
+            &signer,
+            SUBMIT_CONFIG_REMEDY,
+        )
+        .unwrap();
+        assert_eq!(
+            error,
+            format!(
+                "the node at /ip4/127.0.0.1/tcp/8337 is peer \u{2026}node01, but submissions \
+                 would be signed by {} (peer \u{2026}conf02), and a node accepts only \
+                 submissions signed with its own peer key; pass --submit-config <DIR> with \
+                 the running node's config directory",
+                dir.display()
+            )
+        );
+        assert!(!error.contains('\n'));
+        // The node's own config: its network or its Ed448 peer ID.
+        for own in [signer.falcon.clone(), signer.ed448.clone()] {
+            let own = own.unwrap();
+            assert_eq!(
+                submit_identity_mismatch(
+                    "/ip4/127.0.0.1/tcp/8337",
+                    &own,
+                    &dir,
+                    &signer,
+                    SUBMIT_CONFIG_REMEDY
+                ),
+                None
+            );
+        }
+        // Nothing to compare: an older node reports no peer ID, or the config
+        // holds no identity.
+        assert_eq!(
+            submit_identity_mismatch(
+                "/ip4/127.0.0.1/tcp/8337",
+                "",
+                &dir,
+                &signer,
+                SUBMIT_CONFIG_REMEDY
+            ),
+            None
+        );
+        assert_eq!(
+            submit_identity_mismatch(
+                "/ip4/127.0.0.1/tcp/8337",
+                node,
+                &dir,
+                &ConfigIdentity::default(),
+                SUBMIT_CONFIG_REMEDY
+            ),
+            None
+        );
+        assert_eq!(short_peer("abc"), "\u{2026}abc");
+    }
+
+    #[test]
+    fn a_local_config_notice_names_the_default_and_the_fix() {
+        let default = std::path::Path::new("configs").join("default");
+        assert_eq!(
+            local_config_notice(&default, Some("QmPeer123456")),
+            format!(
+                "using the default node config {} (peer \u{2026}123456); a node config in \
+                 ./.config was not used: pass --config ./.config to use it",
+                default.display()
+            )
+        );
+        assert!(!local_config_notice(&default, None).contains("peer"));
+    }
+
+    /// Every command that builds a submission is checked; reads are not.
+    #[test]
+    fn submitting_commands_are_the_checked_ones() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct TokenCli {
+            #[command(flatten)]
+            token: TokenArgs,
+        }
+        let command = |arguments: &[&str]| {
+            TokenCli::try_parse_from([&["token"][..], arguments].concat())
+                .unwrap()
+                .token
+                .command
+        };
+        let reads: [&[&str]; 6] = [
+            &["claimable-rewards"],
+            &["balance"],
+            &["coins"],
+            &["account"],
+            &["legacy"],
+            &["confidential-address"],
+        ];
+        for read in reads {
+            assert!(!command(read).submits(), "{read:?}");
+        }
+        let submits: [&[&str]; 7] = [
+            &["mint"],
+            &["transfer", "recipient", "9"],
+            &["merge"],
+            &["split", "coin", "1"],
+            &["pending-transfer", "recipient", "9"],
+            &["accept", "00"],
+            &["reject", "00"],
+        ];
+        for submit in submits {
+            assert!(command(submit).submits(), "{submit:?}");
+        }
+        #[cfg(feature = "native-proof")]
+        {
+            let submits: [&[&str]; 3] = [
+                &["shield", "coin", "9"],
+                &["shield-all"],
+                &["custom-mint", "9"],
+            ];
+            for submit in submits {
+                assert!(command(submit).submits(), "{submit:?}");
+            }
+            assert!(!command(&["prefunded"]).submits());
+        }
+        let parsed = TokenCli::try_parse_from([
+            "token",
+            "--config",
+            "prover/.config",
+            "mint",
+            "--submit-config",
+            "node/.config",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.token.common.submit_config.as_deref(),
+            Some("node/.config")
+        );
+    }
+
+    /// `--submit-config` takes the Send key and the node address from its own
+    /// config and everything the wallet signs from `--config`; it is refused
+    /// where submissions go to a public RPC.
+    #[test]
+    fn the_submit_config_supplies_only_the_send_key_and_the_node() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = test_nodes::write(
+            &directory.path().join("node"),
+            31,
+            "/ip4/127.0.0.1/tcp/18337",
+        );
+        let prover = test_nodes::write(
+            &directory.path().join("prover"),
+            32,
+            "/ip4/127.0.0.1/tcp/28337",
+        );
+        let peer_key = |key_manager: &FileKeyManager| {
+            key_manager
+                .get_signer_by_id("q-peer-key")
+                .unwrap()
+                .public_key()
+                .to_vec()
+        };
+        let falcon = |key_manager: &FileKeyManager| {
+            key_manager
+                .get_public_key_bytes_by_id("q-prover-key")
+                .unwrap()
+        };
+
+        let tc = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&prover.dir, Some(&node.dir), false),
+        )
+        .unwrap();
+        assert_eq!(peer_key(&tc.submit_key_manager), node.ed448_public);
+        assert_eq!(falcon(&tc.key_manager), prover.falcon_public);
+        assert_eq!(peer_key(&tc.key_manager), prover.ed448_public);
+        assert_eq!(tc.config_dir, prover.dir);
+        assert_eq!(tc.submit_config_dir, node.dir);
+        assert_eq!(
+            tc.submit_identity.falcon.as_deref(),
+            Some(node.peer_id.as_str())
+        );
+        assert_eq!(
+            tc.submit_opts.listen_grpc_multiaddr,
+            "/ip4/127.0.0.1/tcp/18337"
+        );
+        // Reads follow the running node unless --read-rpc says otherwise.
+        assert_eq!(
+            tc.connect_opts.listen_grpc_multiaddr,
+            "/ip4/127.0.0.1/tcp/18337"
+        );
+
+        // Without it, the --config node signs and takes everything.
+        let tc = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&prover.dir, None, false),
+        )
+        .unwrap();
+        assert_eq!(peer_key(&tc.submit_key_manager), prover.ed448_public);
+        assert_eq!(
+            tc.submit_opts.listen_grpc_multiaddr,
+            "/ip4/127.0.0.1/tcp/28337"
+        );
+
+        for (client_public_rpc, flag) in [(false, true), (true, false)] {
+            let error = TokenCtx::from_context(
+                &test_nodes::context(client_public_rpc),
+                &test_nodes::common(&prover.dir, Some(&node.dir), flag),
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(error.starts_with("--submit-config names a node"), "{error}");
+        }
+    }
+}
+
+/// `token shield-all --config <pre-2.1 identity> --submit-config <running
+/// node>` up to the wallet it shields into.
+#[cfg(all(test, feature = "confidential-tokens"))]
+mod old_keystore_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::wallet::RecipientWallet;
+    use super::*;
+
+    /// A pre-2.1 identity's config directory: its Ed448 peer key from
+    /// `seed`, the generated relative keystore path `.config/keys.yml` and
+    /// a keystore of keys without the wallet key.
+    fn write_pre_2_1(dir: &Path, seed: u8) -> Vec<u8> {
+        let mut config = quil_config::Config::default();
+        config.listen_grpc_multiaddr = "/ip4/127.0.0.1/tcp/38337".into();
+        config.key.key_store_file.path = ".config/keys.yml".into();
+        config.key.key_store_file.encryption_key = hex::encode([seed; 32]);
+        let ed448_seed = [seed; 57];
+        let ed448_public = quil_crypto::Ed448Signer::derive_public(&ed448_seed)
+            .unwrap()
+            .to_vec();
+        let mut peer_key = ed448_seed.to_vec();
+        peer_key.extend_from_slice(&ed448_public);
+        config.p2p.peer_priv_key = hex::encode(peer_key);
+        quil_config::save_config(dir, &config).unwrap();
+        let km = quil_keys::FileKeyManager::new(
+            dir.join("keys.yml"),
+            &config.key.key_store_file.encryption_key,
+            "default-proving-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        km.create_bls_key("q-prover-key").unwrap();
+        km.create_bls_key("default-proving-key").unwrap();
+        km.create_agreement_key("q-device-key", 4).unwrap();
+        km.create_agreement_key("q-device-pre-key", 4).unwrap();
+        ed448_public
+    }
+
+    fn wallet_of(tc: &TokenCtx) -> anyhow::Result<String> {
+        let network =
+            quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+        let wallet = RecipientWallet::load(tc, &network, &quil_execution::domains::QUIL_TOKEN)?;
+        Ok(hex::encode(wallet.address().encode()))
+    }
+
+    fn keys_of(path: &Path) -> Vec<(String, Vec<u8>)> {
+        let km = quil_keys::FileKeyManager::new(
+            path.to_path_buf(),
+            "",
+            "default-proving-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        km.list_keys()
+            .into_iter()
+            .map(|key| (key.id, key.public_key))
+            .collect()
+    }
+
+    struct Layout {
+        _tmp: tempfile::TempDir,
+        running: PathBuf,
+        old: PathBuf,
+        old_public: Vec<u8>,
+    }
+
+    /// The running node at `<node>/.config`, the old identity copied to
+    /// `<node>/.config-old`.
+    fn layout() -> Layout {
+        let tmp = tempfile::tempdir().unwrap();
+        let running = tmp.path().join("node").join(".config");
+        let old = tmp.path().join("node").join(".config-old");
+        test_nodes::write(&running, 41, "/ip4/127.0.0.1/tcp/18337");
+        let old_public = write_pre_2_1(&old, 42);
+        Layout {
+            _tmp: tmp,
+            running,
+            old,
+            old_public,
+        }
+    }
+
+    /// Reproducer of the operator's failure: the old identity's wallet was
+    /// read from the running node's keystore (`q-onion-key secret: crypto
+    /// error: decryption failed`), and its own keystore has no wallet key.
+    /// Now the wallet comes from the old identity's keystore, which receives
+    /// a wallet key; the running node's keystore is untouched.
+    #[test]
+    fn shield_all_from_a_pre_2_1_identity_shields_into_its_own_wallet() {
+        let layout = layout();
+        let running_keys = std::fs::read(layout.running.join("keys.yml")).unwrap();
+        let old_keys = keys_of(&layout.old.join("keys.yml"));
+        let tc = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&layout.old, Some(&layout.running), false),
+        )
+        .unwrap();
+        let wallet = wallet_of(&tc).unwrap_or_else(|e| panic!("{e:#}"));
+
+        // The legacy owner and the wallet are both the old identity's.
+        assert_eq!(
+            super::legacy::config_public_key(&tc.node_config.p2p.peer_priv_key)
+                .unwrap()
+                .to_vec(),
+            layout.old_public
+        );
+        let mut now = keys_of(&layout.old.join("keys.yml"));
+        let created = now.iter().position(|(id, _)| id == "q-onion-key").unwrap();
+        now.remove(created);
+        assert_eq!(now, old_keys, "existing keys are kept as they were");
+        assert_eq!(
+            std::fs::read(layout.running.join("keys.yml")).unwrap(),
+            running_keys
+        );
+
+        // The key persists: the same wallet on the next run, distinct from
+        // the running node's.
+        let again = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&layout.old, Some(&layout.running), false),
+        )
+        .unwrap();
+        assert_eq!(wallet_of(&again).unwrap(), wallet);
+        let node = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&layout.running, None, false),
+        )
+        .unwrap();
+        assert_ne!(wallet_of(&node).unwrap(), wallet);
+    }
+
+    /// A wallet key is created only in a keystore shown to be this config's,
+    /// and a wallet key that does not decrypt is named with its keystore and
+    /// left in place.
+    #[test]
+    fn a_wallet_key_is_created_only_in_this_configs_keystore() {
+        let layout = layout();
+        let tc = |dir: &Path| {
+            TokenCtx::from_context(
+                &test_nodes::context(false),
+                &test_nodes::common(dir, Some(&layout.running), false),
+            )
+            .unwrap()
+        };
+        // A keystore path naming no file: nothing is created there.
+        let missing = layout.old.join("elsewhere").join("keys.yml");
+        let mut config = quil_config::load_config(&layout.old).unwrap();
+        config.key.key_store_file.path = missing.to_string_lossy().into_owned();
+        quil_config::save_config(&layout.old, &config).unwrap();
+        let error = format!("{:#}", wallet_of(&tc(&layout.old)).unwrap_err());
+        assert!(error.contains(missing.to_str().unwrap()), "{error}");
+        assert!(!missing.exists(), "no keystore is created at a wrong path");
+
+        // A keystore holding this config's keys and a wallet key encrypted
+        // under another key: named, never replaced.
+        let own = layout.old.join("keys.yml");
+        let other = quil_keys::FileKeyManager::new(
+            own.clone(),
+            &hex::encode([43u8; 32]),
+            "default-proving-key".into(),
+            Box::new(quil_crypto::FalconKeyConstructor),
+        )
+        .unwrap();
+        other.create_agreement_key("q-onion-key", 9).unwrap();
+        config.key.key_store_file.path = own.to_string_lossy().into_owned();
+        quil_config::save_config(&layout.old, &config).unwrap();
+        let before = std::fs::read(&own).unwrap();
+        let error = format!("{:#}", wallet_of(&tc(&layout.old)).unwrap_err());
+        assert!(error.contains("decryption failed"), "{error}");
+        assert!(error.contains(own.to_str().unwrap()), "{error}");
+        assert!(
+            error.contains(layout.old.join("config.yml").to_str().unwrap()),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&own).unwrap(), before);
+    }
+
+    /// Workaround on releases without this fix: a copy of the old config
+    /// whose keyManagerFile names the running node's keystore (absolute path
+    /// and encryptionKey) lists and signs for the old identity's legacy
+    /// coins and shields them into the running node's wallet.
+    #[test]
+    fn the_old_peer_key_with_the_nodes_keystore_shields_into_the_nodes_wallet() {
+        let layout = layout();
+        let node_config = quil_config::load_config(&layout.running).unwrap();
+        let mut config = quil_config::load_config(&layout.old).unwrap();
+        config.key.key_store_file = node_config.key.key_store_file.clone();
+        let copy = layout.old.parent().unwrap().join("shield-old");
+        quil_config::save_config(&copy, &config).unwrap();
+        let tc = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&copy, Some(&layout.running), false),
+        )
+        .unwrap();
+        assert_eq!(
+            super::legacy::config_public_key(&tc.node_config.p2p.peer_priv_key)
+                .unwrap()
+                .to_vec(),
+            layout.old_public
+        );
+        let node = TokenCtx::from_context(
+            &test_nodes::context(false),
+            &test_nodes::common(&layout.running, None, false),
+        )
+        .unwrap();
+        assert_eq!(wallet_of(&tc).unwrap(), wallet_of(&node).unwrap());
     }
 }

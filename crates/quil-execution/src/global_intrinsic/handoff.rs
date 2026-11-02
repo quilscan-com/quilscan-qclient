@@ -848,7 +848,7 @@ pub fn set_presence_exclusion_frame_for_thread(frame: Option<u64>) {
 }
 
 /// From this GLOBAL frame GLOBAL fences a closing session that has not
-/// sealed one epoch after its closing request, instead of
+/// sealed two epochs after its closing request, instead of
 /// [`schedule::FENCE_AFTER_EPOCHS`] epochs ([`schedule::fence_due_frame`]).
 /// The request's frame selects the rule, so a request's fence is due at the
 /// same frame whenever and wherever it is evaluated, and a request made
@@ -857,12 +857,17 @@ pub fn set_presence_exclusion_frame_for_thread(frame: Option<u64>) {
 /// committees sat closing one to three votes short for the full four epochs
 /// before their fences. Not shorter than an epoch: stale seats stay eligible
 /// until the next epoch boundary, so a successor seated sooner would take
-/// them again and be fenced again. Consensus-affecting for GLOBAL: every
-/// archive and GLOBAL prover must run a build with it before the frame. App
-/// provers date fences by the same rule when they rewind past one
-/// (`fence_rewind` in the engine), so they should too. Not scheduled on
-/// mainnet; `QUIL_EARLY_FENCE_FRAME` elsewhere, never by default.
-pub const MAINNET_EARLY_FENCE_FRAME: Option<u64> = None;
+/// them again and be fenced again. Two, not one: in the seven days to
+/// 2026-10-29, 30 of 572 closing sessions sealed one to two epochs after
+/// their request (at most 1.84) while GLOBAL ran slow; one epoch would have
+/// fenced them and discarded their undrained frames. Consensus-affecting for
+/// GLOBAL: every archive and GLOBAL prover must run a build with it before
+/// the frame. App provers date fences by the same rule when they rewind past
+/// one (`fence_rewind` in the engine), so they should too. Mainnet: 984,240,
+/// the first frame of epoch 1367, which GLOBAL cannot reach before
+/// 2026-11-02 00:00 UTC even at ten seconds a frame;
+/// `QUIL_EARLY_FENCE_FRAME` elsewhere, never by default.
+pub const MAINNET_EARLY_FENCE_FRAME: Option<u64> = Some(984_240);
 
 static EARLY_FENCE_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -905,6 +910,72 @@ pub fn early_fence_frame() -> u64 {
 /// Set the early fence frame for the calling thread only (tests).
 pub fn set_early_fence_frame_for_thread(frame: Option<u64>) {
     EARLY_FENCE_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// From this GLOBAL frame a seal that closes a membership request's source
+/// leaves its successor to the next session pass, which seats the shard's
+/// eligible provers then when they form a valid committee unlike the one
+/// the request fixed (`schedule::activate_sealed_successors`), as a fence
+/// does from [`fenced_successor_eligibility_frame`]. The request fixes its
+/// committee when it is scheduled, and its source may take most of an
+/// epoch to seal: a successor seated at a seal eight hours after its
+/// request had four of its twelve members expired or rejected, one short
+/// of its quorum of nine, and its shard halted until the fence
+/// (2026-10-29). The pass adds at most [`schedule::SESSION_PASS_FRAMES`]
+/// frames before the successor, and a committed prover scan at a pass with
+/// one to seat. Consensus-affecting for GLOBAL: every archive and GLOBAL
+/// prover must run a build with it before the frame; an older build
+/// authorizes the successor at the seal and commits another GLOBAL state.
+/// Not scheduled on mainnet; `QUIL_SEAL_SUCCESSOR_ELIGIBILITY_FRAME`
+/// elsewhere, never by default.
+pub const MAINNET_SEAL_SUCCESSOR_ELIGIBILITY_FRAME: Option<u64> = None;
+
+static SEAL_SUCCESSOR_ELIGIBILITY_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SEAL_SUCCESSOR_ELIGIBILITY_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn seal_successor_eligibility_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SEAL_SUCCESSOR_ELIGIBILITY_FRAME.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's seal successor eligibility frame from its network,
+/// and return it. Called at startup before any frame is processed; the
+/// first call decides.
+pub fn init_seal_successor_eligibility_frame(network: u8) -> u64 {
+    *SEAL_SUCCESSOR_ELIGIBILITY_FRAME.get_or_init(|| {
+        seal_successor_eligibility_frame_for(
+            network,
+            std::env::var("QUIL_SEAL_SUCCESSOR_ELIGIBILITY_FRAME")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The seal successor eligibility frame: the mainnet value until
+/// [`init_seal_successor_eligibility_frame`] fixes the network, as
+/// [`presence_credit_frame`].
+pub fn seal_successor_eligibility_frame() -> u64 {
+    if let Some(frame) = SEAL_SUCCESSOR_ELIGIBILITY_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    SEAL_SUCCESSOR_ELIGIBILITY_FRAME
+        .get()
+        .copied()
+        .unwrap_or_else(|| seal_successor_eligibility_frame_for(0, None))
+}
+
+/// Set the seal successor eligibility frame for the calling thread only
+/// (tests).
+pub fn set_seal_successor_eligibility_frame_for_thread(frame: Option<u64>) {
+    SEAL_SUCCESSOR_ELIGIBILITY_OVERRIDE.with(|cell| cell.set(frame));
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1525,6 +1596,9 @@ pub fn verify_closing_certificate(
 /// Returns true only when all requested old committees have closed and the
 /// successor authorization has been staged. It becomes usable after global
 /// frame commit/sync, and is never a certificate under the NEW committee.
+/// From [`seal_successor_eligibility_frame`] a membership request's seal is
+/// recorded and its successor left to the next session pass
+/// (`schedule::activate_sealed_successors`): false.
 pub fn apply_submission(
     state: &HypergraphState,
     frame: u64,
@@ -1545,6 +1619,16 @@ pub fn apply_submission(
                 &key,
                 &submission.to_canonical_bytes()?,
             )?;
+        }
+        // From the seal successor eligibility frame the next session pass
+        // seats a membership successor (`schedule::activate_sealed_successors`).
+        if frame >= seal_successor_eligibility_frame()
+            && request
+                .sources
+                .first()
+                .is_some_and(|source| schedule::membership_request(&request, &source.filter))
+        {
+            return Ok(false);
         }
         activate(state, frame, &request)
     })

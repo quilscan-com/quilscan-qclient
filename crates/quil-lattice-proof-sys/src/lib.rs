@@ -12,6 +12,8 @@
 #[cfg(feature = "native-backend")]
 pub static NATIVE_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+pub mod cpu;
+
 #[cfg(feature = "native-backend")]
 pub mod ffi {
     use std::ffi::{c_int, c_void};
@@ -19,6 +21,8 @@ pub mod ffi {
     pub type RejectionDecider =
         unsafe extern "C" fn(u32, i64, i64, *const u8, *const u8, i32, *const u8, i32) -> c_int;
     extern "C" {
+        /// adapter/target_features.c; read through [`crate::cpu`].
+        pub fn quil_lattice_target_x86_features() -> *const std::ffi::c_char;
         pub fn quil_set_private_gaussian_sampler(sampler: Option<GaussianSampler>);
         pub fn quil_set_rejection_decider(decider: Option<RejectionDecider>);
         pub fn quil_fixture_exact_rejection(
@@ -63,6 +67,16 @@ pub mod ffi {
         pub fn quil_fixture_test_sampling_error(
             ctx: *mut c_void,
             stage: u32,
+            bytes: *mut u8,
+            capacity: usize,
+            written: *mut usize,
+        ) -> c_int;
+        /// Prove with the next `faults` LNP input-witness checks failing;
+        /// `left` receives the unconsumed count. Diagnostic only.
+        pub fn quil_fixture_test_witness_faults(
+            ctx: *mut c_void,
+            faults: u32,
+            left: *mut u32,
             bytes: *mut u8,
             capacity: usize,
             written: *mut usize,
@@ -132,6 +146,8 @@ pub mod ffi {
         pub fn quil_fixture_check(ctx: *mut c_void) -> c_int;
         pub fn quil_fixture_check_count(ctx: *mut c_void) -> usize;
         pub fn quil_fixture_drop_witness(ctx: *mut c_void);
+        /// 0 on success. 8: all 8 attempts failed LNP's input-witness check
+        /// (one stderr line each); a new call may succeed. 7: other failure.
         pub fn quil_fixture_prove_encoded(
             ctx: *mut c_void,
             bytes: *mut u8,

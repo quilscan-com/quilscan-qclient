@@ -31,6 +31,9 @@ pub(crate) mod sign;
 mod status;
 mod status_json;
 
+pub(super) use manage::command as manage_command;
+pub use manage::ManageArgs;
+
 #[derive(Debug, Subcommand)]
 pub enum ProverCommand {
     /// List prover status and shard allocations.
@@ -44,35 +47,7 @@ pub enum ProverCommand {
     /// List all known shards with prover counts and estimated rewards.
     Shardinfo,
     /// Interactive prover shard management TUI.
-    Manage {
-        /// Fetch one official Manage snapshot as versioned JSON and exit.
-        #[arg(long, conflicts_with_all = ["render", "help_text"])]
-        once: bool,
-        /// Print one frame as plain text and exit, after fetching once and
-        /// applying --keys; never runs joins, lifecycle operations or worker
-        /// changes.
-        #[arg(long)]
-        render: bool,
-        /// Print the TUI help as plain text and exit.
-        #[arg(long)]
-        help_text: bool,
-        /// Width of --render and --help-text, in columns.
-        #[arg(long, default_value_t = 160)]
-        width: u16,
-        /// Height of --render, in rows.
-        #[arg(long, default_value_t = 50)]
-        height: u16,
-        /// Keys applied before --render draws, space-separated (e.g. "n Tab Down").
-        #[arg(long, default_value = "")]
-        keys: String,
-        /// Draw --render with colors on, as interactively; plain text then
-        /// loses the warnings that the default marks with `!`.
-        #[arg(long)]
-        color: bool,
-        /// Seconds --render waits for the node's answers.
-        #[arg(long, default_value_t = 30)]
-        timeout: u64,
-    },
+    Manage(ManageArgs),
     /// Joins the prover to the network for the given shard filters.
     Join {
         /// Hex-encoded 32-byte shard filters (default: all-0xFF).
@@ -118,8 +93,9 @@ pub enum ProverCommand {
 
 /// Shared prover context (Go `getConfig` + `getNodeClient`).
 pub struct ProverCtx {
-    #[allow(dead_code)]
     pub node_config: Config,
+    /// The directory `node_config` was read from.
+    pub config_dir: std::path::PathBuf,
     pub connect_opts: ConnectOpts,
     /// Key manager for signing prover ops (`q-prover-key` Falcon inner
     /// sig + `q-peer-key` Ed448 outer auth). Lazily needed only by the
@@ -141,6 +117,7 @@ impl ProverCtx {
         };
         Ok(Self {
             node_config,
+            config_dir: dir,
             connect_opts,
             key_manager,
         })
@@ -188,14 +165,9 @@ pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> 
         return merge::run(configs);
     }
 
-    if let ProverCommand::Manage {
-        help_text: true,
-        width,
-        ..
-    } = cmd
-    {
-        print!("{}", manage::help_text(*width));
-        return Ok(());
+    // The manager loads the node context itself, unless it only prints help.
+    if let ProverCommand::Manage(args) = cmd {
+        return manage::command(global, args).await;
     }
 
     let pc = ProverCtx::load(global)?;
@@ -204,29 +176,6 @@ pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> 
         ProverCommand::Status { json: false } => status::run(&pc).await,
         ProverCommand::Shards => shards::run(&pc).await,
         ProverCommand::Shardinfo => shardinfo::run(&pc).await,
-        ProverCommand::Manage { once: true, .. } => manage::run_once(&pc).await,
-        ProverCommand::Manage {
-            render: true,
-            width,
-            height,
-            keys,
-            color,
-            timeout,
-            ..
-        } => {
-            manage::render(
-                &pc,
-                manage::RenderOptions {
-                    width: *width,
-                    height: *height,
-                    keys: keys.split_whitespace().map(str::to_string).collect(),
-                    color: *color,
-                    timeout: std::time::Duration::from_secs(*timeout),
-                },
-            )
-            .await
-        }
-        ProverCommand::Manage { .. } => manage::run(&pc).await,
         ProverCommand::Join { filters, delegate } => join::run(&pc, filters, delegate).await,
         ProverCommand::Leave { filters } => ops::leave(&pc, filters).await,
         ProverCommand::Confirm { filters } => ops::confirm(&pc, filters).await,
@@ -235,7 +184,7 @@ pub async fn run(global: GlobalArgs, cmd: &ProverCommand) -> anyhow::Result<()> 
         ProverCommand::Resume { filter } => ops::resume(&pc, filter.as_deref()).await,
         ProverCommand::Delegate { address } => ops::delegate(&pc, address).await,
         ProverCommand::AltShardUpdate { roots } => ops::alt_shard_update(&pc, roots).await,
-        ProverCommand::Merge { .. } => unreachable!("handled above"),
+        ProverCommand::Merge { .. } | ProverCommand::Manage(_) => unreachable!("handled above"),
     }
 }
 

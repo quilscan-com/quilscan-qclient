@@ -232,6 +232,72 @@ pub fn epoch_length_frames() -> u64 {
     }
 }
 
+/// The GLOBAL frame interval in milliseconds: a leader stamps each header
+/// this far past its production instant and paces the next proposal to it.
+pub const IDEAL_FRAME_TIME_MS: u64 = 10_000;
+
+/// Local-network schedule of GLOBAL frame intervals: `(first frame,
+/// interval ms)` entries in ascending frame order, the first from frame 0.
+/// Empty = the `IDEAL_FRAME_TIME_MS` mainnet default throughout. The node
+/// sets it once at startup from `QUIL_FRAME_TIME_MS` on networks other than
+/// mainnet, so a localnet can run frames at the pace of its VDF instead of
+/// every ten seconds, and change pace between phases of one run. Keyed by
+/// frame so every node gives the same frame the same interval.
+static FRAME_TIME_SCHEDULE: std::sync::RwLock<Vec<(u64, u64)>> = std::sync::RwLock::new(Vec::new());
+
+/// Whether [`FRAME_TIME_SCHEDULE`] holds entries: mainnet reads the default
+/// without taking the lock.
+static FRAME_TIME_SCHEDULED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The latest GLOBAL frame this process noted ([`note_frame_time_head`]),
+/// for the interval of callers with no frame at hand.
+static FRAME_TIME_HEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the GLOBAL frame-interval schedule of a local network: `(first frame,
+/// interval ms)` entries, ascending, the first from frame 0. An empty
+/// schedule restores the mainnet `IDEAL_FRAME_TIME_MS` default. Only call
+/// this in node startup or tests, never with entries on mainnet.
+pub fn set_frame_time_schedule(schedule: Vec<(u64, u64)>) {
+    let scheduled = !schedule.is_empty();
+    *FRAME_TIME_SCHEDULE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = schedule;
+    FRAME_TIME_SCHEDULED.store(scheduled, std::sync::atomic::Ordering::Release);
+}
+
+/// The GLOBAL frame interval in milliseconds for frame `frame`: the last
+/// schedule entry starting at or before it, else the mainnet default. The
+/// ASERT difficulty adjuster keeps its own constant.
+pub fn ideal_frame_time_ms_at(frame: u64) -> u64 {
+    if !FRAME_TIME_SCHEDULED.load(std::sync::atomic::Ordering::Acquire) {
+        return IDEAL_FRAME_TIME_MS;
+    }
+    FRAME_TIME_SCHEDULE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .take_while(|(from, _)| *from <= frame)
+        .last()
+        .map_or(IDEAL_FRAME_TIME_MS, |(_, millis)| *millis)
+}
+
+/// Note that this process saw GLOBAL frame `frame` (the GLOBAL materializer
+/// and every app shard's engine do); [`ideal_frame_time_ms`] reads the
+/// interval at the latest noted frame.
+pub fn note_frame_time_head(frame: u64) {
+    FRAME_TIME_HEAD.fetch_max(frame, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The GLOBAL frame interval in milliseconds at the latest GLOBAL frame this
+/// process noted ([`note_frame_time_head`]); before it noted one, the
+/// interval at frame 0. For callers with no frame at hand; a span converted
+/// with it takes the interval at its start throughout, even when a schedule
+/// changes pace inside it.
+pub fn ideal_frame_time_ms() -> u64 {
+    ideal_frame_time_ms_at(FRAME_TIME_HEAD.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Epoch length for testnet/devnet (`network != 0`): a short epoch so the
 /// epoch-aligned join→confirm(E+1)→activate(E+2) lifecycle plays out in
 /// minutes instead of hours. The whole pipeline (`epoch_for_frame`,
@@ -1072,6 +1138,290 @@ pub fn set_unsealed_issuance_epoch_for_thread(epoch: Option<u64>) {
     UNSEALED_ISSUANCE_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which a storage seat that closes an epoch with committed
+/// openings roots its member never proved no longer kicks the member. The
+/// seat's epoch still ends `Expired` and its held issuance shares are still
+/// never paid, so the member loses that seat's epoch rewards and nothing
+/// else: it stays a prover with its seniority and allocations. From
+/// [`MAINNET_HASH_STORAGE_PROOF_EPOCH`] a missing epoch proof kicked the
+/// whole prover for good (Status 4, Seniority 0, every allocation, no
+/// rejoin), while a regular node often cannot seal or settle in time. From
+/// this epoch a prover that rule kicked may rejoin too. Read from the GLOBAL
+/// frame that closes the seat or executes the join. Consensus-affecting
+/// (prover state): every node that executes GLOBAL frames must run a build
+/// carrying the epoch before it. Mainnet epoch 1342 (GLOBAL frame 966,240;
+/// decided 2026-10-30); `QUIL_STORAGE_KICK_SUSPENSION_EPOCH` elsewhere,
+/// never by default.
+pub const MAINNET_STORAGE_KICK_SUSPENSION_EPOCH: Option<u64> = Some(1342);
+
+static STORAGE_KICK_SUSPENSION_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static STORAGE_KICK_SUSPENSION_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn storage_kick_suspension_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_STORAGE_KICK_SUSPENSION_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's storage kick suspension epoch from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_storage_kick_suspension_epoch(network: u8) -> u64 {
+    *STORAGE_KICK_SUSPENSION_EPOCH.get_or_init(|| {
+        storage_kick_suspension_epoch_for(
+            network,
+            std::env::var("QUIL_STORAGE_KICK_SUSPENSION_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_storage_kick_suspension_epoch`]; the mainnet
+/// epoch in a process that never called it, so the setting cannot reach
+/// mainnet. `u64::MAX` when the network has none.
+pub fn storage_kick_suspension_epoch() -> u64 {
+    if let Some(epoch) = STORAGE_KICK_SUSPENSION_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *STORAGE_KICK_SUSPENSION_EPOCH.get_or_init(|| storage_kick_suspension_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` closes an unproven storage seat without
+/// kicking its member, and lets a member that rule kicked rejoin
+/// ([`MAINNET_STORAGE_KICK_SUSPENSION_EPOCH`]).
+pub fn storage_kicks_suspended(frame: u64) -> bool {
+    epoch_for_frame(frame) >= storage_kick_suspension_epoch()
+}
+
+/// Set the storage kick suspension epoch for the calling thread only
+/// (tests). `Some(u64::MAX)` disables it; `None` restores the process
+/// setting.
+pub fn set_storage_kick_suspension_epoch_for_thread(epoch: Option<u64>) {
+    STORAGE_KICK_SUSPENSION_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+/// The GLOBAL frame that gives back the seniority storage epoch proof kicks
+/// took before [`MAINNET_STORAGE_KICK_SUSPENSION_EPOCH`]. Such a kick set the
+/// prover's `Seniority` to 0, and a prover kicked more than once lost it at
+/// its first kick; a forgiven rejoin keeps what the vertex holds. At this
+/// frame each prover of [`kicked_seniority_restorations`] gains what it held
+/// before its first kick less what its vertex held when it rejoined, so
+/// seniority earned since the rejoin is kept, once. Consensus-affecting
+/// (prover state): every node that executes GLOBAL frames must run a build
+/// carrying the frame before it. Mainnet: not set until decided;
+/// `QUIL_KICKED_SENIORITY_RESTORATION_FRAME` elsewhere, never by default.
+pub const MAINNET_KICKED_SENIORITY_RESTORATION_FRAME: Option<u64> = None;
+
+/// A prover whose seniority [`MAINNET_KICKED_SENIORITY_RESTORATION_FRAME`]
+/// restores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeniorityRestoration {
+    /// The prover address, `poseidon(BLS public key)`.
+    pub prover: [u8; 32],
+    /// `Seniority` before the prover's first storage kick: the value under
+    /// the prover tree root of the GLOBAL header of that kick's frame.
+    pub before_kick: u64,
+    /// `Seniority` its vertex held when it rejoined, before the rejoin's
+    /// credit: what the kick left plus accrual after it.
+    pub at_rejoin: u64,
+}
+
+const fn hex_nibble(digit: u8) -> u8 {
+    match digit {
+        b'0'..=b'9' => digit - b'0',
+        b'a'..=b'f' => digit - b'a' + 10,
+        _ => panic!("a prover address is lowercase hex"),
+    }
+}
+
+const fn restoration(prover: &str, before_kick: u64, at_rejoin: u64) -> SeniorityRestoration {
+    let digits = prover.as_bytes();
+    assert!(digits.len() == 64, "a prover address is 64 hex digits");
+    let mut address = [0u8; 32];
+    let mut index = 0;
+    while index < 32 {
+        address[index] = hex_nibble(digits[2 * index]) << 4 | hex_nibble(digits[2 * index + 1]);
+        index += 1;
+    }
+    SeniorityRestoration {
+        prover: address,
+        before_kick,
+        at_rejoin,
+    }
+}
+
+/// The provers mainnet's storage epoch proof kicks took seniority from
+/// (GLOBAL frames 947,520 to 962,654), with the frame of each one's first
+/// kick. `before_kick` is the `Seniority` an archive read under the prover
+/// tree root of that frame's GLOBAL header (the state before the kick;
+/// Status active, no kick frame). `at_rejoin` is the vertex's `Seniority`
+/// after its last accrual after the kick, which a forgiven rejoin keeps
+/// and logs.
+pub const MAINNET_KICKED_SENIORITY_RESTORATIONS: &[SeniorityRestoration] = &[
+    // First kick 947,520.
+    restoration(
+        "1be38997d3b5ae8d626164c455061e2b0dccc3e684283f9ee0bb3017652862cb",
+        1_162_677,
+        5_100,
+    ),
+    // First kick 948,240.
+    restoration(
+        "11a909818f3a2e90684b2331b061a216d2de8ce940d9a84df04d1ef70591916e",
+        28_844_392,
+        5_980,
+    ),
+    // First kick 950,407.
+    restoration(
+        "25c9e7b56a1611b6ab8bf9112b8594e08a775370783505c9d03bd7ef3ec0a8d7",
+        176_020,
+        950,
+    ),
+    // First kick 954,729.
+    restoration(
+        "2115763118c4e978a14202afefa944b4bab18c56cbc201c4fb398eada30bf6ff",
+        28_641_616,
+        20,
+    ),
+    // First kick 959,763; kicked again at 960,492 and 960,494.
+    restoration(
+        "1686725b05014c4cbb10407b9c16a7db6935792b7b974a75bd940de46582fa1a",
+        259_700,
+        0,
+    ),
+    // First kick 961,920; kicked seven times more, last at 962,651.
+    restoration(
+        "0a50db2cd64c64a4bfa889a6b464f8a0939d64f3b97141aeb0b35121d77c3aa1",
+        468_340,
+        0,
+    ),
+    // First kick 962,645; kicked again at 962,647.
+    restoration(
+        "265e57dfed98a882e76836f0745e4080331a0ed594cc42df2f895e418c7c5a61",
+        455_270,
+        0,
+    ),
+    // First kick 962,654.
+    restoration(
+        "30593459e4d154de9b889250e3adead18dad2750402257a74181ece3242da812",
+        15_440_933,
+        1_840,
+    ),
+];
+
+static KICKED_SENIORITY_RESTORATION: std::sync::OnceLock<(u64, Vec<SeniorityRestoration>)> =
+    std::sync::OnceLock::new();
+
+thread_local! {
+    static KICKED_SENIORITY_RESTORATION_FRAME_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static KICKED_SENIORITY_RESTORATIONS_OVERRIDE: std::cell::RefCell<Option<Vec<SeniorityRestoration>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `address:before_kick:at_rejoin`, comma-separated; `None` when any entry
+/// is malformed.
+fn parse_seniority_restorations(setting: &str) -> Option<Vec<SeniorityRestoration>> {
+    setting
+        .split(',')
+        .map(|entry| {
+            let mut parts = entry.trim().split(':');
+            let (address, before_kick, at_rejoin) = (parts.next()?, parts.next()?, parts.next()?);
+            if parts.next().is_some() || address.len() != 64 {
+                return None;
+            }
+            let mut prover = [0u8; 32];
+            for (index, byte) in prover.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(address.get(2 * index..2 * index + 2)?, 16).ok()?;
+            }
+            Some(SeniorityRestoration {
+                prover,
+                before_kick: before_kick.parse().ok()?,
+                at_rejoin: at_rejoin.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+fn kicked_seniority_restoration_for(
+    network: u8,
+    frame: Option<&str>,
+    table: Option<&str>,
+) -> (u64, Vec<SeniorityRestoration>) {
+    if network == 0 {
+        return (
+            MAINNET_KICKED_SENIORITY_RESTORATION_FRAME.unwrap_or(u64::MAX),
+            MAINNET_KICKED_SENIORITY_RESTORATIONS.to_vec(),
+        );
+    }
+    (
+        frame
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u64::MAX),
+        table
+            .and_then(parse_seniority_restorations)
+            .unwrap_or_default(),
+    )
+}
+
+/// Fix this process's kicked seniority restoration frame and table from its
+/// network (off mainnet `QUIL_KICKED_SENIORITY_RESTORATION_FRAME` and
+/// `QUIL_KICKED_SENIORITY_RESTORATIONS`, `address:before_kick:at_rejoin`
+/// comma-separated), and return the frame and how many provers it restores.
+/// Called at startup before any frame is processed; the first call decides.
+pub fn init_kicked_seniority_restoration(network: u8) -> (u64, usize) {
+    let (frame, table) = KICKED_SENIORITY_RESTORATION.get_or_init(|| {
+        kicked_seniority_restoration_for(
+            network,
+            std::env::var("QUIL_KICKED_SENIORITY_RESTORATION_FRAME")
+                .ok()
+                .as_deref(),
+            std::env::var("QUIL_KICKED_SENIORITY_RESTORATIONS")
+                .ok()
+                .as_deref(),
+        )
+    });
+    (*frame, table.len())
+}
+
+fn kicked_seniority_restoration() -> &'static (u64, Vec<SeniorityRestoration>) {
+    KICKED_SENIORITY_RESTORATION.get_or_init(|| kicked_seniority_restoration_for(0, None, None))
+}
+
+/// The frame fixed by [`init_kicked_seniority_restoration`]; mainnet's in a
+/// process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX` when the network has none.
+pub fn kicked_seniority_restoration_frame() -> u64 {
+    if let Some(frame) = KICKED_SENIORITY_RESTORATION_FRAME_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    kicked_seniority_restoration().0
+}
+
+/// The provers [`kicked_seniority_restoration_frame`] restores.
+pub fn kicked_seniority_restorations() -> Vec<SeniorityRestoration> {
+    KICKED_SENIORITY_RESTORATIONS_OVERRIDE
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_else(|| kicked_seniority_restoration().1.clone())
+}
+
+/// Set the kicked seniority restoration frame for the calling thread only
+/// (tests). `Some(u64::MAX)` disables it; `None` restores the process
+/// setting.
+pub fn set_kicked_seniority_restoration_frame_for_thread(frame: Option<u64>) {
+    KICKED_SENIORITY_RESTORATION_FRAME_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// Set the kicked seniority restoration table for the calling thread only
+/// (tests). `None` restores the process setting.
+pub fn set_kicked_seniority_restorations_for_thread(table: Option<Vec<SeniorityRestoration>>) {
+    KICKED_SENIORITY_RESTORATIONS_OVERRIDE.with(|cell| *cell.borrow_mut() = table);
+}
+
 /// The epoch from which a vertex membership proof authenticates a field only
 /// when the field's leaf commitment binds its value. A leaf carrying a
 /// `hash_target` commits that target instead of its value, so its value is
@@ -1207,6 +1557,105 @@ mod exact_state_size_epoch_tests {
         assert_eq!(super::exact_state_size_epoch_for(1, Some("4")), 4);
         assert_eq!(super::exact_state_size_epoch_for(1, Some("x")), u64::MAX);
         assert_eq!(super::exact_state_size_epoch_for(1, None), u64::MAX);
+    }
+
+    /// Mainnet restores at no frame until one is set, whatever the settings
+    /// say, and always from its own table; other networks take both
+    /// settings, and nothing without them.
+    #[test]
+    fn only_a_test_network_reads_the_kicked_seniority_restoration_settings() {
+        let address = "09b404433671157db1a6f606b4d27378c970021a9d806a48b52396bb7e1a0ecf";
+        let table = format!("{address}:2420:0, {}:5:7", "ab".repeat(32));
+        assert_eq!(super::MAINNET_KICKED_SENIORITY_RESTORATION_FRAME, None);
+        let (frame, mainnet) =
+            super::kicked_seniority_restoration_for(0, Some("700"), Some(&table));
+        assert_eq!(frame, u64::MAX);
+        assert_eq!(mainnet, super::MAINNET_KICKED_SENIORITY_RESTORATIONS);
+        let (frame, devnet) = super::kicked_seniority_restoration_for(1, Some("700"), Some(&table));
+        assert_eq!(frame, 700);
+        assert_eq!(devnet.len(), 2);
+        assert_eq!(devnet[0].prover[..2], [0x09, 0xb4]);
+        assert_eq!(devnet[0].prover[30..], [0x0e, 0xcf]);
+        assert_eq!((devnet[0].before_kick, devnet[0].at_rejoin), (2420, 0));
+        assert_eq!(devnet[1].prover, [0xAB; 32]);
+        assert_eq!((devnet[1].before_kick, devnet[1].at_rejoin), (5, 7));
+        assert_eq!(
+            super::kicked_seniority_restoration_for(1, None, None),
+            (u64::MAX, Vec::new())
+        );
+        for bad in [
+            String::new(),
+            "09b4:1:2".to_string(),
+            format!("{address}:1"),
+            format!("{address}:1:2:3"),
+            format!("{address}:x:2"),
+            format!("{address}:1:2,zz"),
+            format!("{}:1:2", "g".repeat(64)),
+        ] {
+            assert_eq!(
+                super::kicked_seniority_restoration_for(1, Some("700"), Some(&bad)).1,
+                Vec::new(),
+                "{bad}"
+            );
+        }
+        super::set_kicked_seniority_restoration_frame_for_thread(None);
+        super::set_kicked_seniority_restorations_for_thread(None);
+        assert_eq!(super::kicked_seniority_restoration_frame(), u64::MAX);
+        assert_eq!(
+            super::kicked_seniority_restorations(),
+            super::MAINNET_KICKED_SENIORITY_RESTORATIONS
+        );
+    }
+
+    /// The mainnet table names the eight provers storage kicks took
+    /// seniority from, each once, and gives each back more than its rejoin
+    /// kept.
+    #[test]
+    fn the_mainnet_restoration_table_names_the_eight_storage_kicked_provers() {
+        let table = super::MAINNET_KICKED_SENIORITY_RESTORATIONS;
+        let tails: Vec<[u8; 3]> = table
+            .iter()
+            .map(|entry| entry.prover[29..].try_into().unwrap())
+            .collect();
+        assert_eq!(
+            tails,
+            [
+                [0x28, 0x62, 0xcb],
+                [0x91, 0x91, 0x6e],
+                [0xc0, 0xa8, 0xd7],
+                [0x0b, 0xf6, 0xff],
+                [0x82, 0xfa, 0x1a],
+                [0x7c, 0x3a, 0xa1],
+                [0x7c, 0x5a, 0x61],
+                [0x2d, 0xa8, 0x12],
+            ]
+        );
+        for (index, entry) in table.iter().enumerate() {
+            assert!(entry.before_kick > entry.at_rejoin, "entry {index}");
+            assert!(
+                table[index + 1..]
+                    .iter()
+                    .all(|other| other.prover != entry.prover),
+                "entry {index} is listed twice"
+            );
+        }
+    }
+
+    /// Mainnet stops storage epoch proof kicks from GLOBAL frame 966,240,
+    /// the first frame of epoch 1342, whatever the setting says; other
+    /// networks take the setting, and none without it.
+    #[test]
+    fn storage_kicks_are_suspended_from_the_first_frame_of_epoch_1342() {
+        assert_eq!(super::MAINNET_STORAGE_KICK_SUSPENSION_EPOCH, Some(1342));
+        assert_eq!(1342 * super::EPOCH_LENGTH_FRAMES, 966_240);
+        assert_eq!(super::storage_kick_suspension_epoch_for(0, Some("5")), 1342);
+        assert_eq!(super::storage_kick_suspension_epoch_for(0, None), 1342);
+        assert_eq!(super::storage_kick_suspension_epoch_for(1, Some("5")), 5);
+        assert_eq!(super::storage_kick_suspension_epoch_for(1, None), u64::MAX);
+        super::set_storage_kick_suspension_epoch_for_thread(None);
+        assert_eq!(super::storage_kick_suspension_epoch(), 1342);
+        assert!(!super::storage_kicks_suspended(966_239));
+        assert!(super::storage_kicks_suspended(966_240));
     }
 
     /// Mainnet's rule starts at GLOBAL frame 943,920, with the other gates
@@ -2786,6 +3235,29 @@ pub(crate) mod epoch_tests {
         set_epoch_length_frames(0);
         assert_eq!(epoch_length_frames(), EPOCH_LENGTH_FRAMES);
         assert_eq!(epoch_for_frame(720), 1);
+    }
+
+    /// A frame-interval schedule gives each frame the interval of the last
+    /// entry starting at or before it, and an empty schedule restores the
+    /// ten-second default. Serialized on the epoch-length mutex, which every
+    /// test reading process-global consensus timing takes.
+    #[test]
+    fn frame_time_schedule_applies_by_frame_and_restores() {
+        let _guard = epoch_length_guard();
+        assert_eq!(ideal_frame_time_ms_at(0), IDEAL_FRAME_TIME_MS);
+        set_frame_time_schedule(vec![(0, 2_500), (240, 10_000), (500, 3_000)]);
+        assert_eq!(ideal_frame_time_ms_at(0), 2_500);
+        assert_eq!(ideal_frame_time_ms_at(239), 2_500);
+        assert_eq!(ideal_frame_time_ms_at(240), 10_000);
+        assert_eq!(ideal_frame_time_ms_at(241), 10_000);
+        assert_eq!(ideal_frame_time_ms_at(499), 10_000);
+        assert_eq!(ideal_frame_time_ms_at(500), 3_000);
+        assert_eq!(ideal_frame_time_ms_at(u64::MAX), 3_000);
+        set_frame_time_schedule(vec![(0, 2_000)]);
+        assert_eq!(ideal_frame_time_ms(), 2_000, "one interval throughout");
+        set_frame_time_schedule(Vec::new());
+        assert_eq!(ideal_frame_time_ms_at(240), 10_000);
+        assert_eq!(ideal_frame_time_ms(), 10_000);
     }
 
     /// Members are counted by effective status: a confirmed join is

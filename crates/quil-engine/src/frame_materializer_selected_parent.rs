@@ -175,6 +175,9 @@ pub struct GlobalParentExecutor {
     /// Highest frame whose certified finalization waits to be published here
     /// ([`Self::note_finalized`]).
     finalized: std::sync::atomic::AtomicU64,
+    /// Finalization materializes the application frames each GLOBAL frame
+    /// sequences before executing it ([`Self::sequence_with_ingest`]).
+    sequenced: AtomicBool,
 }
 
 /// Ancestors an earlier preparation executed above the published base,
@@ -299,6 +302,15 @@ impl ParentState {
     }
 }
 
+/// How a proposal's declared parent state differs from this node's own
+/// execution of the parent ([`PreparedGlobalParent::own_parent_state_differs`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParentStateDifference {
+    pub(crate) own_prover_root: Vec<u8>,
+    pub(crate) proposed_prover_root: Vec<u8>,
+    pub(crate) auxiliary_roots_differ: bool,
+}
+
 pub(crate) struct PreparedGlobalParent {
     branch: MaterializerBranch,
     leader: Option<GlobalLeaderProvider>,
@@ -355,19 +367,34 @@ impl PreparedGlobalParent {
     /// its base itself keeps it; a reconcile must not move it toward any single
     /// proposer's declaration.
     pub(crate) fn divergent_parent_root(&self, header: &GlobalFrameHeader) -> Option<Vec<u8>> {
-        let extends = self
-            .parent
-            .header
-            .as_ref()
-            .and_then(|h| h.frame_number.checked_add(1))
-            == Some(header.frame_number)
-            && header.rank == self.context.view
-            && header.parent_selector == self.context.parent.as_ref();
-        (extends && !self.state.matches(header) && !self.receipted_base)
+        (self.extends(header) && !self.state.matches(header) && !self.receipted_base)
             .then(|| header.prover_tree_commitment.clone())
     }
 
+    /// A child that extends this parent's height, view and identity but
+    /// declares another parent state than this node's own receipted
+    /// execution of it, which this node keeps
+    /// ([`Self::divergent_parent_root`]): one side executed the parent under
+    /// other rules. Nothing reconciles it.
+    pub(crate) fn own_parent_state_differs(
+        &self,
+        header: &GlobalFrameHeader,
+    ) -> Option<ParentStateDifference> {
+        (self.extends(header) && !self.state.matches(header) && self.receipted_base).then(|| {
+            ParentStateDifference {
+                own_prover_root: self.state.prover.clone(),
+                proposed_prover_root: header.prover_tree_commitment.clone(),
+                auxiliary_roots_differ: header.prover_tree_aux_roots != self.state.auxiliary,
+            }
+        })
+    }
+
     pub(crate) fn matches_child(&self, header: &GlobalFrameHeader) -> bool {
+        self.extends(header) && self.state.matches(header)
+    }
+
+    /// The child's height, view and parent identity follow this parent.
+    fn extends(&self, header: &GlobalFrameHeader) -> bool {
         self.parent
             .header
             .as_ref()
@@ -375,7 +402,6 @@ impl PreparedGlobalParent {
             == Some(header.frame_number)
             && header.rank == self.context.view
             && header.parent_selector == self.context.parent.as_ref()
-            && self.state.matches(header)
     }
 
     pub(crate) fn prove(
@@ -698,14 +724,16 @@ impl GlobalParentExecutor {
         Ok(published)
     }
 
-    /// This node's own GLOBAL execution is in use: a proposal, verification or
-    /// publication holds the lease, or the canonical materializer holds the
-    /// frame lock. Either clears without anything from the network.
     #[cfg(test)]
     pub(crate) fn forget_authenticated_ancestors(&self) {
         *self.authenticated.lock().unwrap() = AuthenticatedAncestors::default();
     }
 
+    /// This node's own GLOBAL execution is in use: a proposal, verification or
+    /// publication holds the lease, or the canonical materializer holds the
+    /// frame lock. Either clears without anything from the network. A sample:
+    /// a capture can still find a source in use after it reads false
+    /// ([`quil_execution::source_busy`]).
     pub(crate) fn busy(&self) -> bool {
         self.active.load(Ordering::Acquire) || self.source.frame_execution_busy()
     }
@@ -742,7 +770,50 @@ impl GlobalParentExecutor {
             authenticated: Default::default(),
             executed: Default::default(),
             finalized: std::sync::atomic::AtomicU64::new(0),
+            sequenced: AtomicBool::new(false),
         }
+    }
+
+    /// Finalization brings this archive's application state to each GLOBAL
+    /// frame's sequenced point before executing it
+    /// ([`crate::global_finalization::GlobalFinalizationPipeline::with_sequenced_ingest`]);
+    /// see [`Self::sequenced_publication_wait`].
+    pub(crate) fn sequence_with_ingest(&self) {
+        self.sequenced.store(true, Ordering::Release);
+    }
+
+    /// `Some((published, finalized))` while executing the parent `number`
+    /// privately would miss application frames: it is above the published
+    /// frame, and finalized frames wait to publish here. An archive
+    /// materializes the application frames a GLOBAL frame sequences only when
+    /// finalization publishes that frame, and shard-header rewards read the
+    /// shard and world sizes they change. A private execution before then
+    /// declared a prover root the finalized execution did not reproduce:
+    /// every archive logged a prover root mismatch and GLOBAL stalled for
+    /// 70-160 s until a leader proposed on the published state (devnet,
+    /// 2026-10-30). Publication needs nothing from consensus, so the wait ends
+    /// once those frames publish. A parent nothing above the published frame
+    /// is finalized for executes as before: it may finalize only through the
+    /// child, which waiting would never build.
+    pub(crate) fn sequenced_publication_wait(&self, number: u64) -> Option<(u64, u64)> {
+        if !self.sequenced.load(Ordering::Acquire) {
+            return None;
+        }
+        let published = self.source.last_materialized_frame();
+        let finalized = self.finalized.load(Ordering::Acquire);
+        (number > published && finalized > published).then_some((published, finalized))
+    }
+
+    /// Whether finalization ingests application frames before executing a
+    /// GLOBAL frame here ([`Self::sequence_with_ingest`]): a private execution
+    /// of a finalized frame before its publication then differs from it.
+    pub(crate) fn sequences_with_ingest(&self) -> bool {
+        self.sequenced.load(Ordering::Acquire)
+    }
+
+    /// The highest GLOBAL frame published here.
+    pub(crate) fn published_frame(&self) -> u64 {
+        self.source.last_materialized_frame()
     }
 
     /// The finalization pipeline holds `number`'s certified finalization.
@@ -805,7 +876,7 @@ impl GlobalParentExecutor {
         }
         self.active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| unavailable("selected GLOBAL execution is busy"))?;
+            .map_err(|_| quil_execution::busy_unavailable("selected GLOBAL execution"))?;
         let admission = Admission::new(
             self.active.clone(),
             if for_proposal {

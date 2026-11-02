@@ -196,18 +196,50 @@ fn log_connect_outage(
     use quil_engine::outage::OutageEvent;
     match event {
         Some(OutageEvent::Began) => {
-            tracing::warn!(%addr, error_chain, scope = "peer", action = "wait",
-            "archive connection failing; retried until the archive accepts connections again")
+            info!(%addr, error_chain, scope = "peer",
+                warn_after_s = quil_engine::outage::OUTAGE_LOG_EVERY.as_secs(),
+                action = "no action needed: retried until the archive accepts connections, \
+                          and this node uses the other archives meanwhile; it warns if it \
+                          lasts 10 min",
+                "cannot connect to an archive; retrying")
         }
         Some(OutageEvent::Continues { secs, failures }) => {
-            tracing::warn!(%addr, secs, failures, error_chain,
-            scope = "peer", action = "wait", "archive connection still failing")
+            tracing::warn!(%addr, secs, failures, error_chain, scope = "peer",
+                action = "if this warning names every archive, check this node's outbound \
+                          connections, DNS and firewall; if it names one, that archive is down \
+                          and this node uses the others: no action needed",
+                "archive connection still failing")
         }
         Some(OutageEvent::Ended { secs, failures }) => {
             info!(%addr, secs, failures, "archive connection recovered")
         }
         None => {}
     }
+}
+
+/// How long one request on an mTLS (PQNoise) channel may run, from its start
+/// to the answer's headers. Consensus and sync calls rely on it to give up on
+/// an archive that stopped answering.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The longest [`submit_deadline`]: under the 120 s an archive's peer
+/// listener allows one request, its body included.
+pub const SUBMIT_DEADLINE_CAP: Duration = Duration::from_secs(100);
+
+/// Bytes a submission may take one second longer for, beyond
+/// [`REQUEST_TIMEOUT`]: 32 KiB/s to an archive still delivers it.
+const SUBMIT_BYTES_PER_SECOND: usize = 32 << 10;
+
+/// How long a submission of `bytes` bytes may take: [`REQUEST_TIMEOUT`] plus
+/// a second per 32 KiB, at most [`SUBMIT_DEADLINE_CAP`]. A submission under
+/// 32 KiB (a frame header, a join, a confirmation) keeps 15 s; a 0.54 MB
+/// storage epoch proof gets 31 s, a 1.46 MB one 59 s.
+pub fn submit_deadline(bytes: usize) -> Duration {
+    REQUEST_TIMEOUT
+        .saturating_add(Duration::from_secs(
+            (bytes / SUBMIT_BYTES_PER_SECOND) as u64,
+        ))
+        .min(SUBMIT_DEADLINE_CAP)
 }
 
 /// The runtime that dials archives for callers on a current-thread runtime
@@ -316,19 +348,47 @@ impl ArchiveClient {
         Self::connect_pq(addr, connector).await
     }
 
+    /// [`Self::connect_mtls`] for one submission of `bytes` bytes: its
+    /// requests may run for [`submit_deadline`] instead of
+    /// [`REQUEST_TIMEOUT`]. A request carries its body, and a fixed 15 s cut
+    /// a 0.54 MB storage epoch proof off below 36 KB/s to an archive; the
+    /// archives it goes to at once share the node's uplink.
+    pub async fn connect_mtls_for_submit(
+        addr: &str,
+        falcon_signing_key: &[u8],
+        bytes: usize,
+    ) -> Result<Self, ArchiveClientError> {
+        let connector = QuilPqNoiseConnector::new(falcon_signing_key.to_vec());
+        Self::dial_pq(
+            addr,
+            connector.pinned_for(addr),
+            dials_off_this_thread(),
+            submit_deadline(bytes),
+        )
+        .await
+    }
+
     async fn connect_pq(
         addr: &str,
         connector: QuilPqNoiseConnector,
     ) -> Result<Self, ArchiveClientError> {
-        Self::dial_pq(addr, connector.pinned_for(addr), dials_off_this_thread()).await
+        Self::dial_pq(
+            addr,
+            connector.pinned_for(addr),
+            dials_off_this_thread(),
+            REQUEST_TIMEOUT,
+        )
+        .await
     }
 
     /// [`Self::connect_pq`], on [`archive_io`] when `off_thread`, else on
-    /// the caller's runtime.
+    /// the caller's runtime; each request on the channel may run for
+    /// `request_timeout`.
     async fn dial_pq(
         addr: &str,
         connector: QuilPqNoiseConnector,
         off_thread: bool,
+        request_timeout: Duration,
     ) -> Result<Self, ArchiveClientError> {
         // Note: scheme is `http://` — tonic's Endpoint refuses `https://`
         // unless its own `tls_config(...)` is set; we bypass that to install
@@ -343,7 +403,7 @@ impl ArchiveClient {
             // during the handshake. Matches the plaintext path's
             // 10s timeout.
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(15))
+            .timeout(request_timeout)
             .tcp_nodelay(true)
             // Actively PING the peer every 10s. `keep_alive_while_idle(true)`
             // alone is a NO-OP in tonic unless an interval is set — without
@@ -1521,7 +1581,7 @@ mod tests {
         );
     }
 
-    /// Each archive address has its own outage: failures warn once when
+    /// Each archive address has its own outage: failures log once when
     /// they begin, and a success ends only that address's outage.
     #[test]
     fn connection_failures_are_one_outage_per_archive() {
@@ -1698,6 +1758,20 @@ mod pinned_master_tests {
             assert_eq!(recognized, own, "own={own}");
             server.abort();
         }
+    }
+
+    /// A submission's deadline grows with its size from the 15 s every
+    /// other request keeps, and stays under the archives' 120 s.
+    #[test]
+    fn a_submission_deadline_grows_with_its_size_under_the_archives_limit() {
+        assert_eq!(submit_deadline(0), REQUEST_TIMEOUT);
+        assert_eq!(submit_deadline(32 * 1024 - 1), REQUEST_TIMEOUT);
+        assert_eq!(submit_deadline(32 * 1024), Duration::from_secs(16));
+        assert_eq!(submit_deadline(541_968), Duration::from_secs(31));
+        assert_eq!(submit_deadline(1_460_000), Duration::from_secs(59));
+        assert_eq!(submit_deadline(4 << 20), SUBMIT_DEADLINE_CAP);
+        assert_eq!(submit_deadline(usize::MAX), SUBMIT_DEADLINE_CAP);
+        assert!(SUBMIT_DEADLINE_CAP < Duration::from_secs(120));
     }
 
     #[test]
@@ -1967,6 +2041,7 @@ mod off_thread_dial_tests {
                             &address,
                             QuilPqNoiseConnector::new(key),
                             off_thread,
+                            REQUEST_TIMEOUT,
                         ));
                         let dial = started.elapsed();
                         ready.wait();

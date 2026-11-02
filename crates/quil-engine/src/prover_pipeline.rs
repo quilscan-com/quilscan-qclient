@@ -282,6 +282,35 @@ struct PreparedConfirm {
 }
 
 impl PreparedConfirm {
+    /// The seats whose storage snapshot this confirm registers (a leaf-root
+    /// group of theirs names a leaf), and those left out while theirs is
+    /// requested and not encoded yet (`LeftOutCause::SnapshotPending`). A
+    /// seat renewing without a registration is in neither.
+    fn storage_seats(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut groups = self.roots.iter();
+        let encoded = self
+            .filters
+            .iter()
+            .zip(&self.seat_groups)
+            .filter_map(|(filter, count)| {
+                // Every group of the seat is consumed, to keep the next
+                // seat's aligned.
+                let registers = groups
+                    .by_ref()
+                    .take(*count)
+                    .fold(false, |any, group| any || !group.entries.is_empty());
+                registers.then(|| filter.clone())
+            })
+            .collect();
+        let encoding = self
+            .left_out
+            .iter()
+            .filter(|seat| seat.cause == LeftOutCause::SnapshotPending)
+            .map(|seat| seat.filter.clone())
+            .collect();
+        (encoded, encoding)
+    }
+
     /// Settle the left-out seats' reservations: a seat its worker did not
     /// prepare is released, so the next cycle retries it; a seat over the
     /// decode limits is fenced from `frame` until the epoch ends, as
@@ -361,10 +390,14 @@ fn stopped_mid_encode(
 const PENDING_SNAPSHOT_REPORT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The GLOBAL frame a seat whose snapshot leaves have `remaining` to run by
-/// their estimate is projected to be encoded by, at the ideal frame time.
+/// their estimate is projected to be encoded by, at the ideal frame time
+/// (the interval at `frame_number` throughout, even when a localnet
+/// schedule changes it within the span).
 fn projected_snapshot_frame(frame_number: u64, remaining: std::time::Duration) -> u64 {
-    let frame_seconds = (crate::difficulty::IDEAL_FRAME_TIME as u64 / 1000).max(1);
-    frame_number.saturating_add(remaining.as_secs().div_ceil(frame_seconds))
+    let frame_millis =
+        u128::from(quil_types::consensus::ideal_frame_time_ms_at(frame_number).max(1));
+    let frames = remaining.as_millis().div_ceil(frame_millis);
+    frame_number.saturating_add(u64::try_from(frames).unwrap_or(u64::MAX))
 }
 
 /// Report the seats a confirm leaves out because their storage snapshot is
@@ -876,16 +909,18 @@ const REMOTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// frame and lapses at the next boundary. Without a deadline each worker that
 /// never answers held the round for its whole timeout, eight at a time, while
 /// the round kept an encoder permit: 40 such workers held it for 50 minutes
-/// of a two-hour mainnet epoch (720 frames of `IDEAL_FRAME_TIME`). A sixth of
+/// of a two-hour mainnet epoch (720 frames of ten seconds). A sixth of
 /// an epoch, 20 minutes on mainnet, still gives a worker asked in the round's
 /// first half its full timeout, and leaves five more rounds in the epoch for
 /// the seats a round leaves out.
 const REMOTE_ROUND_EPOCH_SHARE: u64 = 6;
 
-/// When a round of standalone-worker preparations starting now must end.
-fn remote_round_deadline() -> std::time::Instant {
+/// When a round of standalone-worker preparations starting now, at GLOBAL
+/// frame `frame_number`, must end: an epoch converted at that frame's
+/// interval throughout.
+fn remote_round_deadline(frame_number: u64) -> std::time::Instant {
     let epoch_ms = quil_types::consensus::epoch_length_frames()
-        .saturating_mul(crate::difficulty::IDEAL_FRAME_TIME as u64);
+        .saturating_mul(quil_types::consensus::ideal_frame_time_ms_at(frame_number));
     std::time::Instant::now()
         + std::time::Duration::from_millis(epoch_ms / REMOTE_ROUND_EPOCH_SHARE)
 }
@@ -1402,6 +1437,11 @@ impl ProverPipeline {
                 .await;
                 match prepared {
                     Ok((Ok(prepared), mut attempt)) => {
+                        // The capacity shed spares seats whose storage for the
+                        // next epoch is encoding or encoded until they renew.
+                        let (encoded, encoding) = prepared.storage_seats();
+                        me.lifecycle
+                            .note_renewal_storage(frame_number, &encoded, &encoding);
                         if !prepared.left_out.is_empty() {
                             prepared.settle_left_out(&mut attempt, me.frame_now(frame_number));
                             me.report_left_out_seats(frame_number, &prepared);
@@ -2034,7 +2074,13 @@ impl ProverPipeline {
                 std::time::Instant::now(),
             );
         }
-        self.publish_prover_message(bytes, frame_number).await
+        self.publish_prover_message(bytes, frame_number).await?;
+        crate::storage_registration_landed::note_submitted(
+            &confirm.leaf_roots,
+            &filters,
+            frame_number,
+        );
+        Ok(())
     }
 
     /// Each of `filters`' storage snapshot sources for `epoch` that GLOBAL has
@@ -2164,7 +2210,7 @@ impl ProverPipeline {
                 let answers = query_remote_workers(
                     &requests,
                     REMOTE_PREPARATIONS,
-                    remote_round_deadline(),
+                    remote_round_deadline(frame_number),
                     |filter, targets, timeout| {
                         let (_, snapshots) = sources(filter, targets);
                         remote(filter, targets, frame_number, timeout, &snapshots)
@@ -2716,6 +2762,7 @@ fn prune_confirmation_replicas(
     current_epoch: u64,
 ) {
     let keep_from = crate::app_shard_metadata::replica_keep_from(current_epoch);
+    crate::storage_snapshot::note_replica_eviction(current_epoch);
     let workers = filters.iter().filter_map(|filter| {
         worker
             .and_then(|resolve| resolve(filter))
@@ -2780,6 +2827,13 @@ mod tests {
             unrelated.get(5, b"leaf").unwrap(),
             Some(vec![5]),
             "unselected stores are untouched"
+        );
+        // The GLOBAL frame the eviction happened at is noted first: a
+        // settlement of an epoch evicted here finds its window closed.
+        assert_eq!(
+            crate::storage_snapshot::global_frame(),
+            Some(quil_types::consensus::epoch_start_frame(7)),
+            "the eviction notes the epoch GLOBAL reached"
         );
         // A low epoch cannot underflow the retention boundary.
         super::prune_confirmation_replicas(None, Some(&resolve), &[vec![1]], 0);
@@ -4236,6 +4290,52 @@ mod tests {
         assert!(!later.roots[0].entries.is_empty());
         assert!(later.left_out.is_empty());
         quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// A confirm tells the lifecycle which seats' storage it registers and
+    /// which are still encoding; a seat renewing without a registration (an
+    /// empty leaf-root group) or left out for another cause is neither.
+    #[test]
+    fn a_confirm_reports_which_seats_storage_is_encoded_or_encoding() {
+        use quil_execution::global_intrinsic::leaf_root_registration::LeafRootEntry;
+        let encoded = |filter: &[u8]| {
+            let mut roots = roots_of(filter);
+            roots.entries.push(LeafRootEntry {
+                prefix: vec![0],
+                leaf_root: vec![7; 32],
+                num_blocks: 1,
+            });
+            roots
+        };
+        let filters = vec![vec![1], vec![2], vec![3], vec![4], vec![5]];
+        let prepared = super::prepare_confirm(
+            &filters,
+            &[],
+            2,
+            |filter, _| match filter {
+                // No registration (past the grace), then two groups whose
+                // second registers.
+                [1] => Ok(super::Prepared::Roots(vec![roots_of(filter)])),
+                [2] => Ok(super::Prepared::Roots(vec![
+                    roots_of(filter),
+                    encoded(filter),
+                ])),
+                [3] => Err(quil_types::error::QuilError::StorageSnapshotPending(
+                    "leaf snapshot not encoded yet".into(),
+                )),
+                [4] => Ok(super::Prepared::Unanswered(
+                    super::LeftOutCause::Failed,
+                    unanswered(),
+                )),
+                _ => Ok(super::Prepared::Roots(vec![encoded(filter)])),
+            },
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.storage_seats(),
+            (vec![vec![2], vec![5]], vec![vec![3]])
+        );
     }
 
     /// A confirm whose every seat awaits its snapshot submits none and
