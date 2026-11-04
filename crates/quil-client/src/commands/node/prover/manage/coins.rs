@@ -42,10 +42,12 @@ pub enum CoinsFocus {
 }
 
 /// What the middle panel shows: it follows the Balances row under the
-/// cursor, and a shield's preparation or confirmation while it is open.
+/// cursor, and a shield's or a mint's preparation or confirmation while it
+/// is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Middle {
-    /// The claimable reward: its amount, frame and authorization.
+    /// The claimable reward: its amount, frame and mint, and the
+    /// authorizations saved for a claim.
     Claim,
     /// `token shield-all`'s batches of the legacy coins.
     ShieldPlan,
@@ -66,6 +68,9 @@ pub fn middle(m: &Model) -> Middle {
     if m.coins.shield.dialog.is_some() {
         return Middle::ShieldPlan;
     }
+    if m.coins.mint.dialog.is_some() {
+        return Middle::Claim;
+    }
     match m.coins.cursor {
         0 => Middle::Claim,
         _ => Middle::ShieldPlan,
@@ -83,7 +88,8 @@ pub enum Selection {
     Legacy,
     /// A batch of the Shield plan: legacy coins too.
     Plan,
-    /// The Claim status panel: the claimable reward too.
+    /// The Claim status panel: the claimable reward and the saved
+    /// authorizations.
     Claim,
     Notifications,
 }
@@ -152,6 +158,40 @@ fn move_edge(m: &mut Model, key: char) {
     }
 }
 
+/// Place the panels in `rest` lines: Balances' default `balances` lines
+/// moved by its edge first, then `split` gives Notifications' default
+/// height from the lines Balances leaves, the middle panel the rest, and
+/// their edge moves. The split so follows the height Balances is drawn
+/// with. Kept and stored as [`place_edges`] keeps and stores them.
+pub fn place_panels(
+    m: &mut Model,
+    rest: u16,
+    balances: u16,
+    split: impl Fn(u16) -> u16,
+) -> [u16; PANELS] {
+    let min = PANEL_MIN;
+    let upper = if balances >= min && rest >= balances + 2 * min {
+        i32::from(m.coins.edges[0]).clamp(
+            i32::from(min) - i32::from(balances),
+            i32::from(rest - balances - 2 * min),
+        )
+    } else {
+        0
+    };
+    let drawn = (i32::from(balances) + upper) as u16;
+    let left = rest.saturating_sub(drawn);
+    let notices = split(left);
+    let heights = [drawn, left.saturating_sub(notices), notices];
+    // Balances' edge is in `drawn`: place_edges moves only the lower one,
+    // and a terminal too small for it keeps the edge for a larger one.
+    let moved = m.coins.edges[0];
+    let placed = heights.iter().all(|&h| h >= min);
+    m.coins.edges[0] = 0;
+    let heights = place_edges(m, heights);
+    m.coins.edges[0] = if placed { upper as i16 } else { moved };
+    heights
+}
+
 /// Apply the moved edges to the panels' default `heights`, each kept to
 /// [`PANEL_MIN`], and store the result and the edges as drawn, so the next
 /// key moves the visible edge.
@@ -180,7 +220,11 @@ fn cursor_rows(m: &Model) -> (usize, usize, &'static str) {
     match m.coins.focus {
         CoinsFocus::Balances => (m.coins.cursor, BALANCE_ROWS, "Balances"),
         CoinsFocus::Middle => match middle(m) {
-            Middle::Claim => (0, 1, Middle::Claim.title()),
+            Middle::Claim => (
+                m.coins.mint.cursor,
+                m.coins.mint.saved.len().max(1),
+                Middle::Claim.title(),
+            ),
             Middle::ShieldPlan => (m.coins.plan_cursor, plan_rows(m), "Shield plan"),
         },
         CoinsFocus::Notifications => (
@@ -230,6 +274,29 @@ pub fn key_refusal(m: &Model, key: &str) -> Option<String> {
             "Shield: ‹S› shields legacy coins; select the legacy row or the Shield plan.".into(),
         ),
         "S" => super::shield::refusal(m),
+        "M" if !matches!(selection(m), Selection::Claimable | Selection::Claim) => Some(
+            "Mint: ‹M› mints the claimable reward; select the claimable row or its Claim status."
+                .into(),
+        ),
+        "M" => super::mint::mint_refusal(m),
+        "C" if selection(m) != Selection::Claim => {
+            Some("Mint: ‹C› claims a saved authorization; select it in the Claim status.".into())
+        }
+        "C" => super::mint::claim_refusal(m),
+        "esc" if m.coins.shield.dialog.is_some() || m.coins.mint.dialog.is_some() => None,
+        "esc" => match m
+            .coins
+            .shield
+            .run
+            .as_ref()
+            .filter(|_| super::shield::running(m))
+        {
+            None => Some("Shield: ‹esc› stops a running shield; none is running.".into()),
+            Some(run) if run.stopping => {
+                Some("Shield: already stopping; nothing more is submitted.".into())
+            }
+            Some(_) => None,
+        },
         "[/] {/}" => ['[', ']', '{', '}']
             .iter()
             .all(|&key| edge_move(m, key).is_err())
@@ -272,6 +339,8 @@ pub struct Coins {
     pub plan_offset: usize,
     /// The shield action.
     pub shield: super::shield::Shield,
+    /// The reward mint and its saved authorizations.
+    pub mint: super::mint::Mint,
     /// When each current notice was first shown, by its key.
     pub notice_since: HashMap<&'static str, SystemTime>,
     /// How far each edge is moved from its default, in rows (kept between
@@ -340,11 +409,16 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     }
     let notices = m.coins.focus == CoinsFocus::Notifications;
     let plan = selection(m) == Selection::Plan;
+    let claim = selection(m) == Selection::Claim;
     let plan_rows = plan_rows(m);
     let hint = match ev.code {
         KeyCode::Up | KeyCode::Char('k') => Some("↑/k"),
         KeyCode::Down | KeyCode::Char('j') => Some("↓/j"),
-        KeyCode::Char(key @ ('r' | 'S')) => Some(if key == 'r' { "r" } else { "S" }),
+        KeyCode::Char('r') => Some("r"),
+        KeyCode::Char('S') => Some("S"),
+        KeyCode::Char('M') => Some("M"),
+        KeyCode::Char('C') => Some("C"),
+        KeyCode::Esc => Some("esc"),
         _ => None,
     };
     if let Some(why) = hint.and_then(|key| key_refusal(m, key)) {
@@ -358,13 +432,22 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
             m.tab = Tab::Provers;
             m.notice_offset = 0;
             m.coins.shield.dialog = None;
+            m.coins.mint.dialog = None;
         }
         KeyCode::Char('S') => return super::shield::request(m),
+        KeyCode::Char('M') => return super::mint::request_mint(m),
+        KeyCode::Char('C') => return super::mint::request_claim(m),
+        KeyCode::Esc if m.coins.mint.dialog.is_some() => {
+            m.coins.mint.dialog = None;
+            m.status_msg = "Mint: cancelled; nothing was submitted.".into();
+            m.status_is_error = false;
+        }
         KeyCode::Esc if m.coins.shield.dialog.is_some() => {
             m.coins.shield.dialog = None;
             m.status_msg = "Shield: cancelled; nothing was submitted.".into();
             m.status_is_error = false;
         }
+        KeyCode::Esc => return super::shield::stop_request(m),
         KeyCode::Char('r') => return start_legacy(m, Instant::now()),
         KeyCode::Tab => {
             m.coins.focus = match m.coins.focus {
@@ -379,6 +462,13 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
                 CoinsFocus::Middle => CoinsFocus::Balances,
                 CoinsFocus::Notifications => CoinsFocus::Middle,
             };
+        }
+        KeyCode::Up | KeyCode::Char('k') if claim => {
+            m.coins.mint.cursor = m.coins.mint.cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') if claim => {
+            m.coins.mint.cursor =
+                (m.coins.mint.cursor + 1).min(m.coins.mint.saved.len().saturating_sub(1));
         }
         KeyCode::Up | KeyCode::Char('k') if plan => {
             m.coins.plan_cursor = m.coins.plan_cursor.saturating_sub(1);
@@ -464,6 +554,7 @@ pub fn shields_open_at(snapshot: &Snapshot) -> Option<(u64, u64)> {
 /// Every current Coins condition, in display order.
 pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
     let mut out = super::shield::notices(m, &fmt_amount);
+    out.extend(super::mint::notices(m, &fmt_amount));
     let busy = m.coins.shield.dialog.is_some() || super::shield::running(m);
     let mut push = |key, severity, attention, text: String| {
         out.push(Notice {
@@ -476,14 +567,13 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
         })
     };
     match (&m.claimable_reward, &m.reward_error) {
-        (Some((units, frame)), _) if *units > 0 => push(
+        // The amount and its frame are the claimable row's; the notice,
+        // counted from the Provers tab too, names the condition and key.
+        (Some((units, _)), _) if *units > 0 => push(
             "coins-claimable",
             NoticeSeverity::Info,
             true,
-            format!(
-                "Claimable: {} Q at f{frame}; `qclient token mint` authorizes a mint.",
-                fmt_amount(*units)
-            ),
+            "Reward claimable: ‹M› authorizes a mint.".into(),
         ),
         (None, Some(error)) => push(
             "coins-claimable-failed",
@@ -494,17 +584,14 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
         _ => {}
     }
     let legacy = &m.coins.legacy;
+    // The legacy row's `As of` marks how old its figures are.
     if let (Some(error), Some(since)) = (&legacy.error, legacy.failing_since) {
-        let figures = match &legacy.answer {
-            Some((_, at, _)) => format!("; figures as of {}", utc_hm(*at)),
-            None => String::new(),
-        };
         push(
             "coins-legacy-failed",
             NoticeSeverity::Warning,
             false,
             format!(
-                "Legacy coins: read failed {} since {} ({error}){figures}.",
+                "Legacy coins: read failed {} since {} ({error}).",
                 plural(legacy.failures as usize, "time", "times"),
                 utc_hm(since)
             ),
@@ -517,37 +604,22 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
     if unshielded == 0 {
         return out;
     }
-    let counts = format!(
-        "{unshielded} unshielded, {} shielded",
-        snapshot.tally.shielded
-    );
+    // Counts are the legacy row's, the batches and the frame shields open
+    // at the Shield plan's: these notices name the condition and the key.
     match (shields_open_at(snapshot), snapshot.plan) {
-        (Some((frame, left)), _) => push(
+        (Some(_), _) => push(
             "coins-shield-gate",
             NoticeSeverity::Info,
             false,
-            format!(
-                "Shields open at f{frame}, in {}.",
-                plural(left as usize, "frame", "frames")
-            ),
+            "Legacy coins: shields are not open yet; the Shield plan gives the frame.".into(),
         ),
-        (None, Some(plan)) if !busy => push(
+        (None, Some(_)) if !busy => push(
             "coins-unshielded",
             NoticeSeverity::Info,
             true,
-            format!(
-                "Legacy coins: {counts}; {}{}; ‹S› shields the rest.",
-                if plan.exact { "" } else { "≥" },
-                plural(plan.batches, "batch", "batches")
-            ),
+            "Legacy coins unshielded: ‹S› shields them.".into(),
         ),
-        (None, Some(_)) => {}
-        (None, None) => push(
-            "coins-unshielded",
-            NoticeSeverity::Info,
-            true,
-            format!("Legacy coins: {counts}."),
-        ),
+        (None, _) => {}
     }
     if let Some(plan) = snapshot.plan {
         if plan.outside > 0 {
@@ -555,10 +627,7 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
                 "coins-outside",
                 NoticeSeverity::Info,
                 false,
-                format!(
-                    "Legacy coins: {} on no live shard; a later run covers them.",
-                    plan.outside
-                ),
+                "Legacy coins on no live shard wait for a later run.".into(),
             );
         }
         if !plan.exact {
@@ -566,10 +635,7 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
                 "coins-plan-inexact",
                 NoticeSeverity::Warning,
                 false,
-                format!(
-                    "Shield plan: shard list unavailable; batches may exceed {}.",
-                    plan.batches
-                ),
+                "Shield plan: shard list unavailable; the batch count is a lower bound.".into(),
             );
         }
     }
@@ -768,6 +834,83 @@ mod coins_tests {
         assert_eq!((m.coins.cursor, middle(&m)), (0, Middle::ShieldPlan));
         m.coins.shield.dialog = None;
         assert_eq!(middle(&m), Middle::Claim);
+        // A mint being prepared keeps its Claim status on screen.
+        m.coins.mint.dialog = Some(super::super::mint::Dialog::Preparing(Instant::now(), false));
+        handle_key(&mut m, key('j'));
+        assert_eq!((m.coins.cursor, middle(&m)), (1, Middle::Claim));
+        m.coins.mint.dialog = None;
+        assert_eq!(middle(&m), Middle::ShieldPlan);
+    }
+
+    /// `M` acts with the claimable row or its Claim status selected, `C` in
+    /// the Claim status only, on the saved authorization under its cursor;
+    /// elsewhere both do nothing but say why.
+    #[test]
+    fn m_and_c_act_only_on_the_claimable_reward() {
+        let mut m = Model::new();
+        open(&mut m);
+        apply_legacy(
+            &mut m,
+            Ok(Some(snapshot(3, 2000, 0, true))),
+            Duration::from_secs(6),
+        );
+        m.claimable_reward = Some((5_000, 1200));
+        m.coins.mint.saved = [1300, 1200]
+            .map(|frame| super::super::mint::Saved {
+                path: format!("/x/mint-{frame}.bin").into(),
+                cited_frame: frame,
+                amounts: Some((900, 9)),
+            })
+            .to_vec();
+        for (focus, cursor) in [
+            (CoinsFocus::Balances, 1),
+            (CoinsFocus::Middle, 1),
+            (CoinsFocus::Notifications, 0),
+        ] {
+            m.coins.focus = focus;
+            m.coins.cursor = cursor;
+            assert!(handle_key(&mut m, key('M')).is_empty());
+            assert_eq!(
+                m.status_msg,
+                "Mint: ‹M› mints the claimable reward; select the claimable row or its Claim \
+                 status."
+            );
+            assert!(handle_key(&mut m, key('C')).is_empty());
+            assert_eq!(
+                m.status_msg,
+                "Mint: ‹C› claims a saved authorization; select it in the Claim status."
+            );
+            assert!(m.coins.mint.dialog.is_none());
+        }
+        m.coins.focus = CoinsFocus::Balances;
+        m.coins.cursor = 0;
+        assert!(handle_key(&mut m, key('C')).is_empty());
+        assert!(m.status_msg.contains("select it in the Claim status"));
+        assert!(matches!(
+            handle_key(&mut m, key('M')).as_slice(),
+            [Cmd::MintPrepare]
+        ));
+        m.coins.mint.dialog = None;
+        m.coins.focus = CoinsFocus::Middle;
+        assert_eq!(selection(&m), Selection::Claim);
+        assert!(matches!(
+            handle_key(&mut m, key('M')).as_slice(),
+            [Cmd::MintPrepare]
+        ));
+        m.coins.mint.dialog = None;
+        // The Claim status cursor moves over the saved authorizations.
+        handle_key(&mut m, key('j'));
+        assert_eq!((m.coins.cursor, m.coins.mint.cursor), (0, 1));
+        assert!(handle_key(&mut m, key('j')).is_empty());
+        assert_eq!(m.status_msg, "Claim status: already at the last row.");
+        assert!(matches!(
+            handle_key(&mut m, key('C')).as_slice(),
+            [Cmd::ClaimPrepare(_, 1200)]
+        ));
+        // ‹esc› cancels the preparation, and the Claim status stays.
+        handle_key(&mut m, KeyEvent::from(KeyCode::Esc));
+        assert!(m.coins.mint.dialog.is_none());
+        assert_eq!(m.status_msg, "Mint: cancelled; nothing was submitted.");
     }
 
     /// `[`/`]` and `{`/`}` move the focused panel's upper and lower edge
@@ -869,8 +1012,8 @@ mod coins_tests {
         assert_eq!(
             texts,
             [
-                "Claimable: 7 Q at f120; `qclient token mint` authorizes a mint.",
-                "Legacy coins: 4 unshielded, 2 shielded; 3 batches; ‹S› shields the rest.",
+                "Reward claimable: ‹M› authorizes a mint.",
+                "Legacy coins unshielded: ‹S› shields them.",
             ],
             "the outside-shard note is info and hides at the default level"
         );
@@ -893,11 +1036,11 @@ mod coins_tests {
         assert_eq!(
             texts,
             [
-                "Shields open at f1000, in 10 frames.",
-                "Shield plan: shard list unavailable; batches may exceed 3.",
+                "Legacy coins: shields are not open yet; the Shield plan gives the frame.",
+                "Shield plan: shard list unavailable; the batch count is a lower bound.",
             ]
         );
-        // A failing read keeps the last figures and says how old they are.
+        // A failing read keeps the last figures; their row says how old.
         apply_legacy(&mut m, Err("unavailable".into()), Duration::from_secs(1));
         apply_legacy(&mut m, Err("unavailable".into()), Duration::from_secs(1));
         let failed = notices(&m, fmt)
@@ -906,6 +1049,6 @@ mod coins_tests {
             .unwrap();
         assert_eq!(failed.severity, NoticeSeverity::Warning);
         assert!(failed.text.contains("read failed 2 times since "));
-        assert!(failed.text.contains("; figures as of "));
+        assert!(!failed.text.contains("figures as of"), "{}", failed.text);
     }
 }

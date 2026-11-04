@@ -1,7 +1,10 @@
 //! The Coins tab's shield action: `S` reads and quotes `token shield-all`'s
 //! batches, a confirmation names them, `y` runs them in the background
-//! through the CLI's own functions. One run at a time; quitting during one
-//! asks first. `--render` reads and quotes but never runs.
+//! through the CLI's own functions, paced as the CLI paces them: one batch
+//! at a time, each proved after the previous one's inclusion, submissions 5 min
+//! apart, held while GLOBAL is degraded. One run at a time; `esc` stops
+//! one before its next submission and quitting during one asks first, each
+//! confirmed by `y`. `--render` reads and quotes but never runs.
 //!
 //! A run logs two kinds of lines. The operator log (target
 //! [`LOG_TARGET`], at info, on stderr like qclient's other logs) gets one
@@ -27,6 +30,12 @@ pub const INCLUSION_CHECK: Duration = Duration::from_secs(120);
 /// How long after a run's start inclusion is still looked for.
 const INCLUSION_WINDOW: Duration = Duration::from_secs(3600);
 
+/// The pacing the notices describe (`token shield-all`'s defaults, which
+/// the manager runs with): minutes between two submissions, and minutes of
+/// healthy GLOBAL before a paused run submits again.
+pub const SPACING_MIN: u64 = 5;
+pub const RESUME_AFTER_MIN: u64 = 10;
+
 /// What the confirmation shows, read and quoted just before it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preview {
@@ -42,8 +51,8 @@ pub struct Preview {
     /// The wallet address the coins are shielded into, in full.
     pub recipient: String,
     /// Every listed legacy coin, and those not in the batches: already
-    /// shielded, on no live shard, submitted within the hour, or listed
-    /// twice. The five counts add up to `listed`.
+    /// shielded, on no live shard, submitted within the last two hours, or
+    /// listed twice. The five counts add up to `listed`.
     pub listed: usize,
     pub shielded: usize,
     pub uncovered: usize,
@@ -51,7 +60,7 @@ pub struct Preview {
     pub duplicates: usize,
 }
 
-/// What a running shield reports.
+/// What a running shield reports. Batches count from 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
     Proving {
@@ -59,15 +68,49 @@ pub enum Progress {
         count: usize,
         coins: usize,
     },
+    /// Proved; submitted once the pacing allows.
+    Proved {
+        index: usize,
+        count: usize,
+    },
     Skipped {
         index: usize,
         count: usize,
     },
+    /// Submitted; the run waits for its inclusion before the next proof.
     Submitted {
         index: usize,
         count: usize,
         addresses: Vec<[u8; 32]>,
         shielded: u128,
+    },
+    /// Held `secs` for the minimum spacing between submissions.
+    Spacing {
+        index: usize,
+        count: usize,
+        secs: u64,
+    },
+    /// The run read the batch's coins shielded.
+    Included {
+        index: usize,
+        count: usize,
+    },
+    /// GLOBAL is degraded: submissions wait, and the wait for inclusion
+    /// does not count toward its timeout. Repeats with the current reason.
+    Paused {
+        reason: String,
+    },
+    /// GLOBAL has been healthy long enough again.
+    Resumed {
+        paused_secs: u64,
+    },
+    /// The projected end after a batch, in Unix seconds.
+    Projected {
+        end: u64,
+    },
+    /// The run stopped on request, nothing more submitted.
+    Stopped {
+        submitted: usize,
     },
     /// A line the CLI would print (a fee estimate).
     Note(String),
@@ -85,9 +128,22 @@ pub enum Dialog {
 
 #[derive(Debug, Clone)]
 pub struct Submitted {
+    /// The batch, from 1.
+    pub index: usize,
     pub addresses: Vec<[u8; 32]>,
     pub shielded: u128,
     pub included: bool,
+}
+
+/// What a paced run waits for between proofs and submissions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pace {
+    /// Batch `index` is proved and submits at `at`, the minimum spacing
+    /// after the last submission.
+    Spacing { index: usize, at: SystemTime },
+    /// Batch `index` was submitted at `at`; the next is proved after its
+    /// inclusion.
+    Inclusion { index: usize, at: SystemTime },
 }
 
 #[derive(Debug)]
@@ -98,6 +154,18 @@ pub struct Run {
     pub start_frame: u64,
     /// The batch being proved and submitted: index, coins, since when.
     pub proving: Option<(usize, usize, Instant)>,
+    /// The batch proved and not yet submitted.
+    pub held: Option<usize>,
+    pub pace: Option<Pace>,
+    /// GLOBAL is degraded: why, and since when.
+    pub paused: Option<(String, SystemTime)>,
+    /// The last pause ended: when, and how long it lasted in seconds.
+    pub resumed: Option<(SystemTime, u64)>,
+    pub projected_end: Option<SystemTime>,
+    /// A stop was requested; the run ends before its next submission.
+    pub stopping: bool,
+    /// The run stopped on request.
+    pub stopped: bool,
     pub submitted: Vec<Submitted>,
     pub skipped: usize,
     pub note: Option<String>,
@@ -115,37 +183,15 @@ pub struct Shield {
     pub refused: Option<(String, SystemTime)>,
     /// `q` was pressed during a run; `y` quits.
     pub quit_pending: bool,
+    /// `esc` was pressed during a run; `y` stops it.
+    pub stop_pending: bool,
     /// The last run's private action log could not be written: why.
     pub log_failed: Option<String>,
 }
 
-/// The operator log's target: `RUST_LOG=qclient::action=info` shows its
-/// lines on stderr; redirect it to a file while the manager draws.
-pub const LOG_TARGET: &str = "qclient::action";
-
-/// What went wrong, as the operator log names it: a fixed class and its
-/// fixed reason. The error text itself can carry the node's address, a
-/// config path or amounts, so it stays on screen and in the private log.
-pub fn error_class(error: &str) -> (&'static str, &'static str) {
-    let has = |part: &str| error.contains(part);
-    if has("--max-fee") || has("automatic fee limit") {
-        ("fee_cap", "a fee quote exceeds --max-fee")
-    } else if has("plan changed") {
-        ("plan_changed", "the coins changed since the confirmation")
-    } else if has("accepts only submissions signed") {
-        ("identity", "the signing config is not the node's")
-    } else if has("shields") && has("open") {
-        ("not_open", "shields are not admitted yet")
-    } else if has("prov") || has("budget") {
-        ("proving", "a batch proof failed")
-    } else if has("transport") || has("status:") || has("connect") || has("deadline") {
-        ("rpc", "a node request failed")
-    } else if has("no node config") {
-        ("config", "the node config did not load")
-    } else {
-        ("other", "unclassified; the manager shows the error")
-    }
-}
+/// The operator log's target and error classes, shared with the CLI's
+/// wallet commands.
+pub(crate) use crate::commands::token::action_log::{error_class, LOG_TARGET};
 
 /// The operator log's start line.
 fn log_start(run: &Run) {
@@ -166,6 +212,7 @@ fn log_outcome(run: &Run, frame: u64) {
         return;
     };
     let (outcome, (class, reason)) = match done {
+        Ok(()) if run.stopped => ("stopped", ("none", "")),
         Ok(()) => ("ok", ("none", "")),
         Err(error) if !run.submitted.is_empty() => ("partial", error_class(error)),
         Err(error) => ("failed", error_class(error)),
@@ -192,14 +239,15 @@ fn log_outcome(run: &Run, frame: u64) {
     );
 }
 
-/// The legacy row's state while a run proves and submits: the batch under
-/// way of all, e.g. `shielding 3/106`.
+/// The legacy row's state while a run proves, submits or waits for an
+/// inclusion: the batch under way of all, e.g. `shielding 3/106`.
 pub fn row_state(m: &Model) -> Option<String> {
     let run = m.coins.shield.run.as_ref().filter(|_| running(m))?;
     let count = run.preview.batches;
-    let current = match run.proving {
-        Some((index, ..)) => index,
-        None => (run.submitted.len() + run.skipped + 1).min(count),
+    let current = match (run.proving, run.held, &run.pace) {
+        (Some((index, ..)), ..) | (None, Some(index), _) => index,
+        (None, None, Some(Pace::Spacing { index, .. } | Pace::Inclusion { index, .. })) => *index,
+        (None, None, None) => (run.submitted.len() + run.skipped + 1).min(count),
     };
     Some(format!("shielding {current}/{count}"))
 }
@@ -216,8 +264,8 @@ pub fn running(m: &Model) -> bool {
 /// Why `S` cannot start now, as the line pressing it shows; `None` when
 /// there is something to shield and nothing else runs.
 pub fn refusal(m: &Model) -> Option<String> {
-    let why = if running(m) {
-        "a run is in progress; one action at a time.".to_string()
+    let why = if running(m) || super::mint::running(m) || m.coins.mint.dialog.is_some() {
+        "another action is in progress; one action at a time.".to_string()
     } else if m.coins.shield.dialog.is_some() {
         "the shield is being prepared; ‹esc› cancels it.".to_string()
     } else {
@@ -279,6 +327,13 @@ pub fn dialog_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
                 started: Instant::now(),
                 start_frame: m.last_global_head,
                 proving: None,
+                held: None,
+                pace: None,
+                paused: None,
+                resumed: None,
+                projected_end: None,
+                stopping: false,
+                stopped: false,
                 submitted: Vec::new(),
                 skipped: 0,
                 note: None,
@@ -299,9 +354,32 @@ pub fn dialog_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     }
 }
 
-/// Keys on any tab while a run is in progress: quitting asks first.
-/// Returns the commands when the key was taken.
+/// `esc` on the Coins tab during a run: ask before stopping it.
+pub fn stop_request(m: &mut Model) -> Vec<Cmd> {
+    m.coins.shield.stop_pending = true;
+    m.status_msg = "Shield: ‹y› stops the run before its next submission; submitted batches \
+                    stay submitted. Any other key keeps it running."
+        .into();
+    m.status_is_error = true;
+    vec![]
+}
+
+/// Keys on any tab while a run is in progress: quitting and stopping ask
+/// first. Returns the commands when the key was taken.
 pub fn quit_guard(m: &mut Model, ev: &KeyEvent, quit: bool) -> Option<Vec<Cmd>> {
+    if m.coins.shield.stop_pending {
+        m.coins.shield.stop_pending = false;
+        let run = m.coins.shield.run.as_mut().filter(|run| run.done.is_none());
+        if let (KeyCode::Char('y'), Some(run)) = (ev.code, run) {
+            run.stopping = true;
+            m.status_msg = "Shield: stopping; nothing more is submitted.".into();
+            m.status_is_error = false;
+            return Some(vec![Cmd::ShieldStop]);
+        }
+        m.status_msg = "Shield: the run continues.".into();
+        m.status_is_error = false;
+        return Some(vec![]);
+    }
     if m.coins.shield.quit_pending {
         m.coins.shield.quit_pending = false;
         if ev.code == KeyCode::Char('y') {
@@ -311,11 +389,16 @@ pub fn quit_guard(m: &mut Model, ev: &KeyEvent, quit: bool) -> Option<Vec<Cmd>> 
         m.status_is_error = false;
         return Some(vec![]);
     }
-    if quit && running(m) {
+    if quit && (running(m) || super::mint::running(m)) {
         m.coins.shield.quit_pending = true;
-        m.status_msg = "A shield submission is in progress: ‹y› quits and abandons the batch \
-                        being proved; any other key keeps it running."
-            .into();
+        m.status_msg = if running(m) {
+            "A shield run is in progress: ‹y› quits and abandons it; submitted batches stay \
+             submitted. Any other key keeps it running."
+        } else {
+            "A submission is in progress: ‹y› quits and abandons what is being proved; any \
+             other key keeps it running."
+        }
+        .into();
         m.status_is_error = true;
         return Some(vec![]);
     }
@@ -328,33 +411,102 @@ pub fn apply_progress(m: &mut Model, progress: Progress) {
     let Some(run) = m.coins.shield.run.as_mut() else {
         return;
     };
+    let wall = SystemTime::now();
     match progress {
-        Progress::Proving { index, coins, .. } => run.proving = Some((index, coins, now)),
-        Progress::Skipped { .. } => run.skipped += 1,
+        Progress::Proving { index, coins, .. } => {
+            run.proving = Some((index, coins, now));
+            run.pace = None;
+        }
+        Progress::Proved { index, .. } => {
+            run.proving = None;
+            run.held = Some(index);
+        }
+        Progress::Skipped { .. } => {
+            run.proving = None;
+            run.skipped += 1;
+        }
         Progress::Submitted {
+            index,
             addresses,
             shielded,
             ..
         } => {
             run.proving = None;
+            run.held = None;
+            run.resumed = None;
+            run.pace = Some(Pace::Inclusion { index, at: wall });
             run.submitted.push(Submitted {
+                index,
                 addresses,
                 shielded,
                 included: false,
             });
             m.coins.legacy.refresh_at = Some(now + INCLUSION_CHECK);
         }
+        Progress::Spacing { index, secs, .. } => {
+            run.pace = Some(Pace::Spacing {
+                index,
+                at: wall + Duration::from_secs(secs),
+            });
+        }
+        Progress::Included { index, .. } => {
+            for batch in run.submitted.iter_mut().filter(|b| b.index == index) {
+                batch.included = true;
+            }
+            if matches!(run.pace, Some(Pace::Inclusion { index: i, .. }) if i == index) {
+                run.pace = None;
+            }
+        }
+        Progress::Paused { reason } => {
+            let since = run.paused.take().map_or(wall, |(_, since)| since);
+            run.paused = Some((reason, since));
+            run.resumed = None;
+        }
+        Progress::Resumed { paused_secs } => {
+            run.paused = None;
+            run.resumed = Some((wall, paused_secs));
+        }
+        Progress::Projected { end } => {
+            run.projected_end = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(end));
+        }
+        Progress::Stopped { .. } => {
+            run.stopped = true;
+            run.proving = None;
+            run.held = None;
+            run.pace = None;
+        }
         Progress::Note(line) => run.note = Some(line),
         Progress::LogFailed(why) => m.coins.shield.log_failed = Some(why),
         Progress::Done(result) => {
             if result.is_err() {
-                run.failed_at = run.proving.map(|(index, ..)| index);
+                run.failed_at = run.proving.map(|(index, ..)| index).or(run.held);
             }
             run.proving = None;
+            run.held = None;
+            run.pace = None;
+            run.paused = None;
             run.done = Some(result);
+            m.coins.shield.stop_pending = false;
             log_outcome(run, m.last_global_head);
         }
     }
+}
+
+/// A projected end, e.g. `~18:05 UTC`, or `~02:10 UTC +1d` on a later day.
+fn projected(end: SystemTime, now: SystemTime) -> String {
+    let day = |time: SystemTime| {
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            / 86_400
+    };
+    let days = day(end).saturating_sub(day(now));
+    let later = if days > 0 {
+        format!(" +{days}d")
+    } else {
+        String::new()
+    };
+    format!("~{}{later}", coins::utc_hm(end))
 }
 
 /// After a legacy read: batches whose coins GLOBAL now records as shielded
@@ -431,10 +583,7 @@ pub fn notices(m: &Model, fmt_amount: &dyn Fn(u128) -> String) -> Vec<Notice> {
                 NoticeSeverity::Info,
                 false,
                 false,
-                format!(
-                    "Shield: {} submitted <1h ago are hidden from the plan.",
-                    plural(snapshot.pending, "coin", "coins")
-                ),
+                "Shield: coins submitted <2h ago are hidden from the plan.".into(),
             );
         }
     }
@@ -455,9 +604,89 @@ pub fn notices(m: &Model, fmt_amount: &dyn Fn(u128) -> String) -> Vec<Notice> {
             ),
         );
     }
+    match (&run.paused, run.held) {
+        (Some((reason, since)), Some(index)) => push(
+            "shield-paused",
+            NoticeSeverity::Warning,
+            false,
+            false,
+            format!(
+                "Shield batch {index}/{count}: proved and held; paused since {}: {reason}; \
+                 it submits after {RESUME_AFTER_MIN} min of healthy GLOBAL.",
+                coins::utc_hm(*since)
+            ),
+        ),
+        (Some((reason, since)), None) => push(
+            "shield-paused",
+            NoticeSeverity::Warning,
+            false,
+            false,
+            format!(
+                "Shield paused since {}: {reason}; the next submission waits for \
+                 {RESUME_AFTER_MIN} min of healthy GLOBAL.",
+                coins::utc_hm(*since)
+            ),
+        ),
+        (None, _) => {
+            if let Some(Pace::Spacing { index, at }) = &run.pace {
+                push(
+                    "shield-spacing",
+                    NoticeSeverity::Info,
+                    true,
+                    false,
+                    format!(
+                        "Shield batch {index}/{count}: proved; submits at {}, {SPACING_MIN} \
+                         min after the last submission.",
+                        coins::utc_hm(*at)
+                    ),
+                );
+            }
+        }
+    }
+    if let Some((at, paused_secs)) = run.resumed.filter(|_| run.done.is_none()) {
+        push(
+            "shield-resumed",
+            NoticeSeverity::Info,
+            true,
+            false,
+            format!(
+                "Shield resumed at {} after {} min paused; GLOBAL healthy for \
+                 {RESUME_AFTER_MIN} min.",
+                coins::utc_hm(at),
+                paused_secs / 60
+            ),
+        );
+    }
     let submitted = run.submitted.len();
     let included: Vec<&Submitted> = run.submitted.iter().filter(|b| b.included).collect();
-    if submitted > included.len() {
+    let awaited = match &run.pace {
+        Some(Pace::Inclusion { index, at }) if run.done.is_none() => run
+            .submitted
+            .iter()
+            .find(|b| b.index == *index && !b.included)
+            .map(|b| (b, *at)),
+        _ => None,
+    };
+    if let Some((batch, at)) = awaited {
+        let next = if batch.index < count {
+            "; the next batch is proved after it"
+        } else {
+            ""
+        };
+        push(
+            "shield-submitted",
+            NoticeSeverity::Info,
+            true,
+            false,
+            format!(
+                "Shield batch {}/{count}: {} coins submitted at {}; inclusion not yet \
+                 confirmed{next}.",
+                batch.index,
+                batch.addresses.len(),
+                coins::utc_hm(at)
+            ),
+        );
+    } else if submitted > included.len() {
         push(
             "shield-submitted",
             NoticeSeverity::Info,
@@ -485,15 +714,41 @@ pub fn notices(m: &Model, fmt_amount: &dyn Fn(u128) -> String) -> Vec<Notice> {
                 fmt_amount(included.iter().map(|b| b.shielded).sum())
             )
         };
+        let end = match run.projected_end {
+            Some(end) if run.done.is_none() && included.len() < count => {
+                format!("; projected end {}", projected(end, SystemTime::now()))
+            }
+            _ => String::new(),
+        };
         push(
             "shield-included",
             NoticeSeverity::Info,
             true,
             true,
             format!(
-                "Shield: {} of {count} included: {coins} coins{amount} shielded.",
+                "Shield: {} of {count} included: {coins} coins{amount} shielded{end}.",
                 plural(included.len(), "batch", "batches"),
             ),
+        );
+    }
+    if run.stopped {
+        push(
+            "shield-stopped",
+            NoticeSeverity::Info,
+            false,
+            false,
+            format!(
+                "Shield: stopped on request after {} of {count} submitted; the rest were not.",
+                plural(submitted, "batch", "batches")
+            ),
+        );
+    } else if run.stopping && run.done.is_none() {
+        push(
+            "shield-stopping",
+            NoticeSeverity::Info,
+            true,
+            false,
+            "Shield: stopping on request; nothing more is submitted.".into(),
         );
     }
     if let Some(why) = &shield.log_failed {
@@ -527,6 +782,10 @@ pub fn notices(m: &Model, fmt_amount: &dyn Fn(u128) -> String) -> Vec<Notice> {
                 Some(index) => format!(
                     "Shield batch {index}/{count} failed: {error}; it was not submitted, \
                      the run stopped."
+                ),
+                None if submitted > 0 => format!(
+                    "Shield: the run stopped after {} of {count} submitted: {error}",
+                    plural(submitted, "batch", "batches")
                 ),
                 None => {
                     format!("Shield: failed before any batch ({error}); nothing was submitted.")
@@ -618,11 +877,14 @@ pub(crate) mod shield_tests {
         // One action at a time.
         assert!(request(&mut m).is_empty());
         assert!(m.status_msg.contains("one action at a time"));
+        // Nor a mint beside it.
+        m.claimable_reward = Some((5, 1));
+        assert!(super::super::mint::request_mint(&mut m).is_empty());
     }
 
     /// A sink for the operator log's formatted lines.
     #[derive(Clone, Default)]
-    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    pub(crate) struct Capture(pub(crate) std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl std::io::Write for Capture {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -633,6 +895,21 @@ pub(crate) mod shield_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// The operator log's lines `work` writes, formatted as on stderr.
+    pub(crate) fn operator_log(work: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, work);
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
     }
 
     /// The operator log gets one line at the start and one at the outcome,
@@ -745,6 +1022,16 @@ pub(crate) mod shield_tests {
                 "plan_changed",
             ),
             ("transport error", "rpc"),
+            (
+                "the reward changed since it was confirmed (f43, 1001 base units now); \
+                 press ‹M› again",
+                "reward_changed",
+            ),
+            (
+                "the authorization citing f42 is not finalized: GLOBAL holds no witness for \
+                 it yet",
+                "not_finalized",
+            ),
             ("something new", "other"),
         ] {
             assert_eq!(error_class(error).0, class, "{error}");
@@ -770,6 +1057,9 @@ pub(crate) mod shield_tests {
                 shielded: 9,
             },
         );
+        // Its inclusion is awaited before the next batch is proved.
+        assert_eq!(row_state(&m).as_deref(), Some("shielding 1/2"));
+        apply_progress(&mut m, Progress::Included { index: 1, count: 2 });
         assert_eq!(row_state(&m).as_deref(), Some("shielding 2/2"));
         apply_progress(&mut m, Progress::Done(Ok(())));
         assert_eq!(row_state(&m), None);
@@ -822,6 +1112,11 @@ pub(crate) mod shield_tests {
             Some(0)
         );
         assert!(m.coins.shield.quit_pending);
+        assert!(
+            m.status_msg.starts_with("A shield run is in progress"),
+            "{}",
+            m.status_msg
+        );
         assert!(quit_guard(&mut m, &key('x'), false).unwrap().is_empty());
         assert!(running(&m));
         quit_guard(&mut m, &key('q'), true);
@@ -859,9 +1154,14 @@ pub(crate) mod shield_tests {
             },
         );
         assert!(m.coins.legacy.refresh_at.is_some());
-        assert_eq!(
-            texts(&m),
-            ["Shield: 1 batch of 2 submitted (2 coins); inclusion not yet confirmed."]
+        let submitted = texts(&m);
+        assert!(
+            matches!(submitted.as_slice(), [text] if text.starts_with(
+                "Shield batch 1/2: 2 coins submitted at "
+            ) && text.ends_with(
+                "; inclusion not yet confirmed; the next batch is proved after it."
+            )),
+            "{submitted:?}"
         );
         // The next read shows the coins shielded.
         if let Some((Some(snapshot), _, _)) = m.coins.legacy.answer.as_mut() {

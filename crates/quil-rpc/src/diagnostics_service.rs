@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use prost::Message as _;
 use tonic::transport::{Channel, Endpoint};
@@ -28,7 +28,7 @@ use quil_types::proto::diagnostics::diagnostics_service_server::{
 };
 use quil_types::proto::diagnostics::{
     Blocker, FailureCount, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure,
-    RecoveryPhase, WorkerHealth,
+    RecoveryPhase, StoreIoHealth, WorkerHealth,
 };
 use quil_types::proto::node::{GlobalAppFrameHead, WorkerExecution};
 
@@ -162,7 +162,8 @@ pub fn phase_name(phase: Phase) -> &'static str {
 }
 
 pub fn blocker(text: &str) -> Blocker {
-    if text.is_empty() {
+    // The worker view's note of a renewal decision: nothing blocks the worker.
+    if text.is_empty() || text == quil_types::consensus::SILENT_RENEWAL_BLOCKER {
         return Blocker::None;
     }
     lookup(&BLOCKERS, text).unwrap_or(Blocker::Unrecognized)
@@ -307,6 +308,9 @@ pub struct HealthInputs {
     pub master_store_write_failed: bool,
     /// The configured worker count; 0 unknown.
     pub worker_capacity: u32,
+    /// The master store's latest I/O interval
+    /// ([`quil_forest::store_io::latest`]).
+    pub store_io: Option<StoreIoHealth>,
 }
 
 /// The report of `inputs` at `now_ms`: allocated workers first, by core,
@@ -322,6 +326,7 @@ pub fn build_report(inputs: &HealthInputs, build_fingerprint: &[u8], now_ms: u64
         generated_unix_ms: now_ms,
         master_store_write_failed: inputs.master_store_write_failed,
         worker_capacity: inputs.worker_capacity,
+        store_io: inputs.store_io.clone(),
         ..Default::default()
     };
     let mut entries: Vec<&WorkerEntry> = inputs.workers.iter().collect();
@@ -467,10 +472,31 @@ pub struct Admission {
     enabled: bool,
     /// Empty while disabled, so every other caller takes the same lookup.
     allowed: HashSet<PeerId>,
+    /// When the grants of allowed peers end; a peer without an entry has no
+    /// end.
+    grant_ends: HashMap<PeerId, Instant>,
     own: PeerId,
     min_interval: Duration,
     served: Mutex<HashMap<PeerId, Instant>>,
     refusals: Mutex<RefusalSummary>,
+}
+
+/// When each grant of `allowed_until` (Unix seconds by peer ID) ends, on the
+/// clock of [`Admission::admit`]: an end already past is `now`. Keys that are
+/// not peer IDs name no allowed peer and are left out.
+fn grant_ends(
+    allowed_until: &BTreeMap<String, u64>,
+    now: Instant,
+    unix_now: u64,
+) -> HashMap<PeerId, Instant> {
+    allowed_until
+        .iter()
+        .filter_map(|(peer, until)| {
+            let peer = PeerId::from_str(peer.trim()).ok()?;
+            let left = Duration::from_secs(until.saturating_sub(unix_now));
+            Some((peer, now.checked_add(left)?))
+        })
+        .collect()
 }
 
 /// The peer IDs of `entries`, and the indices of the entries that are not
@@ -504,9 +530,15 @@ impl Admission {
             *quil_config::HEALTH_REPORT_INTERVAL_SECS.start(),
             *quil_config::HEALTH_REPORT_INTERVAL_SECS.end(),
         );
+        let unix_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let grant_ends = grant_ends(&config.allowed_until, Instant::now(), unix_now);
         if config.enabled {
             info!(
                 health_peers = allowed.len(),
+                peers_with_an_end = grant_ends.len(),
                 min_interval_secs,
                 serves = if allowed.is_empty() {
                     "this node only"
@@ -526,6 +558,7 @@ impl Admission {
             } else {
                 HashSet::new()
             },
+            grant_ends,
             own,
             min_interval: Duration::from_secs(min_interval_secs),
             served: Mutex::default(),
@@ -558,7 +591,8 @@ impl Admission {
         if *caller == self.own {
             return Ok(Requester::Own);
         }
-        if !self.allowed.contains(caller) {
+        let ended = self.grant_ends.get(caller).is_some_and(|end| now >= *end);
+        if ended || !self.allowed.contains(caller) {
             return Err(if self.enabled {
                 Refusal::NotAllowed
             } else {
@@ -702,6 +736,22 @@ pub async fn connect_peer(
 }
 
 #[cfg(test)]
+mod renewal_blocker_tests {
+    use super::*;
+
+    /// The worker view's note of a withheld renewal blocks nothing, and an
+    /// unknown text is still reported as unrecognized.
+    #[test]
+    fn a_withheld_renewal_note_is_no_blocker() {
+        assert_eq!(
+            blocker(quil_types::consensus::SILENT_RENEWAL_BLOCKER),
+            Blocker::None
+        );
+        assert_eq!(blocker("something else"), Blocker::Unrecognized);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use quil_engine::worker_execution::{
@@ -722,6 +772,7 @@ mod tests {
             enabled,
             allowed_peers: allowed.iter().map(|peer| peer.to_base58()).collect(),
             min_interval_secs: 60,
+            ..Default::default()
         }
     }
 
@@ -762,6 +813,53 @@ mod tests {
 
     /// No identity, an unlisted peer and a node that has not enabled the
     /// report give the same answer; this node and listed peers are served.
+    #[test]
+    fn a_grant_admits_until_its_end_and_no_later() {
+        const HOUR: u64 = 3_600;
+        let (own, ending, lasting, lapsed) = (peer(), peer(), peer(), peer());
+        let mut granted = config(true, &[ending, lasting, lapsed]);
+        let unix_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        granted.allowed_until = BTreeMap::from([
+            (ending.to_base58(), unix_now + HOUR),
+            (lapsed.to_base58(), unix_now - 1),
+            ("not a peer ID".to_string(), unix_now + HOUR),
+        ]);
+        let admission = Admission::new(&granted, own);
+        let now = Instant::now();
+        let later = now + Duration::from_secs(HOUR + 1);
+        let denied = |caller: &PeerId, at: Instant| {
+            let status = admission.admit(Some(caller), at).unwrap_err();
+            (status.code(), status.message().to_string())
+        };
+        let refused = (tonic::Code::PermissionDenied, DENIED.to_string());
+        assert_eq!(
+            admission.admit(Some(&ending), now).unwrap(),
+            Requester::Peer(ending)
+        );
+        assert_eq!(denied(&ending, later), refused, "past its end");
+        assert_eq!(denied(&lapsed, now), refused, "ended before this start");
+        assert_eq!(
+            admission.admit(Some(&lasting), later).unwrap(),
+            Requester::Peer(lasting),
+            "a listed peer without an end stays served"
+        );
+        assert_eq!(admission.admit(Some(&own), later).unwrap(), Requester::Own);
+        // An end names no peer the list does not name.
+        let (mut unlisted, stranger) = (config(true, &[]), peer());
+        unlisted.allowed_until = BTreeMap::from([(stranger.to_base58(), unix_now + HOUR)]);
+        let admission = Admission::new(&unlisted, own);
+        assert_eq!(
+            admission
+                .admit(Some(&stranger), Instant::now())
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
     #[tokio::test]
     async fn only_this_node_and_listed_peers_are_served_and_refusals_are_alike() {
         let (own, listed, other) = (peer(), peer(), peer());
@@ -1085,6 +1183,36 @@ mod tests {
             ..inputs
         };
         assert!(build_report(&inputs, &[], 3_000).master_store_write_failed);
+    }
+
+    /// The master store's latest I/O interval rides the report as given,
+    /// through encoding; a node without one sends none.
+    #[test]
+    fn the_store_io_interval_is_reported() {
+        use prost::Message;
+        use quil_types::proto::diagnostics::{StoreIoReason, StoreIoVerdict};
+        let mut io = StoreIoHealth {
+            slow_secs: 120,
+            interval_secs: 60,
+            canary_reads: 58,
+            canary_p99_us: 400_000,
+            disk_read_await_us: Some(25_000),
+            ..Default::default()
+        };
+        io.set_verdict(StoreIoVerdict::Slow);
+        io.set_slow_reason(StoreIoReason::CanaryP99);
+        let inputs = HealthInputs {
+            store_io: Some(io.clone()),
+            ..Default::default()
+        };
+        let report = build_report(&inputs, &[], 3_000);
+        assert_eq!(report.store_io.as_ref(), Some(&io));
+        let decoded = HealthReport::decode(report.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.store_io, Some(io));
+        assert_eq!(
+            build_report(&HealthInputs::default(), &[], 3_000).store_io,
+            None
+        );
     }
 
     /// The configured count and each worker above it, which drains, are

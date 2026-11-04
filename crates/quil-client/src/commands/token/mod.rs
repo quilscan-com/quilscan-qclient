@@ -22,10 +22,18 @@ pub(crate) mod balance;
 mod claimable_rewards;
 pub(crate) mod legacy;
 pub(crate) mod output;
+#[cfg(feature = "native-proof")]
+pub(crate) mod shield_pacing;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
+#[cfg(feature = "confidential-tokens")]
+pub(crate) use wallet::saved_mints;
 #[cfg(feature = "native-proof")]
-pub(crate) use wallet::{execute_shield_all, plan_shield_all, shield_batch_fee, ShieldEvent};
+pub(crate) use wallet::{
+    execute_mint, execute_mint_claim, execute_shield_all, mint_claim_witness, plan_mint,
+    plan_shield_all, reward_mint_fee, shield_batch_fee, MintEvent, MintPlan, ShieldAllPlan,
+    ShieldEvent, ShieldReport,
+};
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
 /// flags).
@@ -396,11 +404,36 @@ pub enum TokenCommand {
     /// shields are refused ("source owner mismatch"), so this command refuses
     /// to start before the node's GLOBAL head reaches it. Batches themselves
     /// are admitted from frame 864,000. `token legacy` shows the plan.
+    ///
+    /// Batches are paced so a run cannot load GLOBAL faster than archives
+    /// verify the proofs (each batch costs an archive tens of seconds). One
+    /// batch at a time: after submitting, the run waits for the batch's
+    /// coins to stop reading unshielded before proving the next, and stops
+    /// naming the check if that takes longer than `--inclusion-timeout`
+    /// (time GLOBAL is paused does not count; the default, an hour, outlasts
+    /// the shard stalls of up to 30 minutes seen after frames carrying
+    /// batches: a batch commits with its shard's next frame). A submitted
+    /// batch's coins stay out of new runs for two hours. Submissions are at
+    /// least `--min-interval` seconds apart (default 300, at most 12 per
+    /// hour).
+    /// The run pauses while GLOBAL is degraded (head not advancing for 60 s,
+    /// or under 330 frames per hour as the head advanced across the sampled
+    /// window, judged once 10 minutes are sampled) and resumes after 10
+    /// minutes of healthy advance. Each pause, resume, submission and
+    /// inclusion is printed with the projected end.
     #[cfg(feature = "native-proof")]
     ShieldAll {
         /// Legacy coins per batch (1 to 96).
         #[arg(long, default_value_t = 96)]
         max_per_batch: usize,
+        /// Minimum seconds between two submissions. 0 disables the spacing
+        /// (devnets only; it can slow GLOBAL on mainnet).
+        #[arg(long, default_value_t = shield_pacing::DEFAULT_MIN_INTERVAL_SECS)]
+        min_interval: u64,
+        /// Seconds of healthy GLOBAL to wait for a submitted batch to be
+        /// included before stopping the run.
+        #[arg(long, default_value_t = shield_pacing::DEFAULT_INCLUSION_TIMEOUT_SECS)]
+        inclusion_timeout: u64,
     },
     /// Mint a custom token under its deployed policy.
     #[cfg(feature = "native-proof")]
@@ -556,6 +589,10 @@ pub enum TokenCommand {
         /// Saved authorization bytes from the first stage; builds and submits the claim.
         #[arg(long)]
         claim: Option<PathBuf>,
+        /// Report a saved authorization and submit nothing: whether GLOBAL included
+        /// it, the frame a claim would cite, and whether its claim already committed.
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["recipient", "fee", "claim"])]
+        status: Option<PathBuf>,
     },
 }
 
@@ -580,8 +617,8 @@ impl TokenCommand {
             | TokenCommand::Split { .. }
             | TokenCommand::PendingTransfer { .. }
             | TokenCommand::Accept { .. }
-            | TokenCommand::Reject { .. }
-            | TokenCommand::Mint { .. } => true,
+            | TokenCommand::Reject { .. } => true,
+            TokenCommand::Mint { status, .. } => status.is_none(),
             #[cfg(feature = "native-proof")]
             TokenCommand::Shield { .. }
             | TokenCommand::ShieldAll { .. }
@@ -727,8 +764,13 @@ impl TokenCtx {
         Self::from_context(&Context::load(global)?, common)
     }
 
+    /// Refuse a keystore with no keys, for the commands that sign or read
+    /// a wallet key (`token account` and `token legacy` read none).
+    pub(crate) fn require_keys(&self) -> anyhow::Result<()> {
+        crate::keys::require_keys(&self.key_manager, &self.node_config, &self.config_dir, true)
+    }
+
     fn from_context(ctx: &Context, common: &TokenCommonArgs) -> anyhow::Result<Self> {
-        output::line("Loading node config...".into());
         let config_arg = common.single_config()?;
         let (node_config, config_dir) = ctx.load_node_config(config_arg)?;
 
@@ -746,10 +788,7 @@ impl TokenCtx {
         // The legacy Ed448 peer id is shown only if the Falcon network key is
         // absent (a pre-migration keystore).
         let config_identity = ConfigIdentity::of(&node_config, &key_manager);
-        match config_identity.shown() {
-            Some(peer) => output::line(peer.to_string()),
-            None => output::line("(no network identity configured)".into()),
-        }
+        output::line(crate::keys::node_line(config_identity.shown(), &config_dir));
         if config_arg.is_empty() || config_arg == "default" {
             let unused = std::env::current_dir()
                 .ok()
@@ -860,6 +899,7 @@ pub(crate) async fn pay_for_bundle(
         max_fee: max_fee_from_env()?,
     };
     let tc = TokenCtx::load(global, &common)?;
+    tc.require_keys()?;
     wallet::pay_for_bundle(&tc, destination, rest, None, wait).await
 }
 
@@ -870,6 +910,9 @@ pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
         return legacy::run(global, &args.common, &application(args)?, listing).await;
     }
     let tc = TokenCtx::load(global, &args.common)?;
+    if !matches!(args.command, TokenCommand::Account) {
+        tc.require_keys()?;
+    }
     run_with_context(&tc, args).await
 }
 
@@ -1078,34 +1121,50 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 recipient,
                 fee,
                 claim,
+                status,
             } => {
                 anyhow::ensure!(
                     decoded == quil_execution::domains::QUIL_TOKEN,
                     "reward mint requires the QUIL application; use custom-mint for custom tokens"
                 );
-                // The mint pays its own state-growth charge (one coin and the
-                // receipt marker) out of the minted amount.
-                let mint_fee = if claim.is_some() {
-                    0
-                } else {
-                    // Reward mints execute in the global venue: quote its pricing.
-                    wallet::quoted_quil_fee(
+                if let Some(saved) = status {
+                    return wallet::run_mint_status(tc, saved).await;
+                }
+                // Recorded in the private action log, with the operator lines.
+                let mut action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    // The mint pays its own state-growth charge (one coin and
+                    // the receipt marker) out of the minted amount.
+                    let mint_fee = if claim.is_some() {
+                        0
+                    } else {
+                        wallet::reward_mint_fee(&tc, *fee).await?
+                    };
+                    wallet::run_mint(
                         &tc,
-                        *fee,
-                        Shape {
-                            coins: 1,
-                            markers: 1,
-                            escrow: false,
-                        },
-                        true,
+                        recipient.as_deref(),
+                        mint_fee,
+                        claim.as_deref(),
+                        action.as_mut(),
                     )
-                    .await?
+                    .await
+                }
+                .await;
+                return match action {
+                    Some(action) => action.finish(result),
+                    None => result,
                 };
-                return wallet::run_mint(&tc, recipient.as_deref(), mint_fee, claim.as_deref())
-                    .await;
             }
-            TokenCommand::ShieldAll { max_per_batch } => {
-                return wallet::run_shield_all(&tc, &application, *max_per_batch).await
+            TokenCommand::ShieldAll {
+                max_per_batch,
+                min_interval,
+                inclusion_timeout,
+            } => {
+                let pacing = shield_pacing::Pacing {
+                    min_interval: *min_interval,
+                    inclusion_timeout: *inclusion_timeout,
+                };
+                return wallet::run_shield_all(&tc, &application, *max_per_batch, pacing).await;
             }
             TokenCommand::Shield {
                 source,

@@ -200,6 +200,37 @@ struct SharedBlockCache {
 static SHARED_BLOCK_CACHE: std::sync::OnceLock<std::sync::Mutex<SharedBlockCache>> =
     std::sync::OnceLock::new();
 
+/// Every store opened in this process that is still open, for
+/// [`open_stores_memory`].
+fn open_stores() -> &'static std::sync::Mutex<Vec<quil_forest::WeakCoordinatedDb>> {
+    static OPEN: std::sync::OnceLock<std::sync::Mutex<Vec<quil_forest::WeakCoordinatedDb>>> =
+        std::sync::OnceLock::new();
+    OPEN.get_or_init(Default::default)
+}
+
+/// `(stores, memtable bytes, table-reader bytes)` summed over every RocksDB
+/// store open in this process: the master's and each thread worker's. The
+/// shared block cache is left out ([`shared_block_cache_memory`]).
+pub fn open_stores_memory() -> (usize, u64, u64) {
+    let mut open = open_stores()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let live: Vec<_> = open.iter().filter_map(|weak| weak.upgrade()).collect();
+    // Drop the closed stores' entries.
+    open.retain(|weak| weak.upgrade().is_some());
+    drop(open);
+    let sum = |name: &str| -> u64 {
+        live.iter()
+            .map(|db| db.property_int_value(name).ok().flatten().unwrap_or(0))
+            .sum()
+    };
+    (
+        live.len(),
+        sum("rocksdb.cur-size-all-mem-tables"),
+        sum("rocksdb.estimate-table-readers-mem"),
+    )
+}
+
 /// The shared block cache's `(usage, capacity)` bytes, once a store opened
 /// on it: what its stores' [`RocksDbMemory::total`] leave out.
 pub fn shared_block_cache_memory() -> Option<(u64, u64)> {
@@ -257,6 +288,46 @@ fn memory_budget_bytes() -> Option<u64> {
             .ok()
     });
     Some(limit.map_or(physical, |limit| limit.min(physical)).max(1))
+}
+
+/// The block cache of a store opened with `base` bytes: `override_mb`
+/// (`QUIL_ROCKSDB_BLOCK_CACHE_MB`) replaces it when it parses.
+fn block_cache_with_override(base: usize, override_mb: Option<&str>) -> usize {
+    override_mb
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(base, |mb| mb.saturating_mul(1024 * 1024))
+}
+
+/// The block cache a store of this process opens with when it has one of
+/// its own, in bytes: an archive's memory-sized cache, or
+/// `QUIL_ROCKSDB_BLOCK_CACHE_MB` for any store. Without that override the
+/// other stores share one cache ([`shared_block_cache_bytes`]).
+pub fn effective_block_cache_bytes(archive: bool) -> usize {
+    let base = if archive {
+        archive_block_cache_bytes()
+    } else {
+        DEFAULT_BLOCK_CACHE_BYTES
+    };
+    block_cache_with_override(
+        base,
+        std::env::var("QUIL_ROCKSDB_BLOCK_CACHE_MB").ok().as_deref(),
+    )
+}
+
+/// RocksDB background flush and compaction threads per store:
+/// `QUIL_ROCKSDB_BG_THREADS`, else the CPUs available, within 2..=8.
+pub fn background_threads() -> i32 {
+    background_threads_for(std::env::var("QUIL_ROCKSDB_BG_THREADS").ok().as_deref())
+}
+
+fn background_threads_for(override_threads: Option<&str>) -> i32 {
+    override_threads
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| (n.get() as i32).clamp(2, 8))
+                .unwrap_or(4)
+        })
 }
 
 impl RocksDb {
@@ -325,14 +396,7 @@ impl RocksDb {
         // threads to keep up, plus extra memtable headroom to absorb bursts.
         // Threads scale with cores (compaction is the bottleneck on weak HW);
         // env-overridable for constrained nodes.
-        let bg_threads: i32 = std::env::var("QUIL_ROCKSDB_BG_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| (n.get() as i32).clamp(2, 8))
-                    .unwrap_or(4)
-            });
+        let bg_threads = background_threads();
         opts.increase_parallelism(bg_threads);
         opts.set_max_background_jobs(bg_threads);
         // More memtables in flight (default 2) so a flush stall doesn't immediately
@@ -448,10 +512,15 @@ impl RocksDb {
     /// A writable store watches the prover registry's keys, so execution
     /// branches can reuse a registry scan no write has changed.
     fn coordinated(db: rocksdb::DB) -> quil_forest::CoordinatedDb {
-        quil_forest::CoordinatedDb::with_watched_prefixes(
+        let db = quil_forest::CoordinatedDb::with_watched_prefixes(
             db,
             crate::encoding::prover_registry_key_prefixes(),
-        )
+        );
+        open_stores()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(db.downgrade());
+        db
     }
 
     /// Share the database and its write barrier across store implementations.
@@ -617,6 +686,19 @@ mod read_only_tests {
         assert_eq!(shared_capacity(28, 64 * MB), 64 * MB);
     }
 
+    /// The cache a store opens with is the override when it parses, else the
+    /// base; the thread count is the override when it parses, else bounded.
+    #[test]
+    fn block_cache_and_thread_overrides_replace_the_defaults() {
+        let base = DEFAULT_BLOCK_CACHE_BYTES;
+        assert_eq!(block_cache_with_override(base, None), base);
+        assert_eq!(block_cache_with_override(base, Some("junk")), base);
+        assert_eq!(block_cache_with_override(base, Some("64")), 64 << 20);
+        assert_eq!(background_threads_for(Some("3")), 3);
+        assert!((2..=8).contains(&background_threads_for(None)));
+        assert!((2..=8).contains(&background_threads_for(Some("x"))));
+    }
+
     /// New table files carry a partitioned index; files written without one
     /// (an older build) still read.
     #[test]
@@ -664,6 +746,48 @@ mod read_only_tests {
         );
         assert_eq!(reopened.get(key(7)).unwrap(), Some(vec![7u8; 64]));
         assert_eq!(reopened.get(key(30_000)).unwrap(), Some(vec![9u8; 64]));
+    }
+
+    /// The open stores' memtables and table readers are summed over every
+    /// store still open, and a closed store leaves the sum.
+    #[test]
+    fn open_stores_memory_counts_stores_that_are_open() {
+        let (before_stores, before_memtables, _) = open_stores_memory();
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+        let stores: Vec<RocksDb> = dirs
+            .iter()
+            .map(|dir| RocksDb::open(dir.path()).unwrap())
+            .collect();
+        let db = stores[0].inner();
+        for i in 0..2_000u32 {
+            db.put(format!("key-{i:08}").into_bytes(), [5u8; 1024])
+                .unwrap();
+        }
+        let (stores_open, memtables, _) = open_stores_memory();
+        assert!(
+            stores_open >= before_stores + 2,
+            "{stores_open} stores open after opening two beside {before_stores}"
+        );
+        assert!(
+            memtables >= before_memtables + (1 << 20),
+            "{memtables} memtable bytes after writing 2 MB beside {before_memtables}"
+        );
+        drop(db);
+        drop(stores);
+        let (stores_after, _, _) = open_stores_memory();
+        assert!(
+            stores_after < stores_open,
+            "closed stores still counted: {stores_after} of {stores_open}"
+        );
+    }
+}
+
+/// Whether `file`'s keys span into `[start, end)`: its first key is below
+/// `end` and its last at or past `start`.
+fn file_overlaps(file: &rocksdb::LiveFile, start: &[u8], end: &[u8]) -> bool {
+    match (file.start_key.as_deref(), file.end_key.as_deref()) {
+        (Some(first), Some(last)) => first < end && last >= start,
+        _ => false,
     }
 }
 
@@ -715,13 +839,21 @@ impl store::KvDb for RocksDb {
             .db
             .live_files()
             .map_err(|e| QuilError::Store(e.to_string()))?;
-        Ok(files.iter().any(|file| {
-            file.size as u64 >= min_file_bytes
-                && match (file.start_key.as_deref(), file.end_key.as_deref()) {
-                    (Some(first), Some(last)) => first < end && last >= start,
-                    _ => false,
-                }
-        }))
+        Ok(files
+            .iter()
+            .any(|file| file.size as u64 >= min_file_bytes && file_overlaps(file, start, end)))
+    }
+
+    fn live_file_bytes(&self, range: Option<(&[u8], &[u8])>) -> Result<u64> {
+        let files = self
+            .db
+            .live_files()
+            .map_err(|e| QuilError::Store(e.to_string()))?;
+        Ok(files
+            .iter()
+            .filter(|file| range.is_none_or(|(start, end)| file_overlaps(file, start, end)))
+            .map(|file| file.size as u64)
+            .sum())
     }
 
     fn compact_reclaiming(&self, start: &[u8], end: &[u8], min_file_bytes: u64) -> Result<bool> {

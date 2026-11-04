@@ -38,6 +38,12 @@ use crate::worker_allocator::WorkerAllocator;
 /// [`ProverLifecycle::set_confirm_window_frames`] so a 4-node smoke
 /// test doesn't need to wait an hour for each join cycle.
 pub const DEFAULT_CONFIRM_WINDOW_FRAMES: u64 = 360;
+
+/// Frames into an epoch by which this node's registry has refreshed for the
+/// boundary (it refreshes on events, so sooner it may not show a leave that
+/// landed). A leave signed in the last epoch has landed or never will: every
+/// node refuses one landing in a later epoch.
+const OPERATOR_LEAVE_SETTLE_FRAMES: u64 = 5;
 /// Cap on join filters per cycle (matches Go's 100).
 pub const MAX_PROPOSALS_PER_CYCLE: usize = 100;
 /// Max proposals per single PlanAndAllocate call in Go (worker_allocator.go:215).
@@ -293,16 +299,31 @@ pub struct AllocationBuckets {
     /// (`EffectiveStatus::ExpiredEpoch`) — must re-confirm fresh leaf roots
     /// for the current epoch to keep counting + avoid the storage audit.
     pub expired_epoch: Vec<Vec<u8>>,
+    /// Expired joins and leaves the network still refuses to re-join (until
+    /// `REJOIN_WINDOW_FRAMES` after their join frame). No worker serves them,
+    /// so they stay out of `all_ours` and hold no worker slot; they only leave
+    /// the join candidates ([`Self::join_excluded`]).
+    pub rejoin_blocked: Vec<Vec<u8>>,
 }
 
 impl AllocationBuckets {
+    /// The filters no join may name: those we hold, and those still inside
+    /// their rejoin window.
+    pub fn join_excluded(&self) -> Vec<Vec<u8>> {
+        self.all_ours
+            .iter()
+            .chain(&self.rejoin_blocked)
+            .cloned()
+            .collect()
+    }
+
     /// Partition a prover's allocation list by effective status at
     /// `frame_number`. Terminal and expired statuses (Rejected,
     /// Kicked, ExpiredJoining, ExpiredLeaving, Unknown) are
-    /// excluded from every bucket — the lifecycle treats them as
-    /// "doesn't exist," which prevents `plan_leaves` from
-    /// proposing a Leave for an allocation the network already
-    /// considers terminal.
+    /// excluded from every bucket but `rejoin_blocked` — the
+    /// lifecycle treats them as "doesn't exist," which prevents
+    /// `plan_leaves` from proposing a Leave for an allocation the
+    /// network already considers terminal.
     pub fn from_allocations(
         allocations: &[quil_types::consensus::ProverAllocationInfo],
         frame_number: u64,
@@ -390,15 +411,20 @@ impl AllocationBuckets {
                 // the one filter it cannot take, which after split/merge churn
                 // left whole nodes carrying no shard at all. So keep it out of
                 // every ACTION bucket exactly as before (no Leave for something
-                // already terminal on chain) but keep it in `all_ours` until the
-                // window passes, so those workers go to a shard it CAN join.
+                // already terminal on chain) but keep it out of the join
+                // candidates until the window passes, so those workers go to a
+                // shard it CAN join. Not in `all_ours`: no worker serves it, and
+                // counting it against capacity held the very worker it should
+                // redirect, so the node proposed no join anywhere.
                 EffectiveStatus::ExpiredJoining | EffectiveStatus::ExpiredLeaving => {
                     if frame_number
                         < alloc.join_frame_number.saturating_add(
                             quil_execution::global_intrinsic::verify::REJOIN_WINDOW_FRAMES,
                         )
                     {
-                        buckets.all_ours.push(alloc.confirmation_filter.clone());
+                        buckets
+                            .rejoin_blocked
+                            .push(alloc.confirmation_filter.clone());
                     }
                 }
                 // Terminal / past-grace. Treat as "doesn't exist":
@@ -551,12 +577,16 @@ pub struct ProverLifecycle {
     evaluation_outage: std::sync::Mutex<crate::outage::Outage>,
     /// The contents and time of the last `lifecycle allocation buckets` line.
     buckets_logged: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    /// Whether free workers are waiting on capacity; see [`capacity_wait_note`].
+    capacity_wait: std::sync::Mutex<Option<CapacityWait>>,
     /// Halt-risk leave penalty notices already logged (#976).
     seniority_guard: std::sync::Mutex<SeniorityGuard>,
     /// How long each bound seat's worker has not hosted the committee
     /// session that counts it; a seat an epoch unhosted is not renewed.
     session_hosting: std::sync::Mutex<super::session_hosting::SessionHosting>,
     leave_decisions: super::leave_decisions::LeaveDecisions,
+    /// What the latest plan repeats, for its bounded log lines.
+    plan_repeats: std::sync::Mutex<super::plan_repeats::PlanRepeats>,
     pub allocation_reasons: super::allocation_reasons::AllocationReasons,
     /// This node's prover address (32 bytes, Poseidon hash of BLS pubkey).
     pub prover_address: Vec<u8>,
@@ -668,12 +698,18 @@ pub struct ProverLifecycle {
     /// under way, with the epoch they were last warned of in
     /// (`renewal_awaits_leave`).
     storage_skips_warned: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Operator leaves already reported as never landed, by filter and signed
+    /// frame (`report_unlanded_operator_leaves`).
+    unlanded_leaves_reported: std::sync::Mutex<std::collections::HashSet<(Vec<u8>, u64)>>,
     /// Seats the capacity shed spares while their storage renewal is under
     /// way, with the frame it first did (`report_storage_spared`).
     storage_shed_spared: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
     /// Capacity leaves the halt-risk shield kept, with the epoch they were
     /// last reported in (`report_capacity_shield`).
     capacity_shield_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
+    /// Silent seats a shield keeps renewing, with the epoch they were last
+    /// reported in (`report_silence_shield`).
+    silence_shield_reported: std::sync::Mutex<HashMap<Vec<u8>, u64>>,
     /// Per-filter "last frame we proposed Join on this filter."
     /// Worker-level `pending_filter_frame` already prevents re-using
     /// the same worker slot mid-flight, but it times out after 10
@@ -739,12 +775,14 @@ impl ProverLifecycle {
         Self {
             evaluation_lock: std::sync::Mutex::new(()),
             leave_decisions: super::leave_decisions::LeaveDecisions::default(),
+            plan_repeats: Default::default(),
             allocation_reasons: super::allocation_reasons::AllocationReasons::default(),
             prover_address,
             proof_in_progress: AtomicBool::new(false),
             // Evaluated once per GLOBAL frame: three failed frames in a row.
             evaluation_outage: std::sync::Mutex::new(crate::outage::Outage::begin_after(3)),
             buckets_logged: std::sync::Mutex::new(None),
+            capacity_wait: std::sync::Mutex::new(None),
             seniority_guard: Default::default(),
             session_hosting: Default::default(),
             initial_sync_complete: AtomicBool::new(false),
@@ -766,8 +804,10 @@ impl ProverLifecycle {
             renewal_skips_reported: std::sync::Mutex::new(HashMap::new()),
             renewal_storage: super::renewal_storage::RenewalStorageNotes::default(),
             storage_skips_warned: std::sync::Mutex::new(HashMap::new()),
+            unlanded_leaves_reported: Default::default(),
             storage_shed_spared: std::sync::Mutex::new(HashMap::new()),
             capacity_shield_reported: std::sync::Mutex::new(HashMap::new()),
+            silence_shield_reported: std::sync::Mutex::new(HashMap::new()),
             last_join_attempt: RwLock::new(HashMap::new()),
             shard_info_loaded: AtomicBool::new(false),
             submission_attempts,
@@ -1296,6 +1336,64 @@ impl ProverLifecycle {
         );
     }
 
+    /// What keeps the seat on `filter` renewing however silent its worker is
+    /// (`super::session_hosting`).
+    fn silence_shield(
+        &self,
+        filter: &[u8],
+        workers: &[crate::worker::WorkerInfo],
+        descriptors: &[ShardDescriptor],
+    ) -> Option<super::session_hosting::SilenceShield> {
+        use super::session_hosting::SilenceShield;
+        if workers
+            .iter()
+            .any(|w| w.manually_managed && w.filter == filter)
+        {
+            return Some(SilenceShield::Pinned);
+        }
+        if self.halt_state.any_halted() {
+            return Some(SilenceShield::CoverageHalt);
+        }
+        match descriptors.iter().find(|d| d.filter == filter) {
+            Some(d) if d.size > 0 && d.active_count > proposer::HALT_RISK_PROVER_COUNT + 1 => None,
+            Some(d) if d.size > 0 => Some(SilenceShield::HaltRisk {
+                active: d.active_count,
+            }),
+            _ => Some(SilenceShield::ShardUnknown),
+        }
+    }
+
+    /// Report a seat silent for an epoch that keeps renewing under `why`,
+    /// once per seat per epoch.
+    fn report_silence_shield(
+        &self,
+        frame_number: u64,
+        filter: &[u8],
+        run: &super::session_hosting::Unvoted,
+        why: super::session_hosting::SilenceShield,
+    ) {
+        use super::session_hosting::SilenceShield;
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let Ok(mut reported) = self.silence_shield_reported.lock() else {
+            return;
+        };
+        reported.retain(|_, last| *last >= epoch);
+        if reported.insert(filter.to_vec(), epoch).is_some() {
+            return;
+        }
+        let active = match why {
+            SilenceShield::HaltRisk { active } => active,
+            _ => 0,
+        };
+        tracing::warn!(frame = frame_number, epoch, filter = hex::encode(filter),
+            core_id = run.core_id, silent_since = run.since, silent_frames = run.silent_frames,
+            silent_secs = run.silent_ms / 1000, peer_votes = run.peer_votes, shield = why.describe(),
+            active, scope = "local", action = "check",
+            "seat renews although its worker has sent no vote for an epoch while the session's other \
+             members voted: withholding it would cost the network more. Check this worker: restart it \
+             if it stays silent (reported once per seat per epoch)");
+    }
+
     /// Report the leaves rejected at `frame_number` because the halt-risk
     /// shield kept them, although the node serves more seats than its worker
     /// count: the seat stays and renews, and the surplus leave does not
@@ -1447,6 +1545,48 @@ impl ProverLifecycle {
         ))
     }
 
+    /// Warn once about a leave an operator sent through this node that never
+    /// landed. The sender was told only that it went out, and the node that
+    /// drops it may be another: a bad signature or a seat that cannot leave
+    /// says so nowhere this operator reads. Checked for a few frames once the
+    /// registry has refreshed for the next epoch, for the leaves of the last one,
+    /// so a restart later on does not replay old ones.
+    fn report_unlanded_operator_leaves(
+        &self,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+        frame_number: u64,
+    ) {
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        let length = quil_types::consensus::epoch_length_frames();
+        let into = frame_number - epoch * length;
+        if epoch == 0
+            || !(OPERATOR_LEAVE_SETTLE_FRAMES..2 * OPERATOR_LEAVE_SETTLE_FRAMES).contains(&into)
+        {
+            return;
+        }
+        let (lo, hi) = ((epoch - 1) * length, epoch * length - 1);
+        let Ok(mut reported) = self.unlanded_leaves_reported.lock() else {
+            return;
+        };
+        reported.retain(|(_, signed)| *signed >= lo);
+        for (filter, signed) in self.allocation_reasons.operator_leaves_between(lo, hi) {
+            // Execution writes the frame including the leave, and a later
+            // reject or confirm keeps it.
+            let landed = allocations
+                .iter()
+                .any(|a| a.confirmation_filter == filter && a.leave_frame_number >= signed);
+            if landed || !reported.insert((filter.clone(), signed)) {
+                continue;
+            }
+            tracing::warn!(frame = frame_number, filter = %hex::encode(&filter), signed_frame = signed,
+                scope = "this prover",
+                action = "the leave had no effect: check the seat with qclient node prover status, \
+                          update qclient to this node's version, and send it again; report it if \
+                          this repeats",
+                "lifecycle: an operator's leave never landed, and no longer can");
+        }
+    }
+
     /// Release the published joins GLOBAL refuses, so their retry fences do
     /// not hold the allocation already on their filter off its confirm or
     /// leave. GLOBAL refuses a join of a filter while this prover's
@@ -1529,6 +1669,102 @@ impl ProverLifecycle {
                 _ => {}
             }
         }
+    }
+
+    /// Whether `action`, of the latest plan, was not in the one before it: a
+    /// repeat is covered by the plan's repeat lines.
+    pub fn action_is_new(&self, action: &LifecycleAction) -> bool {
+        self.plan_repeats
+            .lock()
+            .map_or(true, |repeats| repeats.is_new(action))
+    }
+
+    /// Whether the latest plan repeats work on any of `filters`.
+    pub(crate) fn plan_repeats_filters(&self, filters: &[Vec<u8>]) -> bool {
+        self.plan_repeats
+            .lock()
+            .is_ok_and(|repeats| repeats.repeats_filters(filters))
+    }
+
+    /// Log the transitions of a plan that repeats, with why it does, and say
+    /// whether the plan holds new work, so its own line is logged only then.
+    fn report_plan_repeats(
+        &self,
+        actions: &[LifecycleAction],
+        held: &[ShardDescriptor],
+        frame_number: u64,
+    ) -> bool {
+        use crate::outage::OutageEvent;
+        let Ok(mut repeats) = self.plan_repeats.lock() else {
+            return !actions.is_empty();
+        };
+        let seen = repeats.observe(actions, frame_number, std::time::Instant::now());
+        if seen.event.is_none() {
+            return seen.new_work;
+        }
+        // Every node refuses a leave confirm at this floor
+        // (`check_leave_confirm_halt_risk`).
+        let floor =
+            quil_execution::global_intrinsic::materialize::HALT_RISK_PROVER_COUNT as u64 + 1;
+        let at_floor: Vec<String> = actions
+            .iter()
+            .filter_map(|a| match a {
+                LifecycleAction::ConfirmLeaves { filters, .. } => Some(filters),
+                _ => None,
+            })
+            .flatten()
+            .filter(|f| {
+                held.iter()
+                    .any(|d| &d.filter == *f && d.active_count <= floor)
+            })
+            .map(hex::encode)
+            .collect();
+        let reason = if at_floor.is_empty() {
+            "the registry does not show its outcome yet; a send is retried at most every 30 frames"
+        } else {
+            "every node refuses a leave confirm while its shard keeps at most 4 active provers; \
+             the seat lapses at the epoch boundary and departs all the same"
+        };
+        let repeated = repeats.repeated();
+        match seen.event {
+            Some(OutageEvent::Began) => {
+                info!(
+                    frame = frame_number,
+                    ?repeated,
+                    ?at_floor,
+                    reason,
+                    scope = "local",
+                    action = "none needed unless it outlasts the epoch",
+                    "lifecycle: the plan repeats until the registry shows its outcome"
+                );
+            }
+            Some(OutageEvent::Continues { secs, failures }) => {
+                info!(
+                    frame = frame_number,
+                    since_frame = seen.since_frame,
+                    secs,
+                    plans = failures,
+                    ?repeated,
+                    ?at_floor,
+                    reason,
+                    scope = "local",
+                    action = "none needed unless it outlasts the epoch",
+                    "lifecycle: the plan still repeats"
+                );
+            }
+            Some(OutageEvent::Ended { secs, failures }) => {
+                info!(
+                    frame = frame_number,
+                    since_frame = seen.since_frame,
+                    secs,
+                    plans = failures,
+                    scope = "local",
+                    "lifecycle: the plan no longer repeats"
+                );
+            }
+            None => {}
+        }
+        seen.new_work
     }
 
     /// Go's `selectExcessPendingFilters` (`worker_allocator.go:1319-1385`)
@@ -1886,9 +2122,16 @@ impl ProverLifecycle {
             return Ok(Vec::new());
         }
 
-        let _evaluation = self.evaluation_lock.lock().map_err(|_| {
-            quil_types::error::QuilError::Internal("lifecycle evaluation lock poisoned".into())
-        })?;
+        // The message loop's GLOBAL frame path also evaluates, so this wait
+        // can hold that task.
+        let _evaluation = {
+            let _wait = quil_types::thread_probe::section(
+                quil_types::thread_probe::Section::LifecycleEvaluationLockWait,
+            );
+            self.evaluation_lock.lock().map_err(|_| {
+                quil_types::error::QuilError::Internal("lifecycle evaluation lock poisoned".into())
+            })?
+        };
 
         // Between frames, before any gate: a draining worker that holds no
         // seat and no join stops.
@@ -1915,19 +2158,24 @@ impl ProverLifecycle {
         }
 
         // Gather inputs
-        let registry_view = registry.get_lifecycle_view(&self.prover_address, frame_number)?;
+        let registry_view = {
+            let _read = quil_types::thread_probe::section(
+                quil_types::thread_probe::Section::LifecycleRegistryView,
+            );
+            registry.get_lifecycle_view(&self.prover_address, frame_number)?
+        };
         let summaries = registry_view.summaries;
         let prover_info = registry_view.prover;
         let membership = registry_view.members;
         let reward_rings = registry_view.reward_rings;
-        let workers = worker_manager.range_workers()?;
+        let workers = worker_read(|| worker_manager.range_workers())?;
         let worker_view = WorkerView::from_workers(workers.clone());
         // Allocations the node may hold. Not `workers.len()`: records left
         // from a larger configuration still finish their obligations but add
         // no capacity.
-        let worker_capacity = worker_manager.allocation_capacity()?;
+        let worker_capacity = worker_read(|| worker_manager.allocation_capacity())?;
         // Workers above the configured count, and the seats they hold.
-        let draining_cores = worker_manager.draining_workers();
+        let draining_cores = worker_read(|| worker_manager.draining_workers());
         let draining_filters: std::collections::HashSet<Vec<u8>> = workers
             .iter()
             .filter(|w| draining_cores.contains(&w.core_id) && !w.filter.is_empty())
@@ -1990,6 +2238,9 @@ impl ProverLifecycle {
             .as_ref()
             .map(|p| AllocationBuckets::from_allocations(&p.allocations, frame_number))
             .unwrap_or_default();
+        // Join candidates skip the seats still inside their rejoin window as
+        // well as those we hold; only the held ones count against capacity.
+        let join_excluded_filters = buckets.join_excluded();
         let joining_filters = buckets.joining;
         let active_filters = buckets.active;
         let leaving_filters = buckets.leaving;
@@ -2046,6 +2297,10 @@ impl ProverLifecycle {
                 "lifecycle allocation buckets"
             );
         }
+        self.report_unlanded_operator_leaves(
+            prover_info.as_ref().map_or(&[][..], |p| &p.allocations),
+            frame_number,
+        );
         // Seniority penalties (#976): warn about a fall of this prover's
         // committed seniority no executed penalty explains (the aggregated
         // per-epoch warning reports those), and tell the operator once when a
@@ -2205,13 +2460,13 @@ impl ProverLifecycle {
             proposal_grid_filters(&shards_store_filters, &current_summaries, &remote_shards);
         let mut proposal_descriptors = build_proposal_descriptors(
             &current_summaries,
-            &all_our_filters,
+            &join_excluded_filters,
             &shard_sizes_snapshot,
             &proposal_grid,
         );
         // Recently-rejected join backoff: drop any shard that rejected our
         // join within the last `JOIN_REJECT_BACKOFF_FRAMES`. A Rejected
-        // allocation is terminal so it's excluded from `all_our_filters`
+        // allocation is terminal so it's excluded from `join_excluded_filters`
         // and would otherwise reappear as a join candidate immediately —
         // producing the Joining↔Rejected oscillation that saturates
         // workers with never-confirming pending joins. Backing it off
@@ -2378,10 +2633,10 @@ impl ProverLifecycle {
                 .collect();
             // A worker stopped to reopen its store cannot host its seat.
             let executions = crate::worker_execution::with_held_stores(
-                worker_manager.worker_execution(),
+                worker_read(|| worker_manager.worker_execution()),
                 &bound,
             );
-            let unanswered = worker_manager.unanswered_workers();
+            let unanswered = worker_read(|| worker_manager.unanswered_workers());
             let now = crate::worker_execution::now_ms();
             let mut hosting = self
                 .session_hosting
@@ -2410,7 +2665,11 @@ impl ProverLifecycle {
                         }),
                     observed => observed,
                 };
-                if observed.seen_unable(seat) {
+                let observed = hosting.stopped_voting(filter, report, observed, now);
+                // A seat withheld for silence: its worker may be refused only
+                // for the seat, but the leave must stand, or the seat comes
+                // back silent.
+                if observed.seen_unable(seat) || hosting.withheld_for_silence(filter) {
                     unable_seats.insert(filter.clone());
                 }
                 if !membership_known {
@@ -2521,6 +2780,27 @@ impl ProverLifecycle {
             )
             .collect();
         let allow_proposals = !assignable_worker_ids.is_empty();
+        let note = self
+            .capacity_wait
+            .lock()
+            .map(|mut state| {
+                capacity_wait_note(
+                    &mut state,
+                    &CapacityCounts {
+                        frame: frame_number,
+                        free_workers: free_worker_ids.len(),
+                        assignable_workers: assignable_worker_ids.len(),
+                        occupied,
+                        unbound_held: unbound_held_count,
+                        worker_capacity,
+                    },
+                    std::time::Instant::now(),
+                )
+            })
+            .unwrap_or(None);
+        if let Some(note) = note {
+            log_capacity_wait(&note);
+        }
 
         // Go's canPropose (cooldown + readiness + halt). The
         // readiness snapshot was captured at the top of evaluate;
@@ -2643,8 +2923,8 @@ impl ProverLifecycle {
         // seen unable to host is given a settle period, not a fresh epoch.
         // Nor does a seat whose worker's host has been seen an epoch sending
         // no vote in that session while the other members vote (decided
-        // 2026-10-22): it renews once the worker votes or its engine or host
-        // restarts, and until then the worker takes no new seats.
+        // 2026-10-22): it renews once the worker votes or its engine restarts,
+        // or under a shield, and until then the worker takes no new seats.
         // Bound seats whose renewal has not landed and whose storage for it
         // is being encoded or is encoded: the capacity shed spares them
         // until the renewal lands or its grace frame passes.
@@ -2668,7 +2948,8 @@ impl ProverLifecycle {
                 .filter(|f| worker_bound_filters.contains(f))
                 .filter(|f| !self.renewal_awaits_leave(f, frame_number))
                 .filter(|f| {
-                    let hold = hosting.withhold(f, frame_number, epoch_frames);
+                    let shield = self.silence_shield(f, &workers, &decide_all_descriptors);
+                    let hold = hosting.withhold(f, frame_number, epoch_frames, shield);
                     // The seat's worker names this decision, not a failed
                     // confirmation, when its lapsed seat refuses its start.
                     if let Some(why) = hold.as_ref().and_then(super::session_hosting::RenewalWithheld::of) {
@@ -2679,6 +2960,10 @@ impl ProverLifecycle {
                     Some(Hold::Settling { until }) => {
                         settling.push((f.clone(), until));
                         false
+                    }
+                    Some(Hold::Shielded { run, why }) => {
+                        self.report_silence_shield(frame_number, f, &run, why);
+                        true
                     }
                     Some(Hold::Withheld(withheld)) => {
                         if withheld.first {
@@ -2701,7 +2986,7 @@ impl ProverLifecycle {
                                 scope = "local", action = "check",
                                 "seat renewal withheld: its worker hosts the committee session that counts this \
                                  prover but has sent no vote for an epoch while the other members voted; the seat \
-                                 renews once the worker votes or its engine or host restarts on it, otherwise it \
+                                 renews once the worker votes, its engine restarts on it or four epochs pass, otherwise it \
                                  lapses and is left. The worker takes no new seats until it votes, restarts while \
                                  still on this seat, or four epochs pass (see the worker's warning that this member \
                                  has sent no consensus vote)");
@@ -2946,7 +3231,7 @@ impl ProverLifecycle {
                 .iter()
                 .filter(|s| {
                     !s.filter.is_empty()
-                        && !all_our_filters.contains(&s.filter)
+                        && !join_excluded_filters.contains(&s.filter)
                         && shard_sizes_snapshot.get(&s.filter).copied().unwrap_or(0) == 0
                 })
                 .count();
@@ -3779,6 +4064,8 @@ impl ProverLifecycle {
             .filter(|(_, lf)| cur_epoch == quil_types::consensus::epoch_for_frame(*lf) + 1)
             .map(|(f, _)| f.clone())
             .collect();
+        // Leaves rejected for the seniority penalty, for their operator line.
+        let mut penalised_rejections: Vec<Vec<u8>> = Vec::new();
 
         if !ready_leave_filters.is_empty() {
             let manual_bound_filters = manually_managed_filters(&workers);
@@ -4100,6 +4387,7 @@ impl ProverLifecycle {
                 }
             }
             auto_reject.extend(penalty_withheld.iter().map(|(f, _)| f.clone()));
+            penalised_rejections.extend(penalty_withheld.iter().map(|(f, _)| f.clone()));
 
             auto_reject.extend(retained_rejections);
             let kept: Vec<&Vec<u8>> = capacity_shielded
@@ -4113,19 +4401,36 @@ impl ProverLifecycle {
                 serving,
                 worker_capacity,
             );
-            info!(
-                frame = frame_number,
-                score = auto_confirm.len(),
-                capacity = capacity_ready.len(),
-                halt_risk_swap = swap_confirm.len(),
-                orphan = orphan_ready.len(),
-                lapsed = lapsed_ready.len(),
-                manual = manual_ready.len(),
-                reject = auto_reject.len(),
-                penalty_withheld = penalty_withheld.len(),
-                confirmed_departure_workers = confirmed_departure_workers.len(),
-                "lifecycle leave decision causes"
-            );
+            let causes = [
+                auto_confirm.len(),
+                capacity_ready.len(),
+                swap_confirm.len(),
+                orphan_ready.len(),
+                lapsed_ready.len(),
+                manual_ready.len(),
+                auto_reject.len(),
+                penalty_withheld.len(),
+                confirmed_departure_workers.len(),
+            ];
+            if self
+                .plan_repeats
+                .lock()
+                .is_ok_and(|mut repeats| repeats.causes_changed(causes))
+            {
+                info!(
+                    frame = frame_number,
+                    score = auto_confirm.len(),
+                    capacity = capacity_ready.len(),
+                    halt_risk_swap = swap_confirm.len(),
+                    orphan = orphan_ready.len(),
+                    lapsed = lapsed_ready.len(),
+                    manual = manual_ready.len(),
+                    reject = auto_reject.len(),
+                    penalty_withheld = penalty_withheld.len(),
+                    confirmed_departure_workers = confirmed_departure_workers.len(),
+                    "lifecycle leave decision causes"
+                );
+            }
             if !lapsed_ready.is_empty() {
                 info!(frame = frame_number, lapsed = lapsed_ready.len(), scope = "local",
                     reason = "seat had missed its epoch renewal when its leave was proposed, and its rebound worker is seen unable to host its session",
@@ -4183,7 +4488,14 @@ impl ProverLifecycle {
                     .flatten()
                     .filter_map(|filter| leaving_filters.iter().find(|(f, _)| f == filter).cloned())
                     .collect();
-                self.leave_decisions.commit(&rejected, frame_number)?;
+                let new_rejections = self.leave_decisions.commit(&rejected, frame_number)?;
+                log_leave_rejections(
+                    frame_number,
+                    &new_rejections,
+                    &held_descriptors,
+                    self.strategy,
+                    &penalised_rejections,
+                );
                 for (filter, joining, reason) in proposal_reasons {
                     let accepted = actions.iter().any(|a| match a {
                         LifecycleAction::ProposeJoin { filters, .. } if joining => {
@@ -4217,7 +4529,8 @@ impl ProverLifecycle {
                         &held_descriptors,
                     );
                 }
-                if !actions.is_empty() && tracing::enabled!(tracing::Level::INFO) {
+                let new_work = self.report_plan_repeats(&actions, &held_descriptors, frame_number);
+                if new_work && tracing::enabled!(tracing::Level::INFO) {
                     let inputs: Vec<_> = held_descriptors.iter().map(|d| {
                         let summary = summaries.iter().find(|s| s.filter == d.filter);
                         let allocation = prover_info.as_ref().and_then(|p| p.allocations.iter()
@@ -4248,14 +4561,63 @@ impl ProverLifecycle {
     }
 }
 
+/// Why the node rejected a leave it decides itself: not a manual worker's.
+/// `held` is the seat's descriptor, absent while its current rank is unknown;
+/// `penalised` comes first, as it rejects the leave whatever else holds.
+fn leave_rejection_reason(
+    held: Option<&ShardDescriptor>,
+    strategy: Strategy,
+    penalised: bool,
+) -> &'static str {
+    if penalised {
+        return "seniority_penalty";
+    }
+    match held {
+        None => "unknown_rank",
+        Some(d) if strategy == Strategy::RewardGreedy && d.shards == 0 => "unknown_rank",
+        Some(d) if d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT => "halt_risk",
+        Some(_) => "no_better_shard",
+    }
+}
+
+/// One line per leave the node has just rejected: nothing else tells the
+/// operator, whose seat only reads Active again. `new_rejections` holds each
+/// leave once (`LeaveDecisions::commit`), so a leave logs once however often
+/// the plan repeats its rejection, including across a restart.
+fn log_leave_rejections(
+    frame_number: u64,
+    new_rejections: &[(Vec<u8>, u64)],
+    held: &[ShardDescriptor],
+    strategy: Strategy,
+    penalised: &[Vec<u8>],
+) {
+    for (filter, leave_frame) in new_rejections {
+        let reason = leave_rejection_reason(
+            held.iter().find(|d| &d.filter == filter),
+            strategy,
+            penalised.contains(filter),
+        );
+        let action = if reason == "seniority_penalty" {
+            "none needed: the node keeps the seat until its shard keeps more than 3 provers after \
+             it leaves; a manual worker's leave goes ahead and costs the halt-risk leave penalty"
+        } else {
+            "to leave anyway, switch the worker to manual (qclient node prover manage, Ctrl+O) \
+             and send the leave again"
+        };
+        info!(frame = frame_number, filter = %hex::encode(filter), leave_frame, reason, action,
+            scope = "local",
+            "lifecycle: rejecting a leave, not a manual worker's; the seat returns to Active");
+    }
+}
+
 /// Retire each draining worker that holds no seat and no pending join
 /// (`WorkerManager::retire_worker`); its store stays on disk.
 fn retire_drained_workers(worker_manager: &dyn WorkerManager) {
-    let draining = worker_manager.draining_workers();
+    let draining = worker_read(|| worker_manager.draining_workers());
     if draining.is_empty() {
         return;
     }
-    let Ok(workers) = worker_manager.range_workers() else {
+    let Ok(workers) = worker_read(|| worker_manager.range_workers()) else {
         return;
     };
     for worker in workers.iter().filter(|w| draining.contains(&w.core_id)) {
@@ -4268,6 +4630,16 @@ fn retire_drained_workers(worker_manager: &dyn WorkerManager) {
                 "draining worker could not be retired");
         }
     }
+}
+
+/// Run one worker manager read as a marked section: the node's managers
+/// answer each from their worker table's lock, so an evaluation can wait
+/// there (`draining_workers` and `allocation_capacity` default to a range
+/// read).
+fn worker_read<T>(read: impl FnOnce() -> T) -> T {
+    let _read =
+        quil_types::thread_probe::section(quil_types::thread_probe::Section::LifecycleWorkerRead);
+    read()
 }
 
 /// Preserve the exact scoring inputs, without treating a decoded ring zero
@@ -4655,6 +5027,138 @@ fn build_decide_descriptors(
         .collect()
 }
 
+/// How often a continuing capacity wait is logged again.
+const CAPACITY_WAIT_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A capacity wait in progress: free workers, but no join may be proposed.
+#[derive(Debug)]
+struct CapacityWait {
+    since_frame: u64,
+    since: std::time::Instant,
+    logged: std::time::Instant,
+}
+
+/// The counts one evaluation saw when deciding whether joins may be proposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CapacityCounts {
+    frame: u64,
+    free_workers: usize,
+    assignable_workers: usize,
+    occupied: usize,
+    unbound_held: usize,
+    worker_capacity: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CapacityWaitNote {
+    Began(CapacityWaitDetail),
+    Continues(CapacityWaitDetail, u64),
+    Ended {
+        secs: u64,
+        frames: u64,
+        outcome: &'static str,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CapacityWaitDetail {
+    counts: CapacityCounts,
+    reason: &'static str,
+    expected: &'static str,
+}
+
+/// Whether the planner has free workers yet may propose no join, and the line
+/// to log: one on entering the wait, a repeat every [`CAPACITY_WAIT_LOG_EVERY`]
+/// while it lasts, one when it ends.
+fn capacity_wait_note(
+    state: &mut Option<CapacityWait>,
+    c: &CapacityCounts,
+    now: std::time::Instant,
+) -> Option<CapacityWaitNote> {
+    let waiting = c.free_workers > 0 && c.assignable_workers == 0;
+    if !waiting {
+        return state.take().map(|w| CapacityWaitNote::Ended {
+            secs: now.duration_since(w.since).as_secs(),
+            frames: c.frame.saturating_sub(w.since_frame),
+            outcome: if c.free_workers == 0 {
+                "no worker is free any more"
+            } else {
+                "free workers may take joins again"
+            },
+        });
+    }
+    let (reason, expected) = if c.unbound_held >= c.free_workers {
+        (
+            "seats we hold with no worker bound to them take every free worker",
+            "the free workers are bound to those seats; joins resume once a held seat ends \
+             or the worker count rises",
+        )
+    } else {
+        (
+            "every worker slot is occupied by a seat we hold or a worker's bound shard",
+            "joins resume once a held seat ends or the worker count rises",
+        )
+    };
+    let detail = CapacityWaitDetail {
+        counts: *c,
+        reason,
+        expected,
+    };
+    match state {
+        None => {
+            *state = Some(CapacityWait {
+                since_frame: c.frame,
+                since: now,
+                logged: now,
+            });
+            Some(CapacityWaitNote::Began(detail))
+        }
+        Some(w) if now.duration_since(w.logged) >= CAPACITY_WAIT_LOG_EVERY => {
+            w.logged = now;
+            Some(CapacityWaitNote::Continues(
+                detail,
+                now.duration_since(w.since).as_secs(),
+            ))
+        }
+        Some(_) => None,
+    }
+}
+
+fn log_capacity_wait(note: &CapacityWaitNote) {
+    let (d, waited) = match note {
+        CapacityWaitNote::Began(d) => (d, 0),
+        CapacityWaitNote::Continues(d, secs) => (d, *secs),
+        CapacityWaitNote::Ended {
+            secs,
+            frames,
+            outcome,
+        } => {
+            info!(
+                secs,
+                frames,
+                outcome,
+                scope = "local",
+                "free workers no longer wait for capacity"
+            );
+            return;
+        }
+    };
+    let c = &d.counts;
+    info!(
+        frame = c.frame,
+        free_workers = c.free_workers,
+        occupied = c.occupied,
+        unbound_held = c.unbound_held,
+        worker_capacity = c.worker_capacity,
+        waited_secs = waited,
+        scope = "local",
+        action = "wait",
+        reason = d.reason,
+        expected = d.expected,
+        "no join is proposed: free workers wait for capacity"
+    );
+}
+
 /// How often an unchanged `lifecycle allocation buckets` line repeats.
 const BUCKETS_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -4808,17 +5312,21 @@ mod buckets_tests {
             quil_types::consensus::EffectiveStatus::ExpiredJoining
         );
 
-        // Inside the chain's window: owned, so the proposer leaves it alone.
+        // Inside the chain's window: no join candidate, so the proposer
+        // leaves it alone.
         assert!(
             expired_at < join_frame + window,
             "fixture must sit inside the window"
         );
         let blocked = AllocationBuckets::from_allocations(&[allocation.clone()], expired_at);
         assert_eq!(
-            blocked.all_ours.len(),
-            1,
-            "an expired join the chain still blocks stays owned"
+            blocked.join_excluded(),
+            vec![vec![0x09]],
+            "an expired join the chain still blocks is no join candidate"
         );
+        assert_eq!(blocked.rejoin_blocked, vec![vec![0x09]]);
+        // ...nor a seat we hold: no worker serves it, so it takes no slot.
+        assert!(blocked.all_ours.is_empty());
         // ...but it is not an ACTION: no re-confirm, no Leave for something the
         // chain already treats as gone.
         assert!(blocked.joining.is_empty());
@@ -4829,7 +5337,7 @@ mod buckets_tests {
         // candidate again.
         let free = AllocationBuckets::from_allocations(&[allocation], join_frame + window);
         assert!(
-            free.all_ours.is_empty(),
+            free.join_excluded().is_empty(),
             "past the window the shard is re-joinable"
         );
 
@@ -4880,7 +5388,7 @@ mod buckets_tests {
         .into_iter()
         .collect();
 
-        let ours = AllocationBuckets::from_allocations(&[blocked.clone()], at).all_ours;
+        let ours = AllocationBuckets::from_allocations(&[blocked.clone()], at).join_excluded();
         let descriptors = super::build_proposal_descriptors(&summaries, &ours, &shard_sizes, &[]);
         assert!(
             descriptors.iter().all(|d| d.filter != blocked_filter),
@@ -4906,7 +5414,7 @@ mod buckets_tests {
         // Past the window the network accepts a re-join, so it is a candidate
         // again and nothing is permanently forfeited.
         let later = join_frame + window;
-        let ours_later = AllocationBuckets::from_allocations(&[blocked], later).all_ours;
+        let ours_later = AllocationBuckets::from_allocations(&[blocked], later).join_excluded();
         assert!(ours_later.is_empty());
         let reopened =
             super::build_proposal_descriptors(&summaries, &ours_later, &shard_sizes, &[]);
@@ -5286,6 +5794,99 @@ mod buckets_tests {
         assert!(
             b.expired_epoch.is_empty(),
             "global empty-filter alloc must never re-confirm",
+        );
+    }
+
+    fn capacity_counts(
+        frame: u64,
+        free_workers: usize,
+        assignable_workers: usize,
+        unbound_held: usize,
+    ) -> CapacityCounts {
+        CapacityCounts {
+            frame,
+            free_workers,
+            assignable_workers,
+            occupied: 2,
+            unbound_held,
+            worker_capacity: 2,
+        }
+    }
+
+    /// Seats we hold that no worker serves yet take every free worker, so no
+    /// join may be proposed. The planner says so once with the counts, repeats
+    /// on a bound, and logs the end when the workers are bound to the seats.
+    #[test]
+    fn a_free_worker_owed_to_a_held_seat_is_logged_as_a_capacity_wait() {
+        let start = std::time::Instant::now();
+        let later = |s| start + std::time::Duration::from_secs(s);
+        let mut state = None;
+        let Some(CapacityWaitNote::Began(d)) =
+            capacity_wait_note(&mut state, &capacity_counts(100, 1, 0, 1), start)
+        else {
+            panic!("entering the wait logs");
+        };
+        assert_eq!(d.counts, capacity_counts(100, 1, 0, 1));
+        assert!(d.reason.contains("no worker bound"), "{}", d.reason);
+        assert!(d.expected.contains("joins resume"), "{}", d.expected);
+        assert_eq!(
+            capacity_wait_note(&mut state, &capacity_counts(105, 1, 0, 1), later(599)),
+            None,
+            "quiet inside the interval"
+        );
+        assert!(matches!(
+            capacity_wait_note(&mut state, &capacity_counts(160, 1, 0, 1), later(600)),
+            Some(CapacityWaitNote::Continues(_, 600))
+        ));
+        assert_eq!(
+            capacity_wait_note(&mut state, &capacity_counts(170, 0, 0, 0), later(660)),
+            Some(CapacityWaitNote::Ended {
+                secs: 660,
+                frames: 70,
+                outcome: "no worker is free any more",
+            })
+        );
+        assert!(state.is_none());
+        assert_eq!(
+            capacity_wait_note(&mut state, &capacity_counts(180, 0, 0, 0), later(670)),
+            None,
+            "nothing more once the wait is over"
+        );
+    }
+
+    /// At the worker count with every seat served, a free worker (one above
+    /// the count) gets no join: the slots are full. The line names that, and
+    /// its end says joins may be proposed again.
+    #[test]
+    fn a_free_worker_at_a_full_worker_count_is_logged_until_a_slot_opens() {
+        let start = std::time::Instant::now();
+        let mut state = None;
+        let Some(CapacityWaitNote::Began(d)) =
+            capacity_wait_note(&mut state, &capacity_counts(100, 1, 0, 0), start)
+        else {
+            panic!("entering the wait logs");
+        };
+        assert!(d.reason.contains("every worker slot"), "{}", d.reason);
+        assert_eq!(
+            capacity_wait_note(
+                &mut state,
+                &capacity_counts(130, 1, 1, 0),
+                start + std::time::Duration::from_secs(300)
+            ),
+            Some(CapacityWaitNote::Ended {
+                secs: 300,
+                frames: 30,
+                outcome: "free workers may take joins again",
+            })
+        );
+        assert_eq!(
+            capacity_wait_note(
+                &mut state,
+                &capacity_counts(0, 0, 0, 0),
+                start + std::time::Duration::from_secs(310)
+            ),
+            None,
+            "a node with nothing free logs nothing"
         );
     }
 
@@ -5700,6 +6301,73 @@ mod proposal_loop_tests {
         assert_eq!(missing.ring_source, "summary_tail");
     }
 
+    /// A leave confirm planned frame after frame logs its plan, action
+    /// decision and repeat once, with the reason, and its end, not per frame.
+    #[test]
+    fn a_repeated_leave_confirm_logs_once_with_its_reason() {
+        let held = filter_bytes(0xA1);
+        let address = vec![0xCD; 32];
+        for (active, reason) in [
+            (2, "keeps at most 4 active provers"),
+            (53, "does not show its outcome yet"),
+        ] {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(manual_worker(1, held.clone()));
+            let reg = Arc::new(ConfigurableRegistry::new());
+            let mut leaving = alloc(held.clone(), ProverStatus::Leaving, 10);
+            leaving.leave_frame_number = 10;
+            reg.set_prover(prover(address.clone(), vec![leaving]));
+            reg.set_summaries(vec![shard_summary(held.clone(), active)]);
+            let lc = make_lifecycle(
+                address.clone(),
+                wm.clone() as Arc<dyn WorkerManager>,
+                reg.clone() as Arc<dyn ProverRegistry>,
+            );
+            let mut logged = String::new();
+            for frame in 720..730 {
+                lc.set_prover_root_verified_frame(frame);
+                let (actions, lines) = evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref());
+                assert!(
+                    actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))),
+                    "{actions:?}"
+                );
+                let planned = actions
+                    .iter()
+                    .find(|a| matches!(a, LifecycleAction::ConfirmLeaves { .. }))
+                    .unwrap();
+                assert_eq!(lc.action_is_new(planned), frame == 720, "{frame}");
+                assert_eq!(
+                    lc.plan_repeats_filters(std::slice::from_ref(&held)),
+                    frame > 720
+                );
+                logged.push_str(&lines);
+            }
+            let count = |text: &str| logged.matches(text).count();
+            assert_eq!(count("lifecycle plan prepared"), 1, "{logged}");
+            assert_eq!(count("lifecycle leave decision causes"), 1, "{logged}");
+            assert_eq!(count("the plan repeats until"), 1, "{logged}");
+            let began = logged
+                .lines()
+                .find(|l| l.contains("the plan repeats until"))
+                .unwrap();
+            assert!(began.contains(" INFO "), "{began}");
+            assert!(began.contains(reason), "{reason} in {began}");
+            assert!(began.contains(&hex::encode(&held)), "{began}");
+
+            reg.set_prover(prover(
+                address.clone(),
+                vec![alloc(held.clone(), ProverStatus::Active, 10)],
+            ));
+            lc.set_prover_root_verified_frame(730);
+            let (_, lines) = evaluate_logged(&lc, 730, reg.as_ref(), wm.as_ref());
+            assert_eq!(
+                lines.matches("the plan no longer repeats").count(),
+                1,
+                "{lines}"
+            );
+        }
+    }
+
     /// A worker manager whose workers cannot be listed, so every evaluation
     /// fails once past its readiness gates.
     struct UnlistableWorkers;
@@ -5722,6 +6390,128 @@ mod proposal_loop_tests {
         fn respawn_worker(&self, _: u32, _: &[u8]) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// A worker manager whose workers cannot be listed until `gate` is free.
+    /// It keeps the default `draining_workers`, which lists the workers, as
+    /// the node's managers do.
+    struct GatedWorkers {
+        gate: std::sync::Mutex<()>,
+    }
+
+    impl WorkerManager for GatedWorkers {
+        fn set_worker_filter(&self, _: u32, _: &[u8], _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn deallocate_worker(&self, _: u32) -> Result<()> {
+            Ok(())
+        }
+        fn check_workers_connected(&self) -> Result<Vec<u32>> {
+            Ok(Vec::new())
+        }
+        fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
+            let _wait = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            Err(quil_types::error::QuilError::Store("unreadable".into()))
+        }
+        fn respawn_worker(&self, _: u32, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run one evaluation on a thread carrying a master-task probe while the
+    /// caller holds what it waits on. Returns the section the watchdog would
+    /// name once it shows `expected` (else the last seen, after 10 s) and the
+    /// evaluation's thread; the caller releases the wait, joins, then
+    /// asserts, so a failed assertion poisons nothing the thread waits on.
+    fn section_named_while_blocked(
+        lc: Arc<ProverLifecycle>,
+        wm: Arc<dyn WorkerManager>,
+        reg: Arc<TestProverRegistry>,
+        expected: &str,
+    ) -> (Option<&'static str>, std::thread::JoinHandle<()>) {
+        use quil_types::thread_probe::{install, ThreadProbe};
+        lc.set_prover_root_verified_frame(100);
+        let probe = ThreadProbe::new();
+        let on_thread = probe.clone();
+        let worker = std::thread::spawn(move || {
+            let _installed = install(on_thread);
+            let _ = lc.evaluate(100, 50_000, reg.as_ref(), wm.as_ref());
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = None;
+        while std::time::Instant::now() < deadline {
+            seen = probe.snapshot().section.map(|m| m.section.label());
+            if seen == Some(expected) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (seen, worker)
+    }
+
+    /// An evaluation waiting for the evaluation lock another thread holds is
+    /// marked as that wait, not as the unmarked evaluation around it.
+    #[test]
+    fn an_evaluation_waiting_for_its_lock_is_marked() {
+        let address = vec![0xCD; 32];
+        let wm: Arc<dyn WorkerManager> = Arc::new(UnlistableWorkers);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), Vec::new()));
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let expected = "prover lifecycle evaluation lock wait";
+        let held = lc.evaluation_lock.lock().unwrap();
+        let (seen, worker) = section_named_while_blocked(lc.clone(), wm, reg, expected);
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(
+            seen,
+            Some(expected),
+            "the blocked evaluation names its wait"
+        );
+    }
+
+    /// An evaluation waiting for the registry's lifecycle view is marked.
+    #[test]
+    fn an_evaluation_waiting_for_the_registry_view_is_marked() {
+        let address = vec![0xCD; 32];
+        let wm: Arc<dyn WorkerManager> = Arc::new(UnlistableWorkers);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), Vec::new()));
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let expected = "prover registry lifecycle view";
+        let held = reg.hold_provers();
+        let (seen, worker) = section_named_while_blocked(lc, wm, reg.clone(), expected);
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(
+            seen,
+            Some(expected),
+            "the blocked evaluation names its wait"
+        );
+    }
+
+    /// An evaluation waiting for the worker manager is marked. Its first
+    /// read is the drained-worker retirement's, before any gate.
+    #[test]
+    fn an_evaluation_waiting_for_the_worker_read_is_marked() {
+        let address = vec![0xCD; 32];
+        let gated = Arc::new(GatedWorkers {
+            gate: std::sync::Mutex::new(()),
+        });
+        let wm: Arc<dyn WorkerManager> = gated.clone();
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), Vec::new()));
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        let expected = "worker manager read";
+        let held = gated.gate.lock().unwrap();
+        let (seen, worker) = section_named_while_blocked(lc, wm, reg, expected);
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(
+            seen,
+            Some(expected),
+            "the blocked evaluation names its wait"
+        );
     }
 
     /// Evaluations that keep failing decide no joins, confirms or leaves; the
@@ -6436,7 +7226,7 @@ mod proposal_loop_tests {
                 hosting.observe_votes(frame, epoch, &lapsed, 1, Seat::Member, &silent, instance);
             }
             assert!(matches!(
-                hosting.withhold(&lapsed, epoch, epoch),
+                hosting.withhold(&lapsed, epoch, epoch, None),
                 Some(Hold::Unvoted(_))
             ));
         };
@@ -6573,6 +7363,230 @@ mod proposal_loop_tests {
         }
         commit(2);
         global
+    }
+
+    /// The leave of a seat withheld for silence stands although its worker
+    /// could host: the score rule rejected it, and the seat came back silent
+    /// every four epochs. Without the withholding the same leave is rejected.
+    #[test]
+    fn a_silent_seats_leave_is_confirmed_though_its_worker_could_host() {
+        use crate::provers::session_hosting::{epoch_ms, Hosting, Instance, Seat};
+        use quil_types::proto::node::WorkerExecution;
+
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let better_held = filter_bytes(0xA2);
+        let available = filter_bytes(0xA3);
+        for withheld in [false, true] {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, held.clone()));
+            wm.add(allocated_worker(2, better_held.clone()));
+            wm.set_execution(
+                1,
+                &held,
+                WorkerExecution {
+                    state: "blocked".into(),
+                    blocker: "committee admission unavailable".into(),
+                    observed_unix_ms: crate::worker_execution::now_ms(),
+                    ..Default::default()
+                },
+            );
+            let reg = Arc::new(ConfigurableRegistry::new());
+            let mut leaving = alloc(held.clone(), ProverStatus::Leaving, 10);
+            leaving.ring = 1;
+            leaving.leave_frame_number = 730;
+            leaving.epoch = 0;
+            reg.set_prover(prover(
+                address.clone(),
+                vec![
+                    leaving,
+                    alloc(better_held.clone(), ProverStatus::Active, 10),
+                ],
+            ));
+            reg.set_summaries(vec![
+                shard_summary(held.clone(), 53),
+                shard_summary(better_held.clone(), 59),
+                shard_summary(available.clone(), 8),
+            ]);
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.set_remote_shard_metrics(HashMap::from([
+                (held.clone(), (1_000_000, 1)),
+                (better_held.clone(), (100_000_000, 1)),
+                (available.clone(), (100_000, 1)),
+            ]));
+            if withheld {
+                let epoch = quil_types::consensus::epoch_length_frames();
+                let mut hosting = lc.session_hosting.lock().unwrap();
+                let silent = Hosting::Silent {
+                    peer_votes: 7,
+                    silent_ms: epoch_ms(epoch),
+                };
+                for frame in (0..=epoch).step_by(60) {
+                    hosting.observe_votes(
+                        frame,
+                        epoch,
+                        &held,
+                        1,
+                        Seat::Member,
+                        &silent,
+                        Instance::default(),
+                    );
+                }
+                assert!(hosting.withhold(&held, epoch, epoch, None).is_some());
+            }
+            lc.set_prover_root_verified_frame(1440);
+            let actions = lc
+                .evaluate(1440, 50_000, reg.as_ref(), wm.as_ref())
+                .unwrap();
+            let rejects = actions.iter().any(|a| {
+                matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held))
+            });
+            let confirms = actions.iter().any(|a| {
+                matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))
+            });
+            assert_eq!(
+                (confirms, rejects),
+                (withheld, !withheld),
+                "withheld {withheld}: {actions:?}"
+            );
+        }
+    }
+
+    /// A seat of this prover and another, whose worker's hosts have sent no
+    /// vote since each session's start, 15 frames after each boundary,
+    /// evaluated through to the second boundary, GLOBAL frame 1440: no one
+    /// host lasted an epoch by then, the silence has. Whether it renewed
+    /// there, with the lifecycle and an evaluation for later frames.
+    fn silent_across_hosts_to_the_second_boundary(
+        pinned: bool,
+        halted: bool,
+        active: u32,
+    ) -> (
+        bool,
+        Arc<ProverLifecycle>,
+        Box<dyn Fn(&ProverLifecycle, u64) -> bool>,
+    ) {
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::node::WorkerExecution;
+
+        let signers: Vec<_> = (0..2)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
+        let [local, other] = [0, 1].map(|i| signers[i].public_key().to_vec());
+        let address = vec![0xCD; 32];
+        let held = vec![0xB5; 32];
+        let authority = session_authority(&[(&held, vec![local.clone(), other])]);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(ProverInfo {
+            public_key: local,
+            ..prover(
+                address.clone(),
+                vec![ProverAllocationInfo {
+                    // Due from the second boundary.
+                    epoch: 2,
+                    ..alloc(held.clone(), ProverStatus::Active, 10)
+                }],
+            )
+        });
+        reg.set_summaries(vec![shard_summary(held.clone(), active)]);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(crate::worker::WorkerInfo {
+            manually_managed: pinned,
+            ..allocated_worker(1, held.clone())
+        });
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        lc.allocator.set_session_authority(authority);
+        let evaluate = move |lc: &ProverLifecycle, frame: u64| {
+            let frame_ms = crate::provers::session_hosting::epoch_ms(720) / 720;
+            let started = if frame < 735 { 15 } else { 735 };
+            let now = crate::worker_execution::now_ms();
+            wm.set_execution(
+                1,
+                &held,
+                WorkerExecution {
+                    state: "serving".into(),
+                    observed_unix_ms: now,
+                    own_votes: Some(0),
+                    peer_votes: 90,
+                    last_peer_vote_unix_ms: now,
+                    silent_ms: (frame - started) * frame_ms,
+                    host_started_unix_ms: started,
+                    engine_started_unix_ms: 1,
+                    ..Default::default()
+                },
+            );
+            lc.set_prover_root_verified_frame(frame);
+            let actions = lc
+                .evaluate(frame, 50_000, reg.as_ref(), wm.as_ref())
+                .unwrap();
+            actions.iter().any(|a| {
+                matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held))
+            })
+        };
+        for frame in (15..720).step_by(60).chain((735..1440).step_by(60)) {
+            evaluate(&lc, frame);
+        }
+        if halted {
+            lc.halt_state().mark_halted(vec![0xB5; 32]);
+        }
+        (evaluate(&lc, 1440), lc, Box::new(evaluate))
+    }
+
+    /// Silent across the hosts of its rotating sessions, a seat is withheld
+    /// at the boundary where that has lasted an epoch, and its worker takes
+    /// no new seats, also just above the halt-risk count.
+    #[test]
+    fn a_seat_silent_across_its_session_hosts_is_withheld() {
+        use crate::provers::session_hosting::{renewal_withheld, RenewalWithheld};
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let (renewed, lc, _) = silent_across_hosts_to_the_second_boundary(false, false, 50);
+        assert!(!renewed);
+        assert_eq!(
+            renewal_withheld(&[0xB5; 32], 1440),
+            Some(RenewalWithheld::Unvoted)
+        );
+        assert_eq!(
+            lc.session_hosting.lock().unwrap().held_back(),
+            std::collections::HashSet::from([1])
+        );
+    }
+
+    #[test]
+    fn a_silent_seat_just_above_the_halt_risk_count_is_withheld() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        assert!(!silent_across_hosts_to_the_second_boundary(false, false, 5).0);
+    }
+
+    #[test]
+    fn a_silent_seat_at_the_halt_risk_count_renews() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        assert!(silent_across_hosts_to_the_second_boundary(false, false, 4).0);
+    }
+
+    #[test]
+    fn a_pinned_silent_seat_renews() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        assert!(silent_across_hosts_to_the_second_boundary(true, false, 50).0);
+    }
+
+    #[test]
+    fn a_silent_seat_renews_during_a_coverage_halt() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        assert!(silent_across_hosts_to_the_second_boundary(false, true, 50).0);
+    }
+
+    /// A seat already withheld for silence renews once a shield applies, and
+    /// its worker takes seats again.
+    #[test]
+    fn a_withheld_silent_seat_renews_once_a_coverage_halt_begins() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let (renewed, lc, evaluate) = silent_across_hosts_to_the_second_boundary(false, false, 50);
+        assert!(!renewed);
+        assert!(!evaluate(&lc, 1441), "still withheld");
+        lc.halt_state().mark_halted(vec![0xB5; 32]);
+        assert!(evaluate(&lc, 1442));
+        assert!(lc.session_hosting.lock().unwrap().held_back().is_empty());
     }
 
     /// A seat whose renewal was withheld because its worker cannot host
@@ -9372,6 +10386,83 @@ mod proposal_loop_tests {
         );
     }
 
+    /// A leave an operator sent that never reached the registry is reported
+    /// once, after the next epoch's refresh, and not before; one that landed or
+    /// the planner's own is not, and old records do not speak after a restart.
+    #[test]
+    fn an_operator_leave_that_never_landed_warns_once() {
+        let line = "an operator's leave never landed";
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, held.clone()));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(
+            address.clone(),
+            vec![alloc(held.clone(), ProverStatus::Active, 10)],
+        ));
+        reg.set_summaries(vec![shard_summary(held.clone(), 53)]);
+        let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        lc.allocation_reasons
+            .record(std::slice::from_ref(&held), false, 100, "M")
+            .unwrap();
+        let logged_at = |lc: &ProverLifecycle, frame| {
+            lc.set_prover_root_verified_frame(frame);
+            evaluate_logged(lc, frame, reg.as_ref(), wm.as_ref()).1
+        };
+        // Until the registry has refreshed for the boundary it may not show one.
+        let length = quil_types::consensus::epoch_length_frames();
+        let last_chance = length + OPERATOR_LEAVE_SETTLE_FRAMES - 1;
+        let logged = logged_at(&lc, 200);
+        assert_eq!(logged.matches(line).count(), 0, "same epoch: {logged}");
+        let logged = logged_at(&lc, last_chance);
+        assert_eq!(logged.matches(line).count(), 0, "too early: {logged}");
+        let logged = logged_at(&lc, last_chance + 1);
+        assert_eq!(logged.matches(line).count(), 1, "{logged}");
+        let at = logged.lines().find(|l| l.contains(line)).unwrap();
+        for text in [
+            " WARN ".to_string(),
+            format!("filter={}", hex::encode(&held)),
+            "signed_frame=100".to_string(),
+            "update qclient".to_string(),
+        ] {
+            assert!(at.contains(&text), "{text} in {at}");
+        }
+        let logged = logged_at(&lc, last_chance + 2);
+        assert_eq!(logged.matches(line).count(), 0, "once: {logged}");
+
+        // Past the bounded span a fresh start says nothing of it.
+        let restarted = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        restarted
+            .allocation_reasons
+            .record(std::slice::from_ref(&held), false, 100, "M")
+            .unwrap();
+        let far = length + 2 * OPERATOR_LEAVE_SETTLE_FRAMES;
+        let logged = logged_at(&restarted, far);
+        assert_eq!(logged.matches(line).count(), 0, "old record: {logged}");
+
+        // Landed, even if later rejected: the seat keeps the frame.
+        let landed = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+        landed
+            .allocation_reasons
+            .record(std::slice::from_ref(&held), false, 100, "M")
+            .unwrap();
+        let mut seat = alloc(held.clone(), ProverStatus::Active, 10);
+        seat.leave_frame_number = 103;
+        reg.set_prover(prover(address.clone(), vec![seat]));
+        let logged = logged_at(&landed, last_chance + 1);
+        assert_eq!(logged.matches(line).count(), 0, "landed: {logged}");
+
+        // The planner's own leave has its own reason and its own lines.
+        let planner = make_lifecycle(address, wm.clone(), reg.clone());
+        planner
+            .allocation_reasons
+            .record(std::slice::from_ref(&held), false, 100, "$")
+            .unwrap();
+        let logged = logged_at(&planner, last_chance + 1);
+        assert_eq!(logged.matches(line).count(), 0, "planner: {logged}");
+    }
+
     #[test]
     fn rejection_stays_fixed_after_archive_refresh_and_lifecycle_restart() {
         let address = vec![0xCD; 32];
@@ -9837,6 +10928,65 @@ mod proposal_loop_tests {
             "5 idle workers less 3 allocations already owed a slot = 2; got \
              {} in {:?}",
             proposed, actions
+        );
+    }
+
+    /// A seat inside its rejoin window blocks a join of its own shard and
+    /// nothing else. With short epochs it reads expired while the chain still
+    /// refuses a re-join; no worker serves it, so a node at its worker count
+    /// with only that seat still has a free worker and must spend it on
+    /// another shard. Counting the seat against capacity left the worker idle
+    /// until the window passed. The blocked shard is at halt risk, so it would
+    /// be picked first were it a candidate.
+    #[test]
+    fn a_rejoin_window_seat_blocks_only_its_own_shard() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        struct RestoreEpoch(u64);
+        impl Drop for RestoreEpoch {
+            fn drop(&mut self) {
+                quil_types::consensus::set_epoch_length_frames(self.0);
+            }
+        }
+        let _restore = RestoreEpoch(quil_types::consensus::epoch_length_frames());
+        quil_types::consensus::set_epoch_length_frames(60);
+        let window = quil_execution::global_intrinsic::verify::REJOIN_WINDOW_FRAMES;
+
+        let address = vec![0xCDu8; 32];
+        let blocked = filter_bytes(0xB1);
+        let open = filter_bytes(0xB2);
+        let joined = 100u64;
+        // Two epochs on: expired by this node's reckoning, still inside the
+        // chain's window.
+        let at = 60 * (quil_types::consensus::epoch_for_frame(joined) + 2);
+        assert!(at < joined + window, "fixture must sit inside the window");
+        let seat = alloc(blocked.clone(), ProverStatus::Joining, joined);
+        assert_eq!(
+            seat.effective_status(at),
+            quil_types::consensus::EffectiveStatus::ExpiredJoining
+        );
+
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), vec![seat]));
+        reg.set_summaries(vec![
+            shard_summary(blocked.clone(), 1),
+            shard_summary(open.clone(), 10),
+        ]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        assert_eq!(wm.allocation_capacity().unwrap(), 1, "at its worker count");
+        lifecycle.set_prover_root_verified_frame(at);
+        let actions = lifecycle
+            .evaluate(at, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert_eq!(
+            proposed_join_filters(&actions),
+            vec![open],
+            "the free worker joins the other shard, never the blocked one: {actions:?}"
         );
     }
 
@@ -10490,6 +11640,158 @@ mod proposal_loop_tests {
         });
         let bytes = lines.0.lock().unwrap().clone();
         (actions, String::from_utf8(bytes).unwrap())
+    }
+
+    /// The operator lines one evaluation logged for rejected leaves.
+    fn leave_rejection_lines(logged: &str) -> Vec<&str> {
+        logged
+            .lines()
+            .filter(|line| line.contains("lifecycle: rejecting a leave"))
+            .collect()
+    }
+
+    /// A seat Leaving since `leave_frame` on a worker, in a shard of `active`
+    /// provers, with no free shard to go to, decided at frame 720.
+    fn pending_leave(
+        worker: WorkerInfo,
+        active: u32,
+        leave_frame: u64,
+        known_rank: bool,
+    ) -> (
+        Arc<ConfigurableWorkerManager>,
+        Arc<ConfigurableRegistry>,
+        Arc<ProverLifecycle>,
+    ) {
+        let address = vec![0xCD; 32];
+        let held = filter_bytes(0xA1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(worker);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        let mut leaving = alloc(held.clone(), ProverStatus::Leaving, 10);
+        leaving.leave_frame_number = leave_frame;
+        reg.set_prover(prover(address.clone(), vec![leaving]));
+        reg.set_summaries(vec![shard_summary(held.clone(), active)]);
+        let lc = make_lifecycle(address, wm.clone(), reg.clone());
+        // `make_lifecycle` seeds every summary's size with one shard, a known
+        // rank; none reads as the reward inputs not having arrived.
+        if !known_rank {
+            lc.set_local_shard_metrics(HashMap::from([(held, (1_000_000, 0))]));
+        }
+        lc.set_prover_root_verified_frame(720);
+        (wm, reg, lc)
+    }
+
+    /// A leave the score rule rejects says so once, at info, with its filter,
+    /// its frame, the reason and the way out; a repeat of the same rejection
+    /// says nothing and a later leave speaks again.
+    #[test]
+    fn a_rejected_leave_logs_one_line_per_leave() {
+        let held = filter_bytes(0xA1);
+        let (wm, reg, lc) = pending_leave(allocated_worker(1, held.clone()), 53, 10, true);
+
+        let (actions, logged) = evaluate_logged(&lc, 720, reg.as_ref(), wm.as_ref());
+        assert!(
+            actions.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held))),
+            "{actions:?}"
+        );
+        let lines = leave_rejection_lines(&logged);
+        assert_eq!(lines.len(), 1, "{logged}");
+        for text in [
+            " INFO ",
+            &format!("filter={}", hex::encode(&held)),
+            "leave_frame=10",
+            "no_better_shard",
+            "switch the worker to manual",
+        ] {
+            assert!(lines[0].contains(text), "{text} in {}", lines[0]);
+        }
+
+        for frame in [721, 722] {
+            lc.set_prover_root_verified_frame(frame);
+            let (actions, logged) = evaluate_logged(&lc, frame, reg.as_ref(), wm.as_ref());
+            assert!(
+                actions.iter().any(|a| matches!(a, LifecycleAction::RejectLeaves { filters, .. } if filters.contains(&held))),
+                "the rejection repeats until it lands: {actions:?}"
+            );
+            assert!(leave_rejection_lines(&logged).is_empty(), "{logged}");
+        }
+
+        let mut again = alloc(held.clone(), ProverStatus::Leaving, 10);
+        again.leave_frame_number = 11;
+        reg.set_prover(prover(vec![0xCD; 32], vec![again]));
+        lc.set_prover_root_verified_frame(723);
+        let (_, logged) = evaluate_logged(&lc, 723, reg.as_ref(), wm.as_ref());
+        let lines = leave_rejection_lines(&logged);
+        assert_eq!(lines.len(), 1, "{logged}");
+        assert!(lines[0].contains("leave_frame=11"), "{}", lines[0]);
+    }
+
+    /// The other rejections name their own reason: an unknown rank, a shard
+    /// the departure would leave at halt risk, and an orphan's leave that would
+    /// cost the seniority penalty.
+    #[test]
+    fn a_rejected_leave_names_its_reason() {
+        let held = filter_bytes(0xA1);
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(Some(2));
+        let (wm, reg, lc) = pending_leave(idle_worker(1), 1, 100, true);
+        let (_, logged) = evaluate_logged(&lc, 720, reg.as_ref(), wm.as_ref());
+        quil_types::consensus::set_seniority_penalty_and_succession_epoch_for_thread(None);
+        let lines = leave_rejection_lines(&logged);
+        assert_eq!(lines.len(), 1, "{logged}");
+        assert!(lines[0].contains("seniority_penalty"), "{}", lines[0]);
+        assert!(!lines[0].contains("switch the worker"), "{}", lines[0]);
+        for (active, known_rank, reason) in [(53, false, "unknown_rank"), (2, true, "halt_risk")] {
+            let (wm, reg, lc) =
+                pending_leave(allocated_worker(1, held.clone()), active, 10, known_rank);
+            let (_, logged) = evaluate_logged(&lc, 720, reg.as_ref(), wm.as_ref());
+            let lines = leave_rejection_lines(&logged);
+            assert_eq!(lines.len(), 1, "{reason}: {logged}");
+            assert!(lines[0].contains(reason), "{reason}: {}", lines[0]);
+        }
+    }
+
+    /// Each reason as the decision reaches it, the penalty first: it is what
+    /// rejected the leave whatever else holds.
+    #[test]
+    fn leave_rejection_reason_follows_the_decision() {
+        let descriptor = |size, shards, active_count| ShardDescriptor {
+            filter: filter_bytes(0xA1),
+            size,
+            ring: 0,
+            shards,
+            active_on_ring: 0,
+            total_active_joining: active_count,
+            active_count,
+            activating_count: 0,
+        };
+        let reason = leave_rejection_reason;
+        let healthy = descriptor(100, 1, 53);
+        let small = descriptor(100, 1, proposer::HALT_RISK_PROVER_COUNT);
+        let unpriced = descriptor(100, 0, 53);
+        let g = Strategy::RewardGreedy;
+        assert_eq!(reason(Some(&healthy), g, false), "no_better_shard");
+        assert_eq!(reason(None, g, false), "unknown_rank");
+        assert_eq!(reason(Some(&unpriced), g, false), "unknown_rank");
+        assert_eq!(reason(Some(&small), g, false), "halt_risk");
+        assert_eq!(reason(Some(&healthy), g, true), "seniority_penalty");
+        assert_eq!(
+            reason(Some(&unpriced), Strategy::DataGreedy, false),
+            "no_better_shard",
+            "only the reward strategy needs reward inputs"
+        );
+    }
+
+    /// A manual worker's leave is confirmed: no rejection, no line.
+    #[test]
+    fn a_manual_workers_leave_logs_no_rejection() {
+        let held = filter_bytes(0xA1);
+        let (wm, reg, lc) = pending_leave(manual_worker(1, held.clone()), 53, 10, true);
+        let (actions, logged) = evaluate_logged(&lc, 720, reg.as_ref(), wm.as_ref());
+        assert!(
+            actions.iter().any(|a| matches!(a, LifecycleAction::ConfirmLeaves { filters, .. } if filters.contains(&held))),
+            "{actions:?}"
+        );
+        assert!(leave_rejection_lines(&logged).is_empty(), "{logged}");
     }
 
     /// One seated core, an idle manual core and an idle auto core, with one

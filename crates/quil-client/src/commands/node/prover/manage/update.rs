@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use super::super::epoch::{epoch_len, ConfirmWindow, WindowState};
 use super::super::sign;
 use super::coins;
+use super::mint;
 use super::model::{
     AwaitFilterEntry, ColumnFilter, FilterColKind, Model, PanelFocus, PendingAction, Tab,
 };
@@ -25,8 +26,16 @@ pub enum Cmd {
     FetchLegacy,
     /// Read and quote `token shield-all`'s batches for its confirmation.
     ShieldPrepare,
-    /// Prove and submit the confirmed batches.
+    /// Prove and submit the confirmed batches, paced.
     ShieldRun(super::shield::Preview),
+    /// Read the reward and quote the fee for a mint confirmation.
+    MintPrepare,
+    /// Read the saved authorization's GLOBAL witness for a claim.
+    ClaimPrepare(std::path::PathBuf, u64),
+    /// Prove and submit the confirmed mint, or submit the claim.
+    MintRun(super::mint::Preview),
+    /// End the running shield before its next submission.
+    ShieldStop,
     Join(Vec<Vec<u8>>),
     Lifecycle {
         action: String,
@@ -48,10 +57,45 @@ pub enum Cmd {
 
 // ── Message application ──────────────────────────────────────────────────
 
+/// The notice while a leave, pause or resume waits to sign: what it waits for
+/// and why. The next action message replaces it.
+fn signing_wait_text(action: &str, frames_left: u64) -> String {
+    format!(
+        "{action} waits for the next epoch to sign: this one ends in {frames_left} frames, and \
+         an operation landing after it is refused."
+    )
+}
+
 pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
-        Msg::LegacyRefresh { answer, took } => {
+        Msg::SigningWait {
+            action,
+            frames_left,
+        } => {
+            m.status_msg = signing_wait_text(&action, frames_left);
+            m.status_is_error = false;
+            vec![]
+        }
+        Msg::LegacyRefresh {
+            answer,
+            took,
+            mints,
+        } => {
+            m.coins.mint.saved = mints;
+            m.coins.mint.cursor = m
+                .coins
+                .mint
+                .cursor
+                .min(m.coins.mint.saved.len().saturating_sub(1));
             coins::apply_legacy(m, answer, took);
+            vec![]
+        }
+        Msg::MintPreview(preview) => {
+            mint::apply_preview(m, preview);
+            vec![]
+        }
+        Msg::Mint(progress) => {
+            mint::apply_progress(m, progress);
             vec![]
         }
         Msg::ShieldPreview(preview) => {
@@ -426,12 +470,12 @@ fn finish_confirmed(m: &mut Model, frame: u64) -> Vec<Cmd> {
         m.status_is_error = false;
     } else if confirmed == 0 {
         m.status_msg = format!(
-            "{action} broadcast at frame {send_frame} but {unchanged}/{total} filter(s) did not change (e.g. {first_unchanged})"
+            "{action} broadcast at frame {send_frame} but {unchanged}/{total} filter(s) did not change yet (e.g. {first_unchanged}); this node's registry may show it only by the next epoch boundary"
         );
         m.status_is_error = true;
     } else {
         m.status_msg = format!(
-            "{action} partial: {confirmed}/{total} confirmed, {unchanged} unchanged (e.g. {first_unchanged})"
+            "{action} partial: {confirmed}/{total} confirmed, {unchanged} unchanged yet (e.g. {first_unchanged}); this node's registry may show them only by the next epoch boundary"
         );
         m.status_is_error = confirmed == 0;
     }
@@ -549,6 +593,9 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if m.tab == Tab::Coins {
         if matches!(m.coins.shield.dialog, Some(shield::Dialog::Confirm(_))) {
             return shield::dialog_key(m, ev);
+        }
+        if matches!(m.coins.mint.dialog, Some(mint::Dialog::Confirm(_))) {
+            return mint::dialog_key(m, ev);
         }
         if m.show_help {
             return handle_help_key(m, ev);
@@ -727,7 +774,7 @@ fn worker_action_refusal(m: &Model, command: char) -> Option<String> {
     } else if m.selected_alloc_rows().is_empty() {
         "no allocation selected.".to_string()
     } else if matches!(command, 'l' | 'y' | 'r')
-        && m.selected_alloc_rows().iter().any(|r| !r.manually_managed)
+        && m.selected_alloc_rows().iter().any(|r| r.auto_worker())
     {
         "join/leave/confirm/reject require manual mode; AUTO allows pause/resume and mode \
          changes."
@@ -1101,7 +1148,7 @@ fn operation_targets(m: &Model, command: char) -> Vec<(String, u32, i64, bool)> 
 }
 
 fn manual_actions_allowed(m: &mut Model) -> bool {
-    if m.focus.is_alloc() && m.selected_alloc_rows().iter().any(|r| !r.manually_managed) {
+    if m.focus.is_alloc() && m.selected_alloc_rows().iter().any(|r| r.auto_worker()) {
         m.status_msg = "Join/leave/confirm/reject require manual mode; AUTO allows pause/resume and mode changes.".into();
         m.status_is_error = true;
         m.status_sticky = true;
@@ -1871,6 +1918,58 @@ mod tests {
     use super::*;
     use quil_types::proto::node::{NodeInfoResponse, ShardAllocationInfo};
 
+    /// The wait to sign shows while the action is in flight, as a notice and
+    /// not an error, and a refresh does not clear it.
+    #[test]
+    fn the_manager_says_why_a_leave_waits_to_sign() {
+        let mut m = Model::new();
+        m.action_in_flight = true;
+        let cmds = apply_msg(
+            &mut m,
+            Msg::SigningWait {
+                action: "Leave".into(),
+                frames_left: 7,
+            },
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(
+            m.status_msg,
+            "Leave waits for the next epoch to sign: this one ends in 7 frames, and an operation \
+             landing after it is refused."
+        );
+        assert!(!m.status_is_error);
+        apply_msg(
+            &mut m,
+            Msg::DataRefresh {
+                node_info: None,
+                shard_info: None,
+                worker_info: None,
+                err: None,
+            },
+        );
+        assert!(m.status_msg.starts_with("Leave waits"), "{}", m.status_msg);
+    }
+
+    /// A seat with no worker has no mode, so the operator's actions reach it;
+    /// a seat on an auto worker stays refused.
+    #[test]
+    fn actions_on_a_seat_with_no_worker_are_not_refused_as_auto() {
+        for (status, command, action) in [(2, 'l', "Leave"), (4, 'r', "Reject")] {
+            let mut m = operational_model(status);
+            m.allocations[0].manually_managed = false;
+            assert_eq!(m.allocations[0].worker_id, -1);
+            assert!(!m.allocations[0].auto_worker());
+            assert!(manual_actions_allowed(&mut m), "{action}");
+            assert!(!m.status_msg.contains("manual mode"), "{}", m.status_msg);
+
+            m.allocations[0].worker_id = 1;
+            assert!(m.allocations[0].auto_worker());
+            assert!(!manual_actions_allowed(&mut m), "{action}");
+            assert!(m.status_msg.contains("manual mode"), "{}", m.status_msg);
+            assert!(dispatch_operation(&mut m, command).is_empty(), "{action}");
+        }
+    }
+
     fn operational_model(status: u32) -> Model {
         let mut m = Model::new();
         m.process_refresh_data(
@@ -2219,6 +2318,7 @@ mod tests {
         let mut auto = m.allocations[0].clone();
         auto.filter_key = "auto".into();
         auto.manually_managed = false;
+        auto.worker_id = 1;
         m.allocations.push(auto);
         m.alloc_selected
             .extend([m.allocations[0].filter_key.clone(), "auto".into()]);
@@ -2231,6 +2331,7 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
         let mut m = operational_model(2);
         m.allocations[0].manually_managed = false;
+        m.allocations[0].worker_id = 1;
         assert_eq!(
             m.applicable_alloc_actions(),
             ["Pause".to_string()].into_iter().collect()
@@ -2244,6 +2345,7 @@ mod tests {
         assert!(!m.allocations[0].manually_managed);
         let mut m = operational_model(3);
         m.allocations[0].manually_managed = false;
+        m.allocations[0].worker_id = 1;
         assert_eq!(
             m.applicable_alloc_actions(),
             ["Resume".to_string()].into_iter().collect()
@@ -2263,6 +2365,7 @@ mod tests {
         auto.filter_key = "auto".into();
         auto.filter = vec![2];
         auto.manually_managed = false;
+        auto.worker_id = 1;
         m.allocations.push(auto);
         m.alloc_selected
             .extend([m.allocations[0].filter_key.clone(), "auto".into()]);
@@ -2306,6 +2409,7 @@ mod tests {
         m.join_picker_active = true;
         m.join_picker_selected.insert(2);
         m.allocations[0].manually_managed = false;
+        m.allocations[0].worker_id = 1;
         assert!(
             handle_join_picker_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .is_empty()

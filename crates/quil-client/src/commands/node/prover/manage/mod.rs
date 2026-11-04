@@ -17,6 +17,7 @@ mod actions;
 mod cadence;
 mod coins;
 mod filter;
+mod mint;
 mod model;
 mod msg;
 #[cfg(test)]
@@ -114,9 +115,9 @@ pub struct ManageArgs {
     /// defaults, then start.
     #[arg(long)]
     pub reset_ui: bool,
-    /// Largest fee in base units a shield batch pays from the node's quote
-    /// (default: 0.1 QUIL); a larger quote stops the run, as in `qclient
-    /// token`.
+    /// Largest fee in base units a shield batch or a mint pays from the
+    /// node's quote (default: 0.1 QUIL); a larger quote stops a shield run
+    /// and refuses a mint, as in `qclient token`.
     #[arg(
         long,
         env = "QUILIBRIUM_MAX_FEE",
@@ -394,6 +395,9 @@ async fn render(
                 Cmd::Fetch => continue,
                 Cmd::FetchLegacy => |msg| matches!(msg, Msg::LegacyRefresh { .. }),
                 Cmd::ShieldPrepare => |msg| matches!(msg, Msg::ShieldPreview(_)),
+                Cmd::MintPrepare | Cmd::ClaimPrepare(..) => {
+                    |msg| matches!(msg, Msg::MintPreview(_))
+                }
                 other => {
                     dropped.push(other);
                     continue;
@@ -503,6 +507,10 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::FetchLegacy => "legacy read",
         Cmd::ShieldPrepare => "shield reads and quotes",
         Cmd::ShieldRun(_) => "shield",
+        Cmd::MintPrepare => "mint reads and quote",
+        Cmd::ClaimPrepare(..) => "mint claim reads",
+        Cmd::MintRun(_) => "mint",
+        Cmd::ShieldStop => "shield stop",
         Cmd::Join(_) => "join",
         Cmd::Lifecycle { .. } => "lifecycle operation",
         Cmd::ToggleManual { .. } | Cmd::MarkManual(_) => "worker mode change",
@@ -523,8 +531,12 @@ struct RefreshState {
     /// What the shield action loads `qclient token`'s context from, and
     /// its `--max-fee`.
     token: Option<(GlobalArgs, u128)>,
-    /// The private action log a shield records itself in, unless off.
+    /// The private action log a shield or a mint records itself in,
+    /// unless off.
     action_log: Option<crate::commands::token::action_log::ActionLog>,
+    /// Set to stop the running shield before its next submission; one
+    /// runs at a time, and each run starts with it cleared.
+    shield_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for RefreshState {
@@ -538,6 +550,7 @@ impl Default for RefreshState {
             config_dir: None,
             token: None,
             action_log: None,
+            shield_stop: Arc::default(),
         }
     }
 }
@@ -631,14 +644,39 @@ fn spawn_action(
                 let _ = tx.send(actions::shield_prepare(token).await);
             });
         }
-        Cmd::ShieldRun(preview) => {
+        Cmd::MintPrepare => {
+            let token = refresh.token.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(actions::mint_prepare(token).await);
+            });
+        }
+        Cmd::ClaimPrepare(path, cited_frame) => {
+            let token = refresh.token.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(actions::claim_prepare(token, path, cited_frame).await);
+            });
+        }
+        Cmd::MintRun(preview) => {
             let token = refresh.token.clone();
             let log = refresh.action_log.clone();
             tokio::spawn(async move {
                 let progress = tx.clone();
-                let _ = tx.send(actions::shield_run(token, preview, progress, log).await);
+                let _ = tx.send(actions::mint_run(token, preview, progress, log).await);
             });
         }
+        Cmd::ShieldRun(preview) => {
+            let token = refresh.token.clone();
+            let log = refresh.action_log.clone();
+            let stop = refresh.shield_stop.clone();
+            stop.store(false, std::sync::atomic::Ordering::Relaxed);
+            tokio::spawn(async move {
+                let progress = tx.clone();
+                let _ = tx.send(actions::shield_run(token, preview, progress, log, stop).await);
+            });
+        }
+        Cmd::ShieldStop => refresh
+            .shield_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed),
         Cmd::Join(filters) => {
             tokio::spawn(async move {
                 let _ = tx.send(actions::do_join(client, filters).await);
@@ -649,9 +687,11 @@ fn spawn_action(
             filters,
             original_status,
         } => {
+            let progress = tx.clone();
             tokio::spawn(async move {
                 let _ = tx.send(
-                    actions::do_lifecycle(client, km, action, filters, original_status).await,
+                    actions::do_lifecycle(client, km, action, filters, original_status, progress)
+                        .await,
                 );
             });
         }

@@ -4,11 +4,28 @@
 
 use std::time::{Instant, SystemTime};
 
+use super::super::mint::{
+    Dialog as MintDialog, Preview as MintPreview, Stage as MintStage, Status as MintStatus,
+};
 use super::super::shield::{Dialog, Preview};
 use super::coins::{self, CoinsFocus, Middle, ATTENTION};
 use super::*;
 
 const COLUMNS: [&str; 5] = ["Kind", "Coins", "Amount [Q]", "State", "As of"];
+
+/// Lines the Balances panel reserves under its rows for the cursor row's
+/// detail; a longer detail ends in the enlarge marker until an edge key
+/// gives the panel more.
+const BALANCE_DETAIL: u16 = 2;
+
+/// Lines the Notifications panel takes inside its borders on a tall
+/// terminal before an edge key moves it: the most it took when it grew
+/// with its notices.
+const NOTICE_LINES: u16 = 6;
+
+/// Lines the middle panel keeps inside its borders before Notifications
+/// takes more than one: the Claim status at 80 columns.
+const MIDDLE_LINES: u16 = 5;
 
 /// A cell's text and color; `None` keeps the table's text color.
 type Cell = (String, Option<Color>);
@@ -105,11 +122,9 @@ fn legacy_row(m: &Model) -> [Cell; 5] {
     };
     [
         plain("legacy"),
-        plain(if total > 0 {
-            format!(
-                "{} unshielded · {} shielded",
-                tally.unshielded, tally.shielded
-            )
+        // Unshielded of all listed; the detail splits them by kind.
+        plain(if tally.unshielded > 0 {
+            format!("{}/{total}", tally.unshielded)
         } else {
             "0".into()
         }),
@@ -122,40 +137,20 @@ fn legacy_row(m: &Model) -> [Cell; 5] {
 /// The cursor row's detail.
 fn detail(m: &Model) -> String {
     if m.coins.cursor == 0 {
-        return match m.claimable_reward {
-            Some((_, frame)) => format!(
-                "Claimable: reward balance at f{frame}, from the GLOBAL reward witness; read with \
-                 each Provers refresh ({}s).",
-                m.refresh_seconds
-            ),
-            None => match &m.reward_error {
-                Some(error) => format!("Claimable: read failed ({error})."),
-                None => "Claimable: read with each Provers refresh.".into(),
-            },
-        };
+        // The cells carry the amount and its frame, Notifications a failure.
+        return format!(
+            "Claimable: the reward balance of the GLOBAL reward witness, read with each Provers \
+             refresh ({}s).",
+            m.refresh_seconds
+        );
     }
     let legacy = &m.coins.legacy;
     let mut parts = Vec::new();
     if let Some((Some(snapshot), _, took)) = &legacy.answer {
-        if let Some(plan) = snapshot.plan {
-            let mut text = format!(
-                "plan {}{} {} of ≤{} coins",
-                if plan.exact { "" } else { "≥" },
-                plan.batches,
-                if plan.batches == 1 {
-                    "batch"
-                } else {
-                    "batches"
-                },
-                snapshot.batch_max.unwrap_or(0)
-            );
-            if plan.outside > 0 {
-                text.push_str(&format!(", {} on no live shard", plan.outside));
-            }
-            parts.push(text);
-        }
-        if let Some((frame, left)) = coins::shields_open_at(snapshot) {
-            parts.push(format!("shields open at f{frame} (in {left} frames)"));
+        // The row's U/T leaves out the shielded count; the plan and when
+        // shields open are the Shield plan's, on screen with this row.
+        if snapshot.tally.shielded > 0 {
+            parts.push(format!("{} shielded", snapshot.tally.shielded));
         }
         parts.push(format!(
             "read {} pages in {:.1}s",
@@ -322,8 +317,10 @@ fn exact_amount(units: u128) -> String {
 const MASKED: &str = "hidden in this render (--reveal shows it)";
 
 /// The confirmation: the action and its exact inputs; `mask` hides the
-/// amount and the recipient's address.
-fn confirm_lines(preview: &Preview, width: u16, mask: bool) -> Vec<Line<'static>> {
+/// amount and the recipient's address. In a panel of `height` lines too
+/// short for them all, the Recipient row's first line, which names the
+/// wallet and its address, stays in view before the marker.
+fn confirm_lines(preview: &Preview, width: u16, height: u16, mask: bool) -> Vec<Line<'static>> {
     let row = |label: &str, text: String| {
         Line::from(vec![
             Span::styled(
@@ -347,7 +344,7 @@ fn confirm_lines(preview: &Preview, width: u16, mask: bool) -> Vec<Line<'static>
     }
     if preview.pending > 0 {
         left.push(format!(
-            "{} submitted <1h ago, awaiting their batch",
+            "{} submitted <2h ago, awaiting their batch",
             preview.pending
         ));
     }
@@ -403,6 +400,7 @@ fn confirm_lines(preview: &Preview, width: u16, mask: bool) -> Vec<Line<'static>
     if !left.is_empty() {
         lines.push(row("Left out", left.join("; ")));
     }
+    let recipient = lines.len();
     lines.push(row(
         "Recipient",
         if mask {
@@ -416,18 +414,52 @@ fn confirm_lines(preview: &Preview, width: u16, mask: bool) -> Vec<Line<'static>
          spent once a batch is included.",
         Style::new().fg(HELP),
     )));
-    lines
-        .into_iter()
-        .flat_map(|line| wrap_message(line, width))
-        .collect()
+    let mut wrapped = Vec::new();
+    let mut kept = 0..0;
+    for (i, line) in lines.into_iter().enumerate() {
+        let start = wrapped.len();
+        wrapped.extend(wrap_message(line, width));
+        if i == recipient {
+            kept = start..(start + 1).min(wrapped.len());
+        }
+    }
+    keep_in_view(wrapped, kept, width, height)
+}
+
+/// `lines` in `height` lines as [`fit_lines`] cuts them, except that the
+/// `kept` lines stay in view: the lines between them and the marker give
+/// way first. A panel too short for them and the marker shows as many as
+/// leave the marker its line, at least one.
+fn keep_in_view(
+    lines: Vec<Line<'static>>,
+    kept: std::ops::Range<usize>,
+    width: u16,
+    height: u16,
+) -> Vec<Line<'static>> {
+    let height = usize::from(height);
+    if height == 0 || lines.len() <= height || kept.end < height {
+        return lines;
+    }
+    let mut out: Vec<Line<'static>> = lines[kept.clone()].to_vec();
+    if out.len() >= height {
+        out.truncate(height.saturating_sub(1).max(1));
+        if out.len() < height {
+            out.push(enlarge_marker(width));
+        }
+        return out;
+    }
+    let room = height - 1 - out.len();
+    out.splice(0..0, lines.into_iter().take(room.min(kept.start)));
+    out.push(enlarge_marker(width));
+    out
 }
 
 /// Rows the panel scrolls: first shown, total and shown.
 type Scroll = Option<(usize, usize, usize)>;
 
-/// The Claim status panel: the claimable reward at its frame and how a
-/// mint of it is authorized.
-fn claim_lines(m: &Model, width: u16) -> Vec<Line<'static>> {
+/// The Claim status panel in `height` rows: the claimable reward at its
+/// frame, its mint, and the authorizations saved for a claim.
+fn claim_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
     let row = |label: &str, text: String| {
         Line::from(vec![
             Span::styled(
@@ -437,36 +469,150 @@ fn claim_lines(m: &Model, width: u16) -> Vec<Line<'static>> {
             Span::styled(text, Style::new().fg(TEXT)),
         ])
     };
-    let claimable = match (&m.claimable_reward, &m.reward_error) {
-        _ if !m.reward_loaded => "not read yet; it comes with the first Provers refresh".into(),
-        (Some((units, frame)), _) if *units > 0 => format!(
-            "{} Q at f{frame}, the reward balance of the GLOBAL reward witness",
-            exact_amount(*units)
-        ),
-        (Some((_, frame)), _) => format!("none at f{frame}"),
-        (None, Some(error)) => format!("read failed ({error})"),
-        (None, None) => "none".into(),
-    };
-    let authorization = match m.claimable_reward {
-        Some((units, _)) if units > 0 => {
-            "none from this manager; `qclient token mint` authorizes a mint of it"
+    // The claimable amount and its frame are the Balances row's; this
+    // panel adds what to do with them.
+    let authorization = if super::super::mint::running(m) {
+        "a mint or claim is under way; Notifications follow it"
+    } else if !m.reward_loaded {
+        "waits for the first Provers refresh to read the reward"
+    } else {
+        match (&m.claimable_reward, &m.reward_error) {
+            (Some((units, _)), _) if *units > 0 => {
+                "‹M› authorizes a mint of the claimable reward, as `qclient token mint` does"
+            }
+            (None, Some(_)) => "waits for a reward read to succeed",
+            _ => "nothing to authorize",
         }
-        _ => "nothing to authorize",
     };
-    [
-        row("Claimable", claimable),
-        row("Authorization", authorization.into()),
-    ]
-    .into_iter()
-    .flat_map(|line| wrap_message(line, width))
-    .collect()
+    let mut lines: Vec<Line<'static>> =
+        wrap_message(row("Authorization", authorization.into()), width);
+    let rest = usize::from(height).saturating_sub(lines.len());
+    lines.extend(saved_lines(m, width, rest));
+    lines
 }
 
-/// The middle panel's title and lines: the confirmation while it is open;
+/// The authorizations `token mint` saved, newest first, one row each with
+/// the Claim status cursor, in `rows` lines.
+fn saved_lines(m: &Model, width: u16, rows: usize) -> Vec<Line<'static>> {
+    let help = Style::new().fg(HELP);
+    let saved = &m.coins.mint.saved;
+    if saved.is_empty() {
+        return wrap_message(
+            Line::from(Span::styled(
+                "Saved authorizations: none; a mint saves one as mint-<frame>.bin for its claim.",
+                help,
+            )),
+            width,
+        );
+    }
+    let cell = |amount: Option<u128>| amount.map_or("-".to_string(), fixed_amount);
+    let cells: Vec<[String; 4]> = saved
+        .iter()
+        .map(|saved| {
+            [
+                format!("f{}", saved.cited_frame),
+                cell(
+                    saved
+                        .amounts
+                        .map(|(reward, fee)| reward.saturating_sub(fee)),
+                ),
+                cell(saved.amounts.map(|(_, fee)| fee)),
+                match super::super::mint::status(saved) {
+                    MintStatus::Unavailable => "unavailable".to_string(),
+                },
+            ]
+        })
+        .collect();
+    let headers = ["Cited", "Amount [Q]", "Fee [Q]", "State"];
+    let mut widths = headers.map(str::len);
+    for row in &cells {
+        for (width, text) in widths.iter_mut().zip(row) {
+            *width = (*width).max(text.chars().count());
+        }
+    }
+    let line = |cells: [&str; 4]| {
+        format!(
+            "{:<w0$}  {:>w1$}  {:>w2$}  {:<w3$}",
+            cells[0],
+            cells[1],
+            cells[2],
+            cells[3],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3]
+        )
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        line(headers),
+        Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+    ))];
+    let height = u16::try_from(rows).unwrap_or(u16::MAX);
+    let note = fit_detail(
+        wrap_message(
+            Line::from(Span::styled(
+                "State: this node reports no authorization status; ‹C› checks for the finalized \
+                 witness before it claims.",
+                help,
+            )),
+            width,
+        ),
+        width,
+        height,
+        2,
+    );
+    let visible = rows.saturating_sub(1 + note.len()).max(1);
+    let focused = m.coins.focus == CoinsFocus::Middle;
+    let first = m.coins.mint.cursor.saturating_sub(visible - 1);
+    for (i, row) in cells.iter().enumerate().skip(first).take(visible) {
+        let mut style = Style::new().fg(TEXT);
+        if i == m.coins.mint.cursor {
+            style = style.bg(if focused {
+                CURSOR_BG
+            } else {
+                INACTIVE_CURSOR_BG
+            });
+        }
+        lines.push(Line::from(Span::styled(
+            line([&row[0], &row[1], &row[2], &row[3]]),
+            style,
+        )));
+    }
+    pin_detail(lines, note, height)
+}
+
+/// The middle panel's title and lines: a confirmation while one is open;
 /// else the selected Balances row's panel ([`Middle`]).
 fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'static>>, Scroll) {
+    match &m.coins.mint.dialog {
+        Some(MintDialog::Confirm(preview)) => {
+            let title = match preview.stage {
+                MintStage::Authorize => "Confirm mint",
+                MintStage::Claim { .. } => "Confirm claim",
+            };
+            let lines = mint_confirm_lines(preview, width, m.mask_private);
+            return (title.into(), lines, None);
+        }
+        Some(MintDialog::Preparing(_, claim)) => {
+            let text = if *claim {
+                "Reading the authorization's GLOBAL witness…"
+            } else {
+                "Reading the reward and quoting the fee…"
+            };
+            return (
+                Middle::Claim.title().into(),
+                vec![Line::from(Span::styled(
+                    format!("{} {text}", spinner(m)),
+                    Style::new().fg(PRIMARY),
+                ))],
+                None,
+            );
+        }
+        None => {}
+    }
     if coins::middle(m) == Middle::Claim {
-        return (Middle::Claim.title().into(), claim_lines(m, width), None);
+        let lines = claim_lines(m, width, height);
+        return (Middle::Claim.title().into(), lines, None);
     }
     plan_lines(m, width, height)
 }
@@ -478,7 +624,7 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
         Some(Dialog::Confirm(preview)) => {
             return (
                 "Confirm shield".into(),
-                confirm_lines(preview, width, m.mask_private),
+                confirm_lines(preview, width, height, m.mask_private),
                 None,
             );
         }
@@ -521,17 +667,19 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
             "Batches: {} of ≤{max} coins; {} coins on no live shard",
             plan.batches, plan.outside
         ),
-        Some(plan) => format!(
-            "Batches: ≥{}; the shard list is unavailable, so no rows",
-            plan.batches
-        ),
+        Some(plan) => format!("Batches: ≥{}; no rows", plan.batches),
     };
     if snapshot.pending > 0 {
-        summary.push_str(&format!("; {} submitted <1h ago hidden", snapshot.pending));
+        summary.push_str(&format!("; {} submitted <2h ago hidden", snapshot.pending));
     }
     footer.push(Line::from(Span::styled(summary, help)));
     let rows = &snapshot.batches;
     let count = rows.len();
+    // Under batch rows the footer keeps to the panel's bottom; without
+    // rows it is the panel's content.
+    if count > 0 {
+        footer = fit_detail(footer, width, height, 2);
+    }
     let visible = usize::from(height).saturating_sub(1 + footer.len()).max(1);
     m.coins.plan_cursor = m.coins.plan_cursor.min(count.saturating_sub(1));
     m.coins.plan_offset = clamp_offset(m.coins.plan_offset, m.coins.plan_cursor, visible, count);
@@ -581,22 +729,192 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
             )));
         }
     }
-    lines.extend(footer);
+    let lines = if count > 0 {
+        pin_detail(lines, footer, height)
+    } else {
+        footer
+    };
     let scroll = (count > visible).then_some((m.coins.plan_offset, count, visible));
     ("Shield plan".into(), lines, scroll)
 }
 
+/// The mint confirmation: the stage and its exact inputs; `mask` hides the
+/// amounts and the recipient's address.
+fn mint_confirm_lines(preview: &MintPreview, width: u16, mask: bool) -> Vec<Line<'static>> {
+    let row = |label: &str, text: String| {
+        Line::from(vec![
+            Span::styled(
+                format!("{label}: "),
+                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text, Style::new().fg(TEXT)),
+        ])
+    };
+    let title = |text: &str| {
+        Line::from(Span::styled(
+            text.to_string(),
+            Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
+        ))
+    };
+    // To the base unit, as `token mint` prints it: a fee far below
+    // 0.00001 Q must not round the minted amount up to the reward.
+    let amount = row(
+        "Amount",
+        if mask {
+            MASKED.to_string()
+        } else {
+            format!(
+                "{} Q (reward {} Q less fee {} Q)",
+                exact_amount(preview.minted()),
+                exact_amount(preview.reward),
+                exact_amount(preview.fee)
+            )
+        },
+    );
+    let lines = match &preview.stage {
+        MintStage::Authorize => vec![
+            title("Authorize a reward mint, as `qclient token mint` does:"),
+            row(
+                "Reward",
+                if mask {
+                    format!(
+                        "{MASKED}; claimable at f{}, from the GLOBAL reward witness",
+                        preview.cited_frame
+                    )
+                } else {
+                    format!(
+                        "{} Q claimable at f{}, from the GLOBAL reward witness",
+                        exact_amount(preview.reward),
+                        preview.cited_frame
+                    )
+                },
+            ),
+            amount,
+            row(
+                "Fee",
+                format!(
+                    "{} base units ({} Q) as quoted now, paid from the reward",
+                    preview.fee,
+                    exact_amount(preview.fee)
+                ),
+            ),
+            row(
+                "Cap",
+                format!(
+                    "{} Q (--max-fee); a higher quote is refused",
+                    fmt_claimable(preview.max_fee)
+                ),
+            ),
+            row(
+                "Recipient",
+                if mask {
+                    format!("this node's wallet, its address {MASKED}")
+                } else {
+                    recipient_text(&preview.recipient)
+                },
+            ),
+            row(
+                "Saved as",
+                "mint-<frame>.bin in the node config directory, for the claim; <frame> is the \
+                 GLOBAL frame the proof cites"
+                    .into(),
+            ),
+            Line::from(Span::styled(
+                "The authorization is proved here and submitted to this node. The run reads the \
+                 reward and quotes the fee again at the frame then current: a reward that grew \
+                 is minted in full to this wallet, and the outcome names both amounts; a changed \
+                 fee reopens this confirmation with it; a reward that fell stops the run. ‹C› \
+                 claims it once GLOBAL finalizes it.",
+                Style::new().fg(HELP),
+            )),
+        ],
+        MintStage::Claim { path, witness } => vec![
+            title("Claim a reward mint, as `qclient token mint --claim` does:"),
+            row(
+                "Authorization",
+                format!(
+                    "{}, citing f{}; finalized, its GLOBAL witness cites f{witness}",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    preview.cited_frame
+                ),
+            ),
+            amount,
+            row(
+                "Recipient",
+                "as the authorization names it (this node's wallet unless `token mint` was \
+                 given another)"
+                    .into(),
+            ),
+            Line::from(Span::styled(
+                "The claim is built here and submitted to this node; it creates the coins.",
+                Style::new().fg(HELP),
+            )),
+        ],
+    };
+    lines
+        .into_iter()
+        .flat_map(|line| wrap_message(line, width))
+        .collect()
+}
+
 /// The UI key row of the Coins tab, or the collapsed row.
 fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
+    if let Some(MintDialog::Confirm(preview)) = &m.coins.mint.dialog {
+        return vec![Line::from(Span::styled(
+            match preview.stage {
+                MintStage::Authorize => "Confirm: ‹y› authorize the mint  any other key cancels",
+                MintStage::Claim { .. } => "Confirm: ‹y› claim  any other key cancels",
+            },
+            Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
+        ))];
+    }
     if matches!(m.coins.shield.dialog, Some(Dialog::Confirm(_))) {
         return vec![Line::from(Span::styled(
             "Confirm: ‹y› shield  any other key cancels",
             Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
         ))];
     }
+    if m.coins.shield.stop_pending {
+        return vec![Line::from(Span::styled(
+            "Stop shield: ‹y› stop before the next submission  any other key keeps it running",
+            Style::new().fg(PRIMARY).add_modifier(Modifier::BOLD),
+        ))];
+    }
     if !m.show_key_rows {
         return vec![collapsed_keys_line()];
     }
+    ui_key_rows(m, width)
+}
+
+/// The UI key rows of the Coins tab, as they show while no question
+/// replaces them.
+fn ui_key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
+    ui_key_rows_esc(m, width, None)
+}
+
+/// Every description of the esc hint, which a question renames; "cancel
+/// transfer" is the transfer dialog's, so the rows fit it too.
+const ESC_LABELS: [&str; 4] = [
+    "stop shield",
+    "cancel mint",
+    "cancel shield",
+    "cancel transfer",
+];
+
+/// The lines the UI key rows take whichever esc description shows, so a
+/// question that renames the hint never moves the panels above.
+fn ui_key_rows_reserved(m: &Model, width: u16) -> usize {
+    ESC_LABELS
+        .iter()
+        .map(|esc| ui_key_rows_esc(m, width, Some(esc)).len())
+        .max()
+        .unwrap_or(0)
+}
+
+/// [`ui_key_rows`], with the esc hint described as `esc` when given.
+fn ui_key_rows_esc(m: &Model, width: u16, esc: Option<&str>) -> Vec<Line<'static>> {
     let compact = if m.compact_actions {
         "expand"
     } else {
@@ -614,6 +932,18 @@ fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
         ("↓/j", "down"),
         ("r", "read legacy"),
         ("S", "shield"),
+        ("M", "mint"),
+        ("C", "claim"),
+        (
+            "esc",
+            if m.coins.mint.dialog.is_some() {
+                "cancel mint"
+            } else if m.coins.shield.dialog.is_some() {
+                "cancel shield"
+            } else {
+                "stop shield"
+            },
+        ),
         ("n", compact),
         ("c", colors),
         ("v", "notice level"),
@@ -630,6 +960,10 @@ fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
     // A key that does not apply to the selection: left out when compact,
     // dimmed when expanded; pressing it says why.
     for (key, description) in entries {
+        let description = match esc {
+            Some(esc) if key == "esc" => esc,
+            _ => description,
+        };
         let usable = coins::key_refusal(m, key).is_none();
         push_key_hint(&mut spans, m, key, description, usable);
     }
@@ -639,22 +973,31 @@ fn key_rows(m: &Model, width: u16) -> Vec<Line<'static>> {
 pub(super) fn render(f: &mut Frame, m: &mut Model, area: Rect) {
     let header = header_lines(m, area.width);
     let actions = key_rows(m, area.width);
+    let reserved = key_rows_height(m, |m| ui_key_rows_reserved(m, area.width));
+    let actions = pad_key_rows(actions, reserved);
     let inner_width = area.width.saturating_sub(2);
-    let mut balances = table_lines(m, inner_width);
-    balances.extend(wrap_message(
+    let balances = table_lines(m, inner_width);
+    let balance_detail = wrap_message(
         Line::from(Span::styled(detail(m), Style::new().fg(HELP))),
         inner_width,
-    ));
+    );
     let notices = notice_lines(m, inner_width);
     let fixed = header.len() as u16 + actions.len() as u16;
     let rest = area.height.saturating_sub(fixed);
-    // Shield plan keeps four lines, Notifications one, inside borders.
-    let balances_h = (balances.len() as u16 + 2).min(rest.saturating_sub(9));
-    let notice_h = (notices.len().clamp(1, 6) as u16 + 2)
-        .min(rest.saturating_sub(balances_h + 6))
-        .max(3);
-    let plan_h = rest.saturating_sub(balances_h + notice_h);
-    let [balances_h, plan_h, notice_h] = coins::place_edges(m, [balances_h, plan_h, notice_h]);
+    // Heights follow the terminal and the edge keys, never the cursor
+    // row's detail or the notices shown. Balances reserves its rows and
+    // BALANCE_DETAIL lines, then its edge moves; of the lines it leaves
+    // as drawn, the middle panel takes MIDDLE_LINES first, then
+    // Notifications up to NOTICE_LINES, the middle panel the rest: inside
+    // borders, Notifications' lines are clamp(left - MIDDLE_LINES - 4, 1,
+    // NOTICE_LINES), 4 for the two panels' borders. A short terminal or a
+    // taller Balances so takes the notices' spare lines before the
+    // content's; Balances leaves at least nine by default, so the middle
+    // panel keeps four lines and Notifications one.
+    let balances_h = (balances.len() as u16 + BALANCE_DETAIL + 2).min(rest.saturating_sub(9));
+    let [balances_h, plan_h, notice_h] = coins::place_panels(m, rest, balances_h, |left| {
+        left.saturating_sub(MIDDLE_LINES + 4).clamp(1, NOTICE_LINES) + 2
+    });
     let chunks = Layout::vertical([
         Constraint::Length(header.len() as u16),
         Constraint::Length(balances_h),
@@ -677,18 +1020,30 @@ pub(super) fn render(f: &mut Frame, m: &mut Model, area: Rect) {
     let block = bordered("Balances".into(), m.coins.focus == CoinsFocus::Balances);
     let inner = block.inner(chunks[1]);
     f.render_widget(block, chunks[1]);
-    f.render_widget(Paragraph::new(balances), inner);
+    // The cursor row's detail keeps to the panel's bottom, as in
+    // Allocations; the rows do not scroll, so it never displaces one.
+    let keep = balances.len() as u16;
+    let balance_detail = fit_detail(balance_detail, inner.width, inner.height, keep);
+    let balances = fit_lines(balances, inner.width, inner.height);
+    f.render_widget(
+        Paragraph::new(pin_detail(balances, balance_detail, inner.height)),
+        inner,
+    );
     let plan_area = chunks[2];
     let (title, lines, scroll) = middle_lines(
         m,
         plan_area.width.saturating_sub(2),
         plan_area.height.saturating_sub(2),
     );
-    let dialog = matches!(m.coins.shield.dialog, Some(Dialog::Confirm(_)));
+    let dialog = matches!(m.coins.shield.dialog, Some(Dialog::Confirm(_)))
+        || matches!(m.coins.mint.dialog, Some(MintDialog::Confirm(_)));
     let block = bordered(title, dialog || m.coins.focus == CoinsFocus::Middle);
     let inner = block.inner(plan_area);
     f.render_widget(block, plan_area);
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(
+        Paragraph::new(fit_lines(lines, inner.width, inner.height)),
+        inner,
+    );
     if let Some((offset, total, visible)) = scroll {
         render_scroll_hint(f, plan_area, offset, total, visible, 0, 0);
     }
@@ -759,10 +1114,11 @@ mod coins_render_tests {
         assert!(text.contains("Balances"));
         assert!(row("claimable").contains("◆ claimable"), "{text}");
         let legacy = row("legacy");
-        assert!(legacy.contains("4 unshielded · 6 shielded"), "{legacy}");
+        assert!(legacy.contains("4/10"), "{legacy}");
+        assert!(!legacy.contains("shielded ·"), "{legacy}");
         assert!(legacy.contains("◆ unshielded"), "{legacy}");
         assert!(
-            text.contains("◆ Legacy coins: 4 unshielded, 6 shielded; 2 batches; ‹S› shields the"),
+            text.contains("◆ Legacy coins unshielded: ‹S› shields them."),
             "{text}"
         );
         // The claimable row is selected: the legacy keys are left out.
@@ -780,7 +1136,7 @@ mod coins_render_tests {
         );
         let text = render_text(&mut m, 200, 24);
         assert!(
-            text.contains("Legacy coins: plan 2 batches of ≤96 coins, 1 on no live shard; read 8 pages in 6.2s"),
+            text.contains("Legacy coins: 6 shielded; read 8 pages in 6.2s"),
             "{text}"
         );
         assert!(
@@ -792,6 +1148,70 @@ mod coins_render_tests {
     /// The middle panel follows the Balances selection and its title names
     /// it; a running shield stays on the legacy row and in Notifications
     /// with the claimable reward selected.
+    /// The legacy row counts the unshielded of all listed coins, `0`
+    /// once none is (its state says which), at every width.
+    #[test]
+    fn the_legacy_row_counts_unshielded_of_all_listed_coins() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.cursor = 1;
+        for (unshielded, shielded, coins, state) in [
+            (4, 6, "4/10", "◆ unshielded"),
+            (0, 6, "0", "shielded"),
+            (0, 0, "0", "none"),
+        ] {
+            if let Some((Some(snapshot), _, _)) = m.coins.legacy.answer.as_mut() {
+                snapshot.tally.unshielded = unshielded;
+                snapshot.tally.shielded = shielded;
+            }
+            for width in [80, 120, 200] {
+                let text = render_text(&mut m, width, 40);
+                let row = text
+                    .lines()
+                    .find(|line| {
+                        line.trim_start_matches('│')
+                            .trim_start()
+                            .starts_with("legacy")
+                    })
+                    .unwrap_or_else(|| panic!("no legacy row in\n{text}"));
+                let cells: Vec<&str> = row
+                    .trim_matches('│')
+                    .split("  ")
+                    .map(str::trim)
+                    .filter(|cell| !cell.is_empty())
+                    .collect();
+                assert_eq!(cells[1], coins, "{width}\n{text}");
+                assert!(cells.contains(&state), "{width}\n{text}");
+            }
+        }
+    }
+
+    /// The legacy row's detail adds the shielded count the row's U/T
+    /// leaves out, and repeats neither the unshielded count nor the
+    /// Shield plan's figures.
+    #[test]
+    fn the_legacy_detail_adds_the_shielded_count() {
+        let mut m = loaded();
+        m.coins.cursor = 1;
+        for (unshielded, shielded) in [(4, 6), (0, 6), (0, 0)] {
+            if let Some((Some(snapshot), _, _)) = m.coins.legacy.answer.as_mut() {
+                snapshot.tally.unshielded = unshielded;
+                snapshot.tally.shielded = shielded;
+            }
+            let text = detail(&m);
+            assert!(
+                !text.contains("unshielded") && !text.contains("batch"),
+                "{text}"
+            );
+            if shielded > 0 {
+                let split = format!("Legacy coins: {shielded} shielded; read 8 pages");
+                assert!(text.starts_with(&split), "{text}");
+            } else {
+                assert!(text.starts_with("Legacy coins: read 8 pages"), "{text}");
+            }
+        }
+    }
+
     #[test]
     fn the_middle_panel_follows_the_selection_and_a_run_stays_visible() {
         use super::super::super::shield::{self, Progress};
@@ -802,12 +1222,11 @@ mod coins_render_tests {
             let text = render_text(&mut m, width, 40);
             assert!(text.contains("╭ Claim status"), "{width}\n{text}");
             assert!(!text.contains("Shield plan"), "{width}\n{text}");
+            // The amount is the Balances row's alone.
+            assert!(!text.contains("312500.000000000000"), "{text}");
+            assert_eq!(text.matches("312500").count(), 1, "{text}");
             assert!(
-                text.contains("Claimable: 312500.000000000000 Q at f1200"),
-                "{text}"
-            );
-            assert!(
-                text.contains("Authorization: none from this manager; `qclient token mint`"),
+                text.contains("Authorization: ‹M› authorizes a mint of the claimable reward"),
                 "{text}"
             );
             m.coins.cursor = 1;
@@ -847,6 +1266,79 @@ mod coins_render_tests {
                 "{width}\n{text}"
             );
         }
+    }
+
+    /// A paced run renders its waits as notices: a held batch while GLOBAL
+    /// is degraded (a warning), the included batches with the projected
+    /// end, and ‹esc›'s stop question as the key row; a render still hides
+    /// the shielded amount without --reveal.
+    #[test]
+    fn a_paced_run_renders_its_waits_and_its_stop_question() {
+        use super::super::super::shield::{self, Progress};
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut m = loaded();
+        m.color_coding = false;
+        m.mask_private = true;
+        m.coins.cursor = 1;
+        shield::request(&mut m);
+        shield::apply_preview(&mut m, Ok(shield::shield_tests::preview()));
+        super::super::super::update::handle_key(&mut m, KeyEvent::from(KeyCode::Char('y')));
+        let end = std::time::SystemTime::now() + Duration::from_secs(1_800);
+        let end = end.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        for progress in [
+            Progress::Proving {
+                index: 1,
+                count: 2,
+                coins: 96,
+            },
+            Progress::Proved { index: 1, count: 2 },
+            Progress::Submitted {
+                index: 1,
+                count: 2,
+                addresses: vec![[1; 32]; 96],
+                shielded: 7_000_000_000_000,
+            },
+            Progress::Included { index: 1, count: 2 },
+            Progress::Projected { end },
+            Progress::Proving {
+                index: 2,
+                count: 2,
+                coins: 4,
+            },
+            Progress::Proved { index: 2, count: 2 },
+            Progress::Paused {
+                reason: "GLOBAL head 2000 has not advanced for 75 s".into(),
+            },
+        ] {
+            shield::apply_progress(&mut m, progress);
+        }
+        for (width, height) in [(80, 40), (160, 40)] {
+            let text = render_text(&mut m, width, height);
+            println!("--- {width}x{height} ---\n{text}");
+            let flat = text
+                .lines()
+                .map(|line| line.trim_matches(|c| c == '│' || c == ' '))
+                .collect::<Vec<_>>()
+                .join(" ");
+            for part in [
+                "Shield batch 2/2: proved and held; paused since ",
+                "GLOBAL head 2000 has not advanced for 75 s; it submits after 10 min of healthy",
+                "Shield: 1 batch of 2 included: 96 coins shielded; projected end ~",
+            ] {
+                assert!(flat.contains(part), "{width}: {part}\n{text}");
+            }
+            assert!(text.contains("shielding 2/2"), "{width}\n{text}");
+            assert!(!text.contains("7000"), "{width}\n{text}");
+        }
+        super::super::super::update::handle_key(&mut m, KeyEvent::from(KeyCode::Esc));
+        let text = render_text(&mut m, 120, 30);
+        println!("--- 120x30 after esc ---\n{text}");
+        assert!(
+            text.contains(
+                "Stop shield: ‹y› stop before the next submission  any other key keeps it running"
+            ),
+            "{text}"
+        );
     }
 
     /// Without --reveal a render hides the confirmation's amount and the
@@ -913,6 +1405,79 @@ mod coins_render_tests {
             revealed_after.contains("included: 1 coins, 875 Q shielded."),
             "{revealed_after}"
         );
+    }
+
+    /// The Balances and middle panels' text of a render, Notifications
+    /// left out.
+    fn upper_panels(text: &str) -> String {
+        text.lines()
+            .take_while(|line| !line.starts_with("╭ Notifications"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The claimable amount shows once on the tab, in its Balances row;
+    /// the Claim status adds the action, not the amount.
+    #[test]
+    fn the_claimable_amount_shows_in_its_row_only() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.cursor = 0;
+        for width in [80, 120, 200] {
+            let text = render_text(&mut m, width, 40);
+            let panels = upper_panels(&text);
+            assert_eq!(panels.matches("312500").count(), 1, "{text}");
+            assert!(text.contains("╭ Claim status"), "{text}");
+            assert!(
+                text.contains("Authorization: ‹M› authorizes a mint of the claimable reward"),
+                "{text}"
+            );
+        }
+    }
+
+    /// The claimable frame shows once, in the row's `As of`; its detail
+    /// says where the figure comes from.
+    #[test]
+    fn the_claimable_frame_shows_in_its_row_only() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.cursor = 0;
+        for width in [80, 120, 200] {
+            let text = render_text(&mut m, width, 40);
+            assert_eq!(upper_panels(&text).matches("f1200").count(), 1, "{text}");
+            assert!(
+                detail(&m).starts_with("Claimable: the reward balance"),
+                "{text}"
+            );
+        }
+    }
+
+    /// Coins notices name a condition and its key, never a figure their
+    /// rows or panels show: amount, frame, counts or batches.
+    #[test]
+    fn coins_notices_name_conditions_not_figures() {
+        let mut m = loaded();
+        m.notice_minimum = NoticeSeverity::Info;
+        let texts: Vec<String> = coins::notices(&m, fmt_claimable)
+            .into_iter()
+            .map(|notice| notice.text)
+            .collect();
+        assert!(
+            texts.contains(&"Reward claimable: ‹M› authorizes a mint.".to_string()),
+            "{texts:?}"
+        );
+        for text in &texts {
+            for figure in [
+                "312500",
+                "f1200",
+                "4 unshielded",
+                "6 shielded",
+                "2 batches",
+                "1 on",
+            ] {
+                assert!(!text.contains(figure), "{figure} in {text}");
+            }
+        }
     }
 
     #[test]
@@ -985,6 +1550,43 @@ mod coins_render_tests {
                 }
             }
         }
+        // `M` on the claimable row and in its Claim status; `C` in the Claim
+        // status only, with a saved authorization under its cursor.
+        m.coins.cursor = 0;
+        m.compact_actions = true;
+        let text = keys(&mut m, 120);
+        assert!(
+            text.contains("‹M› mint") && !text.contains("claim"),
+            "{text}"
+        );
+        m.compact_actions = false;
+        let text = keys(&mut m, 120);
+        assert!(
+            text.contains("‹M› mint") && text.contains("(C) claim"),
+            "{text}"
+        );
+        m.coins.cursor = 1;
+        let text = keys(&mut m, 120);
+        assert!(text.contains("(M) mint"), "{text}");
+        m.coins.cursor = 0;
+        m.coins.focus = CoinsFocus::Middle;
+        let text = keys(&mut m, 120);
+        assert!(
+            text.contains("‹M› mint") && text.contains("(C) claim"),
+            "no saved authorization to claim\n{text}"
+        );
+        m.coins.mint.saved = vec![super::super::super::mint::Saved {
+            path: "/x/mint-1200.bin".into(),
+            cited_frame: 1200,
+            amounts: Some((900, 9)),
+        }];
+        let text = keys(&mut m, 120);
+        assert!(
+            text.contains("‹M› mint") && text.contains("‹C› claim"),
+            "{text}"
+        );
+        m.coins.focus = CoinsFocus::Balances;
+        m.coins.mint.saved.clear();
         m.coins.cursor = 0;
         m.color_coding = true;
         let text = keys(&mut m, 120);
@@ -1024,6 +1626,167 @@ mod coins_render_tests {
                 assert!(text.contains("‹[/] {/}› upper/lower edge"), "{text}");
             }
         }
+    }
+
+    /// The Claim status lists the saved authorizations, and both mint
+    /// confirmations draw there, masked unless revealed; with
+    /// `QCLIENT_RENDER_DIR` set, each frame is also written there.
+    #[test]
+    fn claim_status_lists_authorizations_and_mint_confirmations_draw() {
+        use super::super::super::mint::{self, Saved, Stage};
+        let dump = |name: &str, text: &str| {
+            if let Ok(dir) = std::env::var("QCLIENT_RENDER_DIR") {
+                std::fs::write(format!("{dir}/{name}.txt"), text).unwrap();
+            }
+        };
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.mint.saved = vec![Saved {
+            path: "/cfg/mint-1200.bin".into(),
+            cited_frame: 1200,
+            amounts: Some((80_000_000_000, 8_000_000)),
+        }];
+        for width in [80, 120] {
+            let text = render_text(&mut m, width, 40);
+            dump(&format!("offline-claim-status-{width}x40"), &text);
+            assert!(text.contains("╭ Claim status"), "{text}");
+            assert!(text.contains("Cited  Amount [Q]  Fee [Q]  State"), "{text}");
+            assert!(
+                text.contains("f1200     9.99900  0.00100  unavailable"),
+                "{text}"
+            );
+            // The claimable row is selected: `M` acts, `C` waits for the
+            // Claim status.
+            assert!(
+                text.contains("‹M› mint") && !text.contains("‹C› claim"),
+                "{text}"
+            );
+        }
+        let preview = |stage| mint::Preview {
+            stage,
+            cited_frame: 1200,
+            reward: 80_000_000_000,
+            fee: 8_000_000,
+            max_fee: 800_000_000,
+            recipient: format!("0x{}", "cd".repeat(40)),
+        };
+        // A confirmation shows in the Claim status whichever row is
+        // selected.
+        m.coins.cursor = 1;
+        m.coins.mint.dialog = Some(mint::Dialog::Confirm(preview(Stage::Authorize)));
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-mint-confirm-120x40", &text);
+        for line in [
+            "Confirm mint",
+            "Reward: 10.000000000000 Q claimable at f1200, from the GLOBAL reward witness",
+            "Amount: 9.999000000000 Q (reward 10.000000000000 Q less fee 0.001000000000 Q)",
+            "Fee: 8000000 base units (0.001000000000 Q) as quoted now, paid from the reward",
+            "Cap: 0.1 Q (--max-fee); a higher quote is refused",
+            "Recipient: this node's wallet, 0xcdcdcdcdcdcd",
+            "Saved as: mint-<frame>.bin in the node config directory, for the claim",
+            "Confirm: ‹y› authorize the mint  any other key cancels",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        // The run's re-read, unwrapped: a grown reward is minted, a
+        // changed fee reopens it.
+        let help: String = mint_confirm_lines(&preview(Stage::Authorize), 400, false)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(
+            help.contains(
+                "The run reads the reward and quotes the fee again at the frame then current: a \
+                 reward that grew is minted in full to this wallet, and the outcome names both \
+                 amounts; a changed fee reopens this confirmation with it; a reward that fell \
+                 stops the run."
+            ),
+            "{help}"
+        );
+        m.mask_private = true;
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-mint-confirm-masked-120x40", &text);
+        for line in [
+            "Reward: hidden in this render (--reveal shows it); claimable at f1200",
+            "Amount: hidden in this render (--reveal shows it)",
+            "Recipient: this node's wallet, its address hidden in this render",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        for private in ["10.000000000000", "9.999000000000", "cdcdcd"] {
+            assert!(!text.contains(private), "{private}\n{text}");
+        }
+        m.mask_private = false;
+        // A run that found the reward grown at the confirmed fee mints it
+        // and names both amounts and the frame its authorization cites.
+        mint::dialog_key(
+            &mut m,
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('y')),
+        );
+        mint::apply_progress(
+            &mut m,
+            mint::Progress::Submitted {
+                cited_frame: 1204,
+                reward: 84_000_000_000,
+                saved: "/cfg/mint-1204.bin".into(),
+            },
+        );
+        mint::apply_progress(&mut m, mint::Progress::Done(Ok(())));
+        for width in [80, 200] {
+            let text = render_text(&mut m, width, 40);
+            dump(&format!("offline-mint-grown-{width}x40"), &text);
+            if width == 200 {
+                assert!(
+                    text.contains(
+                        "Mint f1204: authorization of 10.499 Q submitted (confirmed 9.999 Q; \
+                         the reward grew); inclusion not yet confirmed; ‹C› claims it once \
+                         GLOBAL finalizes it."
+                    ),
+                    "{text}"
+                );
+            }
+            assert!(!text.contains("Confirm mint"), "{text}");
+        }
+        // One that found the fee quoted otherwise opens the confirmation
+        // again with it.
+        m.coins.mint.run = None;
+        m.coins.mint.dialog = Some(mint::Dialog::Confirm(preview(Stage::Authorize)));
+        mint::dialog_key(
+            &mut m,
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('y')),
+        );
+        mint::apply_progress(
+            &mut m,
+            mint::Progress::Requoted(mint::Preview {
+                cited_frame: 1205,
+                fee: 8_800_000,
+                ..preview(Stage::Authorize)
+            }),
+        );
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-mint-fee-requoted-120x40", &text);
+        for line in [
+            "Mint: the fee quote changed from 8000000 to 8800000 base units; confirm again.",
+            "Fee: 8800000 base units (0.001100000000 Q) as quoted now, paid from the reward",
+        ] {
+            assert!(text.contains(line), "{line}\n{text}");
+        }
+        m.coins.mint.requoted = None;
+        m.coins.mint.dialog = Some(mint::Dialog::Confirm(preview(Stage::Claim {
+            path: "/cfg/mint-1200.bin".into(),
+            witness: 1250,
+        })));
+        let text = render_text(&mut m, 120, 40);
+        dump("offline-mint-claim-confirm-120x40", &text);
+        assert!(
+            text.contains("Authorization: mint-1200.bin, citing f1200; finalized, its GLOBAL witness cites f1250"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Confirm: ‹y› claim  any other key cancels"),
+            "{text}"
+        );
+        assert!(!text.contains("/cfg/"), "{text}");
     }
 
     /// The Provers rows follow the same rule, and pressing a key that does
@@ -1104,6 +1867,19 @@ mod coins_render_tests {
 
     /// The confirmation and a run's states as they draw; with
     /// `QCLIENT_RENDER_DIR` set, each frame is also written there.
+    /// While a mint or a shield is prepared, ‹esc› names what it cancels.
+    #[test]
+    fn esc_names_the_preparation_it_cancels() {
+        let mut m = loaded();
+        m.coins.mint.dialog = Some(MintDialog::Preparing(std::time::Instant::now(), false));
+        let text = render_text(&mut m, 200, 40);
+        assert!(text.contains("cancel mint"), "{text}");
+        m.coins.mint.dialog = None;
+        m.coins.shield.dialog = Some(Dialog::Preparing(std::time::Instant::now()));
+        let text = render_text(&mut m, 200, 40);
+        assert!(text.contains("cancel shield"), "{text}");
+    }
+
     #[test]
     fn shield_confirmation_and_progress_draw() {
         use super::super::super::shield::{self, Preview, Progress};
@@ -1153,8 +1929,10 @@ mod coins_render_tests {
             pending: 1,
             duplicates: 0,
         }));
-        let text = render_text(&mut m, 120, 30);
-        dump("offline-shield-confirm-120x30", &text);
+        // At 32 lines the rows read below stay in view beside a taller
+        // Balances panel; a shorter terminal ends the question in the marker.
+        let text = render_text(&mut m, 120, 32);
+        dump("offline-shield-confirm-120x32", &text);
         for line in [
             "Confirm shield",
             "Coins: 4 of 8 listed legacy coins, in 2 batches of up to 96 coins, one shard each",
@@ -1162,7 +1940,7 @@ mod coins_render_tests {
             "Recipient: this node's wallet, 0xabababababab…abababababab (40 bytes;",
             "Fee: 16000 base units (0.000002000000 Q) in total as quoted now, up to 9000 per batch",
             "Cap: 0.1 Q per batch (--max-fee); a higher quote stops the run",
-            "Left out: 2 already shielded; 1 on no live shard, for a later run; 1 submitted <1h",
+            "Left out: 2 already shielded; 1 on no live shard, for a later run; 1 submitted <2h",
             "Confirm: ‹y› shield  any other key cancels",
         ] {
             assert!(text.contains(line), "{line}\n{text}");
@@ -1232,10 +2010,445 @@ mod coins_render_tests {
             text.contains("Shield: 1 batch of 2 submitted (3 coins); inclusion not yet confirmed."),
             "{text}"
         );
+        // The run failed between batches: no batch was being proved or
+        // held, and one stays submitted.
         assert!(
-            text.contains("Shield batch 2/2 failed")
-                || text.contains("Shield: failed before any batch"),
+            text.contains("Shield: the run stopped after 1 batch of 2 submitted: fee changed"),
             "{text}"
         );
+        assert!(!text.contains("nothing was submitted"), "{text}");
+    }
+
+    /// The render rows of the panels' top and bottom borders.
+    fn borders(text: &str) -> Vec<usize> {
+        text.lines()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with('╭') || line.starts_with('╰'))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The Balances panel keeps its height while the cursor moves between
+    /// rows whose details differ in length; expanded keys, which show
+    /// every key, keep the key rows out of it.
+    #[test]
+    fn balances_height_ignores_the_cursor_rows_detail() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.compact_actions = false;
+        m.claimable_reward = None;
+        // Here the claimable detail takes one line at 80 columns and the
+        // legacy detail two.
+        let width = 80;
+        for height in [24, 40] {
+            m.coins.cursor = 0;
+            let text = render_text(&mut m, width, height);
+            m.coins.cursor = 1;
+            let moved = render_text(&mut m, width, height);
+            assert_eq!(borders(&moved), borders(&text), "{text}\n{moved}");
+        }
+    }
+
+    /// The key rows keep their height across cursor and focus moves and a
+    /// confirmation, though compact mode leaves out the keys that do not
+    /// apply and a confirmation shows one row: Notifications' bottom
+    /// border, right above them, stays put.
+    #[test]
+    fn coins_key_rows_keep_their_height_across_moves_and_questions() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.compact_actions = true;
+        for (width, height) in [(80, 24), (100, 30), (120, 40), (160, 40), (200, 60)] {
+            m.coins.shield.dialog = None;
+            m.coins.focus = CoinsFocus::Balances;
+            m.coins.cursor = 0;
+            let text = render_text(&mut m, width, height);
+            let bottom = *borders(&text).last().unwrap();
+            for (focus, cursor) in [
+                (CoinsFocus::Balances, 1),
+                (CoinsFocus::Middle, 1),
+                (CoinsFocus::Notifications, 1),
+                (CoinsFocus::Middle, 0),
+            ] {
+                m.coins.focus = focus;
+                m.coins.cursor = cursor;
+                let moved = render_text(&mut m, width, height);
+                assert_eq!(
+                    *borders(&moved).last().unwrap(),
+                    bottom,
+                    "{width}x{height} {focus:?} row {cursor}\n{text}\n{moved}"
+                );
+            }
+            m.coins.shield.dialog = Some(super::super::super::shield::Dialog::Confirm(
+                super::super::super::shield::shield_tests::preview(),
+            ));
+            let asked = render_text(&mut m, width, height);
+            assert!(asked.contains("Confirm: ‹y› shield"), "{asked}");
+            assert_eq!(
+                *borders(&asked).last().unwrap(),
+                bottom,
+                "{width}x{height} confirm\n{text}\n{asked}"
+            );
+        }
+    }
+
+    /// Notifications keeps its height however many notices it shows.
+    #[test]
+    fn coins_panel_borders_ignore_the_notices_shown() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.compact_actions = false;
+        for (width, height) in [(80, 24), (120, 40)] {
+            m.status_msg.clear();
+            let text = render_text(&mut m, width, height);
+            m.status_msg = "Shield: a long reply to a key ".repeat(12);
+            m.status_is_error = true;
+            m.status_message_time = Some(SystemTime::now());
+            let busy = render_text(&mut m, width, height);
+            assert!(busy.contains("a long reply"), "{busy}");
+            assert_eq!(borders(&busy), borders(&text), "{text}\n{busy}");
+        }
+    }
+
+    /// A panel's inner lines, borders and edge spaces trimmed, from the
+    /// render row under its `title` to the one above its bottom border.
+    fn panel_inner(text: &str, title: &str) -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let top = lines
+            .iter()
+            .position(|line| line.starts_with(&format!("╭ {title}")))
+            .unwrap_or_else(|| panic!("no {title} panel in\n{text}"));
+        let height = lines[top + 1..]
+            .iter()
+            .position(|line| line.starts_with('╰'))
+            .unwrap();
+        lines[top + 1..top + 1 + height]
+            .iter()
+            .map(|line| line.trim_matches('│').trim().to_string())
+            .collect()
+    }
+
+    /// `detail` fills the panel's last inner lines, after a blank line
+    /// that parts it from the `rows` lines of content above it.
+    fn assert_pinned(inner: &[String], rows: usize, detail: &[String], text: &str) {
+        assert!(inner.len() > rows + detail.len(), "panel too short\n{text}");
+        assert_eq!(&inner[inner.len() - detail.len()..], detail, "{text}");
+        assert!(
+            inner[rows].is_empty(),
+            "detail right under the rows\n{text}"
+        );
+    }
+
+    /// The text of `text` wrapped to `width`, each line trimmed.
+    fn wrapped(text: &str, width: u16) -> Vec<String> {
+        wrap_message(Line::from(text.to_string()), width)
+            .iter()
+            .map(|line| line.to_string().trim().to_string())
+            .collect()
+    }
+
+    /// A model whose Claim status lists a saved authorization and whose
+    /// Shield plan lists two batches.
+    fn with_rows() -> Model {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.mint.saved = vec![super::super::super::mint::Saved {
+            path: "/cfg/mint-1200.bin".into(),
+            cited_frame: 1200,
+            amounts: Some((80_000_000_000, 8_000_000)),
+        }];
+        if let Some((Some(snapshot), _, _)) = m.coins.legacy.answer.as_mut() {
+            snapshot.batches = vec![
+                crate::commands::token::legacy::PlanBatch {
+                    filter: [vec![0x11; 32], vec![0x90, 0x00, 0x91]].concat(),
+                    coins: 3,
+                    units: 6_000_000_000_000,
+                };
+                2
+            ];
+        }
+        m
+    }
+
+    /// In a Balances panel taller than its content the cursor row's
+    /// detail fills its last lines, as Allocations does, the rows at the
+    /// top.
+    #[test]
+    fn the_balances_detail_keeps_to_the_panel_bottom() {
+        let mut m = with_rows();
+        for (width, height) in [(100, 70), (200, 60)] {
+            m.coins.edges = [6, 0];
+            m.coins.cursor = 0;
+            let text = render_text(&mut m, width, height);
+            let balances = panel_inner(&text, "Balances");
+            let rows = table_lines(&m, width - 2).len();
+            assert_pinned(&balances, rows, &wrapped(&detail(&m), width - 2), &text);
+        }
+    }
+
+    /// A shield confirmation keeps its Recipient in view in a short
+    /// panel: the other rows give way to the enlarge marker. Moving the
+    /// Balances edge down stands in for more balance rows.
+    #[test]
+    fn a_short_shield_confirmation_keeps_its_recipient() {
+        let mut m = loaded();
+        m.color_coding = false;
+        let mut preview = super::super::super::shield::shield_tests::preview();
+        preview.recipient = format!("0x{}", "ab".repeat(40));
+        let full = |width: u16| confirm_lines(&preview, width - 2, u16::MAX, false).len();
+        let full = [full(80), full(120)];
+        m.coins.shield.dialog = Some(super::super::super::shield::Dialog::Confirm(preview));
+        for ((width, height), full) in [(80, 24), (120, 30)].into_iter().zip(full) {
+            for edge in [0, 1, 2] {
+                m.coins.edges = [edge, 0];
+                let text = render_text(&mut m, width, height);
+                let inner = panel_inner(&text, "Confirm shield");
+                assert!(
+                    inner
+                        .iter()
+                        .any(|line| line.starts_with("Recipient: this node's wallet")),
+                    "{width}x{height} edge {edge}: no Recipient\n{text}"
+                );
+                if inner.len() < full {
+                    assert_eq!(
+                        inner.last().map(String::as_str),
+                        Some("… enlarge panel for details"),
+                        "{width}x{height} edge {edge}\n{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The Claim status keeps its State note on its last lines, under the
+    /// saved authorizations.
+    #[test]
+    fn the_claim_status_note_keeps_to_the_panel_bottom() {
+        let mut m = with_rows();
+        for (width, height) in [(100, 70), (200, 60)] {
+            m.coins.cursor = 0;
+            let text = render_text(&mut m, width, height);
+            let claim = panel_inner(&text, "Claim status");
+            let note = wrapped(
+                "State: this node reports no authorization status; ‹C› checks for the finalized \
+                 witness before it claims.",
+                width - 2,
+            );
+            let saved = claim
+                .iter()
+                .position(|line| line.starts_with("f1200"))
+                .unwrap();
+            assert_pinned(&claim, saved + 1, &note, &text);
+        }
+    }
+
+    /// The Shield plan keeps its footer on its last line, under the
+    /// batch rows.
+    #[test]
+    fn the_shield_plan_footer_keeps_to_the_panel_bottom() {
+        let mut m = with_rows();
+        for (width, height) in [(100, 70), (200, 60)] {
+            m.coins.cursor = 1;
+            let text = render_text(&mut m, width, height);
+            let plan = panel_inner(&text, "Shield plan");
+            assert_pinned(
+                &plan,
+                3,
+                &["Batches: 2 of ≤96 coins; 1 coins on no live shard".to_string()],
+                &text,
+            );
+        }
+    }
+
+    /// A Balances panel too short for its detail keeps every row: with no
+    /// line beyond the rows it shows none, with one it shows the marker.
+    #[test]
+    fn a_short_balances_panel_keeps_its_rows_before_the_detail() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.cursor = 0;
+        let width = 80;
+        assert!(wrap_message(Line::from(detail(&m)), width - 2).len() > 1);
+        for (edge, last) in [(-2, None), (-1, Some("… enlarge panel for details"))] {
+            m.coins.edges = [edge, 0];
+            let text = render_text(&mut m, width, 40);
+            let inner = panel_inner(&text, "Balances");
+            let rows = table_lines(&m, width - 2).len();
+            assert!(inner[0].starts_with("Kind"), "{text}");
+            assert!(inner[1].starts_with("claimable"), "{text}");
+            assert!(inner[2].starts_with("legacy"), "{text}");
+            match last {
+                None => assert_eq!(inner.len(), rows, "{text}"),
+                Some(marker) => assert_eq!(inner[rows..], [marker.to_string()], "{text}"),
+            }
+        }
+    }
+
+    /// A Shield plan of two lines keeps its header and a row and drops
+    /// the footer; of three, the footer takes the last.
+    #[test]
+    fn a_short_shield_plan_keeps_a_row_before_its_footer() {
+        let mut m = loaded();
+        if let Some((Some(snapshot), _, _)) = m.coins.legacy.answer.as_mut() {
+            snapshot.batches = vec![
+                crate::commands::token::legacy::PlanBatch {
+                    filter: vec![0x11; 32],
+                    coins: 3,
+                    units: 6_000_000_000_000,
+                };
+                4
+            ];
+        }
+        for height in [2u16, 3] {
+            let (_, lines, _) = plan_lines(&mut m, 100, height);
+            let lines: Vec<String> = lines.iter().map(Line::to_string).collect();
+            assert_eq!(lines.len(), usize::from(height), "{lines:?}");
+            assert!(lines[0].starts_with("Batch"), "{lines:?}");
+            assert!(lines[1].starts_with("1/4"), "{lines:?}");
+            assert_eq!(
+                lines.last().unwrap().starts_with("Batches:"),
+                height > 2,
+                "{lines:?}"
+            );
+        }
+    }
+
+    /// The Claim status lines at `width` columns, each trimmed.
+    fn claim_text(m: &Model, width: u16) -> Vec<String> {
+        claim_lines(m, width - 2, u16::MAX)
+            .iter()
+            .map(|line| line.to_string().trim().to_string())
+            .collect()
+    }
+
+    /// On an 80x24 terminal the Claim status keeps every line, with the
+    /// key rows as `?` leaves them; with the expanded rows it keeps them
+    /// or ends in the enlarge marker, never dropping one unmarked.
+    #[test]
+    fn an_80x24_claim_status_keeps_its_lines() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.coins.cursor = 0;
+        let want = claim_text(&m, 80);
+        assert!(
+            want.iter()
+                .any(|line| line.starts_with("Saved authorizations")),
+            "{want:?}"
+        );
+        for show in [false, true] {
+            m.show_key_rows = show;
+            let text = render_text(&mut m, 80, 24);
+            let claim = panel_inner(&text, "Claim status");
+            if !show || claim.len() >= want.len() {
+                assert!(claim.len() >= want.len(), "{text}");
+                assert_eq!(claim[..want.len()], want[..], "{text}");
+            } else {
+                let shown = claim.len() - 1;
+                assert_eq!(claim[..shown], want[..shown], "{text}");
+                assert_eq!(claim[shown], "… enlarge panel for details", "{text}");
+            }
+        }
+    }
+
+    /// Notifications takes its height from the terminal, the same with no
+    /// notice, one line and six or more: one line until the middle panel
+    /// has MIDDLE_LINES, NOTICE_LINES on a tall terminal.
+    #[test]
+    fn coins_notifications_follow_the_terminal_not_the_notices() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.notice_minimum = NoticeSeverity::Error;
+        for show in [false, true] {
+            m.show_key_rows = show;
+            for (width, height) in [(80, 24), (100, 30), (120, 40), (200, 60)] {
+                let mut drawn = Vec::new();
+                let long = "Shield: a long reply ".repeat(80);
+                for reply in ["", "Shield: a refused key", long.as_str()] {
+                    m.status_msg = reply.to_string();
+                    m.status_is_error = true;
+                    m.status_message_time = Some(SystemTime::now());
+                    let text = render_text(&mut m, width, height);
+                    let notices = panel_inner(&text, "Notifications");
+                    let lines = notices.iter().filter(|line| !line.is_empty()).count();
+                    let all = notice_lines(&mut m, width - 2).len().max(1);
+                    assert_eq!(lines, all.min(notices.len()), "{text}");
+                    drawn.push((borders(&text), text));
+                }
+                let (edges, text) = &drawn[0];
+                for (moved, busy) in &drawn[1..] {
+                    assert_eq!(moved, edges, "{width}x{height}\n{text}\n{busy}");
+                }
+                let [_, _, middle_top, middle_bottom, notice_top, notice_bottom] = edges[..] else {
+                    panic!("not three panels\n{text}");
+                };
+                let middle = middle_bottom - middle_top - 1;
+                let notices = notice_bottom - notice_top - 1;
+                assert!(
+                    notices == 1 || middle >= usize::from(MIDDLE_LINES),
+                    "{width}x{height}: {notices} notice lines, {middle} middle\n{text}"
+                );
+                if height >= 40 {
+                    assert_eq!(notices, usize::from(NOTICE_LINES), "{text}");
+                }
+            }
+        }
+    }
+
+    /// A Claim status shorter than its lines, its lower edge moved up,
+    /// ends in the enlarge marker.
+    #[test]
+    fn a_short_claim_status_ends_in_the_marker() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.show_key_rows = false;
+        m.coins.cursor = 0;
+        let want = claim_text(&m, 80);
+        m.coins.edges = [0, -3];
+        let text = render_text(&mut m, 80, 24);
+        let claim = panel_inner(&text, "Claim status");
+        assert!(claim.len() < want.len(), "{text}");
+        let shown = claim.len() - 1;
+        assert_eq!(claim[..shown], want[..shown], "{text}");
+        assert_eq!(claim[shown], "… enlarge panel for details", "{text}");
+    }
+
+    /// Balances' moved lower edge takes Notifications' spare lines before
+    /// the middle panel's: at 80x24 with the edges [1, 0] (a live
+    /// `coinsPanelEdges`) the Claim status keeps every line, and while
+    /// Notifications has more than one line the middle panel keeps
+    /// MIDDLE_LINES.
+    #[test]
+    fn a_moved_balances_edge_takes_the_spare_notice_lines_first() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.show_key_rows = false;
+        m.coins.cursor = 0;
+        let want = claim_text(&m, 80);
+        let base = borders(&render_text(&mut m, 80, 24));
+        for upper in 0..=4i16 {
+            m.coins.edges = [upper, 0];
+            let text = render_text(&mut m, 80, 24);
+            assert_eq!(m.coins.edges, [upper, 0], "{text}");
+            let drawn = borders(&text);
+            let [top, bottom, middle_top, middle_bottom, notice_top, notice_bottom] = drawn[..]
+            else {
+                panic!("not three panels\n{text}");
+            };
+            assert_eq!(top, base[0], "{text}");
+            assert_eq!(bottom, base[1] + upper as usize, "{text}");
+            let middle = middle_bottom - middle_top - 1;
+            let notices = notice_bottom - notice_top - 1;
+            assert!(
+                notices == 1 || middle >= usize::from(MIDDLE_LINES),
+                "edges [{upper}, 0]: {notices} notice lines, {middle} middle\n{text}"
+            );
+            // The live case, and any split that leaves the middle panel
+            // the Claim status's lines.
+            if upper <= 1 || middle >= want.len() {
+                let claim = panel_inner(&text, "Claim status");
+                assert!(claim.len() >= want.len(), "edges [{upper}, 0]\n{text}");
+                assert_eq!(claim[..want.len()], want[..], "{text}");
+            }
+        }
     }
 }

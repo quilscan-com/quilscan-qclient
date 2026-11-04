@@ -39,6 +39,7 @@ mod overlay;
 mod scope;
 pub mod storage_health;
 mod store;
+pub mod store_io;
 // Efficient JMT Merkle-diff sync — enabled via the vendored jmt visibility patch
 // (crates/jmt: gen_child_node_key + NibblePath::new made pub).
 pub mod subtree_proof;
@@ -57,8 +58,8 @@ pub use sync::{
 // Re-export so sync callers can name the diff's key type + the reader bound
 // without depending on jmt directly.
 pub use database::{
-    CoordinatedDb, DatabaseCommitError, DatabaseWriteGuard, DisjointBatch, KeyPrefixSet,
-    WeakCoordinatedDb,
+    take_all_stores_write_times, CoordinatedDb, DatabaseCommitError, DatabaseWriteGuard,
+    DisjointBatch, KeyPrefixSet, WeakCoordinatedDb, WriteTimesSample,
 };
 pub use jmt::storage::TreeReader;
 pub use jmt::KeyHash;

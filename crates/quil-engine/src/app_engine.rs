@@ -1748,14 +1748,15 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // operation not known to verify within the budget (a batch shield, or
         // a size class this node has not measured) is held until its proofs
         // are verified in the background (`admission_verify`, started when it
-        // arrived, or now), however long that takes: a frame carrying it held
-        // every member's materialization, and nobody proposes past a frame it
-        // has not materialized (1,150 s without a QUIL frame on a devnet,
-        // 2026-10-29). Members verify in arrival order, so they hold its
-        // verdict when its leader does. The rest are carried while their
-        // estimated verification fits the per-frame budget, the first even
-        // when it alone exceeds it, and verify when the frame executes, as
-        // before. A bundle whose background verification failed
+        // arrived, or now; held past `MAX_PROOF_HOLD`, this node verifies it
+        // next, so arrivals queued ahead of it never hold it longer): a frame
+        // carrying it held every member's materialization, and nobody
+        // proposes past a frame it has not materialized (1,150 s without a
+        // QUIL frame on a devnet, 2026-10-29). Members verify in arrival
+        // order, so they hold its verdict when its leader does. The rest are
+        // carried while their estimated verification fits the per-frame
+        // budget, the first even when it alone exceeds it, and verify when
+        // the frame executes, as before. A bundle whose background verification failed
         // `admission_verify::MAX_FAILURES` times on this node is left out and
         // ages out of the pool; one that cannot be queued is budgeted as
         // before. Held bundles are carried forward to this rank, not dropped,
@@ -1769,6 +1770,50 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                     .map(|canon| bundle_proofs(manager, queue, application, canon, budget_secs))
                     .collect();
                 let selection = verification_budget_selection(&proofs, budget_secs);
+                // A long bundle held past `MAX_PROOF_HOLD` verifies next on
+                // this node, behind the frames waiting and ahead of the
+                // arrivals, one per shard at a time: the queue may hold
+                // arrivals ahead of it for longer than any one of them takes.
+                let held_long: Vec<[u8; 32]> = selection
+                    .iter()
+                    .zip(&proofs)
+                    .zip(&canonical_requests)
+                    .filter(|((choice, proofs), _)| {
+                        **choice == Budgeted::Hold && proofs.long && proofs.verifying
+                    })
+                    .map(|(_, canon)| crate::admission_verify::digest(canon))
+                    .collect();
+                let due = PROOF_HOLDS.lock().unwrap_or_else(|e| e.into_inner()).due(
+                    &self.filter,
+                    &held_long,
+                    |digest| queue.pending(digest),
+                    std::time::Instant::now(),
+                );
+                if let Some((digest, held_for)) = due {
+                    if let Some(canon) = canonical_requests
+                        .iter()
+                        .find(|canon| crate::admission_verify::digest(canon) == digest)
+                    {
+                        let verifying = crate::admission_verify::offer_submission(
+                            queue,
+                            manager,
+                            application,
+                            canon,
+                            true,
+                        );
+                        info!(
+                            filter = %hex::encode(&self.filter),
+                            frame = frame_number,
+                            bundle = %hex::encode(&digest[..4]),
+                            held_secs = held_for.as_secs(),
+                            verifying,
+                            scope = "this node",
+                            action = "an expected wait: a later proposal carries it once it verified",
+                            "confidential bundle held for its background verification past the hold bound \
+                             verifies next on this node"
+                        );
+                    }
+                }
                 let held: Vec<Vec<u8>> = selection
                     .iter()
                     .zip(&origins)
@@ -1815,7 +1860,13 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // The leader executes these after finalization like every member;
         // start verifying their proofs now.
         if let Some(exec) = self.execution_engine.as_ref() {
-            prewarm_proof_verdicts(exec, &self.app_address, &canonical_requests);
+            prewarm_proof_verdicts(
+                exec,
+                &self.app_address,
+                &canonical_requests,
+                &self.filter,
+                frame_number,
+            );
         }
         // Deliveries of globally committed outputs this shard owns, each its
         // own bundle, after the
@@ -2804,6 +2855,8 @@ pub struct AppConsensusEngine {
     /// materialized twice (mirrors Go `lastMaterializedFrame`,
     /// app_consensus_engine.go:1444-1449).
     last_materialized_frame: u64,
+    /// Spend relays GLOBAL skipped (`crate::relay_reoffer`).
+    relay_watch: crate::relay_reoffer::RelayWatch,
     /// Thread-safe mirror of `last_materialized_frame` for the CW proposal
     /// check, which runs on the simplex thread. Bumped alongside the
     /// field via [`Self::set_materialized_frame`] wherever the materialized
@@ -3169,6 +3222,7 @@ impl AppConsensusEngine {
             retry_parent_seals: std::collections::BTreeSet::new(),
             pending_seal_rank: None,
             last_materialized_frame: 0,
+            relay_watch: Default::default(),
             shard_mat_frame,
             execution,
             data_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3759,7 +3813,9 @@ impl AppConsensusEngine {
     /// The caller keeps the frame and retries (`PROOF_VERIFICATION_PENDING`).
     /// A leader carries such an operation only once it verified it, and
     /// members verify in arrival order, so a member waits here only when it
-    /// trails the leader; the queue then verifies what frames wait on first.
+    /// trails the leader; the queue then verifies what frames wait on first,
+    /// ahead of vote-time warm-ups and arrivals, and its background work
+    /// leaves the first node-wide worker slot to frames.
     /// The wait lasts until the verdicts are cached, warning every
     /// [`PROOF_DEFERRAL_OVERRUN`]. `None`: materialize now — every verdict is
     /// cached, the operations left are known to verify within the budget
@@ -3778,7 +3834,7 @@ impl AppConsensusEngine {
         let budget_secs = exec.token_verification_budget();
         // Operations not known to verify within the budget; the others verify
         // when the frame executes, as before.
-        let mut unverified: Vec<usize> = Vec::new();
+        let mut unverified: Vec<quil_execution::manager::OperationEstimate> = Vec::new();
         let mut verifying = true;
         let mut restarted = false;
         // Submissions queued ahead of this frame's last one.
@@ -3800,12 +3856,16 @@ impl AppConsensusEngine {
                     || proof_prewarm_running(&canon);
             queued_ahead = queued_ahead.max(queue.queued_ahead(&digest).unwrap_or(0));
         }
+        // This frame finalized and asked for its own submissions above
+        // (moving them to the frames' lane): warm-ups of the proposals that
+        // lost this frame or an earlier one are no longer needed.
+        queue.end_warmups(&self.filter, frame_number);
         if unverified.is_empty() && !proof_deferral_known(&self.filter, frame_number) {
             return None;
         }
         let estimate_secs: f64 = unverified
             .iter()
-            .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
+            .map(quil_execution::ExecutionEngineManager::estimated_operation_secs)
             .sum();
         let decision = PROOF_DEFERRALS
             .lock()
@@ -7610,7 +7670,8 @@ impl AppConsensusEngine {
             .unwrap_or_default();
         let (state, began) = match stall {
             RecordStall::Ended { state, outcome } => {
-                info!(core_id = self.core_id, filter = %filter, session = %session,
+                info!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
+                    latest_global_frame = self.latest_global_header_frame(),
                     global_executed = state.executed, checkpoint = state.checkpoint,
                     copies = state.copies, waited_secs = state.waited_secs, outcome,
                     "closing session's seal record stall ended");
@@ -8499,6 +8560,7 @@ impl AppConsensusEngine {
         } else if !timer_due(&self.seal_follow, self.seal_published_at) {
             return;
         }
+        let view_frame = view.as_ref().ok().map(handoff::CommittedView::frame);
         match view.and_then(|view| handoff::schedule::seal_submitted(&view, session)) {
             Ok(false) => {
                 self.publish_seal(&submission, trigger);
@@ -8509,7 +8571,7 @@ impl AppConsensusEngine {
                 let stall = self.seal_drain_progress.clear(now);
                 self.log_seal_drain_stall(stall, None);
                 let record = self.seal_record.clear("recorded", now);
-                self.log_seal_record_stall(record, None);
+                self.log_seal_record_stall(record, view_frame);
             }
             Err(_) => {}
         }
@@ -8542,7 +8604,12 @@ impl AppConsensusEngine {
             let stall = self.seal_drain_progress.clear(now);
             self.log_seal_drain_stall(stall, None);
             let record = self.seal_record.clear("cleared", now);
-            self.log_seal_record_stall(record, None);
+            let view_frame = if record.is_some() {
+                handoff_view_frame(&global)
+            } else {
+                None
+            };
+            self.log_seal_record_stall(record, view_frame);
             self.sealed_session = None;
             self.seal_published_at = None;
             self.seal_published_head = None;
@@ -8586,6 +8653,7 @@ impl AppConsensusEngine {
         }
         if matches!(status, Ok(true)) {
             self.observe_session_view_lag(&global, &session, now, &filter);
+            self.reoffer_unrelayed_spends(&global);
         }
         match status {
             Ok(true) => {}
@@ -8609,6 +8677,89 @@ impl AppConsensusEngine {
             }
             // Logged above, at its transitions.
             Err(_) => {}
+        }
+    }
+
+    /// Put back in the mempool the confidential bundles GLOBAL's executed
+    /// headers skipped the spend relay of (`crate::relay_reoffer`), from the
+    /// tip this tick's view read. Reads no store unless the tip jumped past
+    /// the relay window, or on the first tick after a start.
+    fn reoffer_unrelayed_spends(&mut self, global: &Arc<quil_hypergraph::HypergraphCrdt>) {
+        use crate::message_collector::SubmitOutcome;
+        use crate::relay_reoffer::{unrelayed_bundles, MAX_REOFFERS, REOFFER_HORIZON_FRAMES};
+        use sha3::Digest;
+        let Some(tip) = self.lagging_voter.global_tip else {
+            return;
+        };
+        let Some(application) = self
+            .app_address
+            .get(..32)
+            .and_then(|address| <[u8; 32]>::try_from(address).ok())
+        else {
+            return;
+        };
+        let filter = hex::encode(&self.filter);
+        let expired = self.relay_watch.observe_tip(tip);
+        if expired > 0 {
+            // Most such frames carry nothing; GLOBAL's own coverage warning
+            // names actual skips.
+            info!(filter = %filter, executed_tip = tip, frames = expired,
+                horizon_frames = REOFFER_HORIZON_FRAMES,
+                "source frames left the spend re-offer horizon without being examined: \
+                 a spend GLOBAL skipped there stays uncommitted until its sender submits it again");
+        }
+        for frame in self.relay_watch.due() {
+            let bundles = match unrelayed_bundles(
+                self.clock_store.as_ref(),
+                global,
+                &application,
+                &self.filter,
+                frame,
+                self.last_materialized_frame,
+            ) {
+                Ok(bundles) => bundles,
+                Err(error) => {
+                    // Another member holds it, or the next jump's pass reads it.
+                    info!(filter = %filter, source_frame = frame, executed_tip = tip, error = %error,
+                        "cannot examine a frame GLOBAL skipped the spend relay of on this node");
+                    self.relay_watch.examined(frame);
+                    continue;
+                }
+            };
+            let mut retry = false;
+            for canonical in bundles {
+                let hash: [u8; 32] = sha3::Sha3_256::digest(&canonical).into();
+                let bundle = hex::encode(&hash[..4]);
+                if !self.relay_watch.may_reoffer(&hash) {
+                    if self.relay_watch.note_given_up(&hash) {
+                        warn!(filter = %filter, source_frame = frame, executed_tip = tip, bundle = %bundle,
+                            reoffers = MAX_REOFFERS, scope = "network: GLOBAL keeps skipping this bundle's relay",
+                            action = "it stays uncommitted and consumed nothing: its sender submits it again",
+                            "giving up re-offering a confidential bundle");
+                    }
+                    continue;
+                }
+                match self.message_collector.readmit(canonical) {
+                    SubmitOutcome::Accepted => {
+                        let attempt = self.relay_watch.note_reoffered(hash);
+                        info!(filter = %filter, source_frame = frame, executed_tip = tip, bundle = %bundle,
+                            attempt, max_attempts = MAX_REOFFERS,
+                            "re-offering a confidential bundle: GLOBAL executed past every header \
+                             relaying it without deciding it; a later frame executes it again");
+                    }
+                    SubmitOutcome::Duplicate => {}
+                    SubmitOutcome::Filtered(refusal) => {
+                        // The collector logs a full rank; the frame waits for
+                        // room, within the horizon.
+                        retry = retry || refusal.retryable();
+                        debug!(filter = %filter, source_frame = frame, bundle = %bundle,
+                            reason = refusal.reason(), "mempool refused a re-offered bundle");
+                    }
+                }
+            }
+            if !retry {
+                self.relay_watch.examined(frame);
+            }
         }
     }
 
@@ -11102,33 +11253,62 @@ impl AppConsensusEngine {
     /// about 190 KB in 8 h on one node) and no proposal read them.
     fn add_app_message(&mut self, data: &[u8]) {
         let data = canonical_app_message(data);
-        stamp_arrival(&self.routing_seen, &data, std::time::Instant::now());
-        // Verify its confidential proofs now, in the background, so the
-        // proposal that carries it and the frame that executes it find the
-        // verdicts cached instead of verifying for minutes. Only on the shard
-        // that proposes it: every shard of the application collects it.
-        if let Some(exec) = self.execution_engine.as_ref() {
-            if quil_execution::ExecutionEngineManager::confidential_operation_count(
-                &self.app_address,
-                &data,
-            ) > 0
-                && arrival_designated(
-                    &self.filter,
-                    routing_shards(&self.app_address).as_deref(),
-                    &crate::admission_verify::digest(&data),
-                    quil_execution::ExecutionEngineManager::shield_source(&data),
-                )
-            {
-                crate::admission_verify::offer_submission(
-                    crate::admission_verify::global(),
+        let now = std::time::Instant::now();
+        stamp_arrival(&self.routing_seen, &data, now);
+        let collected = self.message_collector.add_message_newest(data.clone());
+        self.verify_on_arrival(&data, collected, now);
+    }
+
+    /// Verify an arriving submission's confidential proofs now, in the
+    /// background, so the proposal that carries it and the frame that
+    /// executes it find the verdicts cached instead of verifying for
+    /// minutes. Only on the shard that proposes it (every shard of the
+    /// application collects it), and only what may still execute: one the
+    /// collector did not take as new (`collected`: a finalized frame
+    /// consumed it, the collector holds it, or its rank is full), one that
+    /// fails dispatch's checks before native work, and one the global
+    /// commit already decided are not queued; nor arrivals past the
+    /// admission budget ([`crate::admission_verify::offer_arrival`]). A
+    /// proposal or frame carrying any of them queues it then.
+    fn verify_on_arrival(&self, data: &[u8], collected: bool, now: std::time::Instant) {
+        let Some(exec) = self.execution_engine.as_ref() else {
+            return;
+        };
+        if quil_execution::ExecutionEngineManager::confidential_operation_count(
+            &self.app_address,
+            data,
+        ) == 0
+            || !arrival_designated(
+                &self.filter,
+                routing_shards(&self.app_address).as_deref(),
+                &crate::admission_verify::digest(data),
+                quil_execution::ExecutionEngineManager::shield_source(data),
+            )
+        {
+            return;
+        }
+        let queue = crate::admission_verify::global();
+        if !collected {
+            queue.note_arrival_skipped();
+            return;
+        }
+        let global = self
+            .storage_source_hypergraph
+            .clone()
+            .unwrap_or_else(|| exec.crdt());
+        match exec.arrival_operations(&global, &self.app_address, data) {
+            Ok(sizes) => {
+                crate::admission_verify::offer_arrival(
+                    queue,
                     exec,
                     &self.app_address,
-                    &data,
-                    false,
+                    data,
+                    &sizes,
+                    now,
                 );
             }
+            Err(_) => queue.note_arrival_skipped(),
         }
-        self.message_collector.add_message_newest(data);
     }
 
     // ---------------------------------------------------------------
@@ -12342,9 +12522,6 @@ pub(crate) fn build_requests_root_check(
                 Ok(_) => return Err(("requests root differs from the body", format!("frame {}", header.frame_number))),
                 Err(error) => return Err(("requests root not computable", format!("frame {}: {error}", header.frame_number))),
             }
-            // The body is bound to its root: its proofs are what this frame
-            // will execute if finalized.
-            prewarm_proof_verdicts(&exec, &app_addr, &canonical);
             // (b) Pre-state `state_roots` check. FAIL-CLOSED: a voter
             // must be EXACTLY at N-1 to
             // validate the declared pre-state via the deterministic
@@ -12485,6 +12662,16 @@ pub(crate) fn build_requests_root_check(
                     }
                 }
             }
+            // Every check passed: this member votes for the body, whose
+            // proofs are what this frame executes if finalized. Warm up only
+            // now; a proposal honest members refuse can never finalize.
+            prewarm_proof_verdicts(
+                &exec,
+                &app_addr,
+                &canonical,
+                &filter_for_verify,
+                header.frame_number,
+            );
             Ok(())
         },
     )
@@ -12538,13 +12725,18 @@ static PROOF_PREWARM_THREADS: std::sync::atomic::AtomicUsize =
 /// next frame that relays its spend. Verdicts are deterministic; this changes
 /// only when they are computed. Bounded: at most [`MAX_PROOF_PREWARMS`] threads,
 /// and a body already warming is not warmed again. A body with an operation
-/// not known to verify within the budget goes to the front of the admission
-/// queue ([`crate::admission_verify`]) instead, behind the submissions frames
-/// already wait on.
+/// not known to verify within the budget is queued as a warm-up of `frame`
+/// of `shard` in the admission queue ([`crate::admission_verify`]) instead:
+/// behind the submissions finalized frames wait on, bounded, and dropped
+/// once its time passed or `shard` materialized `frame`, since the proposal
+/// may never finalize (a leader could otherwise queue unbounded work ahead
+/// of every honest frame).
 pub(crate) fn prewarm_proof_verdicts(
     exec: &Arc<quil_execution::ExecutionEngineManager>,
     app_address: &[u8],
     canonical: &[Vec<u8>],
+    shard: &[u8],
+    frame: u64,
 ) {
     let addr = app_address[..app_address.len().min(32)].to_vec();
     let bundles: Vec<Vec<u8>> = canonical
@@ -12555,7 +12747,7 @@ pub(crate) fn prewarm_proof_verdicts(
         .cloned()
         .collect();
     // A bundle with an operation not known to verify within the budget (a
-    // batch shield) goes to the front of the node's one admission queue
+    // batch shield) goes to the node's one admission queue as a warm-up
     // instead: verified beside the queue's own verification, each ran at
     // half speed (devnet, 2026-10-29).
     let budget = exec.token_verification_budget();
@@ -12566,12 +12758,13 @@ pub(crate) fn prewarm_proof_verdicts(
         )
     });
     for bundle in &long {
-        crate::admission_verify::offer_submission(
+        crate::admission_verify::offer_warmup_submission(
             crate::admission_verify::global(),
             exec,
             &addr,
             bundle,
-            true,
+            shard,
+            frame,
         );
     }
     if bundles.is_empty() {
@@ -13237,15 +13430,19 @@ struct BundleProofs {
     released: bool,
 }
 
-/// Whether a bundle whose unverified confidential operations are `sizes`
-/// bytes each is verified in the background before a frame carries it: one
-/// of them is not known to verify within `budget_secs` (a batch shield, or a
-/// size class this node has not measured). Never without a proof worker
-/// (`None`), whose verifications are not budgeted.
-fn verifies_in_background(sizes: &[usize], budget_secs: Option<f64>) -> bool {
+/// Whether a bundle whose unverified confidential operations are
+/// `operations` is verified in the background before a frame carries it:
+/// one of them is not known to verify within `budget_secs` (a batch shield
+/// by its size or sources, or a size class this node has not measured from
+/// accepted verdicts). Never without a proof worker (`None`), whose
+/// verifications are not budgeted.
+fn verifies_in_background(
+    operations: &[quil_execution::manager::OperationEstimate],
+    budget_secs: Option<f64>,
+) -> bool {
     budget_secs.is_some_and(|budget| {
-        sizes.iter().any(|bytes| {
-            !quil_execution::ExecutionEngineManager::verification_known_to_fit(*bytes, budget)
+        operations.iter().any(|operation| {
+            !quil_execution::ExecutionEngineManager::operation_known_to_fit(operation, budget)
         })
     })
 }
@@ -13291,7 +13488,7 @@ fn bundle_proofs(
         unverified: unverified.len(),
         unverified_secs: unverified
             .iter()
-            .map(|bytes| quil_execution::ExecutionEngineManager::estimated_verify_secs(*bytes))
+            .map(quil_execution::ExecutionEngineManager::estimated_operation_secs)
             .sum(),
         long,
         verifying,
@@ -13303,7 +13500,8 @@ fn bundle_proofs(
 /// proof-verification budget (`budget_secs` worker-seconds). Bundles whose
 /// proofs need no more verification are carried. A released bundle is left
 /// out. A long one verifying in the background is held until it is
-/// verified, however long that takes. The rest are taken in collection
+/// verified; held past [`MAX_PROOF_HOLD`], it verifies next on this node
+/// ([`ProofHolds::due`]). The rest are taken in collection
 /// (arrival) order while their estimated verification fits the budget, the
 /// first even when it alone exceeds it. Every shard of the application
 /// collects the same submissions in much the same order, so the shards a
@@ -13380,6 +13578,81 @@ fn arrival_designated(
 /// Whether a proposal of shard `filter` may log the bundles it defers: at
 /// most once a minute per shard, since a held bundle is deferred by every
 /// proposal while it verifies.
+/// How long a proposal holds a long bundle verifying in the background
+/// before this node verifies it next ([`ProofHolds::due`]). Two batch-shield
+/// verifications and more (240-470 s each, mainnet and devnet,
+/// 2026-10-29..31), well under the 30 min a frame waits between warnings.
+const MAX_PROOF_HOLD: std::time::Duration = std::time::Duration::from_secs(600);
+/// Held bundles remembered across shards; past it the least recently held
+/// are forgotten (their hold starts again).
+const PROOF_HOLD_ENTRIES: usize = 4096;
+
+/// When each shard's proposals started holding each long bundle, and the
+/// one each shard last sent ahead in the admission queue.
+#[derive(Default)]
+struct ProofHolds {
+    /// `(filter, submission)` → when first and last held.
+    held: HashMap<(Vec<u8>, [u8; 32]), (std::time::Instant, std::time::Instant)>,
+    /// `filter` → the submission it sent ahead.
+    promoted: HashMap<Vec<u8>, [u8; 32]>,
+}
+
+static PROOF_HOLDS: std::sync::LazyLock<std::sync::Mutex<ProofHolds>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl ProofHolds {
+    /// Note that a proposal of shard `filter` holds the long bundles `held`
+    /// at `now`; the one to verify next, and how long it was held: the
+    /// longest held at least [`MAX_PROOF_HOLD`], unless the one this shard
+    /// sent ahead is still held and verifying (`pending`). A bundle not held
+    /// for [`MAX_PROOF_HOLD`] is forgotten.
+    fn due(
+        &mut self,
+        filter: &[u8],
+        held: &[[u8; 32]],
+        pending: impl Fn(&[u8; 32]) -> bool,
+        now: std::time::Instant,
+    ) -> Option<([u8; 32], std::time::Duration)> {
+        for digest in held {
+            self.held
+                .entry((filter.to_vec(), *digest))
+                .and_modify(|(_, seen)| *seen = now)
+                .or_insert((now, now));
+        }
+        self.held
+            .retain(|_, (_, seen)| now.saturating_duration_since(*seen) < MAX_PROOF_HOLD);
+        if self.held.len() > PROOF_HOLD_ENTRIES {
+            let mut by_seen: Vec<_> = self
+                .held
+                .iter()
+                .map(|(key, (_, seen))| (*seen, key.clone()))
+                .collect();
+            by_seen.sort_by_key(|(seen, _)| *seen);
+            let excess = self.held.len() - PROOF_HOLD_ENTRIES;
+            for (_, key) in by_seen.into_iter().take(excess) {
+                self.held.remove(&key);
+            }
+        }
+        if let Some(promoted) = self.promoted.get(filter) {
+            if held.contains(promoted) && pending(promoted) {
+                return None;
+            }
+            self.promoted.remove(filter);
+        }
+        let (digest, since) = held
+            .iter()
+            .filter_map(|digest| {
+                self.held
+                    .get(&(filter.to_vec(), *digest))
+                    .map(|(since, _)| (*digest, *since))
+            })
+            .filter(|(_, since)| now.saturating_duration_since(*since) >= MAX_PROOF_HOLD)
+            .min_by_key(|(_, since)| *since)?;
+        self.promoted.insert(filter.to_vec(), digest);
+        Some((digest, now.saturating_duration_since(since)))
+    }
+}
+
 fn budget_note_due(filter: &[u8], now: std::time::Instant) -> bool {
     static NOTES: std::sync::LazyLock<
         std::sync::Mutex<std::collections::HashMap<Vec<u8>, std::time::Instant>>,
@@ -16036,6 +16309,13 @@ pub(crate) fn validate_app_frame_panic_safe(
             "app-shard frame validation panicked (malformed input)".into(),
         )),
     }
+}
+
+/// The frame of this worker's committed GLOBAL view, `None` when unreadable.
+fn handoff_view_frame(global: &Arc<quil_hypergraph::HypergraphCrdt>) -> Option<u64> {
+    quil_execution::global_intrinsic::handoff::CommittedView::capture(global)
+        .ok()
+        .map(|view| view.frame())
 }
 
 /// Whether a session's committed GLOBAL view, at `committed_frame`, trails
@@ -19556,6 +19836,80 @@ mod tests {
         );
     }
 
+    /// From the stable replica key epoch, the next epoch's sealed
+    /// registration frees no labels: the leaf's labels, kept once for every
+    /// epoch from it, are the ones the epoch after next registers from
+    /// (#749 review: `forget` wiped them every frame once the next epoch
+    /// was sealed).
+    #[tokio::test]
+    async fn a_sealed_next_epoch_keeps_the_stable_labels_of_the_epoch_after() {
+        use quil_types::consensus::{
+            epoch_start_frame, set_hash_storage_proof_epoch_for_thread,
+            set_stable_replica_key_epoch_for_thread,
+        };
+        set_hash_storage_proof_epoch_for_thread(Some(0));
+        set_stable_replica_key_epoch_for_thread(Some(6));
+        let dir =
+            std::env::temp_dir().join(format!("quil-labels-sealed-next-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::storage_labels::install_with_space(
+            dir.clone(),
+            crate::storage_labels::ample_space(),
+        );
+        let store = crate::storage_labels::installed().unwrap();
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry.clone());
+        engine.kv_db = Some(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_store::RocksHypergraphStore::new(db.inner())),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        engine.hypergraph = Some(crdt);
+        let member = [1u8; 32];
+        let current = 7;
+        let prefix = vec![0u32];
+        let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(&engine.filter, &prefix);
+        let kept = store
+            .admit(
+                current + 2,
+                &member,
+                &leaf_id,
+                64,
+                crate::storage_labels::Stage::Ahead,
+            )
+            .unwrap()
+            .label(&quil_crypto::sdr::SdrParams::default())
+            .unwrap();
+        assert!(kept.kept);
+        registry.set_storage_seat_slot(
+            &member,
+            &engine.filter,
+            quil_types::consensus::StorageSeatSlot {
+                epoch: current + 1,
+                leaves: vec![prefix.clone()],
+                registered_at: 1,
+                sealed_at: Some(2),
+                frames: 0,
+                accumulator: [0; 32],
+                chained: vec![],
+                open: true,
+            },
+        );
+        for frame in [20, 21] {
+            engine.label_storage_ahead(epoch_start_frame(current) + frame);
+        }
+        assert!(
+            store
+                .find(current + 2, &member, &leaf_id, |n| n == 64)
+                .is_some(),
+            "the labels the epoch after next registers from"
+        );
+        set_stable_replica_key_epoch_for_thread(None);
+        set_hash_storage_proof_epoch_for_thread(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A settlement due when its job was queued, whose window closed and
     /// replicas were evicted before the job ran (behind another job in its
     /// lane): the job drops it and withdraws the part it announced, with a
@@ -20931,10 +21285,14 @@ mod tests {
     /// operations or without a proof worker's budget.
     #[test]
     fn unmeasured_operations_verify_in_the_background() {
-        assert!(verifies_in_background(&[177_490], Some(12.0)));
-        assert!(verifies_in_background(&[2048, 177_490], Some(12.0)));
+        let op = |bytes| quil_execution::manager::OperationEstimate {
+            bytes,
+            floor_secs: 0.0,
+        };
+        assert!(verifies_in_background(&[op(177_490)], Some(12.0)));
+        assert!(verifies_in_background(&[op(2048), op(177_490)], Some(12.0)));
         assert!(!verifies_in_background(&[], Some(12.0)));
-        assert!(!verifies_in_background(&[177_490], None));
+        assert!(!verifies_in_background(&[op(177_490)], None));
     }
 
     /// An arriving confidential bundle is verified on the shard that
@@ -21098,6 +21456,68 @@ mod tests {
             wait(true)
         );
         assert!(!deferrals.entries.contains_key(&(filter.to_vec(), 6)));
+    }
+
+    /// A long bundle a shard's proposals hold for its background
+    /// verification is sent ahead after [`MAX_PROOF_HOLD`], the longest
+    /// held first and one per shard while it verifies; a bundle no longer
+    /// held is forgotten, and its hold starts again.
+    #[test]
+    fn a_long_bundle_held_past_the_bound_verifies_next() {
+        let start = std::time::Instant::now();
+        let at = |secs: u64| start + std::time::Duration::from_secs(secs);
+        let bound = MAX_PROOF_HOLD.as_secs();
+        let (shard, other) = ([1u8; 4], [2u8; 4]);
+        let (a, b, c) = ([0xa; 32], [0xb; 32], [0xc; 32]);
+        let mut holds = ProofHolds::default();
+        let pending = |digest: &[u8; 32]| digest == &a;
+        assert_eq!(holds.due(&shard, &[a], pending, at(0)), None);
+        assert_eq!(holds.due(&shard, &[a, b], pending, at(60)), None);
+        assert_eq!(holds.due(&other, &[c], pending, at(60)), None);
+        assert_eq!(holds.due(&shard, &[a, b], pending, at(bound - 1)), None);
+        assert_eq!(holds.due(&other, &[c], pending, at(bound - 1)), None);
+        assert_eq!(
+            holds.due(&shard, &[a, b], pending, at(bound)),
+            Some((a, std::time::Duration::from_secs(bound))),
+            "a bundle held past the bound stays behind the queue's arrivals"
+        );
+        // One per shard while it still verifies; other shards go on.
+        assert_eq!(holds.due(&shard, &[a, b], pending, at(bound + 70)), None);
+        assert_eq!(
+            holds.due(&other, &[c], pending, at(bound + 70)),
+            Some((c, std::time::Duration::from_secs(bound + 10)))
+        );
+        // Once it verified (no longer held), the next longest held goes.
+        assert_eq!(
+            holds.due(&shard, &[b], pending, at(bound + 80)),
+            Some((b, std::time::Duration::from_secs(bound + 20)))
+        );
+        // Released or verified elsewhere: no longer pending, the next goes
+        // even while it is still held.
+        let mut holds = ProofHolds::default();
+        assert_eq!(holds.due(&shard, &[a, b], |_| false, at(0)), None);
+        assert_eq!(
+            holds
+                .due(&shard, &[a, b], |_| false, at(bound))
+                .map(|d| d.0),
+            Some(a)
+        );
+        assert_eq!(
+            holds
+                .due(&shard, &[a, b], |_| false, at(bound + 1))
+                .map(|d| d.0),
+            Some(a)
+        );
+        // A bundle not held for the bound is forgotten.
+        let mut holds = ProofHolds::default();
+        assert_eq!(holds.due(&shard, &[a], pending, at(0)), None);
+        assert_eq!(holds.due(&shard, &[], pending, at(bound)), None);
+        assert!(holds.held.is_empty());
+        assert_eq!(holds.due(&shard, &[a], pending, at(bound + 1)), None);
+        assert_eq!(holds.due(&shard, &[a], pending, at(2 * bound)), None);
+        assert!(holds
+            .due(&shard, &[a], pending, at(2 * bound + 1))
+            .is_some());
     }
 
     /// The collector holds a submission in the encoding a finalized frame's
@@ -25165,7 +25585,13 @@ mod tests {
         engine.maintain_committee_session().await;
         let ended = logs.lines_with("seal record stall ended");
         assert_eq!(ended.len(), 1, "{ended:?}");
-        for field in ["INFO", "cleared", "copies=1", session.as_str()] {
+        for field in [
+            "INFO",
+            "cleared",
+            "copies=1",
+            "committed_frame=2",
+            session.as_str(),
+        ] {
             assert!(ended[0].contains(field), "{field}: {}", ended[0]);
         }
         assert!(!engine.seal_record.waiting());
@@ -25871,3 +26297,11 @@ mod storage_attestation_pause_tests {
 #[cfg(test)]
 #[path = "app_engine_proof_backlog_tests.rs"]
 mod proof_backlog_tests;
+
+#[cfg(test)]
+#[path = "app_engine_arrival_tests.rs"]
+mod arrival_tests;
+
+#[cfg(test)]
+#[path = "app_engine_relay_tests.rs"]
+mod relay_tests;

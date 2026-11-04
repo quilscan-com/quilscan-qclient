@@ -418,7 +418,8 @@ pub fn replica_keep_from(current_epoch: u64) -> u64 {
 /// it encodes. A standalone worker's store has no other eviction, so it kept
 /// one replica set per epoch. `retired_below` holds the boundary already
 /// applied to this store: each boundary is evicted and logged once, and a
-/// failure leaves it for the next encoding. Returns whether this call evicted.
+/// failure leaves it for the next encoding. Returns whether this call evicted
+/// (not when the master's confirmation already evicted this store for it).
 pub fn retire_unchallengeable_replicas(
     replica_store: &quil_store::replica_store::ReplicaStore,
     retired_below: &std::sync::atomic::AtomicU64,
@@ -433,8 +434,12 @@ pub fn retire_unchallengeable_replicas(
         return false;
     }
     crate::storage_snapshot::note_replica_eviction(current_epoch);
-    match replica_store.evict_below_epoch(keep_from) {
-        Ok(()) => {
+    match replica_store.evict_below_epoch_once(keep_from, &hex::encode(filter)) {
+        Ok(false) => {
+            retired_below.fetch_max(keep_from, Ordering::AcqRel);
+            false
+        }
+        Ok(true) => {
             retired_below.fetch_max(keep_from, Ordering::AcqRel);
             // `since_epoch` 0: the first eviction since start, which also
             // drops any backlog an earlier build left.
@@ -555,6 +560,12 @@ pub fn compute_storage_confirm(
     Ok(all)
 }
 
+/// GLOBAL frames a renewal signed at its grace frame keeps for inclusion
+/// before its epoch ends. GLOBAL refuses a confirm signed in one epoch and
+/// included in the next (`validate_confirm_epoch`), which leaves its seat
+/// expired.
+pub const RENEWAL_INCLUSION_FRAMES: u64 = 8;
+
 /// GLOBAL frames after an epoch's snapshot frame within which a renewal waits
 /// for the member's snapshot of it to be encoded; past them a member without
 /// one renews without a registration (its seat stays, its frames that epoch
@@ -562,9 +573,14 @@ pub fn compute_storage_confirm(
 /// that leaves a seat which labels its leaves at the snapshot as long again to
 /// label them for its seal before the epoch begins (decided 2026-10-26). A
 /// seat whose leaves were labelled ahead (`crate::storage_labels`) needs
-/// neither.
+/// neither. In short epochs it ends [`RENEWAL_INCLUSION_FRAMES`] frames
+/// before the epoch's last frame, so a renewal made at it can still land.
 pub fn storage_snapshot_grace() -> u64 {
-    quil_types::consensus::epoch_length_frames() * 4 / 9
+    let length = quil_types::consensus::epoch_length_frames();
+    let latest = length.saturating_sub(
+        quil_types::consensus::STORAGE_SNAPSHOT_OFFSET + 1 + RENEWAL_INCLUSION_FRAMES,
+    );
+    (length * 4 / 9).min(latest)
 }
 
 /// Ask for the snapshot of each of a seat's `filters` (its shard, then the

@@ -14,7 +14,13 @@ pub enum Msg {
     LegacyRefresh {
         answer: super::coins::LegacyAnswer,
         took: std::time::Duration,
+        /// The saved mint authorizations, read with it.
+        mints: Vec<super::mint::Saved>,
     },
+    /// The mint confirmation's reads and quote, or why there is none.
+    MintPreview(Result<super::mint::Preview, String>),
+    /// A running mint's or claim's report.
+    Mint(super::mint::Progress),
     RewardRefresh(Result<Option<(u128, u64)>, String>),
     ShardLoading,
     ShardRefresh(Result<GetShardInfoResponse, String>),
@@ -39,6 +45,11 @@ pub enum Msg {
         send_frame: u64,
         original_status: u32,
         err: Option<String>,
+    },
+    /// A leave, pause or resume waits for the next epoch to sign.
+    SigningWait {
+        action: String,
+        frames_left: u64,
     },
     /// `toggleManualMsg` — SetManuallyManaged result for one worker.
     ToggleManual {
