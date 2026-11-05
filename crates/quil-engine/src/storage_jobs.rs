@@ -438,6 +438,10 @@ pub enum Urgency {
 /// thread asking is often a data worker's, pinned to one core, and counting
 /// its CPUs ran every node's jobs one at a time (2026-10-29).
 pub fn job_slots() -> usize {
+    #[cfg(test)]
+    if let Some(slots) = Some(TEST_SLOTS.load(Ordering::SeqCst)).filter(|&s| s > 0) {
+        return slots;
+    }
     static SLOTS: OnceLock<usize> = OnceLock::new();
     *SLOTS.get_or_init(|| {
         let counted = std::thread::scope(|scope| {
@@ -502,22 +506,29 @@ pub fn for_each_parallel<T: Sync, R: Send>(
     // A test's stable replica key epoch, for the work's threads too.
     let stable_key = quil_types::consensus::stable_replica_key_epoch_thread_override();
     std::thread::scope(|scope| {
-        for _ in 0..job_slots().min(items.len()) {
-            scope.spawn(|| {
-                quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable_key);
-                on_process_cpus();
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= items.len() || failed.load(Ordering::Relaxed) || jobs().stopping() {
-                        break;
+        for slot in 0..job_slots().min(items.len()) {
+            std::thread::Builder::new()
+                .name(format!("stor-leaf-{slot}"))
+                .spawn_scoped(scope, || {
+                    quil_types::consensus::set_stable_replica_key_epoch_for_thread(stable_key);
+                    on_process_cpus();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= items.len()
+                            || failed.load(Ordering::Relaxed)
+                            || jobs().stopping()
+                        {
+                            break;
+                        }
+                        let result = work(&items[index]);
+                        if result.is_err() {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                        results.lock().unwrap_or_else(PoisonError::into_inner)[index] =
+                            Some(result);
                     }
-                    let result = work(&items[index]);
-                    if result.is_err() {
-                        failed.store(true, Ordering::Relaxed);
-                    }
-                    results.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(result);
-                }
-            });
+                })
+                .expect("spawn a storage leaf thread");
         }
     });
     let mut out = Vec::with_capacity(items.len());
@@ -537,6 +548,26 @@ pub fn for_each_parallel<T: Sync, R: Send>(
         }
     }
     Ok(out)
+}
+
+/// Jobs a test lets the node's admission hold at once
+/// ([`set_job_slots_for_test`]); 0 for the host's count ([`job_slots`]).
+#[cfg(test)]
+static TEST_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Make the node's admission ([`reserve`]) hold `slots` jobs at once
+/// whatever this host's CPUs: a test of leaves side by side needs as many
+/// places on a 3-CPU runner as on a larger one. Call it before the
+/// process's first storage job, as the admission counts its slots once. For
+/// tests that run in a process of their own (nextest).
+#[cfg(test)]
+pub(crate) fn set_job_slots_for_test(slots: usize) {
+    TEST_SLOTS.store(slots, Ordering::SeqCst);
+    assert_eq!(
+        admission().slots,
+        slots.max(1),
+        "the job slots are set before the process's first storage job"
+    );
 }
 
 /// Memory a test sizes the node's jobs against ([`set_available_for_test`]);
@@ -3055,5 +3086,22 @@ mod tests {
             leaves.iter().all(|&cpus| cpus == process),
             "the leaves' threads run on {leaves:?} of {process} CPUs"
         );
+    }
+
+    /// A seat's leaves run on named threads, so a crash on one (a stack
+    /// overflow, say) names the work it ran.
+    #[test]
+    fn a_seats_leaves_run_on_named_threads() {
+        let names = for_each_parallel(&[(); 4], |_| {
+            Ok(std::thread::current().name().map(str::to_owned))
+        })
+        .unwrap();
+        for name in &names {
+            assert!(
+                name.as_deref()
+                    .is_some_and(|name| name.starts_with("stor-leaf-")),
+                "the leaves ran on threads named {names:?}"
+            );
+        }
     }
 }

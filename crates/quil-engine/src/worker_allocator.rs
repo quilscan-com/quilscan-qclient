@@ -46,6 +46,14 @@ struct EvictionTrack {
     attempted: Option<std::time::Instant>,
 }
 
+/// First frame at which an unconfirmed join is expired: the start of epoch
+/// `join_epoch + 2` (a join proposed in epoch E must confirm in epoch E+1;
+/// mirrors `ProverAllocationInfo::effective_status`).
+pub(crate) fn join_expiry_frame(join_frame: u64) -> u64 {
+    use quil_types::consensus::{epoch_for_frame, epoch_start_frame};
+    epoch_start_frame(epoch_for_frame(join_frame) + 2)
+}
+
 /// A rejected leave restores Active without renewing storage. Keep its worker
 /// available to encode renewal until the end of the rejection epoch. This is
 /// local recovery scheduling only: the allocation remains ExpiredEpoch for
@@ -395,6 +403,18 @@ pub const PROPOSAL_TIMEOUT_FRAMES: u64 = 10;
 /// `WorkerAllocator::hold_pending_joins_for_registry_sync`), so failing
 /// syncs cannot pin it: about three five-minute syncs.
 pub const PROPOSAL_SYNC_CEILING_FRAMES: u64 = 60;
+
+/// The last GLOBAL frame that can include a join this node proposed at
+/// `proposed_frame`. The join is signed at the head this node reads when it
+/// submits it (`ProverPipeline::submit_join`), the proposal frame on a node
+/// in step with the archives, and GLOBAL accepts it until
+/// `JOIN_FRESHNESS_WINDOW` frames later (`validate_prover_join_structural`),
+/// not only at the next frame: a registry sync begun before then may lack a
+/// join included later (2026-11-03).
+pub(crate) fn last_join_inclusion_frame(proposed_frame: u64) -> u64 {
+    proposed_frame.saturating_add(quil_execution::global_intrinsic::verify::JOIN_FRESHNESS_WINDOW)
+}
+
 /// Pending join/leave not confirmed within this many frames → clear.
 pub const PENDING_FILTER_GRACE_FRAMES: u64 = 720;
 // Confirm window lives on `ProverLifecycle` so testnet bootstraps can
@@ -907,12 +927,20 @@ pub struct WorkerAllocator {
     /// it was logged at, for the rate limiter in `log_rebind_outcome`.
     last_rebind_outcome: std::sync::atomic::AtomicU64,
     last_rebind_outcome_frame: std::sync::atomic::AtomicU64,
+    /// The workers [`WorkerAllocator::join_awaits_registry_sync`] keeps
+    /// reserved past `PROPOSAL_TIMEOUT_FRAMES`, with their join's proposal
+    /// frame, for the lines that report a hold's start and end.
+    join_sync_holds: std::sync::Mutex<HashMap<u32, u64>>,
     /// See `hold_pending_joins_for_registry_sync`.
     pending_joins_await_sync: std::sync::atomic::AtomicBool,
     /// Frame at which each running prover-tree sync began.
     registry_syncs_running: std::sync::Mutex<HashMap<u64, u64>>,
     /// Latest begin frame of a sync that has refreshed the registry.
     registry_synced_from_frame: std::sync::atomic::AtomicU64,
+    /// The seats [`WorkerAllocator::renewal_awaits_registry_sync`] holds, with
+    /// their confirm's publication frame and the last frame that can include
+    /// it, for the lines that report a hold's start and end.
+    renewal_sync_holds: std::sync::Mutex<HashMap<Vec<u8>, (u64, u64)>>,
     /// Once-guard for the prover-reset-v3 worker-filter reset (mainnet frame
     /// 747_000). Fires exactly at that frame in `on_new_frame`, clearing every
     /// AUTO-managed worker's persisted deep filter so re-join lands on the clean
@@ -933,6 +961,101 @@ pub struct WorkerAllocator {
     payload_eviction: std::sync::Mutex<HashMap<u32, EvictionTrack>>,
     /// The running orphan episode, `None` while every seat has a worker.
     orphan_watch: std::sync::Mutex<Option<OrphanWatch>>,
+    /// Workers whose release is held, by core id (see [`WorkerHolds`]).
+    worker_holds: std::sync::Mutex<WorkerHolds>,
+}
+
+/// Why a worker's release is held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldReason {
+    /// A committee session still counts the member's vote.
+    Session,
+    /// The seat owes the epoch's storage settlement, whose window ends at
+    /// frame `until`.
+    Settlement { epoch: u64, until: u64 },
+}
+
+#[derive(Clone, Debug)]
+struct WorkerHold {
+    filter: Vec<u8>,
+    reason: HoldReason,
+    since: u64,
+    /// The latest frame a release was wanted (and so held) at.
+    wanted: u64,
+    /// The latest frame a pass checked the hold at, before its release.
+    top: u64,
+}
+
+/// The workers whose release is held, so a hold logs when it starts and when
+/// it ends, not on every pass in between.
+#[derive(Default)]
+struct WorkerHolds(HashMap<u32, WorkerHold>);
+
+impl WorkerHolds {
+    /// Record a hold; true when it is new and must be logged. A repeat on
+    /// the same shard only refreshes the reason.
+    fn begin(&mut self, core_id: u32, filter: &[u8], reason: HoldReason, frame: u64) -> bool {
+        match self.0.get_mut(&core_id) {
+            Some(hold) if hold.filter == filter => {
+                hold.reason = reason;
+                hold.wanted = frame;
+                false
+            }
+            _ => {
+                self.0.insert(
+                    core_id,
+                    WorkerHold {
+                        filter: filter.to_vec(),
+                        reason,
+                        since: frame,
+                        wanted: frame,
+                        top: frame,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// End the worker's hold, if any, returning it with its length in
+    /// frames and its outcome. `holding` says whether the worker is still
+    /// held on `filter`: a hold on another shard ends regardless.
+    fn end(
+        &mut self,
+        core_id: u32,
+        filter: &[u8],
+        holding: bool,
+        frame: u64,
+    ) -> Option<(WorkerHold, u64, &'static str)> {
+        let current = self.0.get_mut(&core_id)?;
+        let same_shard = current.filter == filter;
+        if holding && same_shard {
+            // Still retained. A pass that wanted no release since the last
+            // check means the allocation recovered and the worker serves on.
+            if current.wanted >= current.top {
+                current.top = frame;
+                return None;
+            }
+            let hold = self.0.remove(&core_id)?;
+            let held = frame.saturating_sub(hold.since);
+            return Some((hold, held, "allocation recovered; worker kept"));
+        }
+        let hold = self.0.remove(&core_id)?;
+        let held = frame.saturating_sub(hold.since);
+        let outcome = hold_outcome(&hold, same_shard, frame);
+        Some((hold, held, outcome))
+    }
+}
+
+/// How a hold ended, given the frame it ended at and whether the worker
+/// still sits on the held shard.
+fn hold_outcome(hold: &WorkerHold, same_shard: bool, frame: u64) -> &'static str {
+    match hold.reason {
+        _ if !same_shard => "worker moved off the held shard",
+        HoldReason::Session => "committee session ended",
+        HoldReason::Settlement { until, .. } if frame >= until => "settlement window closed",
+        HoldReason::Settlement { .. } => "settlement delivered",
+    }
 }
 
 impl WorkerAllocator {
@@ -943,6 +1066,8 @@ impl WorkerAllocator {
     /// then proposes leaving a registration the protocol still accepts.
     /// Only a confirm counts: a seat whose leave is in flight is not being
     /// renewed, and a confirm naming it once it is Leaving is refused.
+    /// Nor does a published renewal lose it while this node's registry may
+    /// not show it yet ([`Self::renewal_awaits_registry_sync`]).
     pub(crate) fn renewal_recovering(
         &self,
         allocation: &quil_types::consensus::ProverAllocationInfo,
@@ -954,6 +1079,107 @@ impl WorkerAllocator {
                 && self
                     .submission_attempts
                     .confirming(&allocation.confirmation_filter, frame))
+            || self
+                .renewal_awaits_registry_sync(allocation, frame)
+                .is_some()
+    }
+
+    /// Whether the registry may still lack a renewal whose last possible
+    /// inclusion frame is `included_frame`: on a node whose registry follows
+    /// prover-tree syncs, none begun after that frame has refreshed it yet.
+    /// A sync anchors at the frame before its begin frame.
+    pub(crate) fn registry_may_lack_renewal(&self, included_frame: u64) -> bool {
+        self.pending_joins_await_sync
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && self
+                .registry_synced_from_frame
+                .load(std::sync::atomic::Ordering::SeqCst)
+                <= included_frame
+    }
+
+    /// The frame this node published a renewal of `allocation` at in its
+    /// recovery epoch, and the last frame that can include it, while past
+    /// that epoch the registry still shows the seat lapsed and may lack the
+    /// renewal: no prover-tree sync begun after that frame has refreshed it
+    /// ([`Self::registry_may_lack_renewal`]), for at most
+    /// `PROPOSAL_SYNC_CEILING_FRAMES` after publication, so failing syncs
+    /// cannot pin the worker. A renewal included late in the recovery epoch
+    /// reaches such a registry after the boundary; meanwhile its worker was
+    /// released and the orphan sweep left the seat it renewed (2026-11-03, a
+    /// devnet). GLOBAL includes a confirm at any frame of the epoch it is
+    /// signed in (`validate_confirm_epoch`), not only the next one, so a
+    /// sync begun between publication and inclusion does not end the hold.
+    fn renewal_awaits_registry_sync(
+        &self,
+        allocation: &quil_types::consensus::ProverAllocationInfo,
+        frame: u64,
+    ) -> Option<(u64, u64)> {
+        use quil_types::consensus::{epoch_for_frame, epoch_start_frame, EffectiveStatus};
+        let recovery_epoch = allocation.epoch.checked_add(1)?;
+        let next_epoch = recovery_epoch.checked_add(1)?;
+        if allocation.effective_status(frame) != EffectiveStatus::ExpiredEpoch
+            || epoch_for_frame(frame) != next_epoch
+        {
+            return None;
+        }
+        let published = self
+            .submission_attempts
+            .confirm_published_in(&allocation.confirmation_filter, recovery_epoch)?;
+        let last_inclusion = epoch_start_frame(next_epoch).saturating_sub(1);
+        (frame <= published.saturating_add(PROPOSAL_SYNC_CEILING_FRAMES)
+            && self.registry_may_lack_renewal(last_inclusion))
+        .then_some((published, last_inclusion))
+    }
+
+    /// Report where [`Self::renewal_awaits_registry_sync`] starts and stops
+    /// holding a seat among `allocations` at `frame`.
+    fn log_renewal_sync_holds(
+        &self,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+        frame: u64,
+    ) {
+        let held: HashMap<Vec<u8>, (u64, u64)> = allocations
+            .iter()
+            .filter_map(|a| {
+                self.renewal_awaits_registry_sync(a, frame)
+                    .map(|hold| (a.confirmation_filter.clone(), hold))
+            })
+            .collect();
+        let mut logged = self
+            .renewal_sync_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (filter, (published, last_inclusion)) in
+            held.iter().filter(|(f, _)| !logged.contains_key(*f))
+        {
+            info!(frame, filter = hex::encode(filter), confirm_frame = published,
+                last_inclusion_frame = last_inclusion,
+                ceiling_frame = published + PROPOSAL_SYNC_CEILING_FRAMES, scope = "local",
+                "lapsed seat keeps its worker: this node published its renewal in the recovery epoch, and the \
+                 registry shows it only after a prover-tree sync begun after the last frame that can include it; \
+                 held until such a sync completes or the ceiling frame");
+        }
+        for (filter, (published, last_inclusion)) in
+            logged.iter().filter(|(f, _)| !held.contains_key(*f))
+        {
+            let renewed = allocations.iter().any(|a| {
+                &a.confirmation_filter == filter
+                    && a.effective_status(frame)
+                        != quil_types::consensus::EffectiveStatus::ExpiredEpoch
+            });
+            let ended = if renewed || !self.registry_may_lack_renewal(*last_inclusion) {
+                "synced"
+            } else if frame > published + PROPOSAL_SYNC_CEILING_FRAMES {
+                "ceiling"
+            } else {
+                "epoch_passed"
+            };
+            info!(frame, filter = hex::encode(filter), confirm_frame = published, ended, renewed,
+                scope = "local",
+                "lapsed seat's registry-sync hold ended: renewed keeps the worker; otherwise the allocator \
+                 releases it unless a renewal of the seat runs");
+        }
+        *logged = held;
     }
 
     /// Whether a lapsed seat keeps its worker until the lifecycle first
@@ -1227,14 +1453,63 @@ impl WorkerAllocator {
     }
 
     /// Free a worker, unless its committee session is still closing or its
-    /// seat still owes a storage epoch proof.
-    fn release_worker(&self, worker: &WorkerInfo, retained: bool) -> Result<()> {
+    /// seat still owes a storage epoch proof. The first held release logs
+    /// why and until when ([`Self::end_worker_hold`] logs its end).
+    fn release_worker(&self, worker: &WorkerInfo, retained: bool, frame_number: u64) -> Result<()> {
         if retained {
-            debug!(core_id = worker.core_id, filter = hex::encode(&worker.filter),
-                "committee session or storage settlement still needs this member; worker stays bound");
+            self.begin_worker_hold(worker, frame_number);
             return Ok(());
         }
         self.worker_manager.deallocate_worker(worker.core_id)
+    }
+
+    fn begin_worker_hold(&self, worker: &WorkerInfo, frame_number: u64) {
+        let owed = self.owed_storage_settlements(&worker.filter, frame_number);
+        let reason = match owed.iter().min_by_key(|(_, until)| *until) {
+            Some(&(epoch, until)) => HoldReason::Settlement { epoch, until },
+            None => HoldReason::Session,
+        };
+        let new = self
+            .worker_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin(worker.core_id, &worker.filter, reason, frame_number);
+        if !new {
+            return;
+        }
+        match reason {
+            HoldReason::Settlement { epoch, until } => {
+                let left = until.saturating_sub(frame_number);
+                info!(core_id = worker.core_id, filter = %hex::encode(&worker.filter),
+                    frame = frame_number, reason = "storage_settlement", epoch,
+                    window_ends_frame = until, frames_left = left,
+                    "worker release held: the seat owes its storage settlement; the worker stays \
+                     bound until the epoch proof is delivered or its window ends (~{} min); no \
+                     free worker from it before then",
+                    left.saturating_mul(quil_types::consensus::ideal_frame_time_ms()) / 60_000);
+            }
+            HoldReason::Session => {
+                info!(core_id = worker.core_id, filter = %hex::encode(&worker.filter),
+                    frame = frame_number, reason = "committee_session",
+                    "worker release held: its committee session still needs this member; the \
+                     worker stays bound until the session's seal is recorded");
+            }
+        }
+    }
+
+    /// Log the end of a worker's held release once nothing holds it any
+    /// more (`holding`) or it moved to another shard.
+    fn end_worker_hold(&self, worker: &WorkerInfo, holding: bool, frame_number: u64) {
+        let ended = self
+            .worker_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .end(worker.core_id, &worker.filter, holding, frame_number);
+        if let Some((hold, held, outcome)) = ended {
+            info!(core_id = worker.core_id, filter = %hex::encode(&hold.filter),
+                frame = frame_number, held_frames = held, outcome,
+                "worker release hold ended: see outcome");
+        }
     }
 
     /// Whether this prover's seat on `filter` still owes GLOBAL an epoch proof
@@ -1403,13 +1678,16 @@ impl WorkerAllocator {
             last_priority_review_frame: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome: std::sync::atomic::AtomicU64::new(0),
             last_rebind_outcome_frame: std::sync::atomic::AtomicU64::new(0),
+            join_sync_holds: std::sync::Mutex::new(HashMap::new()),
             pending_joins_await_sync: std::sync::atomic::AtomicBool::new(false),
             registry_syncs_running: std::sync::Mutex::new(HashMap::new()),
             registry_synced_from_frame: std::sync::atomic::AtomicU64::new(0),
+            renewal_sync_holds: std::sync::Mutex::new(HashMap::new()),
             worker_reset_v3_done: std::sync::atomic::AtomicBool::new(false),
             pending_shard_changes: RwLock::new(None),
             payload_eviction: std::sync::Mutex::new(HashMap::new()),
             orphan_watch: std::sync::Mutex::new(None),
+            worker_holds: std::sync::Mutex::new(WorkerHolds::default()),
         }
     }
 
@@ -1708,7 +1986,8 @@ impl WorkerAllocator {
     /// For a node whose registry shows a landed join only after the next
     /// prover-tree sync (every five minutes, about 20 frames on mainnet):
     /// keep a proposal's worker reserved past `PROPOSAL_TIMEOUT_FRAMES` until
-    /// a sync begun after the join's inclusion has refreshed the registry.
+    /// a sync begun after the last frame that can include the join
+    /// ([`last_join_inclusion_frame`]) has refreshed the registry.
     /// Freed earlier, the worker is proposed for a second shard while the
     /// first join is still on its way.
     pub fn hold_pending_joins_for_registry_sync(&self) {
@@ -1735,9 +2014,9 @@ impl WorkerAllocator {
         running.retain(|later, _| *later > sync);
     }
 
-    /// Whether a join proposed at `pending_frame` (included at the next
-    /// frame) may still appear with the next registry sync, holding its
-    /// worker for at most `PROPOSAL_SYNC_CEILING_FRAMES`.
+    /// Whether a join proposed at `pending_frame` may still appear with the
+    /// next registry sync, holding its worker for at most
+    /// `PROPOSAL_SYNC_CEILING_FRAMES`.
     fn join_awaits_registry_sync(&self, pending_frame: u64, frame_number: u64) -> bool {
         pending_frame > 0
             && frame_number <= pending_frame + PROPOSAL_SYNC_CEILING_FRAMES
@@ -1745,17 +2024,23 @@ impl WorkerAllocator {
     }
 
     /// Whether the registry may still lack a join proposed at
-    /// `proposed_frame` (included at the next frame): on a node whose
-    /// registry shows a landed join only after a prover-tree sync, no sync
-    /// begun after the inclusion has refreshed it yet. A sync anchors at the
-    /// frame before its begin frame.
+    /// `proposed_frame`: on a node whose registry shows a landed join only
+    /// after a prover-tree sync, no sync begun after the last frame that can
+    /// include it ([`last_join_inclusion_frame`]) has refreshed it yet. A
+    /// sync anchors at the frame before its begin frame.
     pub(crate) fn registry_may_lack_join(&self, proposed_frame: u64) -> bool {
+        self.registry_may_lack_inclusion(last_join_inclusion_frame(proposed_frame))
+    }
+
+    /// Whether the registry may still lack an operation included at
+    /// `included_frame`, as [`Self::registry_may_lack_join`].
+    pub(crate) fn registry_may_lack_inclusion(&self, included_frame: u64) -> bool {
         self.pending_joins_await_sync
             .load(std::sync::atomic::Ordering::SeqCst)
             && self
                 .registry_synced_from_frame
                 .load(std::sync::atomic::Ordering::SeqCst)
-                <= proposed_frame + 1
+                <= included_frame
     }
 
     /// Clear the pending-join marker of a worker still idle after the bind
@@ -1828,6 +2113,64 @@ impl WorkerAllocator {
                 .worker_manager
                 .set_pending_filter_frame(worker.core_id, 0);
         }
+        Ok(())
+    }
+
+    /// Report where [`Self::join_awaits_registry_sync`] starts and stops
+    /// keeping a worker reserved past `PROPOSAL_TIMEOUT_FRAMES`: a worker
+    /// whose join the registry does not show on it yet.
+    fn log_join_sync_holds(
+        &self,
+        frame: u64,
+        allocations: &[quil_types::consensus::ProverAllocationInfo],
+    ) -> Result<()> {
+        let workers = self.worker_manager.range_workers()?;
+        let shown = |w: &crate::worker::WorkerInfo| {
+            !w.filter.is_empty()
+                && allocations
+                    .iter()
+                    .any(|a| a.confirmation_filter == w.filter)
+        };
+        let held: HashMap<u32, u64> = workers
+            .iter()
+            .filter(|w| {
+                let pending = w.pending_filter_frame;
+                pending > 0
+                    && frame > pending + PROPOSAL_TIMEOUT_FRAMES
+                    && !shown(w)
+                    && self.join_awaits_registry_sync(pending, frame)
+            })
+            .map(|w| (w.core_id, w.pending_filter_frame))
+            .collect();
+        let mut logged = self
+            .join_sync_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (core_id, proposed) in held.iter().filter(|(c, p)| logged.get(*c) != Some(*p)) {
+            info!(frame, core_id, proposed_frame = proposed,
+                last_inclusion_frame = last_join_inclusion_frame(*proposed),
+                ceiling_frame = proposed + PROPOSAL_SYNC_CEILING_FRAMES, scope = "local",
+                "join keeps its worker past the proposal timeout: GLOBAL can include it through the last \
+                 inclusion frame, and this node's registry shows it only after a prover-tree sync begun after \
+                 that frame; held until such a sync completes or the ceiling frame");
+        }
+        for (core_id, proposed) in logged.iter().filter(|(c, p)| held.get(*c) != Some(*p)) {
+            let worker = workers.iter().find(|w| w.core_id == *core_id);
+            let ended = if worker.is_some_and(|w| w.pending_filter_frame == *proposed && shown(w)) {
+                "shown"
+            } else if !self.registry_may_lack_join(*proposed) {
+                "synced"
+            } else if frame > proposed + PROPOSAL_SYNC_CEILING_FRAMES {
+                "ceiling"
+            } else {
+                "cleared"
+            };
+            info!(frame, core_id, proposed_frame = proposed,
+                last_inclusion_frame = last_join_inclusion_frame(*proposed), ended, scope = "local",
+                "join's registry-sync hold ended: shown keeps the worker on the join; otherwise its \
+                 reservation is released");
+        }
+        *logged = held;
         Ok(())
     }
 
@@ -2055,6 +2398,10 @@ impl WorkerAllocator {
         // Get current worker assignments
         let workers = self.worker_manager.range_workers()?;
 
+        if let Some(prover) = prover_info.as_ref() {
+            self.log_renewal_sync_holds(&prover.allocations, frame_number);
+        }
+
         // The seats the first reconcile finds bound although lapsed past
         // recovery; see `awaits_renewal_offer`.
         if prover_info.is_some() {
@@ -2148,6 +2495,8 @@ impl WorkerAllocator {
             // was still Joining at every sync and stopped it after, and each
             // restart withdrew the engine's queued recovery claim.
             let runs_consensus = retention.unwrap_or(worker.allocated) || settling;
+            // End a logged hold once nothing holds the worker (or it moved).
+            self.end_worker_hold(worker, retained, frame_number);
             if worker.filter.is_empty() {
                 // Idle worker: an expired pending-join marker is swept after
                 // the bind pass below (`expire_unlanded_join_markers`), so a
@@ -2189,7 +2538,7 @@ impl WorkerAllocator {
                          active child allocation is unbound (likely split-parent) — \
                          deallocating so the child rebinds"
                     );
-                    self.release_worker(worker, retained)?;
+                    self.release_worker(worker, retained, frame_number)?;
                     continue;
                 }
             }
@@ -2209,7 +2558,7 @@ impl WorkerAllocator {
                                 current_epoch = quil_types::consensus::epoch_for_frame(frame_number),
                                 "epoch-expired allocation released so a live shard can use the worker"
                             );
-                            self.release_worker(worker, retained)?;
+                            self.release_worker(worker, retained, frame_number)?;
                             continue;
                         }
                         Some(GivenUp::LeftLapsed) => {
@@ -2223,7 +2572,7 @@ impl WorkerAllocator {
                                 "worker released from a seat left after its storage registration lapsed, which its \
                                  committee no longer seats: it owes no notice; the seat departs at its leave boundary"
                             );
-                            self.release_worker(worker, retained)?;
+                            self.release_worker(worker, retained, frame_number)?;
                             continue;
                         }
                         // `gives_up` never reports it: only the recovery gate does.
@@ -2276,9 +2625,15 @@ impl WorkerAllocator {
                                     core_id = worker.core_id,
                                     filter = hex::encode(&worker.filter),
                                     join_frame = alloc.join_frame_number,
-                                    "join expired after 720 frames, clearing worker"
+                                    frames_since_join =
+                                        frame_number.saturating_sub(alloc.join_frame_number),
+                                    expiry_frame = join_expiry_frame(alloc.join_frame_number),
+                                    current_frame = frame_number,
+                                    "join expired unconfirmed, clearing worker: its confirm was \
+                                     never included before the activation frame; check the \
+                                     join's confirm submission and inclusion"
                                 );
-                                self.release_worker(worker, retained)?;
+                                self.release_worker(worker, retained, frame_number)?;
                             }
                         }
                         ProverStatus::Rejected | ProverStatus::Kicked | ProverStatus::Historic => {
@@ -2307,7 +2662,7 @@ impl WorkerAllocator {
                                 status = ?alloc.status,
                                 "allocation ended/reassigned, clearing worker"
                             );
-                            self.release_worker(worker, retained)?;
+                            self.release_worker(worker, retained, frame_number)?;
                         }
                         ProverStatus::Leaving => {
                             // Live Leave (within 720-frame grace) →
@@ -2332,7 +2687,7 @@ impl WorkerAllocator {
                                         leave_frame = alloc.leave_frame_number,
                                         "leave expired after 720 frames, clearing worker"
                                     );
-                                    self.release_worker(worker, retained)?;
+                                    self.release_worker(worker, retained, frame_number)?;
                                 }
                             }
                         }
@@ -2396,7 +2751,7 @@ impl WorkerAllocator {
                             pending_since = worker.pending_filter_frame,
                             "proposal timed out after 10 frames, clearing worker"
                         );
-                        self.release_worker(worker, retained)?;
+                        self.release_worker(worker, retained, frame_number)?;
                     } else if worker.pending_filter_frame == 0
                         && frame_number > PENDING_FILTER_GRACE_FRAMES
                     {
@@ -2407,7 +2762,7 @@ impl WorkerAllocator {
                             filter = hex::encode(&worker.filter),
                             "orphaned filter with no pending frame, clearing worker"
                         );
-                        self.release_worker(worker, retained)?;
+                        self.release_worker(worker, retained, frame_number)?;
                     }
                 }
             }
@@ -2693,6 +3048,13 @@ impl WorkerAllocator {
         self.log_idled_manual_workers(frame_number, &manual_seats, &alloc_by_filter)?;
 
         self.expire_unlanded_join_markers(
+            frame_number,
+            prover_info
+                .as_ref()
+                .map(|p| p.allocations.as_slice())
+                .unwrap_or(&[]),
+        )?;
+        self.log_join_sync_holds(
             frame_number,
             prover_info
                 .as_ref()
@@ -3026,6 +3388,20 @@ mod tests {
 
     use crate::test_support::{TestProverRegistry, TestWorkerManager as MockWorkerManager};
 
+    #[test]
+    fn join_expiry_frame_is_start_of_epoch_after_confirm_epoch() {
+        let len = epoch_length_frames();
+        // Joined mid-epoch 3: confirm window is epoch 4, expired from epoch 5.
+        let jf = 3 * len + 17;
+        let exp = join_expiry_frame(jf);
+        assert_eq!(exp, 5 * len);
+        let mut a = make_alloc(vec![1; 32]);
+        a.status = ProverStatus::Joining;
+        a.join_frame_number = jf;
+        assert_eq!(a.effective_status(exp - 1), EffectiveStatus::Joining);
+        assert_eq!(a.effective_status(exp), EffectiveStatus::ExpiredJoining);
+    }
+
     fn make_alloc(filter: Vec<u8>) -> ProverAllocationInfo {
         ProverAllocationInfo {
             status: ProverStatus::Active,
@@ -3312,6 +3688,102 @@ mod tests {
             "no sync has refreshed the registry since"
         );
         assert_eq!(pending(100 + PROPOSAL_SYNC_CEILING_FRAMES + 1), 0);
+    }
+
+    /// GLOBAL includes a join until `JOIN_FRESHNESS_WINDOW` frames after the
+    /// frame it is signed at, not only at the next one, so a prover-tree sync
+    /// begun between the proposal and a late inclusion completes without it.
+    /// The join's worker stays reserved until a sync begun after the last
+    /// frame that can include it completes; freed at the first sync begun
+    /// after the proposal, it was offered for a second shard while the join
+    /// could still land (2026-11-03).
+    #[test]
+    fn a_join_held_for_a_registry_sync_outlasts_a_sync_begun_before_a_late_inclusion() {
+        use quil_execution::global_intrinsic::verify::{
+            validate_prover_join_structural, JOIN_FRESHNESS_WINDOW,
+        };
+        let proposed = 100;
+        let last_inclusion = proposed + JOIN_FRESHNESS_WINDOW;
+        // The network's verifier takes a join signed at the proposal frame
+        // through `last_inclusion` and refuses it one frame later.
+        let join = quil_execution::global_intrinsic::prover_join::ProverJoin {
+            filters: vec![vec![0x01; 32]],
+            frame_number: proposed,
+            public_key_signature_bls48581: Some(
+                quil_execution::global_intrinsic::SignatureWithPop {
+                    signature: vec![0xAA; 74],
+                    public_key: Some(vec![0xBB; 585]),
+                    pop_signature: vec![0xCC; 74],
+                },
+            ),
+            delegate_address: vec![],
+            merge_targets: vec![],
+            proof: vec![],
+        };
+        assert!(validate_prover_join_structural(&join, last_inclusion).is_ok());
+        assert!(validate_prover_join_structural(&join, last_inclusion + 1).is_err());
+
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.add(crate::worker::WorkerInfo {
+            core_id: 1,
+            filter: Vec::new(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: proposed,
+            allocated: false,
+        });
+        let alloc = WorkerAllocator::new(
+            wm.clone(),
+            Arc::new(TestProverRegistry::new()),
+            vec![0xAAu8; 32],
+        );
+        alloc.hold_pending_joins_for_registry_sync();
+        let early = proposed + 5;
+        alloc.note_registry_sync_begun(1, early);
+        alloc.note_registry_synced(1);
+        // Begun at the last inclusion frame, a sync anchors before it.
+        alloc.note_registry_sync_begun(2, last_inclusion);
+        let pending = || wm.range_workers().unwrap()[0].pending_filter_frame;
+        let timed_out = proposed + PROPOSAL_TIMEOUT_FRAMES + 1;
+        let logged = reconcile_logged(&alloc, timed_out);
+        assert_eq!(
+            pending(),
+            proposed,
+            "worker core 1 freed at frame {timed_out}: GLOBAL can still include its join, proposed at \
+             frame {proposed}, through frame {last_inclusion}, and the only registry sync completed \
+             began at frame {early}, before then"
+        );
+        let start = "join keeps its worker past the proposal timeout";
+        assert_eq!(logged.matches(start).count(), 1, "{logged}");
+        let ceiling = proposed + PROPOSAL_SYNC_CEILING_FRAMES;
+        assert!(
+            logged.contains(&format!("last_inclusion_frame={last_inclusion}"))
+                && logged.contains(&format!("ceiling_frame={ceiling}")),
+            "{logged}"
+        );
+        alloc.note_registry_synced(2);
+        let logged = reconcile_logged(&alloc, timed_out + 1);
+        assert_eq!(
+            pending(),
+            proposed,
+            "a sync begun at the last inclusion frame cannot show the join"
+        );
+        assert!(!logged.contains(start), "reported once: {logged}");
+        alloc.note_registry_sync_begun(3, last_inclusion + 1);
+        alloc.note_registry_synced(3);
+        let logged = reconcile_logged(&alloc, timed_out + 2);
+        assert_eq!(
+            pending(),
+            0,
+            "a registry synced since the last inclusion frame without the join frees the worker"
+        );
+        assert!(
+            logged.contains("join's registry-sync hold ended")
+                && logged.contains("ended=\"synced\"")
+                && logged.contains(&format!("last_inclusion_frame={last_inclusion}")),
+            "{logged}"
+        );
     }
 
     /// A node loads its prover registry in the background at startup. A
@@ -4992,6 +5464,228 @@ mod tests {
         }
     }
 
+    /// A renewal published late in the recovery epoch reaches a registry that
+    /// follows prover-tree syncs only after the boundary. Until a sync begun
+    /// after its inclusion completes, the seat keeps its worker and is not
+    /// given up, so the orphan sweep does not leave it; a failing sync holds
+    /// it for at most `PROPOSAL_SYNC_CEILING_FRAMES` (2026-11-03, a devnet:
+    /// the worker was released at the boundary and the seat left).
+    #[test]
+    fn a_renewal_published_in_the_recovery_epoch_keeps_its_worker_until_a_registry_sync_shows_it() {
+        use quil_types::consensus::EffectiveStatus;
+        let filter = vec![0x01; 32];
+        let published = 1430;
+        for synced in [true, false] {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, &filter).unwrap();
+            let mut renewing = make_alloc(filter.clone());
+            renewing.epoch = 0;
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+                renewing.clone()
+            ])));
+            let allocator = WorkerAllocator::new(wm.clone(), reg.clone(), vec![0xAA; 32]);
+            allocator.hold_pending_joins_for_registry_sync();
+            allocator.note_renewals_offered();
+            allocator.note_registry_sync_begun(1, 1420);
+            allocator.note_registry_synced(1);
+            allocator
+                .submission_attempts
+                .begin(
+                    std::slice::from_ref(&filter),
+                    published,
+                    crate::submission_attempts::OpKind::Confirm,
+                )
+                .unwrap()
+                .published(published);
+            let bound = || wm.range_workers().unwrap()[0].filter == filter;
+            let logged = reconcile_logged(&allocator, 1440);
+            assert!(
+                bound(),
+                "worker core 1 released from seat {} at frame 1440: its renewal was published at frame \
+                 {published} in the recovery epoch and no registry sync begun since has completed",
+                hex::encode(&filter)
+            );
+            assert_eq!(
+                allocator.given_up_among(std::slice::from_ref(&renewing), &filter, 1440),
+                None,
+                "the orphan sweep must not leave a seat whose renewal the registry may lack"
+            );
+            let start = "lapsed seat keeps its worker";
+            assert_eq!(logged.matches(start).count(), 1, "{logged}");
+            assert!(logged.contains("ceiling_frame=1490"), "{logged}");
+            assert!(
+                !reconcile_logged(&allocator, 1441).contains(start),
+                "reported once"
+            );
+            let end = "registry-sync hold ended";
+            if synced {
+                // A sync begun after the inclusion shows the renewal.
+                allocator.note_registry_sync_begun(2, 1441);
+                renewing.epoch = 2;
+                reg.set_prover(prover_with(vec![renewing.clone()]));
+                allocator.note_registry_synced(2);
+                let logged = reconcile_logged(&allocator, 1442);
+                assert!(bound(), "the renewed seat keeps its worker");
+                assert_eq!(renewing.effective_status(1442), EffectiveStatus::Active);
+                assert!(
+                    logged.contains(end)
+                        && logged.contains("ended=\"synced\"")
+                        && logged.contains("renewed=true"),
+                    "{logged}"
+                );
+            } else {
+                let ceiling = published + PROPOSAL_SYNC_CEILING_FRAMES;
+                allocator.on_new_frame(ceiling).unwrap();
+                assert!(bound(), "held through the ceiling frame");
+                let logged = reconcile_logged(&allocator, ceiling + 1);
+                assert!(
+                    !bound(),
+                    "failing syncs cannot pin the worker past the ceiling"
+                );
+                assert!(
+                    allocator
+                        .given_up_among(std::slice::from_ref(&renewing), &filter, ceiling + 1)
+                        .is_some(),
+                    "past the ceiling the seat is given up again"
+                );
+                assert!(
+                    logged.contains(end)
+                        && logged.contains("ended=\"ceiling\"")
+                        && logged.contains("renewed=false"),
+                    "{logged}"
+                );
+            }
+        }
+    }
+
+    /// The hold covers only a renewal published in the recovery epoch, on a
+    /// node whose registry follows prover-tree syncs, and ends once a sync
+    /// begun after the last frame that can include it has refreshed the
+    /// registry without it.
+    #[test]
+    fn the_renewal_registry_hold_needs_a_recovery_epoch_publication_and_an_unsynced_registry() {
+        let filter = vec![0x01; 32];
+        // (publication frame, registry follows syncs, sync begun past the
+        // recovery epoch).
+        // 1440 opens the epoch after the recovery epoch: a publication there
+        // is no recovery-epoch renewal. Checked at 1470, inside every case's
+        // sync ceiling and past that confirm's 30-frame retry fence, which
+        // on its own keeps a lapsed seat's worker. (A publication in the
+        // seat's own epoch lies past the ceiling by then: it proves nothing.)
+        let checked = 1470;
+        for (published, awaits_sync, later_sync) in [
+            (1440, true, false),
+            (1430, false, false),
+            (1430, true, true),
+        ] {
+            let wm = Arc::new(MockWorkerManager::new());
+            wm.allocate_worker(1, &filter).unwrap();
+            let mut lapsed = make_alloc(filter.clone());
+            lapsed.epoch = 0;
+            let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![lapsed])));
+            let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+            if awaits_sync {
+                allocator.hold_pending_joins_for_registry_sync();
+            }
+            allocator.note_renewals_offered();
+            allocator
+                .submission_attempts
+                .begin(
+                    std::slice::from_ref(&filter),
+                    published,
+                    crate::submission_attempts::OpKind::Confirm,
+                )
+                .unwrap()
+                .published(published);
+            if later_sync {
+                allocator.note_registry_sync_begun(1, 1440);
+                allocator.note_registry_synced(1);
+            }
+            if published == 1440 {
+                allocator.on_new_frame(1440).unwrap();
+                assert!(
+                    !wm.range_workers().unwrap()[0].filter.is_empty(),
+                    "a confirm inside its retry fence keeps the worker"
+                );
+            }
+            allocator.on_new_frame(checked).unwrap();
+            assert!(
+                wm.range_workers().unwrap()[0].filter.is_empty(),
+                "published={published} awaits_sync={awaits_sync} later_sync={later_sync}"
+            );
+        }
+    }
+
+    /// GLOBAL includes a renewal at any frame of the epoch it is signed in,
+    /// so a prover-tree sync begun after its publication but before a late
+    /// inclusion completes without it. The hold lasts until a sync begun
+    /// past the recovery epoch's last frame completes, then the seat lapses
+    /// as before (2026-11-03).
+    #[test]
+    fn the_renewal_registry_hold_outlasts_a_sync_begun_before_a_late_inclusion() {
+        let filter = vec![0x01; 32];
+        let published = 1430;
+        let wm = Arc::new(MockWorkerManager::new());
+        wm.allocate_worker(1, &filter).unwrap();
+        let mut lapsed = make_alloc(filter.clone());
+        lapsed.epoch = 0;
+        let reg = Arc::new(TestProverRegistry::with_prover(prover_with(vec![
+            lapsed.clone()
+        ])));
+        let allocator = WorkerAllocator::new(wm.clone(), reg, vec![0xAA; 32]);
+        allocator.hold_pending_joins_for_registry_sync();
+        allocator.note_renewals_offered();
+        allocator.note_registry_sync_begun(1, 1420);
+        allocator.note_registry_synced(1);
+        allocator
+            .submission_attempts
+            .begin(
+                std::slice::from_ref(&filter),
+                published,
+                crate::submission_attempts::OpKind::Confirm,
+            )
+            .unwrap()
+            .published(published);
+        // Begun after the publication, before an inclusion at 1436.
+        let early_sync = published + 3;
+        allocator.note_registry_sync_begun(2, early_sync);
+        allocator.note_registry_synced(2);
+        let bound = || wm.range_workers().unwrap()[0].filter == filter;
+        allocator.on_new_frame(1440).unwrap();
+        assert!(
+            bound(),
+            "worker core 1 released from seat {} at frame 1440: its renewal, published at frame \
+             {published}, may be included up to frame 1439, so a registry sync begun at frame \
+             {early_sync} cannot show it",
+            hex::encode(&filter)
+        );
+        assert_eq!(
+            allocator.given_up_among(std::slice::from_ref(&lapsed), &filter, 1440),
+            None,
+            "the orphan sweep must not leave a seat whose renewal a later frame may include"
+        );
+        // Begun once no frame can include the renewal: the seat lapsed.
+        allocator.note_registry_sync_begun(3, 1440);
+        allocator.note_registry_synced(3);
+        let logged = reconcile_logged(&allocator, 1441);
+        assert!(
+            !bound(),
+            "a registry synced past the recovery epoch releases the worker"
+        );
+        assert!(
+            allocator
+                .given_up_among(std::slice::from_ref(&lapsed), &filter, 1441)
+                .is_some(),
+            "and the seat is given up"
+        );
+        assert!(
+            logged.contains("registry-sync hold ended")
+                && logged.contains("ended=\"synced\"")
+                && logged.contains("renewed=false"),
+            "{logged}"
+        );
+    }
+
     /// A seat lapsed past its recovery epoch whose leave is in flight is not
     /// being renewed: its worker is released, and an idle one is not bound
     /// to it, while a running confirm keeps or recovers it (2026-10-22: a
@@ -6359,5 +7053,65 @@ mod tests {
             logged.contains(&format!("activation_frame={}", 3 * e)),
             "{logged}"
         );
+    }
+
+    #[test]
+    fn worker_hold_logs_start_once_and_end_once_with_its_length() {
+        let mut holds = WorkerHolds::default();
+        let filter = vec![7u8; 4];
+        let reason = HoldReason::Settlement {
+            epoch: 9,
+            until: 500,
+        };
+        // The first held release logs; the same hold on later passes does not.
+        assert!(holds.begin(3, &filter, reason, 100), "first hold logs");
+        assert!(!holds.begin(3, &filter, reason, 110), "repeat is silent");
+        assert!(!holds.begin(3, &filter, reason, 120), "repeat is silent");
+        // Still held: nothing ends.
+        assert!(holds.end(3, &filter, true, 130).is_none());
+        // Nothing holds it any more, before the window ends: delivered, with
+        // the frames held counted from the first hold.
+        let (hold, held, outcome) = holds.end(3, &filter, false, 160).expect("end logs");
+        assert_eq!(hold.since, 100);
+        assert_eq!(held, 60);
+        assert_eq!(outcome, "settlement delivered");
+        // It ends once.
+        assert!(holds.end(3, &filter, false, 170).is_none());
+        // A new hold logs again.
+        assert!(holds.begin(3, &filter, reason, 200));
+        // Past the window the outcome is the window closing.
+        let (_, held, outcome) = holds.end(3, &filter, false, 500).unwrap();
+        assert_eq!((held, outcome), (300, "settlement window closed"));
+        // A session hold, and a hold left on another shard.
+        assert!(holds.begin(4, &filter, HoldReason::Session, 10));
+        assert_eq!(
+            holds.end(4, &filter, false, 20).unwrap().2,
+            "committee session ended"
+        );
+        assert!(holds.begin(5, &filter, HoldReason::Session, 10));
+        assert_eq!(
+            holds.end(5, &[8u8; 4], true, 30).unwrap().2,
+            "worker moved off the held shard"
+        );
+    }
+
+    #[test]
+    fn worker_hold_ends_when_the_allocation_recovers_and_the_worker_is_kept() {
+        let mut holds = WorkerHolds::default();
+        let filter = vec![7u8; 4];
+        let reason = HoldReason::Settlement {
+            epoch: 9,
+            until: 500,
+        };
+        // Retained but no release wanted since the last check: the
+        // allocation recovered and the worker is kept.
+        assert!(holds.begin(6, &filter, reason, 10));
+        assert!(holds.end(6, &filter, true, 20).is_none());
+        assert!(holds
+            .end(6, &filter, true, 30)
+            .is_some_and(|(_, held, outcome)| {
+                held == 20 && outcome == "allocation recovered; worker kept"
+            }));
+        assert!(holds.end(6, &filter, true, 40).is_none());
     }
 }

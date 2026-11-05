@@ -27,6 +27,7 @@ mod snapshot;
 mod snapshot_tests;
 mod settings;
 mod shield;
+mod transfer;
 mod update;
 mod util;
 mod view;
@@ -36,7 +37,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Args;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -55,9 +59,9 @@ use quil_types::proto::node::node_service_client::NodeServiceClient;
 
 use crate::context::GlobalArgs;
 
-use self::model::Model;
+use self::model::{Model, NoticeSeverity};
 use self::msg::Msg;
-use self::update::{apply_msg, handle_key, Cmd};
+use self::update::{apply_msg, handle_key, handle_paste, Cmd};
 use super::ProverCtx;
 
 type Client = NodeServiceClient<Channel>;
@@ -74,11 +78,12 @@ const ONCE_SHARD_RPC_TIMEOUT: Duration = Duration::from_secs(90);
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ManageArgs {
     /// Fetch one official Manage snapshot as versioned JSON and exit.
-    #[arg(long, conflicts_with_all = ["render", "help_text", "reset_ui"])]
+    #[arg(long, conflicts_with_all = ["render", "help_text", "reset_ui", "observe", "notices"])]
     pub once: bool,
-    /// Print one frame as plain text and exit, after fetching once and
-    /// applying --keys, with the saved view settings; never runs joins,
-    /// lifecycle operations or worker changes, nor saves settings.
+    /// Print one frame as plain text and exit, after fetching once,
+    /// applying --keys and observing for --observe, with the saved view
+    /// settings; never runs joins, lifecycle operations or worker changes,
+    /// nor saves settings.
     #[arg(long)]
     pub render: bool,
     /// Print the TUI help as plain text and exit.
@@ -100,6 +105,16 @@ pub struct ManageArgs {
     /// Seconds --render waits for the node's answers.
     #[arg(long, default_value_t = 30)]
     pub timeout: u64,
+    /// Keep refreshing for this many seconds at the TUI's refresh interval
+    /// before --render draws, so notices that need several snapshots over
+    /// time (progress stalls, from 60s) can show; 0 draws after one fetch.
+    #[arg(long, value_name = "SECONDS", default_value_t = 0, requires = "render")]
+    pub observe: u64,
+    /// Print only the Notifications lines of both tabs, at every level, one
+    /// per line as `[HH:MM:SS UTC] <ERROR|WARN|INFO> <text>`, instead of the
+    /// --render frame.
+    #[arg(long, requires = "render")]
+    pub notices: bool,
     /// Show private wallet fields in --render: a confirmation's amount and
     /// the recipient's address, and shielded amounts. Without it a render,
     /// which may be shared, shows them as hidden.
@@ -115,9 +130,10 @@ pub struct ManageArgs {
     /// defaults, then start.
     #[arg(long)]
     pub reset_ui: bool,
-    /// Largest fee in base units a shield batch or a mint pays from the
+    /// Largest fee in base units one shield batch, mint or transfer action
+    /// (transfer, pending transfer, accept, refund, merge) pays from the
     /// node's quote (default: 0.1 QUIL); a larger quote stops a shield run
-    /// and refuses a mint, as in `qclient token`.
+    /// and refuses the others, as in `qclient token`.
     #[arg(
         long,
         env = "QUILIBRIUM_MAX_FEE",
@@ -149,6 +165,8 @@ impl ManageArgs {
                 color: self.color,
                 timeout: Duration::from_secs(self.timeout),
                 reveal: self.reveal,
+                observe: Duration::from_secs(self.observe),
+                notices: self.notices,
             })
         } else {
             Mode::Interactive
@@ -199,7 +217,7 @@ async fn run(pc: &ProverCtx, refresh_state: RefreshState) -> anyhow::Result<()> 
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -207,7 +225,11 @@ async fn run(pc: &ProverCtx, refresh_state: RefreshState) -> anyhow::Result<()> 
 
     // Restore the terminal regardless of the loop outcome.
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     res
@@ -271,6 +293,10 @@ async fn event_loop(
                     Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                         handle_key(&mut model, key)
                     }
+                    Some(Ok(Event::Paste(text))) => {
+                        handle_paste(&mut model, &text);
+                        Vec::new()
+                    }
                     Some(Ok(Event::Resize(_, _))) => Vec::new(),
                     Some(Err(_)) | None => break,
                     _ => Vec::new(),
@@ -326,20 +352,28 @@ struct RenderOptions {
     timeout: Duration,
     /// Show private wallet fields (`--reveal`); else they are masked.
     reveal: bool,
+    /// How long to keep refreshing before drawing (`--observe`).
+    observe: Duration,
+    /// Print the notices instead of the frame (`--notices`).
+    notices: bool,
 }
 
 impl RenderOptions {
     /// Set up the model a render draws: private wallet fields masked
-    /// unless `--reveal`.
+    /// unless `--reveal`; `--notices` lists every level.
     fn prepare(&self, model: &mut Model) {
         model.mask_private = !self.reveal;
+        if self.notices {
+            model.notice_minimum = NoticeSeverity::Info;
+        }
     }
 }
 
 /// `qclient node manage --render`: fetch the node's data once, apply
-/// the given keys, draw one frame and print it as plain text. Read-only: the
-/// commands keys or results would start (joins, lifecycle operations, worker
-/// changes, follow-up checks) are dropped and reported on stderr.
+/// the given keys, keep refreshing for `--observe`, then draw one frame and
+/// print it as plain text, or only its notices with `--notices`. Read-only:
+/// the commands keys or results would start (joins, lifecycle operations,
+/// worker changes, follow-up checks) are dropped and reported on stderr.
 async fn render(
     pc: &ProverCtx,
     refresh_state: RefreshState,
@@ -354,6 +388,7 @@ async fn render(
     model.color_coding = opts.color;
     opts.prepare(&mut model);
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    let started = tokio::time::Instant::now();
     spawn_action(&client, &km, &tx, &refresh_state, Cmd::Fetch);
     // The start's legacy read, as interactively.
     for cmd in coins::due(&mut model, std::time::Instant::now()) {
@@ -398,6 +433,8 @@ async fn render(
                 Cmd::MintPrepare | Cmd::ClaimPrepare(..) => {
                     |msg| matches!(msg, Msg::MintPreview(_))
                 }
+                Cmd::FetchShielded => |msg| matches!(msg, Msg::Shielded(_)),
+                Cmd::TransferPrepare(_) => |msg| matches!(msg, Msg::TransferPreview(_)),
                 other => {
                     dropped.push(other);
                     continue;
@@ -427,12 +464,70 @@ async fn render(
             }
         }
     }
-    let frame = view::render_text(&mut model, opts.width, opts.height);
+    if !opts.observe.is_zero() {
+        dropped.extend(
+            observe(
+                &mut model,
+                &mut rx,
+                |cmd| spawn_action(&client, &km, &tx, &refresh_state, cmd),
+                std::time::Instant::now,
+                started..started + opts.observe,
+                (opts.width, opts.height),
+            )
+            .await,
+        );
+    }
+    let frame = if opts.notices {
+        view::notice_text(&mut model)
+    } else {
+        view::render_text(&mut model, opts.width, opts.height)
+    };
     for cmd in &dropped {
         eprintln!("render: not run (read-only): {}", command_name(cmd));
     }
     print!("{frame}");
     Ok(())
+}
+
+/// `--observe`: from `window.start`, the first fetch, until `window.end`,
+/// refresh at the TUI's interval and apply each answer as the interactive
+/// loop does, stamped by `clock`, drawing after each; so the notices that
+/// need several snapshots over time (progress stalls) establish as they do
+/// on screen. `spawn` runs the refreshes and due legacy reads; the commands
+/// the answers would start are returned, as a render does not run them.
+async fn observe(
+    model: &mut Model,
+    rx: &mut mpsc::UnboundedReceiver<Msg>,
+    mut spawn: impl FnMut(Cmd),
+    clock: impl Fn() -> std::time::Instant,
+    window: std::ops::Range<tokio::time::Instant>,
+    (width, height): (u16, u16),
+) -> Vec<Cmd> {
+    let period = Duration::from_secs(model.refresh_seconds.max(1));
+    let mut refresh = tokio::time::interval_at(window.start + period, period);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let end = tokio::time::sleep_until(window.end);
+    tokio::pin!(end);
+    let mut dropped = Vec::new();
+    loop {
+        let mut cmds = tokio::select! {
+            biased;
+            _ = &mut end => break,
+            Some(msg) = rx.recv() => {
+                dropped.extend(
+                    update::apply_msg_at(model, msg, clock())
+                        .into_iter()
+                        .filter(|cmd| !matches!(cmd, Cmd::Fetch)),
+                );
+                Vec::new()
+            }
+            _ = refresh.tick() => vec![Cmd::Fetch],
+        };
+        cmds.extend(coins::due(model, clock()));
+        cmds.into_iter().for_each(&mut spawn);
+        view::render_text(model, width, height);
+    }
+    dropped
 }
 
 /// Apply the render's keys to the model; returns the commands they would
@@ -511,6 +606,9 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::ClaimPrepare(..) => "mint claim reads",
         Cmd::MintRun(_) => "mint",
         Cmd::ShieldStop => "shield stop",
+        Cmd::FetchShielded => "shielded coins read",
+        Cmd::TransferPrepare(_) => "transfer reads and quote",
+        Cmd::TransferRun(_) => "transfer action",
         Cmd::Join(_) => "join",
         Cmd::Lifecycle { .. } => "lifecycle operation",
         Cmd::ToggleManual { .. } | Cmd::MarkManual(_) => "worker mode change",
@@ -531,8 +629,8 @@ struct RefreshState {
     /// What the shield action loads `qclient token`'s context from, and
     /// its `--max-fee`.
     token: Option<(GlobalArgs, u128)>,
-    /// The private action log a shield or a mint records itself in,
-    /// unless off.
+    /// The private action log a shield, a mint or a transfer action
+    /// records itself in, unless off.
     action_log: Option<crate::commands::token::action_log::ActionLog>,
     /// Set to stop the running shield before its next submission; one
     /// runs at a time, and each run starts with it cleared.
@@ -642,6 +740,26 @@ fn spawn_action(
             let token = refresh.token.clone();
             tokio::spawn(async move {
                 let _ = tx.send(actions::shield_prepare(token).await);
+            });
+        }
+        Cmd::FetchShielded => {
+            let token = refresh.token.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(actions::fetch_shielded(token).await);
+            });
+        }
+        Cmd::TransferPrepare(kind) => {
+            let token = refresh.token.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(actions::transfer_prepare(token, kind).await);
+            });
+        }
+        Cmd::TransferRun(preview) => {
+            let token = refresh.token.clone();
+            let log = refresh.action_log.clone();
+            tokio::spawn(async move {
+                let progress = tx.clone();
+                let _ = tx.send(actions::transfer_run(token, preview, progress, log).await);
             });
         }
         Cmd::MintPrepare => {
@@ -845,6 +963,8 @@ mod entry_tests {
                 keys: String::new(),
                 color: false,
                 timeout: 30,
+                observe: 0,
+                notices: false,
                 reveal: false,
                 no_action_log: false,
                 reset_ui: false,
@@ -862,6 +982,9 @@ mod entry_tests {
             "--color",
             "--timeout",
             "5",
+            "--observe",
+            "90",
+            "--notices",
             "--reset-ui",
             "--max-fee",
             "7",
@@ -880,6 +1003,8 @@ mod entry_tests {
                 keys: "n Tab".into(),
                 color: true,
                 timeout: 5,
+                observe: 90,
+                notices: true,
                 reveal: true,
                 no_action_log: true,
                 reset_ui: true,
@@ -907,8 +1032,18 @@ mod entry_tests {
                 .and_then(|c| c.find_subcommand("manage"))
                 .unwrap(),
         );
-        assert_eq!(entry.len(), 12);
+        assert_eq!(entry.len(), 14);
         assert_eq!(entry, alias);
+        // Observing and listing notices belong to a render.
+        for flags in [&["--observe", "90"][..], &["--notices"][..]] {
+            for prefix in [&["manage"][..], &["prover", "manage"][..]] {
+                let argv = [&["qclient"][..], prefix, flags].concat();
+                assert!(
+                    Qclient::try_parse_from(argv).is_err(),
+                    "{flags:?} without --render"
+                );
+            }
+        }
     }
 
     /// What an entry prints before any node answer: the help text, or the
@@ -976,5 +1111,170 @@ mod entry_tests {
         }
         // The help frame is not the main frame, so the keys did apply.
         assert_ne!(direct_frame(&['h'], 80, 24), direct_frame(&[], 80, 24));
+    }
+}
+
+#[cfg(test)]
+mod observe_tests {
+    use quil_types::proto::node::{
+        GetShardInfoResponse, GlobalAppFrameHead, NodeInfoResponse, ShardRewardInfo,
+    };
+
+    use super::*;
+
+    /// The node's answers to poll `step`, its status and its shards, as a
+    /// refresh delivers them: GLOBAL and the shard advance, while GLOBAL's
+    /// committed head for the shard keeps its frame.
+    fn answers(step: u64) -> [Msg; 2] {
+        let status = Msg::DataRefresh {
+            node_info: Some(NodeInfoResponse {
+                last_received_frame: 500 + step * 3,
+                ..Default::default()
+            }),
+            shard_info: None,
+            worker_info: None,
+            err: None,
+        };
+        let shards = GetShardInfoResponse {
+            shards: vec![ShardRewardInfo {
+                filter: vec![1],
+                active_provers: 4,
+                latest_frame: 1000 + step * 6,
+                global_head: Some(GlobalAppFrameHead {
+                    frame: 995,
+                    global_frame: 500 + step * 3,
+                    generation: 1,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        [status, Msg::ShardRefresh(Ok(shards))]
+    }
+
+    fn options(observe: u64) -> RenderOptions {
+        RenderOptions {
+            width: 160,
+            height: 50,
+            keys: Vec::new(),
+            color: false,
+            timeout: Duration::from_secs(30),
+            reveal: false,
+            observe: Duration::from_secs(observe),
+            notices: true,
+        }
+    }
+
+    /// What `--render --notices --observe <secs>` prints when the first
+    /// fetch and every poll are answered by the next scripted snapshot, and
+    /// how many polls ran. Paused time runs the polls; the model's clock
+    /// follows it, ending in the recent past.
+    async fn notices_after(secs: u64) -> (String, u64) {
+        let opts = options(secs);
+        let mut model = Model::new();
+        opts.prepare(&mut model);
+        let started = tokio::time::Instant::now();
+        let base = std::time::Instant::now() - opts.observe - Duration::from_secs(15);
+        let clock = move || base + (tokio::time::Instant::now() - started);
+        for msg in answers(0) {
+            update::apply_msg_at(&mut model, msg, clock());
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut polls = 0;
+        if !opts.observe.is_zero() {
+            observe(
+                &mut model,
+                &mut rx,
+                |cmd| {
+                    if matches!(cmd, Cmd::Fetch) {
+                        polls += 1;
+                        for msg in answers(polls) {
+                            assert!(tx.send(msg).is_ok(), "the receiver lives");
+                        }
+                    }
+                },
+                clock,
+                started..started + opts.observe,
+                (opts.width, opts.height),
+            )
+            .await;
+        }
+        (view::notice_text(&mut model), polls)
+    }
+
+    /// `[HH:MM:SS UTC] <ERROR|WARN|INFO> <text>`, one notice per line.
+    fn assert_notice_line(line: &str) {
+        let bytes = line.as_bytes();
+        let clock = (1..9).all(|i| {
+            if i % 3 == 0 {
+                bytes.get(i) == Some(&b':')
+            } else {
+                bytes.get(i).is_some_and(u8::is_ascii_digit)
+            }
+        });
+        assert!(
+            bytes.first() == Some(&b'[') && clock && line.get(9..15) == Some(" UTC] "),
+            "no timestamp: {line:?}"
+        );
+        let (severity, text) = line[15..].split_once(' ').expect("severity and text");
+        assert!(
+            matches!(severity, "ERROR" | "WARN" | "INFO"),
+            "severity {severity:?} in {line:?}"
+        );
+        assert!(!text.trim().is_empty(), "no text: {line:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observing_raises_the_stall_notice_one_snapshot_cannot() {
+        let stall = "WARN Global app frames unchanged >60s: 1/1 tracked shards.";
+        let (once, polls) = notices_after(0).await;
+        assert_eq!(polls, 0);
+        assert!(
+            !once.contains("unchanged"),
+            "one snapshot shows a stall: {once}"
+        );
+        let (observed, polls) = notices_after(90).await;
+        assert!(
+            observed.lines().any(|line| line.ends_with(stall)),
+            "{stall} missing after 90s: {observed}"
+        );
+        // Polls at 15s, 30s, .. 75s; the run ends at 90s.
+        assert_eq!(polls, 5);
+        observed.lines().for_each(assert_notice_line);
+    }
+
+    #[test]
+    fn notices_print_one_line_each_with_time_and_severity() {
+        let mut model = Model::new();
+        options(0).prepare(&mut model);
+        assert!(
+            view::notice_text(&mut model).is_empty(),
+            "nothing to notice"
+        );
+        let reason = "unreachable ".repeat(30).trim_end().to_string();
+        apply_msg(
+            &mut model,
+            Msg::DataRefresh {
+                node_info: None,
+                shard_info: None,
+                worker_info: None,
+                err: Some(reason.clone()),
+            },
+        );
+        apply_msg(&mut model, Msg::ShardLoading);
+        let text = view::notice_text(&mut model);
+        let lines: Vec<&str> = text.lines().collect();
+        lines.iter().copied().for_each(assert_notice_line);
+        // The status line shows on both tabs yet prints once, unwrapped.
+        let failed: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("Refresh failed"))
+            .collect();
+        assert_eq!(failed.len(), 1, "{text}");
+        let error = format!(" UTC] ERROR Refresh failed: {reason}");
+        assert!(failed[0].ends_with(&error), "{text}");
+        let loading = " UTC] INFO Fetching shards (0s).";
+        assert!(lines.iter().any(|l| l.ends_with(loading)), "{text}");
+        assert!(text.ends_with('\n'));
     }
 }

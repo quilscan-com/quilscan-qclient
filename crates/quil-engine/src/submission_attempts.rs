@@ -19,8 +19,17 @@ pub(crate) enum OpKind {
     Reject,
 }
 
+/// The attempts, and the frame each filter's confirm begun in an epoch was
+/// last published at, kept for one epoch boundary
+/// ([`SubmissionAttempts::confirm_published_in`]).
 #[derive(Default)]
-pub(crate) struct SubmissionAttempts(Mutex<HashMap<Key, Attempt>>);
+pub(crate) struct SubmissionAttempts(
+    Mutex<HashMap<Key, Attempt>>,
+    Mutex<HashMap<(u64, Vec<u8>), u64>>,
+    /// Run each time a check releases the lock (`on_unlock`).
+    #[cfg(test)]
+    Mutex<Option<Box<dyn FnMut() + Send>>>,
+);
 
 struct Attempt {
     frame: u64,
@@ -69,13 +78,32 @@ impl SubmissionAttempts {
     /// Whether a local operation still owns `filter` at `frame` against an
     /// operation of `kind`: one in flight, a publication of this epoch inside
     /// its retry fence, or an epoch fence of the same kind.
+    #[cfg(test)]
     pub(crate) fn owned(&self, filter: &[u8], frame: u64, kind: OpKind) -> bool {
         let epoch = quil_types::consensus::epoch_for_frame(frame);
-        self.0.lock().is_ok_and(|attempts| {
+        let owned = self.0.lock().is_ok_and(|attempts| {
             attempts.iter().any(|((e, owned, k), a)| {
                 owned.as_slice() == filter && a.holds_off(*k, kind, *e, epoch, frame)
             })
-        })
+        });
+        self.unlocked();
+        owned
+    }
+
+    /// Run `hook` each time a check releases the lock, as another task
+    /// acting between two lock sections of a reservation would.
+    #[cfg(test)]
+    pub(crate) fn on_unlock(&self, hook: impl FnMut() + Send + 'static) {
+        *self.2.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn unlocked(&self) {
+        let hook = self.2.lock().unwrap().take();
+        if let Some(mut hook) = hook {
+            hook();
+            *self.2.lock().unwrap() = Some(hook);
+        }
     }
 
     /// Whether a local confirm still owns `filter` at `frame`: one in
@@ -87,6 +115,14 @@ impl SubmissionAttempts {
                 *k == OpKind::Confirm && owned.as_slice() == filter && a.owns(*e, epoch, frame)
             })
         })
+    }
+
+    /// The frame `filter`'s latest confirm begun in `epoch` was published
+    /// at, kept until the epoch after it ends: a later attempt that fails
+    /// does not erase it. A renewal published late in its recovery epoch
+    /// may reach this node's registry only after the boundary.
+    pub(crate) fn confirm_published_in(&self, filter: &[u8], epoch: u64) -> Option<u64> {
+        self.1.lock().ok()?.get(&(epoch, filter.to_vec())).copied()
     }
 
     /// Release the published joins of each `(filter, frames)` whose attempt
@@ -114,26 +150,63 @@ impl SubmissionAttempts {
         released
     }
 
+    /// Begin an attempt over all of `filters`, or `None` when an attempt
+    /// holds off any of them.
+    #[cfg(test)]
     pub(crate) fn begin(
         self: &Arc<Self>,
         filters: &[Vec<u8>],
         frame: u64,
         kind: OpKind,
     ) -> Option<SubmissionAttempt> {
-        if filters.is_empty() {
-            return None;
-        }
+        let (free, attempt) = self.begin_free(filters, frame, kind);
+        attempt.filter(|_| free.iter().all(|free| *free))
+    }
+
+    /// Begin an attempt over those of `filters` no attempt holds off, and
+    /// say which those are; `None` when none is free. The check and the
+    /// reservation take the lock once, so an attempt ending meanwhile frees
+    /// all of its filters for this one or none.
+    pub(crate) fn begin_free(
+        self: &Arc<Self>,
+        filters: &[Vec<u8>],
+        frame: u64,
+        kind: OpKind,
+    ) -> (Vec<bool>, Option<SubmissionAttempt>) {
+        let reserved = self.begin_free_locked(filters, frame, kind);
+        #[cfg(test)]
+        self.unlocked();
+        reserved
+    }
+
+    fn begin_free_locked(
+        self: &Arc<Self>,
+        filters: &[Vec<u8>],
+        frame: u64,
+        kind: OpKind,
+    ) -> (Vec<bool>, Option<SubmissionAttempt>) {
         let epoch = quil_types::consensus::epoch_for_frame(frame);
-        let mut attempts = self.0.lock().ok()?;
+        let Ok(mut attempts) = self.0.lock() else {
+            return (vec![false; filters.len()], None);
+        };
         attempts.retain(|(e, _, _), a| a.owns(*e, epoch, frame));
-        if filters.iter().any(|f| {
-            attempts.iter().any(|((e, existing, k), a)| {
-                existing == f && a.holds_off(*k, kind, *e, epoch, frame)
+        let free: Vec<bool> = filters
+            .iter()
+            .map(|f| {
+                !attempts.iter().any(|((e, existing, k), a)| {
+                    existing == f && a.holds_off(*k, kind, *e, epoch, frame)
+                })
             })
-        }) {
-            return None;
+            .collect();
+        let keys: Vec<Key> = filters
+            .iter()
+            .zip(&free)
+            .filter(|(_, free)| **free)
+            .map(|(f, _)| (epoch, f.clone(), kind))
+            .collect();
+        if keys.is_empty() {
+            return (free, None);
         }
-        let keys: Vec<Key> = filters.iter().map(|f| (epoch, f.clone(), kind)).collect();
         for key in &keys {
             attempts.insert(
                 key.clone(),
@@ -144,12 +217,13 @@ impl SubmissionAttempts {
                 },
             );
         }
-        Some(SubmissionAttempt {
+        let attempt = SubmissionAttempt {
             owner: self.clone(),
             keys,
             published_frames: HashMap::new(),
             epoch_fenced: Vec::new(),
-        })
+        };
+        (free, Some(attempt))
     }
 }
 
@@ -219,6 +293,13 @@ impl Drop for SubmissionAttempt {
                         a.frame = a.frame.max(frame);
                         a.for_epoch |= self.epoch_fenced.contains(&key.1);
                     }
+                    if key.2 == OpKind::Confirm {
+                        if let Ok(mut published) = self.owner.1.lock() {
+                            published.retain(|(epoch, _), _| epoch.saturating_add(1) >= key.0);
+                            let last = published.entry((key.0, key.1.clone())).or_insert(frame);
+                            *last = (*last).max(frame);
+                        }
+                    }
                 } else {
                     attempts.remove(key);
                 }
@@ -230,6 +311,42 @@ impl Drop for SubmissionAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A confirm's publication frame outlives its attempt for one epoch
+    /// boundary: a later attempt that fails does not erase it, a leave does
+    /// not count, and the epoch after next forgets it.
+    #[test]
+    fn a_published_confirm_is_remembered_across_one_epoch_boundary() {
+        let e = quil_types::consensus::epoch_length_frames();
+        let attempts = Arc::new(SubmissionAttempts::default());
+        let (renewed, left, other) = (vec![1], vec![2], vec![3]);
+        attempts
+            .begin(std::slice::from_ref(&renewed), e + 10, OpKind::Confirm)
+            .unwrap()
+            .published(e + 12);
+        drop(attempts.begin(std::slice::from_ref(&renewed), e + 50, OpKind::Confirm));
+        assert_eq!(attempts.confirm_published_in(&renewed, 1), Some(e + 12));
+        assert_eq!(attempts.confirm_published_in(&renewed, 2), None);
+        attempts
+            .begin(std::slice::from_ref(&left), e + 10, OpKind::Leave)
+            .unwrap()
+            .published(e + 11);
+        assert_eq!(attempts.confirm_published_in(&left, 1), None);
+        attempts
+            .begin(std::slice::from_ref(&other), 2 * e + 1, OpKind::Confirm)
+            .unwrap()
+            .published(2 * e + 1);
+        assert_eq!(attempts.confirm_published_in(&renewed, 1), Some(e + 12));
+        attempts
+            .begin(std::slice::from_ref(&other), 3 * e + 1, OpKind::Confirm)
+            .unwrap()
+            .published(3 * e + 1);
+        assert_eq!(
+            attempts.confirm_published_in(&renewed, 1),
+            None,
+            "forgotten the epoch after next"
+        );
+    }
 
     #[test]
     fn in_flight_failure_success_and_epoch_retry() {

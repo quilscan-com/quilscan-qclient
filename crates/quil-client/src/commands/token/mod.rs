@@ -26,14 +26,77 @@ pub(crate) mod output;
 pub(crate) mod shield_pacing;
 #[cfg(feature = "confidential-tokens")]
 mod wallet;
+#[cfg(feature = "native-proof")]
+pub(crate) use wallet::inclusion::Follow;
 #[cfg(feature = "confidential-tokens")]
-pub(crate) use wallet::saved_mints;
+pub(crate) use wallet::{check_recipient, confidential_balance, list_escrows, saved_mints};
+
+/// Default scan bounds of `qclient token` (`--max-pages`, `--max-coins`).
+pub(crate) const SCAN_MAX_PAGES: usize = 2048;
+pub(crate) const SCAN_MAX_COINS: usize = 1024;
 #[cfg(feature = "native-proof")]
 pub(crate) use wallet::{
-    execute_mint, execute_mint_claim, execute_shield_all, mint_claim_witness, plan_mint,
-    plan_shield_all, reward_mint_fee, shield_batch_fee, MintEvent, MintPlan, ShieldAllPlan,
-    ShieldEvent, ShieldReport,
+    execute_mint, execute_mint_claim, execute_shield_all, merge_preview, mint_claim_witness,
+    plan_mint, plan_shield_all, reward_mint_fee, run_claim, run_merge, run_pending_create,
+    run_transfer, shield_batch_fee, transfer_fee, MintEvent, MintPlan, ShieldAllPlan, ShieldEvent,
+    ShieldReport,
 };
+
+/// The input limit of one confidential spend on this network.
+#[cfg(feature = "native-proof")]
+pub(crate) fn max_inputs(tc: &TokenCtx) -> usize {
+    quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(tc.node_config.p2p.network)
+        .limits
+        .max_inputs
+}
+
+/// The fee `token merge` pays: `explicit`, or a quote for one coin and the
+/// input limit's markers.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn merge_fee(
+    tc: &TokenCtx,
+    application: &str,
+    explicit: Option<u128>,
+) -> anyhow::Result<u128> {
+    let shape = quil_execution::token_intrinsic::cost::Shape {
+        coins: 1,
+        markers: max_inputs(tc),
+        escrow: false,
+    };
+    operation_fee(tc, application, explicit, shape).await
+}
+
+/// The fee `token pending-transfer` pays: `explicit`, or a quote for one
+/// escrow coin and the input limit's markers.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn pending_fee(
+    tc: &TokenCtx,
+    application: &str,
+    explicit: Option<u128>,
+) -> anyhow::Result<u128> {
+    let shape = quil_execution::token_intrinsic::cost::Shape {
+        coins: 1,
+        markers: max_inputs(tc),
+        escrow: true,
+    };
+    operation_fee(tc, application, explicit, shape).await
+}
+
+/// The fee `token accept` and `token reject` pay: `explicit`, or a quote
+/// for one coin and one marker.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn claim_fee(
+    tc: &TokenCtx,
+    application: &str,
+    explicit: Option<u128>,
+) -> anyhow::Result<u128> {
+    let shape = quil_execution::token_intrinsic::cost::Shape {
+        coins: 1,
+        markers: 1,
+        escrow: false,
+    };
+    operation_fee(tc, application, explicit, shape).await
+}
 
 /// Flags shared by every `token` subcommand (Go `TokenCmd` persistent
 /// flags).
@@ -107,6 +170,35 @@ fn max_fee_from_env() -> anyhow::Result<u128> {
 }
 
 impl TokenCommonArgs {
+    /// The flags that select this command's configs and read node, as a
+    /// later command repeats them: `--network` too when one was named.
+    fn read_flags(&self, network: Option<&str>) -> Vec<String> {
+        let mut flags = Vec::new();
+        let mut flag = |name: &str, value: Option<&str>| {
+            flags.push(name.to_string());
+            flags.extend(value.map(str::to_string));
+        };
+        if let Some(network) = network {
+            flag("--network", Some(network));
+        }
+        for config in &self.config {
+            flag("--config", Some(config));
+        }
+        if let Some(dir) = &self.submit_config {
+            flag("--submit-config", Some(dir));
+        }
+        if let Some(multiaddr) = &self.read_rpc {
+            flag("--read-rpc", Some(multiaddr));
+        }
+        if self.insecure_read_rpc {
+            flag("--insecure-read-rpc", None);
+        }
+        if self.public_rpc {
+            flag("--public-rpc", None);
+        }
+        flags
+    }
+
     /// The one `--config` of a command other than `token legacy` (empty: the
     /// default node config).
     fn single_config(&self) -> anyhow::Result<&str> {
@@ -334,10 +426,10 @@ pub struct TokenArgs {
     /// Maximum discovery pages (up to 64 confidential coins or escrows each,
     /// 8 from older nodes); exhaustion fails rather than returning a partial
     /// balance.
-    #[arg(long, global = true, default_value_t = 2048)]
+    #[arg(long, global = true, default_value_t = SCAN_MAX_PAGES)]
     pub max_pages: usize,
     /// Maximum recovered unspent coins retained during discovery.
-    #[arg(long, global = true, default_value_t = 1024)]
+    #[arg(long, global = true, default_value_t = SCAN_MAX_COINS)]
     pub max_coins: usize,
     #[command(subcommand)]
     pub command: TokenCommand,
@@ -375,16 +467,33 @@ pub enum TokenCommand {
         /// Fee in base units (default: conservative node estimate).
         #[arg(long)]
         fee: Option<u128>,
+        /// Seconds to wait for the global commit to decide it, then for the coins
+        /// it creates to show in a coin scan (0: print how to check later).
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait: u64,
     },
     /// Print this wallet's confidential (lattice) receiving address.
     ConfidentialAddress,
+    /// Report the global commit's decision on a submitted confidential
+    /// operation: `inclusion <Operation>`, the id its submission printed.
+    /// Committed or rejected, with the deciding GLOBAL frame; an undecided
+    /// operation has not executed yet, or a shard refused it.
+    #[cfg(feature = "native-proof")]
+    Inclusion {
+        /// Operation id (hex), from the submission's `operation:` line.
+        operation: String,
+        /// Seconds to wait for a decision (0: report the current state).
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait: u64,
+    },
     /// Discover recoverable pending transfers; admission determines claim eligibility.
     #[cfg(feature = "confidential-tokens")]
     Escrows {
         #[arg(long, default_value_t = 1024)]
         max_escrows: usize,
     },
-    /// Shield a transparent coin into a confidential coin owned by this wallet.
+    /// Shield a transparent coin into a confidential coin owned by this wallet,
+    /// or by `--recipient`.
     #[cfg(feature = "native-proof")]
     Shield {
         /// Transparent coin address in hexadecimal.
@@ -394,6 +503,14 @@ pub enum TokenCommand {
         /// Fee in base units (default: node estimate for QUIL, zero for custom tokens).
         #[arg(long)]
         fee: Option<u128>,
+        /// Confidential address (from `confidential-address`) to receive the
+        /// coin instead of this wallet. Must be for this node's network.
+        #[arg(long)]
+        recipient: Option<String>,
+        /// Seconds to wait for the global commit to decide it, then for the coins
+        /// it creates to show in a coin scan (0: print how to check later).
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait: u64,
     },
     /// Shield every unshielded legacy coin of this identity, in batches of up
     /// to 96 legacy coins from one shard each.
@@ -434,6 +551,15 @@ pub enum TokenCommand {
         /// included before stopping the run.
         #[arg(long, default_value_t = shield_pacing::DEFAULT_INCLUSION_TIMEOUT_SECS)]
         inclusion_timeout: u64,
+        /// Confidential address (from `confidential-address`) to receive the
+        /// coins instead of this wallet. Must be for this node's network.
+        #[arg(long)]
+        recipient: Option<String>,
+        /// Seconds, once the paced run has ended, to wait for the global commit
+        /// to decide each batch, then for the coins they create to show in a
+        /// coin scan (0: print how to check later).
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait: u64,
     },
     /// Mint a custom token under its deployed policy.
     #[cfg(feature = "native-proof")]
@@ -463,6 +589,10 @@ pub enum TokenCommand {
         /// and the amount the entitled amount.
         #[arg(long)]
         entitlement: Option<String>,
+        /// Seconds to wait for the global commit to decide it, then for the coins
+        /// it creates to show in a coin scan (0: print how to check later).
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait: u64,
     },
     /// Build a token's mint-entitlement tree: prints the root for the token's
     /// configuration and one proof per entitlement. Each line of the file is
@@ -484,6 +614,10 @@ pub enum TokenCommand {
         /// Fee in base units (default: conservative node estimate).
         #[arg(long)]
         fee: Option<u128>,
+        /// Seconds to wait for the global commit to decide it, then for the coins
+        /// it creates to show in a coin scan (0: print how to check later).
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait: u64,
     },
     /// Split one coin into several: `split <Coin> <Amounts>... | --parts N` (at most two outputs per transaction).
     Split {
@@ -500,6 +634,10 @@ pub enum TokenCommand {
         /// Fee in base units (default: conservative node estimate).
         #[arg(long)]
         fee: Option<u128>,
+        /// Seconds to wait for the global commit to decide it, then for the coins
+        /// it creates to show in a coin scan (0: print how to check later).
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait: u64,
     },
     /// Create an acceptable (escrow) transfer to a recipient's escrow address.
     PendingTransfer {
@@ -513,6 +651,10 @@ pub enum TokenCommand {
         /// Fee in base units (default: conservative node estimate).
         #[arg(long)]
         fee: Option<u128>,
+        /// Seconds to wait for the global commit to decide it, then for the coins
+        /// it creates to show in a coin scan (0: print how to check later).
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait: u64,
     },
     /// Accept a pending transfer addressed to this wallet: `accept <Escrow>`.
     Accept {
@@ -521,6 +663,10 @@ pub enum TokenCommand {
         /// Fee in base units (default: conservative node estimate).
         #[arg(long)]
         fee: Option<u128>,
+        /// Seconds to wait for the global commit to decide it, then for the coins
+        /// it creates to show in a coin scan (0: print how to check later).
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait: u64,
     },
     /// Reject/refund a pending transfer (refunder only, after expiration): `reject <Escrow>`.
     Reject {
@@ -529,6 +675,10 @@ pub enum TokenCommand {
         /// Fee in base units (default: conservative node estimate).
         #[arg(long)]
         fee: Option<u128>,
+        /// Seconds to wait for the global commit to decide it, then for the coins
+        /// it creates to show in a coin scan (0: print how to check later).
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait: u64,
     },
     /// Pay QUIL to another application for one bundle: `pay <Destination> <Amount> <Context>`.
     /// `Context` is the SHA3-256 binding of the destination bundle (all requests
@@ -593,6 +743,11 @@ pub enum TokenCommand {
         /// it, the frame a claim would cite, and whether its claim already committed.
         #[arg(long, value_name = "FILE", conflicts_with_all = ["recipient", "fee", "claim"])]
         status: Option<PathBuf>,
+        /// Seconds to wait for the authorization to become claimable; with
+        /// --claim, then also for the claim's commit and its coins (0: do not
+        /// wait).
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        wait: u64,
     },
 }
 
@@ -609,6 +764,7 @@ impl TokenCommand {
             TokenCommand::Escrows { .. } | TokenCommand::ClaimableRewards => false,
             #[cfg(feature = "native-proof")]
             TokenCommand::Entitlements { .. }
+            | TokenCommand::Inclusion { .. }
             | TokenCommand::PaymentAddress
             | TokenCommand::Prefunded
             | TokenCommand::SettlementClaim { .. } => false,
@@ -652,6 +808,9 @@ pub struct TokenCtx {
     /// Largest automatic fee or bundle settlement, in base units, paid from a
     /// node's quote (`--max-fee`).
     pub max_fee: u128,
+    /// The flags naming this command's configs and read node, for the
+    /// commands it prints to check on a submission later.
+    pub read_flags: Vec<String>,
 }
 
 impl TokenCtx {
@@ -845,6 +1004,7 @@ impl TokenCtx {
                 .map(|identity| identity.peer_id_bytes)
                 .unwrap_or_default(),
             max_fee: common.max_fee,
+            read_flags: common.read_flags(ctx.network_override()),
         })
     }
 }
@@ -972,43 +1132,56 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 .map_err(|_| anyhow::anyhow!("{value:?} must be exactly 32 bytes of hex"))
         };
         use quil_execution::token_intrinsic::cost::Shape;
-        let max_inputs = quil_execution::token_intrinsic::dispatch::TokenPolicy::for_network(
-            tc.node_config.p2p.network,
-        )
-        .limits
-        .max_inputs;
-        let spend = |coins: usize| Shape {
-            coins,
-            markers: max_inputs,
-            escrow: false,
+        let secs = std::time::Duration::from_secs;
+        let follow = |wait: u64| wallet::inclusion::Follow {
+            wait: secs(wait),
+            max_pages: args.max_pages,
         };
         match &args.command {
             TokenCommand::Transfer {
                 recipient,
                 amount,
                 fee,
+                wait,
             } => {
-                return wallet::run_transfer(
-                    &tc,
-                    &application,
-                    recipient,
-                    parse_amount(amount)?,
-                    *fee,
-                    args.max_pages,
-                    args.max_coins,
-                )
-                .await
+                // Recorded in the private action log, with the operator lines.
+                let action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    wallet::run_transfer(
+                        &tc,
+                        &application,
+                        recipient,
+                        parse_amount(amount)?,
+                        *fee,
+                        args.max_pages,
+                        args.max_coins,
+                        secs(*wait),
+                    )
+                    .await
+                }
+                .await;
+                return action_log::CliAction::close(action, result);
             }
-            TokenCommand::Merge { coins, fee } => {
-                return wallet::run_merge(
-                    &tc,
-                    &application,
-                    coins,
-                    operation_fee(&tc, &application, *fee, spend(1)).await?,
-                    args.max_pages,
-                    args.max_coins,
-                )
-                .await
+            TokenCommand::Merge { coins, fee, wait } => {
+                let action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    wallet::run_merge(
+                        &tc,
+                        &application,
+                        coins,
+                        merge_fee(&tc, &application, *fee).await?,
+                        args.max_pages,
+                        args.max_coins,
+                        secs(*wait),
+                    )
+                    .await
+                }
+                .await;
+                return action_log::CliAction::close(action, result);
+            }
+            TokenCommand::Inclusion { operation, wait } => {
+                return wallet::inclusion::run_inclusion(tc, &application, operation, secs(*wait))
+                    .await
             }
             TokenCommand::Split {
                 coin,
@@ -1016,6 +1189,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 parts,
                 part_amount,
                 fee,
+                wait,
             } => {
                 let pieces: Vec<u128> = match (parts, part_amount) {
                     (Some(parts), Some(part_amount)) => {
@@ -1046,6 +1220,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     .await?,
                     args.max_pages,
                     args.max_coins,
+                    secs(*wait),
                 )
                 .await;
             }
@@ -1054,74 +1229,50 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 amount,
                 expiration,
                 fee,
+                wait,
             } => {
-                return wallet::run_pending_create(
-                    &tc,
-                    &application,
-                    recipient,
-                    parse_amount(amount)?,
-                    operation_fee(
+                let action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    wallet::run_pending_create(
                         &tc,
                         &application,
-                        *fee,
-                        Shape {
-                            coins: 1,
-                            markers: max_inputs,
-                            escrow: true,
-                        },
+                        recipient,
+                        parse_amount(amount)?,
+                        pending_fee(&tc, &application, *fee).await?,
+                        *expiration,
+                        args.max_pages,
+                        args.max_coins,
+                        secs(*wait),
                     )
-                    .await?,
-                    *expiration,
-                    args.max_pages,
-                    args.max_coins,
-                )
-                .await
+                    .await
+                }
+                .await;
+                return action_log::CliAction::close(action, result);
             }
-            TokenCommand::Accept { escrow, fee } => {
-                return wallet::run_claim(
-                    &tc,
-                    &application,
-                    escrow,
-                    operation_fee(
+            TokenCommand::Accept { escrow, fee, wait }
+            | TokenCommand::Reject { escrow, fee, wait } => {
+                let refund = matches!(args.command, TokenCommand::Reject { .. });
+                let action = action_log::CliAction::start(&tc.config_dir, &args.command);
+                let result = async {
+                    wallet::run_claim(
                         &tc,
                         &application,
-                        *fee,
-                        Shape {
-                            coins: 1,
-                            markers: 1,
-                            escrow: false,
-                        },
+                        escrow,
+                        claim_fee(&tc, &application, *fee).await?,
+                        refund,
+                        follow(*wait),
                     )
-                    .await?,
-                    false,
-                )
-                .await
-            }
-            TokenCommand::Reject { escrow, fee } => {
-                return wallet::run_claim(
-                    &tc,
-                    &application,
-                    escrow,
-                    operation_fee(
-                        &tc,
-                        &application,
-                        *fee,
-                        Shape {
-                            coins: 1,
-                            markers: 1,
-                            escrow: false,
-                        },
-                    )
-                    .await?,
-                    true,
-                )
-                .await
+                    .await
+                }
+                .await;
+                return action_log::CliAction::close(action, result);
             }
             TokenCommand::Mint {
                 recipient,
                 fee,
                 claim,
                 status,
+                wait,
             } => {
                 anyhow::ensure!(
                     decoded == quil_execution::domains::QUIL_TOKEN,
@@ -1146,6 +1297,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                         mint_fee,
                         claim.as_deref(),
                         action.as_mut(),
+                        follow(*wait),
                     )
                     .await
                 }
@@ -1159,17 +1311,29 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 max_per_batch,
                 min_interval,
                 inclusion_timeout,
+                recipient,
+                wait,
             } => {
                 let pacing = shield_pacing::Pacing {
                     min_interval: *min_interval,
                     inclusion_timeout: *inclusion_timeout,
                 };
-                return wallet::run_shield_all(&tc, &application, *max_per_batch, pacing).await;
+                return wallet::run_shield_all(
+                    &tc,
+                    &application,
+                    *max_per_batch,
+                    pacing,
+                    recipient.as_deref(),
+                    follow(*wait),
+                )
+                .await;
             }
             TokenCommand::Shield {
                 source,
                 amount,
                 fee,
+                recipient,
+                wait,
             } => {
                 return wallet::run_shield(
                     &tc,
@@ -1187,6 +1351,8 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                         },
                     )
                     .await?,
+                    recipient.as_deref(),
+                    follow(*wait),
                 )
                 .await
             }
@@ -1257,6 +1423,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 price,
                 pay_wait,
                 entitlement,
+                wait,
             } => {
                 let paid = match (payee, price) {
                     (Some(payee), Some(price)) => Some((
@@ -1280,6 +1447,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     *permissionless,
                     paid,
                     entitlement,
+                    follow(*wait),
                 )
                 .await;
             }
@@ -1337,6 +1505,25 @@ mod tests {
         #[cfg(feature = "native-proof")]
         {
             assert!(TokenCli::try_parse_from(["token", "shield", "coin", "9"]).is_ok());
+            let recipient = |args: &[&str]| {
+                let mut argv = vec!["token"];
+                argv.extend_from_slice(args);
+                match TokenCli::try_parse_from(argv).unwrap().token.command {
+                    TokenCommand::Shield { recipient, .. }
+                    | TokenCommand::ShieldAll { recipient, .. } => recipient,
+                    other => panic!("not a shield: {other:?}"),
+                }
+            };
+            assert_eq!(recipient(&["shield", "coin", "9"]), None);
+            assert_eq!(recipient(&["shield-all"]), None);
+            assert_eq!(
+                recipient(&["shield", "coin", "9", "--recipient", "0xab"]).as_deref(),
+                Some("0xab")
+            );
+            assert_eq!(
+                recipient(&["shield-all", "--recipient", "0xab"]).as_deref(),
+                Some("0xab")
+            );
             assert!(
                 TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app])
                     .is_ok()

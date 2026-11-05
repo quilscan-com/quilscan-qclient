@@ -555,11 +555,12 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
     );
     update_app_progress_warning(m);
     let alloc_heading = alloc_heading_lines(m, &sorted_allocs, chunks[1].width.saturating_sub(4));
+    let alloc_border = Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM });
     let alloc_block = Block::default()
         .title(panel_title(alloc_heading[0].to_string()))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if m.focus.is_alloc() { PRIMARY } else { DIM }));
+        .border_style(alloc_border);
     let alloc_inner = alloc_block.inner(chunks[1]);
     f.render_widget(alloc_block, chunks[1]);
     // Keep room for the table header and a data row on small panels.
@@ -624,6 +625,13 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
                 detail_h,
             ),
         );
+        render_cursor_rule(
+            f,
+            chunks[1],
+            alloc_inner,
+            usize::from(detail_h),
+            alloc_border,
+        );
     }
     render_scroll_hint(
         f,
@@ -639,39 +647,54 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         m.horizontal_limits[0],
     );
 
+    let avail_border = Style::new().fg(if m.focus == PanelFocus::Available {
+        PRIMARY
+    } else {
+        DIM
+    });
     let avail_block = Block::default()
         .title(avail_title(m, &sorted_avail))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if m.focus == PanelFocus::Available {
-            PRIMARY
-        } else {
-            DIM
-        }));
+        .border_style(avail_border);
     let avail_inner = avail_block.inner(chunks[2]);
     f.render_widget(avail_block, chunks[2]);
-    let avail_lines = render_avail_panel(m, &sorted_avail, avail_inner, Some(&avail_widths));
-    let mut avail_lines = avail_lines;
-    let detail = if !sorted_avail.is_empty() && avail_inner.height >= 3 {
-        avail_lines.pop()
-    } else {
-        None
+    // As in Allocations: the table renderer reserves one detail row, the
+    // cursor block takes the rest from the bottom of the table's area.
+    let avail_detail = available_detail_lines(m, &sorted_avail, avail_inner);
+    let avail_table = Rect {
+        height: avail_inner
+            .height
+            .saturating_sub(avail_detail.len().saturating_sub(1) as u16),
+        ..avail_inner
     };
-    let detail_rows = u16::from(detail.is_some());
+    let mut avail_lines = render_avail_panel(m, &sorted_avail, avail_table, Some(&avail_widths));
+    if !avail_detail.is_empty() {
+        avail_lines.pop();
+    }
+    let detail_rows = u16::from(!sorted_avail.is_empty() && avail_table.height >= 3);
     let horizontal = table_horizontal_offset(m, 1, &avail_lines, avail_inner.width);
     f.render_widget(
         Paragraph::new(avail_lines).scroll((0, horizontal)),
         avail_inner,
     );
-    if let Some(detail) = detail {
+    if !avail_detail.is_empty() {
+        let detail_h = avail_detail.len() as u16;
         f.render_widget(
-            Paragraph::new(detail),
+            Paragraph::new(avail_detail),
             Rect::new(
                 avail_inner.x,
-                avail_inner.y + avail_inner.height - 1,
+                avail_inner.y + avail_inner.height - detail_h,
                 avail_inner.width,
-                1,
+                detail_h,
             ),
+        );
+        render_cursor_rule(
+            f,
+            chunks[2],
+            avail_inner,
+            usize::from(detail_h),
+            avail_border,
         );
     }
     render_scroll_hint(
@@ -680,7 +703,7 @@ fn render_main(f: &mut Frame, m: &mut Model, area: Rect) {
         m.avail_offset,
         sorted_avail.len(),
         usize::from(
-            avail_inner
+            avail_table
                 .height
                 .saturating_sub(1 + detail_rows + u16::from(m.shard_error.is_some())),
         ),
@@ -1430,6 +1453,17 @@ fn fmt_materialized(materialized: u64, latest: u64) -> String {
     }
 }
 
+/// The Cert cell: the seat's 60m certificate share in percent, `-` while
+/// the node reports none or counted no frame in the hour. A trailing `!`
+/// marks the node's low-share condition for `warning_slot`.
+fn cert_cell(share: Option<&quil_types::proto::node::CertificateShare>) -> String {
+    match cert_share_percent(share) {
+        None => "-".into(),
+        Some(percent) if cert_share_low(share) => format!("{percent}%!"),
+        Some(percent) => format!("{percent}%"),
+    }
+}
+
 /// The ProverPhases cell: the shard's provers by lifecycle phase, symbols in
 /// compact mode and names in expanded mode. Zero fields are omitted except
 /// active, so an empty shard reads `a0`; unreported counts read `-`. A
@@ -1534,6 +1568,7 @@ fn alloc_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
         14 => next_action_text(m, &a.next_action),
         16 => interval_values(m, m.node_app_cadence.get(&a.filter), m.interval_mask()),
         ALLOC_PROVER_PHASES_COL => prover_phases_cell(m, a.prover_counts.as_ref(), &a.shard_size),
+        ALLOC_CERT_COL => cert_cell(a.certificate_share.as_ref()),
         _ => a
             .default_action
             .render(m.threshold_unit, m.threshold_clock()),
@@ -1578,7 +1613,10 @@ pub(super) fn allocation_status_text(m: &Model, a: &AllocationRow) -> String {
 
 fn alloc_display_cell(m: &Model, a: &AllocationRow, col: usize, fw: usize) -> String {
     let text = alloc_cell(m, a, col, fw);
-    if matches!(col, 6 | 7 | 8 | 12 | ALLOC_PROVER_PHASES_COL) {
+    if matches!(
+        col,
+        6 | 7 | 8 | 12 | ALLOC_PROVER_PHASES_COL | ALLOC_CERT_COL
+    ) {
         warning_slot(&text, m.color_coding)
     } else {
         text
@@ -1606,6 +1644,8 @@ fn alloc_cell_color(m: &Model, a: &AllocationRow, col: usize, selected: bool) ->
         ALLOC_PROVER_PHASES_COL if prover_halt_risk(a.prover_counts.as_ref(), &a.shard_size) => {
             Some(WARNING)
         }
+        ALLOC_CERT_COL if cert_share_low(a.certificate_share.as_ref()) => Some(WARNING),
+        ALLOC_CERT_COL if cert_share_percent(a.certificate_share.as_ref()).is_none() => Some(DIM),
         10 if a.worker_id < 0 => Some(ERROR),
         12 => Some(status_color(&a.status_name)),
         3 if !selected => Some(ring_color(a.ring)),
@@ -1669,7 +1709,7 @@ fn alloc_header(m: &Model, idx: usize) -> String {
         text +=
             snapshot_suffix(m, m.allocations.iter().map(|a| a.global_head.as_ref())).trim_start();
     }
-    if matches!(idx, 6 | 12 | ALLOC_PROVER_PHASES_COL) {
+    if matches!(idx, 6 | 12 | ALLOC_PROVER_PHASES_COL | ALLOC_CERT_COL) {
         warning_slot(&text, true)
     } else {
         text
@@ -1836,6 +1876,17 @@ fn alloc_widths_fixed(
     } else {
         0
     };
+    // Cert likewise, shown unless the picker hides it.
+    let cert_w = if m.alloc_column_visible(ALLOC_CERT_COL) {
+        col_width(
+            &alloc_header(m, ALLOC_CERT_COL),
+            sorted
+                .iter()
+                .map(|row| printed_width(&alloc_display_cell(m, row, ALLOC_CERT_COL, 0))),
+        )
+    } else {
+        0
+    };
     // Whatever the wide columns took comes out of the flexible Filter column.
     let grown = (status_w - STATUS_WIDTH)
         + (global_head_w - GLOBAL_HEAD_WIDTH)
@@ -1844,7 +1895,9 @@ fn alloc_widths_fixed(
         + (next_w - NEXT_ACTION_WIDTH)
         + (default_w - DEFAULT_ACTION_WIDTH)
         + phases_w
-        + usize::from(phases_w > 0);
+        + usize::from(phases_w > 0)
+        + cert_w
+        + usize::from(cert_w > 0);
     let mut fw = content_width.saturating_sub(ALLOC_FIXED_WIDTH + grown);
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -1883,6 +1936,7 @@ fn alloc_widths_fixed(
                 .map(|a| printed_width(&alloc_display_cell(m, a, 16, 0))),
         ),
         phases_w,
+        cert_w,
     ];
     for &col in &ALLOC_FILTERABLE_COLS {
         if col == 1 {
@@ -1914,7 +1968,7 @@ fn alloc_widths_fixed(
         fw = filter_width(
             content_width,
             &widths,
-            widths.len() - usize::from(phases_w == 0),
+            widths.len() - usize::from(phases_w == 0) - usize::from(cert_w == 0),
             FILTER_WIDTH,
         );
         widths[1] = fw;
@@ -2060,27 +2114,18 @@ fn global_snapshot_label<'a>(
     }
 }
 
+/// The cursor row's detail: only what the row lacks. Its cells and the
+/// help already say what Status `bound`, Execution `unknown`, `cached`
+/// or `stale` and LocalMat `0!` mean, so the detail never repeats them.
 fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
-    let binding_detail = if a.status_name == "bound" {
-        "Worker bound; no live allocation reported. "
-    } else {
-        ""
-    };
     let Some(execution) = a.execution.as_ref() else {
         if matches!(a.status_name.as_str(), "joining" | "activating") {
             return peer_materialization_detail(a.materialized_frame, a.latest_frame);
         }
-        return Line::from(Span::styled(
-            format!("{binding_detail}Local execution details unavailable"),
-            Style::new().fg(if binding_detail.is_empty() {
-                HELP
-            } else {
-                WARNING
-            }),
-        ));
+        return Line::default();
     };
     let mut text = format!(
-        "{binding_detail}Last advance: {}",
+        "Last advance: {}",
         if execution.last_advance_unix_ms == 0 {
             "not observed since start"
         } else {
@@ -2100,9 +2145,6 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
     }
     if let Some(coverage) = cadence_coverage(m, &a.filter) {
         text += &format!(" | {coverage}");
-    }
-    if local_warning(m, a) {
-        text += " | Local app frames: none materialized.";
     }
     if let Some(r) = execution.recovery.as_ref() {
         text += &format!(
@@ -2126,15 +2168,9 @@ fn allocation_detail(m: &Model, a: &AllocationRow) -> Line<'static> {
             }
         );
     }
-    if matches!(state, "cached" | "stale") {
-        text += &format!(" | Observation: {state}");
-    }
-    let color = if matches!(state, "cached" | "stale") {
-        HELP
-    } else if matches!(state, "blocked" | "stopped") {
+    // A cached or stale observation is `cached` / `stale`, not `blocked`.
+    let color = if matches!(state, "blocked" | "stopped") {
         ERROR
-    } else if local_warning(m, a) {
-        WARNING
     } else {
         HELP
     };
@@ -2148,12 +2184,7 @@ fn allocation_detail_lines(m: &Model, sorted: &[AllocationRow], area: Rect) -> V
     let Some(row) = sorted.get(m.alloc_cursor) else {
         return vec![];
     };
-    fit_detail(
-        wrap_message(allocation_detail(m, row), area.width),
-        area.width,
-        area.height,
-        2,
-    )
+    cursor_detail(allocation_detail(m, row), area.width, area.height, 2)
 }
 
 /// The detail lines a panel `width` by `height` inside its borders pins
@@ -2168,17 +2199,121 @@ fn fit_detail(
     height: u16,
     keep: u16,
 ) -> Vec<Line<'static>> {
-    if height <= keep || width == 0 {
+    let limit = detail_limit(width, height, keep);
+    if limit == 0 {
         return vec![];
     }
-    let limit = usize::from(height - keep)
-        .min(usize::from(height / 2))
-        .max(1);
     if lines.len() > limit {
         lines.truncate(limit);
         lines[limit - 1] = enlarge_marker(width);
     }
     lines
+}
+
+/// The rows [`fit_detail`] gives a detail in a panel `width` by `height`
+/// inside its borders under `keep` lines it never displaces.
+fn detail_limit(width: u16, height: u16, keep: u16) -> usize {
+    if height <= keep || width == 0 {
+        return 0;
+    }
+    usize::from(height - keep)
+        .min(usize::from(height / 2))
+        .max(1)
+}
+
+/// The label of the rule over a cursor row's pinned detail (user Nov4:
+/// `cursor`, not `selected`), as in dash.sh.
+const CURSOR_LABEL: &str = "cursor";
+
+/// A pinned detail line's style: italic and dim, so it never reads as a
+/// table row; on the warning and error colors italic only, so they stay
+/// bright.
+fn detail_style(style: Style) -> Style {
+    if style.fg == Some(WARNING) || style.fg == Some(ERROR) {
+        style.add_modifier(Modifier::ITALIC)
+    } else {
+        style.add_modifier(Modifier::ITALIC | Modifier::DIM)
+    }
+}
+
+/// `line` in [`detail_style`], span by span.
+fn detail_line(line: Line<'static>) -> Line<'static> {
+    let base = line.style;
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, detail_style(base.patch(span.style))))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The cursor row's `detail`, unwrapped, as the lines a panel `width` by
+/// `height` inside its borders pins to its bottom under `keep` lines, in
+/// the rows [`detail_limit`] gives it, as [`detail_line`]s. With two rows
+/// or more the first is left blank for the `├─ cursor ─┤` rule
+/// [`render_cursor_rule`] draws over it and the borders; with one, a dim
+/// `cursor:` label starts it. A detail too long for its rows ends in the
+/// enlarge marker; an empty one leaves its row blank.
+fn cursor_detail(detail: Line<'static>, width: u16, height: u16, keep: u16) -> Vec<Line<'static>> {
+    match detail_limit(width, height, keep) {
+        0 => vec![],
+        1 => {
+            let label = format!("{CURSOR_LABEL}: ");
+            let room = width.saturating_sub(printed_width(&label) as u16);
+            let mut text = wrap_message(detail, room);
+            let first = if text.len() > 1 {
+                enlarge_marker(room)
+            } else {
+                text.pop().unwrap_or_default()
+            };
+            let mut spans = vec![Span::styled(label, detail_style(Style::new().fg(HELP)))];
+            spans.extend(detail_line(first).spans);
+            vec![Line::from(spans)]
+        }
+        rows => {
+            let mut text = wrap_message(detail, width);
+            if text.is_empty() {
+                text.push(Line::default());
+            }
+            let mut lines = vec![Line::default()];
+            lines.extend(
+                fit_lines(text, width, (rows - 1) as u16)
+                    .into_iter()
+                    .map(detail_line),
+            );
+            lines
+        }
+    }
+}
+
+/// The `├─ cursor ─┤` rule `width` columns wide, borders included: the
+/// panel's `border` style, the label dim.
+fn cursor_rule(width: u16, border: Style) -> Line<'static> {
+    let inner = usize::from(width.saturating_sub(2));
+    let label = format!(" {CURSOR_LABEL} ");
+    let label_width = printed_width(&label);
+    if inner < label_width + 2 {
+        return Line::from(Span::styled(format!("├{}┤", "─".repeat(inner)), border));
+    }
+    Line::from(vec![
+        Span::styled("├─", border),
+        Span::styled(label, Style::new().fg(HELP)),
+        Span::styled(format!("{}┤", "─".repeat(inner - 1 - label_width)), border),
+    ])
+}
+
+/// Draws the cursor rule over the first of the `rows` lines a
+/// [`cursor_detail`] takes at the bottom of `inner`, across the panel's
+/// `outer` area and its borders; a block of one row has no rule.
+fn render_cursor_rule(f: &mut Frame, outer: Rect, inner: Rect, rows: usize, border: Style) {
+    if rows < 2 || rows > usize::from(inner.height) {
+        return;
+    }
+    let y = inner.y + inner.height - rows as u16;
+    f.render_widget(
+        Paragraph::new(cursor_rule(outer.width, border)),
+        Rect::new(outer.x, y, outer.width, 1),
+    );
 }
 
 /// A panel's `lines` in `height` lines `width` wide inside its borders:
@@ -2624,15 +2759,36 @@ fn avail_widths_fixed(m: &Model, content_width: usize, sorted: &[ShardRow]) -> (
     (widths, fw)
 }
 
+/// The cursor row's detail: only what the row lacks. PeerState already
+/// says `current`, `unmat` or `unknown`; a lag adds its frames.
 fn available_detail(m: &Model, s: &ShardRow) -> Line<'static> {
-    let mut line = peer_materialization_detail(s.materialized_frame, s.latest_frame);
+    let mut line = if materialization_state(s.materialized_frame, s.latest_frame) == "lag" {
+        peer_materialization_detail(s.materialized_frame, s.latest_frame)
+    } else {
+        Line::default()
+    };
     if let Some(coverage) = cadence_coverage(m, &s.filter) {
+        let separator = if line.spans.is_empty() { "" } else { " | " };
         line.spans.push(Span::styled(
-            format!(" | {coverage}"),
+            format!("{separator}{coverage}"),
             Style::new().fg(HELP),
         ));
     }
     line
+}
+
+/// The Available panel's cursor block in `area` inside its borders, as
+/// Allocations': the header and a row, and the cached-shards warning
+/// above them, stay in view.
+fn available_detail_lines(m: &Model, sorted: &[ShardRow], area: Rect) -> Vec<Line<'static>> {
+    if area.height < 3 || area.width == 0 {
+        return vec![];
+    }
+    let Some(row) = sorted.get(m.avail_cursor) else {
+        return vec![];
+    };
+    let keep = 2 + u16::from(m.shard_error.is_some());
+    cursor_detail(available_detail(m, row), area.width, area.height, keep)
 }
 
 fn peer_materialization_detail(materialized: u64, latest: u64) -> Line<'static> {
@@ -3314,6 +3470,24 @@ fn condition_notices(m: &Model) -> Vec<(&'static str, NoticeSeverity, String)> {
             format!(
                 "Renewal withheld, no vote sent: {withheld}/{} allocations.",
                 allocations.len()
+            ),
+        ));
+    }
+    let counted: Vec<_> = allocations
+        .iter()
+        .filter(|a| a.certificate_share.is_some())
+        .collect();
+    let low = counted
+        .iter()
+        .filter(|a| cert_share_low(a.certificate_share.as_ref()))
+        .count();
+    if low > 0 {
+        notices.push((
+            "cert-share-low",
+            NoticeSeverity::Warning,
+            format!(
+                "Low certificate share (60m): {low}/{} allocations.",
+                counted.len()
             ),
         ));
     }
@@ -4130,6 +4304,48 @@ pub(super) fn render_text(m: &mut Model, width: u16, height: u16) -> String {
         .collect()
 }
 
+/// The Notifications lines of both tabs, as `manage --render --notices`
+/// prints them: one notice per line, unwrapped, as
+/// `[HH:MM:SS UTC] <ERROR|WARN|INFO> <text>`, the severity its color shows
+/// on screen. A line both tabs show (the status line) prints once.
+pub(super) fn notice_text(m: &mut Model) -> String {
+    update_message_lifetime(m);
+    let (_, status) = footer_lines(m);
+    let mut lines = message_lines(m, status, u16::MAX);
+    lines.extend(coins_view::notice_lines(m, u16::MAX));
+    let mut printed = std::collections::HashSet::new();
+    lines
+        .iter()
+        .filter_map(notice_entry)
+        .filter(|entry| printed.insert(entry.clone()))
+        .map(|entry| entry + "\n")
+        .collect()
+}
+
+/// One Notifications line as `[HH:MM:SS UTC] <SEVERITY> <text>`; a line
+/// without its own timestamp takes the current time. `None` for a blank.
+fn notice_entry(line: &Line<'static>) -> Option<String> {
+    let text = line.to_string();
+    if text.trim().is_empty() {
+        return None;
+    }
+    let color = line.spans.iter().find_map(|span| span.style.fg);
+    let severity = if color == Some(ERROR) {
+        "ERROR"
+    } else if color == Some(WARNING) {
+        "WARN"
+    } else {
+        "INFO"
+    };
+    let stamped = text.starts_with('[') && text.get(9..15) == Some(" UTC] ");
+    let (stamp, body) = if stamped {
+        (text[..15].to_string(), &text[15..])
+    } else {
+        (message_timestamp(None), text.as_str())
+    };
+    Some(format!("{stamp}{severity} {body}"))
+}
+
 /// The help screen at `width`, as plain text without colors.
 pub(super) fn help_text(width: u16) -> String {
     help_lines(width, false)
@@ -4281,6 +4497,9 @@ fn help_items() -> Vec<HelpItem> {
         item("`p` / `paused`: paused provers"),
         item("`-` alone: unavailable from this node (older server or no shard info)"),
         item("`yellow` (or `!` with colors off): halt risk by count; the shard holds data and at most 3 of its provers are active or activating, so losing one risks its quorum"),
+        kv("Cert", "This node's share of its shard's certificates over the last 60m: of the shard frames GLOBAL included from committee sessions this node sits in, the percent whose certificate it signed, as the node counts them from the GLOBAL frames it receives. Only a frame's signers earn its reward, and a certificate carries the first votes to reach quorum, committee - floor((committee - 1) / 3) of them, so a member voting in time signs about 70%. Less means its votes arrive after the quorum, or its worker is blocked or behind its shard; the master log has each seat's hourly counts (`this seat's share of its shard's certificates`)"),
+        item("`yellow` (or `!` with colors off): low; an hour counted with at least 30 frames, of which this node signed under half the in-time share (quorum / committee); the node warns (`this seat signed under half the shard certificates`)"),
+        item("`-`: no frame counted in the last 60m, or a node that predates the count"),
         kv("Ring", "Committed rank; `~` marks a join forecast with one ring of competing admissions"),
         kv("Size [GB]", "Shard size in decimal gigabytes, one decimal; `<0.1` preserves small nonzero sizes"),
         kv("Shards", "Data shards the filter covers"),
@@ -4332,7 +4551,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("Interval [s]", "Node-observed mean seconds per committed app frame. ‹b› exposes `60m`/`24h` sub-items under Interval [s] in Columns and Global interval in Top header; these selections are independent. Sort/filter uses the first visible interval. Coverage needs 60s; gaps/downtime excluded; includes pauses/catch-up. `-` unavailable or no advances"),
         note("Thresholds read `in Nf` (frames from the received GLOBAL frame; `now` once reached) or `@f<frame>`; ‹e› switches. Expanded relative thresholds add a `~` time estimate from the measured GLOBAL interval; `~` marks estimates. Q/d is whole QUIL per day, GB is decimal gigabytes. Available Shards shows the same columns, minus the ones that only exist once a shard is allocated to you."),
         sec("Footers and notifications"),
-        kv("Details", "Selected allocation footer shows reason/blocker, last advance as `<60s` / `>60s`, and Local app frames warnings; no ticking timers. PeerHead is peer-reported metadata"),
+        kv("Details", "The cursor row's detail sits at the bottom of Allocations, Available Shards and Balances under a `├─ cursor ─┤` rule (a `cursor:` label when the panel leaves it one row), in dim italics, warning colors italic only, so it never reads as a row. It adds only what the row's cells lack, never its key or values: in Allocations the last advance as `<60s` / `>60s`, the reason or blocker, the coverage, recovery and seal; in Available Shards the frames PeerMat trails PeerHead by and the coverage. No ticking timers; a cursor move or a longer detail never resizes a panel. PeerHead is peer-reported metadata"),
         kv("Recovery footer", "Compact shows phase and fixed age buckets; expand for archive, attempt, leaf and outcome details. `unobserved` means no timestamp; `<60s` / `>60s` are fixed age buckets. Detail wraps within the panel; enlarge it for omitted lines"),
         kv("Freshness", "Age of the worker state shown; poll delays do not age the received state, and startup restoration is not an advance:"),
         item("`stale`: node observation already >30s old at receipt"),
@@ -4350,6 +4569,7 @@ fn help_items() -> Vec<HelpItem> {
         item("`Local execution blocked or stopped`: staffed earning allocations whose Execution is `blocked` or `stopped`, of those with fresh observations; the row footer names the blocker"),
         item("`Allocation epoch stale (re-confirm!)`: allocations whose epoch is older than the current one. The node reconfirms each allocation during every epoch, so its reconfirm has not been recorded; check the node's prover confirmation log lines"),
         item("`Renewal withheld, no vote sent`: local allocations whose worker hosts its committee session but has sent no vote for an epoch while the other members voted, of all allocations. The node leaves them to lapse: check the worker, and restart it if it stays silent. A seat renews once its worker votes or restarts, or at the latest four epochs on; the master log names each (`seat renewal withheld`)"),
+        item("`Low certificate share (60m)`: allocations whose Cert is low, of those reporting one. Frames a seat does not sign earn it nothing: check its worker's Execution and LocalMat, the node's CPU load and its peer connections"),
         item("`Last recovery attempt failed`: workers whose latest archive recovery attempt failed and whose LocalMat is still below PeerHead, of workers with fresh observations (it ends once the worker catches up); the Recovery footer gives the error and the failure streak"),
         kv("Reachability notice", "`Reachability: peers cannot dial this node`: the verdict of `qclient node doctor`, from the node's own view: AutoNAT servers on 2 or more IPs could not dial it back, AutoNAT holds it private with no confirmed address, or its address is behind carrier-grade NAT. It ends once AutoNAT confirms an address. Missing or unsettled AutoNAT results show nothing. The doctor gives a verdict per address family and what to change; it changes nothing itself."),
         kv("Store notice", "`Store reads slow (this node's disk)`: the node reads one entry of its master store a second (the canary) and, on Linux, times its disk's reads and writes. Shown once a minute's canary p99 reaches 50ms, a read stays unfinished 1s, or the disk takes 20ms a read or 100ms a write (of 20+), two minutes in a row; it clears after three minutes under all of them. Work that reads the store falls behind and allocations may lapse. The cause is this node's disk: check that TRIM runs (fstrim.timer or the discard mount option), the disk's health (SMART) and other I/O load on it. `qclient node diagnostics health --self` and the node's `store i/o` log lines give the figures"),
@@ -4363,7 +4583,7 @@ fn help_items() -> Vec<HelpItem> {
         sec("Measurements and forecasts"),
         kv("Frame windows", "Node samples once/minute; `60m`/`24h` windows survive updates. Downtime/missing reads excluded; selected row shows coverage. Generation changes cannot count inherited heights as produced frames"),
         kv("Frame intervals", "GLOBAL measures received head; app measures committed GlobalHead. Node history survives updates, retains at most 24h, samples once/minute. Freshness 90s; coverage in RPC. Forecasts use current per-frame reward and observed frame rate; 10s is theoretical, none proves earned credits"),
-        kv("Reward estimates", "`60m`/`24h` are observation windows; `T` (`theory` in expanded mode) assumes 10s/frame. Forecasts in heading order; ‹b› exposes shared `60m`/`24h`/`T` sub-items under the Reward column and Allocations header Reward KPI. `~` before `Q/d` marks estimates. Observed zero progress estimates zero; actual credits separate; reward sort/filter uses the first visible window"),
+        kv("Reward estimates", "`60m`/`24h` are observation windows, scaled by the quorum share: a frame pays only its certificate's signers, n−⌊(n−1)/3⌋ of the n active and leaving provers; `T` (`theory` in expanded mode) assumes 10s/frame, every frame paid. Forecasts in heading order; ‹b› exposes shared `60m`/`24h`/`T` sub-items under the Reward column and Allocations header Reward KPI. `~` before `Q/d` marks estimates. Observed zero progress estimates zero; actual credits separate; reward sort/filter uses the first visible window"),
         kv("Global citation", "Compact Global heading / expanded Snapshot cite the GLOBAL frame behind GlobalHead cells. Compact `@-Nf` / `@+Nf` offsets refer to the top Global head; equal-frame citations are omitted. Claimable uses its authenticated balance frame. Expanded shows absolute frames"),
         sec("Display"),
         kv("‹n›", "Toggle compact / expanded display (n: names; default compact): identity, KPIs, action/reason names, threshold estimates, units and recovery/seal detail; default actions remain named"),
@@ -4385,7 +4605,7 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹tab›", "Cycle Allocations, Available Shards and Notifications; ‹Shift+tab› reverses"),
         kv("‹space›", "Toggle selection on cursor row (advances cursor)"),
         kv("‹a›", "Select all / deselect all rows in current table"),
-        kv("Cursor", "Inactive cursor stays visible to bind the detail below to its row"),
+        kv("Cursor", "Inactive cursor stays visible to bind the detail under the `cursor` rule to its row"),
         kv("Boundaries", "Top of Allocations and bottom of Notifications remain fixed"),
         sec("Notifications"),
         kv("‹v›", "Cycle minimum severity (v: verbosity): warnings/errors (default), errors only, all"),
@@ -4442,32 +4662,41 @@ fn help_items() -> Vec<HelpItem> {
         kv("‹esc›", "Cancel without changing the filter"),
         HelpItem::Blank,
         sec(COINS_HELP_SECTION),
-        note("This node's claimable rewards and legacy coins, as `qclient token legacy` lists them, the shield action and the reward mint. The middle panel follows the Balances row under the cursor: Claim status for `claimable`, Shield plan for `legacy`. ‹h› on this tab opens the help here."),
+        note("This node's claimable rewards, legacy coins (as `qclient token legacy` lists them) and shielded coins, the shield action, the reward mint and transfers. The middle panel follows the Balances row under the cursor: Claim status for `reward`, Shield plan for `legacy`, Transfers for `shielded`. ‹h› on this tab opens the help here."),
         kv("Balances", "One row per kind; the cursor row's detail follows the table:"),
-        item("`claimable`: the reward balance the GLOBAL reward witness shows at the `As of` frame, read with each Provers refresh; ‹M› authorizes a mint of it"),
+        item("`reward`: the claimable reward balance the GLOBAL reward witness shows at the `As of` frame, read with each Provers refresh"),
         item("`legacy`: Coins `U/T` counts the U unshielded of the T listed legacy coins, `0` once none is unshielded; Amount is the unshielded total. Read in the background when the manager starts, every 10 min while the tab is open and on ‹r›; `As of` is the read's UTC time, a spinner beside it marks a read in progress. The detail gives the shielded count and the read's pages and duration; the Shield plan beside it gives the `qclient token shield-all` plan and when shields open"),
+        item("`shielded`: this wallet's unspent confidential coins (Coins) and their total (Amount), read on ‹E› with the pending transfers: full scans of the coins and escrows, matched on this machine (about a minute, never on a timer). Their spent and consumed checks read this node's GLOBAL state; no coin or escrow is looked up anywhere else. `As of` is the read's UTC time"),
         kv("State", "What the row needs:"),
         item("`◆ claimable` / `◆ unshielded`: waiting for your action; `blue`, and the `◆` marker keeps the meaning with colors off"),
         item("`unshielded` without `◆`: shields are not open yet, an expected wait; the notice gives the frame"),
         item("`shielding i/N`: a shield run is proving, holding or submitting batch i of N, or waiting for its inclusion, whichever panel is on screen; its notices follow it in Notifications"),
-        item("`shielded`: every listed legacy coin is shielded; `none`: nothing to show"),
+        item("`done` (legacy row): every listed legacy coin is shielded; `none`: nothing to show"),
+        item("`◆ incoming` / `◆ refundable` (shielded row): a pending transfer to this wallet waits for ‹A›, or one of yours is past its refund frame and waits for ‹R›; `held`: coins and nothing pending; `not read`: ‹E› reads them; `in progress`: a transfer action runs"),
         item("`loading`: the first read is in progress; `unavailable`: the read failed (`yellow`, or `!` with colors off); `no key`: the node config has no Ed448 key, so it owns no legacy coins"),
         kv("Coins notices", "Each names a condition and its key, not a figure on screen: the amounts, counts and frames are the rows' and panels'. `Reward claimable: ‹M› …` and `Legacy coins unshielded: ‹S› …` carry `◆` and show from the default level. `shields are not open yet` and `… on no live shard …` are expected waits (info); the Shield plan gives the frame and the counts. A failing read is a warning that says since when it fails; the row's `As of` marks how old its figures are. `Shield plan: shard list unavailable` means the batch count is a lower bound"),
-        kv("Claim status", "With the claimable row selected, or while a mint is prepared or confirmed: what authorizes a mint of the claimable reward (the amount and its frame are the Balances row's), and one row per authorization `qclient token mint` or ‹M› saved as `mint-<frame>.bin` in the node config directory, newest first: the GLOBAL frame it Cited, the Amount it mints and its Fee. State is `unavailable`: this node reports no authorization status, so ‹C› asks GLOBAL for the finalized witness the claim needs before it confirms"),
+        kv("Claim status", "With the reward row selected, or while a mint is prepared or confirmed: `Authorization: a mint or claim is under way` while one runs (the amount, its frame and its state are the Balances row's, ‹M› the `Reward claimable` notice's), and one row per authorization `qclient token mint` or ‹M› saved as `mint-<frame>.bin` in the node config directory, newest first: the GLOBAL frame it Cited, the Amount it mints and its Fee. State is `unavailable`: this node reports no authorization status, so ‹C› asks GLOBAL for the finalized witness the claim needs before it confirms"),
         kv("Shield plan", "With the legacy row selected, or while a shield is prepared: one row per `qclient token shield-all` batch, in its order: Batch `i/N`, the Shard whose members verify it (its filter shortened from the middle), its Coins and Amount. The footer counts batches of up to 96 coins and coins on no live shard, which wait for a later run; coins submitted within the last two hours are hidden until their batch commits. `Shields open at f…` shows while shields are not yet admitted"),
         kv("‹S›", "Shield, with the legacy row or the Shield plan selected: read the coins and quote each batch's fee, then confirm. The confirmation names the coins and batches, the amount, the recipient (this wallet, in full), the quoted fees and the `--max-fee` cap; ‹y› starts, any other key cancels. Batches are proved here and submitted to this node, paced as `qclient token shield-all` paces them, since each batch costs every archive tens of seconds of verification on GLOBAL's critical path: one at a time, each proved after the previous one's inclusion (stopping if that takes an hour of healthy GLOBAL), submissions at least 5 min apart, held while GLOBAL is degraded (head unchanged for 60 s, or under 330 frames an hour) until it has been healthy for 10 min. One action runs at a time; quitting during it asks first"),
-        kv("‹M›", "Mint, with the claimable row or its Claim status selected: read the claimable reward and quote the fee, then confirm. The confirmation names the reward and the frame it cites, the amount, the fee, the `--max-fee` cap, the recipient (this wallet) and the file the authorization is saved as; ‹y› proves it here and submits it to this node, any other key cancels. The run reads the reward and quotes the fee again: at a later frame it goes on; a larger reward (rewards grow every GLOBAL frame) is minted in full to this wallet; a changed fee opens the confirmation again with it; a smaller reward stops the run"),
+        kv("‹M›", "Mint, as `qclient token mint` does, with the reward row or its Claim status selected: read the claimable reward and quote the fee, then confirm. The confirmation names the reward and the frame it cites, the amount, the fee, the `--max-fee` cap, the recipient (this wallet) and the file the authorization is saved as; ‹y› proves it here and submits it to this node, any other key cancels. The run reads the reward and quotes the fee again: at a later frame it goes on; a larger reward (rewards grow every GLOBAL frame) is minted in full to this wallet; a changed fee opens the confirmation again with it; a smaller reward stops the run"),
         kv("‹C›", "Claim, in the Claim status, the saved authorization under its cursor once GLOBAL has finalized it: the confirmation names the file, its witness frame and the amount; ‹y› builds and submits the claim, which creates the coins"),
-        kv("‹esc›", "With a shield running: stop it before its next submission (‹y› confirms, any other key keeps it running); a batch being proved is not submitted, submitted batches stay submitted. While a shield or a mint is prepared: cancel it"),
+        kv("‹esc›", "With a shield running: stop it before its next submission (‹y› confirms, any other key keeps it running); a batch being proved is not submitted, submitted batches stay submitted. While a shield, a mint or a transfer action is prepared: cancel it"),
         kv("Mint notices", "`Mint: reading the reward …` / `Mint claim: reading its GLOBAL witness …`; `Mint f…: proving … <60s` / `>60s`; `authorization … submitted; inclusion not yet confirmed`, with `(confirmed … Q; the reward grew)` when the run minted more than the confirmation showed; `Mint claim f…: … submitted`; `Mint: the fee quote changed from … to … base units; confirm again` (`◆`): the run found the fee quoted otherwise since the confirmation and proved nothing. A refusal or failure (`red`) says why; nothing more was submitted. `Action log: not written (…)` (`yellow`), as for shields; the mint runs on. One action runs at a time, shields included"),
         kv("Node config", "Coin actions are signed with the node config the manager loaded (`--network <name>`: `~/.quilibrium/configs/<name>`; else the default config; else the node directory's `.config`), and a node accepts only submissions signed with its own peer key. An action signed with another config is refused before any read, naming the fix"),
         kv("Shield notices", "`Shield batch i/N: proving … <60s` / `>60s` while a batch is proved; `proved; submits at …` while it waits out the 5 min spacing; `submitted at …; inclusion not yet confirmed` until the run or a legacy read sees its coins shielded, then `included` (`green`) with the projected end of the run (`~`, from the pace so far). `Shield paused since …` (`yellow`) names the GLOBAL signal that holds submissions and the 10 min of healthy GLOBAL that ends it; `Shield resumed at …` follows. `stopping` / `stopped on request` after ‹esc› ‹y›. A failure (`red`) names the batch; batches before it stay submitted. `--render` reads and quotes for the confirmation but never runs it. `Action log: not written (…)` (`yellow`): the private action log refused the write, e.g. its file is open to other users; the shield runs on"),
-        kv("Logs", "A shield run, a mint and a claim each log one line at the start and one with the outcome (target `qclient::action`, at info; `RUST_LOG=qclient::action=info` shows them on stderr, so redirect it to a file): counts, frames, the duration and an error class, never amounts, the recipient, coin addresses or hashes, so they can be shared. The details (amounts, fees, recipient, coin addresses, the error) go only to the private action log `wallet/actions.jsonl` in the node config directory: one JSON line per step, owner-only (a wider mode refuses the write), never in the node's `.log/`, log exports or renders, kept a year within 4 MiB. `--no-action-log`, or `noActionLog: true` in the qclient config, turns it off; `qclient token shield-all` and `token mint` record there too, and log the two lines with `source=\"cli\"`"),
-        kv("--render", "A render may be shared, so it hides private wallet fields (a confirmation's amount, the recipient's address, shielded amounts) as `hidden in this render`; `--reveal` shows them. Amounts the network lists publicly under this node's key (legacy coins, the claimable reward) show either way"),
+        kv("Logs", "A shield run, a mint, a claim and each transfer action log one line at the start and one with the outcome (target `qclient::action`, at info; `RUST_LOG=qclient::action=info` shows them on stderr, so redirect it to a file): counts, frames, the duration and an error class, never amounts, the recipient, coin addresses or hashes, so they can be shared. The details (amounts, fees, recipient, coin addresses, the error) go only to the private action log `wallet/actions.jsonl` in the node config directory: one JSON line per step, owner-only (a wider mode refuses the write), never in the node's `.log/`, log exports or renders, kept a year within 4 MiB. `--no-action-log`, or `noActionLog: true` in the qclient config, turns it off; `qclient token shield-all`, `token mint` and the transfer commands (`transfer`, `pending-transfer`, `accept`, `reject`, `merge`) record there too, and log the two lines with `source=\"cli\"`"),
+        kv("--render", "A render may be shared, so it hides private wallet fields (a confirmation's amounts, the recipient's address, escrow addresses, shielded and pending amounts, typed form fields) as `hidden in this render`; `--reveal` shows them. Amounts the network lists publicly under this node's key (legacy coins, the claimable reward) show either way"),
+        kv("Transfers", "With the shielded row selected, or while a transfer form or confirmation is open: the pending transfers (escrows) this wallet can act on, from the last ‹E› read: the Escrow (`…` and its last six characters, in full with ‹n›), its Direction (`in`: to this wallet, `out`: funded by it), its Amount and, for an outgoing one, the frame from which its refund opens (`open` once passed). Its last line names ‹T›, ‹P› and ‹J›; ‹A› and ‹R› are named by the `Pending transfers incoming` and `… refundable` notices, which show whenever a row they act on does"),
+        kv("‹E›", "Read the shielded coins and the pending transfers, with the shielded row or the Transfers panel selected; one read at a time. A qclient config that reads through a public or custom RPC is refused, since that RPC would learn this wallet's coins"),
+        kv("‹T› / ‹P›", "Transfer / pending transfer, with the shielded row or the Transfers panel selected: a form takes the recipient (pasted), the amount in Q and, for a pending transfer, the refund frame (empty: the GLOBAL head plus about a day). Every key is text there; ‹tab› moves between fields, ‹enter› checks them and quotes the fee, ‹esc› cancels, ‹Ctrl+C› quits"),
+        kv("‹A› / ‹R›", "In the Transfers panel: accept the incoming pending transfer under its cursor, or refund an outgoing one once its refund frame passes (`qclient token accept` / `reject`)"),
+        kv("‹J›", "Merge coins, with the shielded row or the Transfers panel selected: a wallet scan selects the coins `qclient token merge all` would take, then confirm"),
+        kv("Transfer confirmations", "Each names the action, the amount to the base unit, the quoted fee, the `--max-fee` cap and, last, the recipient in full; ‹y› proves it here and submits it to this node, any other key cancels. A transfer's fee is quoted again before submission, as the CLI does. One action runs at a time, shields and mints included"),
+        kv("Transfer notices", "`Shielded coins: reading …`; `<action>: proving and submitting <60s` / `>60s`; `submitted; finalized inclusion is not yet confirmed`. A refusal or failure (`red`) says why. `Pending transfers incoming: ‹A› …` and `Pending transfers of yours unclaimed past their refund frame: ‹R› …` (`◆`) name the condition and its key; the Transfers panel gives the transfers, their amounts and refund frames. `Action log: not written (…)` (`yellow`), as for shields; the action runs on"),
         kv("‹r›", "Read legacy coins now, with the legacy row or the Shield plan selected; one read at a time"),
         kv("‹[/]› / ‹{/}›", "Move the focused panel's upper edge up/down / its lower edge up/down; every panel keeps 3 rows. The Coins tab's edges are kept between runs apart from the Provers tab's"),
-        kv("‹tab›", "Move between Balances, the middle panel (Claim status or Shield plan) and Notifications"),
-        kv("‹↑/k› / ‹↓/j›", "Move the Balances, Shield plan or Claim status cursor; scroll Notifications when it is focused"),
+        kv("‹tab›", "Move between Balances, the middle panel (Claim status, Shield plan or Transfers) and Notifications"),
+        kv("‹↑/k› / ‹↓/j›", "Move the Balances, Shield plan, Claim status or Transfers cursor; scroll Notifications when it is focused"),
         HelpItem::Blank,
     ]
 }
@@ -6014,9 +6243,10 @@ mod tests {
         assert!(local_warning(&m, &worker));
         assert_eq!(alloc_cell(&m, &worker, 6, 12), "0!");
         assert_eq!(local_color(&m, &worker), Color::Yellow);
-        assert!(allocation_detail(&m, &worker)
+        // LocalMat's `0!` says it; the detail does not repeat it.
+        assert!(!allocation_detail(&m, &worker)
             .to_string()
-            .contains("Local app frames: none materialized."));
+            .contains("materialized"));
         worker.execution.as_mut().unwrap().recovery =
             Some(quil_types::proto::node::ShardRecovery {
                 phase: "installing_leaves".into(),
@@ -6027,10 +6257,7 @@ mod tests {
                 ..Default::default()
             });
         let detail = allocation_detail(&m, &worker).to_string();
-        assert!(
-            detail.contains("Local app frames: none materialized.")
-                && detail.contains("Recovery: installing_leaves")
-        );
+        assert!(detail.contains("Recovery: installing_leaves"));
         assert!(detail.contains("131072/2517449"));
         worker.execution.as_mut().unwrap().state = "blocked".into();
         worker.execution.as_mut().unwrap().blocker = "awaiting successor".into();
@@ -6326,11 +6553,8 @@ mod tests {
         assert!(peers[1].to_string().contains("unmat"));
         assert!(!peers[1].to_string().contains("unmat!"));
         assert_eq!(peers[1].spans[20].style.fg, Some(WARNING));
-        assert!(peers
-            .last()
-            .unwrap()
-            .to_string()
-            .contains("Peer app frames: none materialized."));
+        // PeerState's `unmat` says it; the detail does not repeat it.
+        assert!(peers.last().unwrap().to_string().is_empty());
         peer.materialized_frame = 15;
         assert!(available_detail(&m, &peer)
             .to_string()
@@ -6339,9 +6563,7 @@ mod tests {
         assert!(!available_detail(&m, &peer).to_string().contains("Warning"));
         peer.latest_frame = 0;
         peer.materialized_frame = 0;
-        assert!(available_detail(&m, &peer)
-            .to_string()
-            .contains("Peer app frame heights unavailable."));
+        assert!(available_detail(&m, &peer).to_string().is_empty());
     }
 
     #[test]
@@ -6761,6 +6983,7 @@ mod tests {
             ring: 5,
             active_provers: provers,
             prover_counts: None,
+            certificate_share: None,
             shard_size: BigInt::from(0),
             data_shards: shards,
             materialized_frame: 0,
@@ -7057,7 +7280,7 @@ mod tests {
         for mode in [ColumnSizing::Fixed, ColumnSizing::Dynamic] {
             m.column_sizing = mode;
             let (alloc, avail) = shared_col_widths(&m, 260, &[a.clone()], &[peer.clone()]);
-            assert_eq!(alloc.len(), 18);
+            assert_eq!(alloc.len(), 19);
             assert_eq!(avail.len(), 13);
             assert_eq!(alloc[16], avail[11]);
             assert!(alloc[16] >= "15.0".len());
@@ -7161,7 +7384,8 @@ mod tests {
         assert_eq!(alloc_cell(&m, &bound, 12, 12), "bound");
         assert_eq!(status_color("bound"), WARNING);
         let detail = allocation_detail(&m, &bound).to_string();
-        assert!(detail.contains("Worker bound; no live allocation reported."));
+        // Status `bound` and its help say it; the detail does not repeat it.
+        assert!(!detail.contains("bound") && !detail.contains("no live allocation"));
         assert!(detail.contains("Blocker: closing session"));
         let title = alloc_title(&m, &m.allocations).to_string();
         assert!(title.contains("Status: bound 1"));
@@ -7170,9 +7394,7 @@ mod tests {
             "worker-only estimates do not enter reward totals"
         );
         bound.execution = None;
-        assert!(allocation_detail(&m, &bound)
-            .to_string()
-            .contains("no live allocation reported"));
+        assert!(allocation_detail(&m, &bound).to_string().is_empty());
         let help = help_body()
             .iter()
             .map(|l| l.to_string())
@@ -7214,7 +7436,8 @@ mod tests {
                 a
             })
             .collect();
-        let compact = render_text(&mut m, 160, 24);
+        // Tall enough for all nine rows above the cursor rule and its row.
+        let compact = render_text(&mut m, 160, 40);
         assert_eq!(compact.matches("leaving(W)").count(), 3, "{compact}");
         m.compact_actions = false;
         let leaving = m.allocations[8].clone();
@@ -7222,7 +7445,7 @@ mod tests {
             allocation_status_text(&m, &leaving),
             "leaving(worker shortage)"
         );
-        let expanded = render_text(&mut m, 200, 24);
+        let expanded = render_text(&mut m, 200, 40);
         assert!(expanded.contains("leaving(worker shortage)"), "{expanded}");
     }
 
@@ -7481,7 +7704,7 @@ mod tests {
             );
         }
         assert_eq!(
-            colored_a[1].spans[26].style.fg,
+            colored_a[1].spans[28].style.fg,
             Some(status_color("re-confirm!"))
         );
         for row in 1..=2 {
@@ -7524,7 +7747,7 @@ mod tests {
         m.compact_actions = false;
         m.compact_units = false; // Dynamic, sorted ascending on Worker
         let rows = joining_table();
-        let (w, fw) = alloc_col_widths(&m, 208, &rows);
+        let (w, fw) = alloc_col_widths(&m, 214, &rows);
 
         assert_eq!(
             w,
@@ -7547,11 +7770,12 @@ mod tests {
                 16, // "activate@f699840", wider than "DefaultAction"
                 20, // "Interval [s 60m/24h]"
                 0,  // "ProverPhases", hidden by default
+                5,  // "Cert" plus marker position
             ]
         );
         assert_eq!(fw, 15);
-        // 17 columns + 16 separators + 2 borders fill the pane exactly.
-        assert_eq!(w.iter().sum::<usize>() + 16 + 2, 208);
+        // 18 columns + 17 separators + 2 borders fill the pane exactly.
+        assert_eq!(w.iter().sum::<usize>() + 17 + 2, 214);
     }
 
     #[test]
@@ -7559,10 +7783,10 @@ mod tests {
         let (w, fw) = alloc_col_widths(&fixed(), 165, &joining_table());
         assert_eq!(
             w,
-            vec![6, 12, 7, 5, 10, 8, 9, 8, 10, 9, 28, 8, 12, 4, 26, 18, 20, 0]
+            vec![6, 12, 7, 5, 10, 8, 9, 8, 10, 9, 28, 8, 12, 4, 26, 18, 20, 0, 5]
         );
         assert_eq!(fw, 12);
-        assert_eq!(w.iter().sum::<usize>() + 16, 216);
+        assert_eq!(w.iter().sum::<usize>() + 17, 222);
         // 26 columns of Next Action for a 13-column value in the fixed layout.
         assert_eq!(w[14], NEXT_ACTION_WIDTH);
     }
@@ -7599,15 +7823,15 @@ mod tests {
         m.compact_actions = false;
         m.compact_units = false;
         let mut rows = joining_table();
-        let (before, before_fw) = alloc_col_widths(&m, 208, &rows);
+        let (before, before_fw) = alloc_col_widths(&m, 214, &rows);
         rows[3].next_action = ActionHint::text("(reject|confirm)");
-        let (after, after_fw) = alloc_col_widths(&m, 208, &rows);
+        let (after, after_fw) = alloc_col_widths(&m, 214, &rows);
 
         assert_eq!(before[14], 13);
         assert_eq!(after[14], 16);
         // Filter gives back exactly what Next Action took; the row still fits.
         assert_eq!(before_fw - after_fw, 3);
-        assert_eq!(after.iter().sum::<usize>() + 16 + 2, 208);
+        assert_eq!(after.iter().sum::<usize>() + 17 + 2, 214);
     }
 
     #[test]
@@ -7618,9 +7842,9 @@ mod tests {
         let rows = joining_table();
         // Wide pane: Filter stops at the longest hex rather than padding on.
         assert_eq!(alloc_col_widths(&m, 300, &rows).1, 64);
-        assert_eq!(alloc_col_widths(&m, 221, &rows).1, 28);
+        assert_eq!(alloc_col_widths(&m, 227, &rows).1, 28);
         // Narrower: Filter absorbs the shortfall…
-        assert_eq!(alloc_col_widths(&m, 208, &rows).1, 15);
+        assert_eq!(alloc_col_widths(&m, 214, &rows).1, 15);
         assert_eq!(alloc_col_widths(&m, 121, &rows).1, 12);
         // …down to the floor, past which the row is clipped rather than shrunk.
         assert_eq!(alloc_col_widths(&m, 118, &rows).1, MIN_FILTER_WIDTH);
@@ -7869,6 +8093,119 @@ mod tests {
         }
     }
 
+    fn cert_share(
+        observed: u64,
+        frames: u64,
+        signed: u64,
+    ) -> Option<quil_types::proto::node::CertificateShare> {
+        Some(quil_types::proto::node::CertificateShare {
+            hour: Some(quil_types::proto::node::CertificateWindow {
+                window_seconds: 3600,
+                observed_seconds: observed,
+                frames,
+                signed_frames: signed,
+            }),
+            day: None,
+            committee: 24,
+            quorum: 17,
+        })
+    }
+
+    #[test]
+    fn cert_cells_show_the_60m_share_and_mark_a_low_one() {
+        let mut m = Model::new();
+        let mut a = row("aa", 24, 1, 1, "", "");
+        assert_eq!(alloc_cell(&m, &a, ALLOC_CERT_COL, 0), "-", "an older node");
+        a.certificate_share = cert_share(3600, 0, 0);
+        assert_eq!(
+            alloc_cell(&m, &a, ALLOC_CERT_COL, 0),
+            "-",
+            "no frame counted"
+        );
+        a.certificate_share = cert_share(3600, 340, 241);
+        assert_eq!(alloc_cell(&m, &a, ALLOC_CERT_COL, 0), "70%");
+        // Under half of 17/24 is low once a full hour holds 30 frames.
+        a.certificate_share = cert_share(3600, 340, 120);
+        assert_eq!(alloc_cell(&m, &a, ALLOC_CERT_COL, 0), "35%!");
+        a.certificate_share = cert_share(3599, 340, 120);
+        assert_eq!(
+            alloc_cell(&m, &a, ALLOC_CERT_COL, 0),
+            "35%",
+            "under an hour"
+        );
+        a.certificate_share = cert_share(3600, 29, 0);
+        assert_eq!(
+            alloc_cell(&m, &a, ALLOC_CERT_COL, 0),
+            "0%",
+            "too few frames"
+        );
+        a.certificate_share = cert_share(3600, 340, 121);
+        assert_eq!(alloc_cell(&m, &a, ALLOC_CERT_COL, 0), "35%");
+        assert!(m.alloc_column_visible(ALLOC_CERT_COL), "shown by default");
+        assert_eq!(alloc_header(&m, ALLOC_CERT_COL), "Cert ");
+
+        let mut low = row("bb", 24, 1, 2, "", "");
+        low.certificate_share = cert_share(3600, 340, 30);
+        let older = row("cc", 24, 1, 3, "", "");
+        m.color_coding = false;
+        assert_eq!(alloc_display_cell(&m, &low, ALLOC_CERT_COL, 0), "8%!");
+        m.color_coding = true;
+        assert_eq!(alloc_display_cell(&m, &low, ALLOC_CERT_COL, 0), "8% ");
+        let rows = [a.clone(), low.clone(), older.clone()];
+        let lines = render_alloc_panel(&mut m, &rows, Rect::new(0, 0, 300, 7), None);
+        let styled = |line: usize, text: &str, color| {
+            lines[line]
+                .spans
+                .iter()
+                .any(|span| span.content.trim() == text && span.style.fg == Some(color))
+        };
+        assert!(lines[0].to_string().contains("Cert"));
+        assert!(styled(2, "8%", WARNING), "{}", lines[2]);
+        assert!(!styled(1, "35%", WARNING), "{}", lines[1]);
+        assert!(styled(3, "-", DIM), "{}", lines[3]);
+        // The cursor row colors it too.
+        low.worker_id = 0;
+        let rows = [low.clone(), a.clone()];
+        let lines = render_alloc_panel(&mut m, &rows, Rect::new(0, 0, 300, 6), None);
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content.trim() == "8%" && span.style.fg == Some(WARNING)),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn a_low_cert_share_raises_one_notice_over_the_seats_reporting_one() {
+        let mut m = Model::new();
+        m.reachable = true;
+        m.last_fetch_success = Some(std::time::Instant::now());
+        let seat = |hex: &str, share| {
+            let mut a = row(hex, 24, 1, 1, "", "");
+            a.certificate_share = share;
+            a
+        };
+        m.allocations = vec![
+            seat("aa", cert_share(3600, 340, 241)),
+            seat("bb", cert_share(3600, 340, 30)),
+            seat("cc", None),
+        ];
+        let low = |m: &Model| {
+            condition_notices(m)
+                .into_iter()
+                .find(|(key, ..)| *key == "cert-share-low")
+        };
+        let (_, severity, text) = low(&m).expect("a low seat raises the notice");
+        assert_eq!(severity, NoticeSeverity::Warning);
+        assert_eq!(text, "Low certificate share (60m): 1/2 allocations.");
+        assert!(text.chars().count() + 15 <= 80);
+        m.allocations[1].certificate_share = cert_share(1800, 340, 30);
+        assert!(low(&m).is_none(), "under an hour counted is no verdict");
+        assert!(help_text().contains("Low certificate share (60m)"));
+    }
+
     fn help_text() -> String {
         help_body()
             .iter()
@@ -8041,6 +8378,9 @@ mod tests {
             "Shield plan",
             "Shield notices",
             "Mint notices",
+            "Transfers",
+            "Transfer confirmations",
+            "Transfer notices",
             "Logs",
             "--render",
             "Node config",
@@ -9399,7 +9739,7 @@ mod visibility_grid_tests {
 
 // Stable names identify columns across consumers; their values and labels stay
 // owned by the same helpers as the terminal view.
-const ALLOC_COLUMN_KEYS: [&str; 18] = [
+const ALLOC_COLUMN_KEYS: [&str; 19] = [
     "select",
     "filter",
     "provers",
@@ -9418,6 +9758,7 @@ const ALLOC_COLUMN_KEYS: [&str; 18] = [
     "default_action",
     "interval",
     "prover_phases",
+    "cert",
 ];
 const AVAIL_COLUMN_KEYS: [&str; 13] = [
     "select",
@@ -9670,10 +10011,10 @@ mod snapshot_presentation_tests {
         let mut m = Model::new();
         let mut a = super::tests::row("abcd", 0, 0, 1, "", "");
         a.status_name = "active".into();
-        for (state, observed, expected_state, expected_tone) in [
-            ("blocked", 1, "stale", "muted"),
-            ("blocked", u64::MAX, "blocked", "error"),
-            ("serving", u64::MAX, "serve", "warning"),
+        for (state, observed, expected_state, expected_detail_tone, expected_cell_tone) in [
+            ("blocked", 1, "stale", "muted", "muted"),
+            ("blocked", u64::MAX, "blocked", "error", "error"),
+            ("serving", u64::MAX, "serve", "muted", "warning"),
         ] {
             a.execution = Some(WorkerExecution {
                 state: state.into(),
@@ -9698,8 +10039,8 @@ mod snapshot_presentation_tests {
                 m.compact_actions = compact;
                 let shown = &exported["allocations"][0]["tui"][mode];
                 assert_eq!(shown["cells"]["execution"], expected_state);
-                assert_eq!(shown["tone"], expected_tone);
-                assert_eq!(shown["tones"]["execution"], expected_tone);
+                assert_eq!(shown["tone"], expected_detail_tone);
+                assert_eq!(shown["tones"]["execution"], expected_cell_tone);
                 assert_eq!(shown["detail"], allocation_detail(&m, &a).to_string());
                 assert!(!shown["detail"].as_str().unwrap().contains("old failure"));
                 if !compact {
@@ -9828,5 +10169,269 @@ mod snapshot_presentation_tests {
                 "1.5"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cursor_rule_tests {
+    use super::tests::{row, shard};
+    use super::*;
+    use quil_types::proto::node::WorkerExecution;
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// Two allocations, one serving (a `HELP` detail) and one blocked (a
+    /// red one), and two available shards, one 5 frames behind its head
+    /// (a yellow detail) and one current.
+    fn model() -> Model {
+        let now = now_ms();
+        let mut m = Model::new();
+        m.data_loaded = true;
+        m.compact_actions = false;
+        let mut serving = row(&format!("{:064x}", 1), 3, 1, 4, "", "");
+        serving.status_name = "active".into();
+        serving.execution = Some(WorkerExecution {
+            state: "serving".into(),
+            observed_unix_ms: now,
+            materialized_frame: Some(10),
+            last_advance_unix_ms: now - 5_000,
+            ..Default::default()
+        });
+        let mut blocked = row(&format!("{:064x}", 2), 3, 1, 5, "", "");
+        blocked.status_name = "active".into();
+        blocked.execution = Some(WorkerExecution {
+            state: "blocked".into(),
+            blocker: "closing session".into(),
+            observed_unix_ms: now,
+            materialized_frame: Some(10),
+            ..Default::default()
+        });
+        m.allocations = vec![serving, blocked];
+        let mut lagging = shard(&format!("{:064x}", 3), 1, 1);
+        lagging.materialized_frame = 15;
+        lagging.latest_frame = 20;
+        let mut current = shard(&format!("{:064x}", 4), 1, 1);
+        current.materialized_frame = 20;
+        current.latest_frame = 20;
+        m.available = vec![lagging, current];
+        m
+    }
+
+    /// Puts each panel's cursor on the row whose filter ends in `alloc` /
+    /// `avail`.
+    fn point(m: &mut Model, alloc: char, avail: char) {
+        m.alloc_cursor = m
+            .sorted_allocations()
+            .iter()
+            .position(|a| a.filter_hex.ends_with(alloc))
+            .unwrap();
+        m.avail_cursor = m
+            .sorted_available()
+            .iter()
+            .position(|s| s.filter_hex.ends_with(avail))
+            .unwrap();
+    }
+
+    fn frame(m: &mut Model, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, m)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn lines(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn borders(lines: &[String]) -> Vec<usize> {
+        (0..lines.len())
+            .filter(|&i| lines[i].starts_with('╭') || lines[i].starts_with('╰'))
+            .collect()
+    }
+
+    /// Each panel's cursor row's detail sits under a `├─ cursor ─┤` rule
+    /// across the panel, borders included, on the panel's last lines; a
+    /// cursor move or a longer detail moves no border.
+    #[test]
+    fn the_cursor_detail_sits_under_a_rule_across_the_panel() {
+        let mut m = model();
+        point(&mut m, '2', '3');
+        let width = 200;
+        let buffer = frame(&mut m, width, 50);
+        let text = lines(&buffer);
+        let all = text.join("\n");
+        let rules: Vec<usize> = (0..text.len())
+            .filter(|&i| {
+                text[i].starts_with("├─ cursor ─")
+                    && text[i].ends_with('┤')
+                    && text[i].chars().count() == usize::from(width)
+            })
+            .collect();
+        assert_eq!(rules.len(), 2, "one rule per table panel\n{all}");
+        assert!(
+            text[rules[0] + 1].contains("Blocker: closing session"),
+            "{all}"
+        );
+        assert!(text[rules[0] + 2].starts_with('╰'), "{all}");
+        assert!(
+            text[rules[1] + 1].contains("trails its head by 5 frames"),
+            "{all}"
+        );
+        assert!(text[rules[1] + 2].starts_with('╰'), "{all}");
+        // The rule takes the border's color, its label the dim one.
+        assert_eq!(buffer[(0, rules[0] as u16)].fg, PRIMARY);
+        assert_eq!(buffer[(3, rules[0] as u16)].fg, HELP);
+        assert_eq!(buffer[(0, rules[1] as u16)].fg, DIM);
+        let before = borders(&text);
+        point(&mut m, '1', '4');
+        assert_eq!(borders(&lines(&frame(&mut m, width, 50))), before);
+        m.allocations[0].execution.as_mut().unwrap().blocker = "x ".repeat(150);
+        point(&mut m, '1', '3');
+        assert_eq!(borders(&lines(&frame(&mut m, width, 50))), before);
+    }
+
+    /// With one row left for it, the detail follows a dim `cursor:` label
+    /// on that row instead of a rule; one too long for it is the marker.
+    #[test]
+    fn one_row_left_puts_a_cursor_label_on_it() {
+        let text = |lines: &[Line<'static>]| -> Vec<String> {
+            lines.iter().map(|l| l.to_string()).collect()
+        };
+        let short = || Line::from(Span::styled("Last advance: <60s", Style::new().fg(HELP)));
+        let long = || Line::from("word ".repeat(20));
+        assert!(cursor_detail(short(), 40, 2, 2).is_empty());
+        let one = cursor_detail(short(), 40, 3, 2);
+        assert_eq!(text(&one), ["cursor: Last advance: <60s"]);
+        assert_eq!(one[0].spans[0].style.fg, Some(HELP));
+        assert!(one[0].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::DIM | Modifier::ITALIC));
+        assert_eq!(
+            text(&cursor_detail(long(), 40, 3, 2)),
+            ["cursor: … enlarge panel for details"]
+        );
+        // Two rows: the first left for the rule, the detail under it.
+        assert_eq!(
+            text(&cursor_detail(short(), 40, 4, 2)),
+            ["", "Last advance: <60s"]
+        );
+        assert_eq!(
+            text(&cursor_detail(long(), 40, 4, 2)),
+            ["", "… enlarge panel for details"]
+        );
+        assert_eq!(text(&cursor_detail(Line::default(), 40, 4, 2)), ["", ""]);
+    }
+
+    /// Detail lines are dim italics, on the warning and error colors
+    /// italics only; table rows, the cursor row included, are neither.
+    #[test]
+    fn detail_lines_are_dim_italics_and_table_rows_are_not() {
+        let width = 200;
+        let check = |m: &mut Model, needle: &str, fg: Color, dim: bool| {
+            let buffer = frame(m, width, 50);
+            let text = lines(&buffer);
+            let y = text
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle} in\n{}", text.join("\n")));
+            let cells: Vec<_> = (1..width - 1)
+                .map(|x| &buffer[(x, y as u16)])
+                .filter(|cell| cell.symbol() != " ")
+                .collect();
+            assert!(!cells.is_empty());
+            for cell in cells {
+                assert_eq!(cell.fg, fg, "{needle}");
+                assert!(cell.modifier.contains(Modifier::ITALIC), "{needle}");
+                assert_eq!(cell.modifier.contains(Modifier::DIM), dim, "{needle}");
+            }
+            // The table's rows, the cursor row among them.
+            let header = text
+                .iter()
+                .position(|line| line.contains("Select Filter"))
+                .unwrap();
+            for y in [header + 1, header + 2] {
+                for x in 1..width - 1 {
+                    let cell = &buffer[(x, y as u16)];
+                    assert!(
+                        !cell.modifier.intersects(Modifier::ITALIC | Modifier::DIM),
+                        "table row {y} column {x}"
+                    );
+                }
+            }
+        };
+        let mut m = model();
+        point(&mut m, '1', '3');
+        check(&mut m, "Last advance: <60s", HELP, true);
+        check(&mut m, "trails its head by 5 frames", WARNING, false);
+        point(&mut m, '2', '3');
+        check(&mut m, "Blocker: closing session", ERROR, false);
+    }
+
+    /// A row's detail adds what its cells lack: never its filter, LocalMat,
+    /// Execution, Status or PeerState, which the help explains.
+    #[test]
+    fn the_cursor_detail_never_repeats_the_rows_key_or_values() {
+        let now = now_ms();
+        let m = model();
+        let mut rows = m.allocations.clone();
+        let mut bound = row(&format!("{:064x}", 7), 3, 1, 6, "", "");
+        bound.status_name = "bound".into();
+        bound.execution = Some(WorkerExecution {
+            state: "blocked".into(),
+            blocker: "closing session".into(),
+            observed_unix_ms: now,
+            materialized_frame: Some(0),
+            ..Default::default()
+        });
+        rows.push(bound.clone());
+        bound.execution = None;
+        rows.push(bound);
+        for a in &rows {
+            let detail = allocation_detail(&m, a).to_string();
+            for col in [1, 6, 9, 12] {
+                let cell = alloc_cell(&m, a, col, 64);
+                let cell = cell.trim_end_matches('!');
+                if cell.len() >= 3 {
+                    assert!(
+                        !detail.contains(cell),
+                        "column {col} `{cell}` in `{detail}`"
+                    );
+                }
+            }
+        }
+        let mut shards = m.available.clone();
+        let mut unmat = shard(&format!("{:064x}", 8), 1, 1);
+        unmat.latest_frame = 20;
+        shards.push(unmat);
+        shards.push(shard(&format!("{:064x}", 9), 1, 1));
+        for s in &shards {
+            let detail = available_detail(&m, s).to_string();
+            for col in [1, 9] {
+                let cell = avail_cell(&m, s, col, 64);
+                let cell = cell.trim_end_matches('!');
+                assert!(
+                    !detail.contains(cell),
+                    "column {col} `{cell}` in `{detail}`"
+                );
+            }
+        }
+        assert_eq!(
+            available_detail(&m, &shards[0]).to_string(),
+            "Peer materialization trails its head by 5 frames."
+        );
     }
 }

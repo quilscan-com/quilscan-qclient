@@ -15,6 +15,7 @@ use super::model::{
 use super::msg::Msg;
 use super::settings;
 use super::shield;
+use super::transfer;
 
 const MAX_AWAIT_RETRIES: u32 = 3;
 
@@ -36,6 +37,13 @@ pub enum Cmd {
     MintRun(super::mint::Preview),
     /// End the running shield before its next submission.
     ShieldStop,
+    /// Read this wallet's shielded coins and the pending transfers it can
+    /// act on.
+    FetchShielded,
+    /// Check and quote a transfer action for its confirmation.
+    TransferPrepare(super::transfer::Kind),
+    /// Run the confirmed transfer action.
+    TransferRun(super::transfer::Preview),
     Join(Vec<Vec<u8>>),
     Lifecycle {
         action: String,
@@ -67,6 +75,12 @@ fn signing_wait_text(action: &str, frames_left: u64) -> String {
 }
 
 pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
+    apply_msg_at(m, msg, Instant::now())
+}
+
+/// [`apply_msg`] with the node's answers received at `now`: the clock the
+/// refresh observations (progress stalls, RPC freshness) count from.
+pub fn apply_msg_at(m: &mut Model, msg: Msg, now: Instant) -> Vec<Cmd> {
     match msg {
         Msg::SigningWait {
             action,
@@ -98,6 +112,18 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             mint::apply_progress(m, progress);
             vec![]
         }
+        Msg::Shielded(read) => {
+            transfer::apply_read(m, read);
+            vec![]
+        }
+        Msg::TransferPreview(preview) => {
+            transfer::apply_preview(m, preview);
+            vec![]
+        }
+        Msg::Transfer(progress) => {
+            transfer::apply_progress(m, progress);
+            vec![]
+        }
         Msg::ShieldPreview(preview) => {
             shield::apply_preview(m, preview);
             vec![]
@@ -110,13 +136,13 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             m.reward_loaded = true;
             m.reward_error = result.as_ref().err().cloned();
             m.claimable_reward = result.ok().flatten();
-            m.reward_last_success = m.claimable_reward.map(|_| Instant::now());
+            m.reward_last_success = m.claimable_reward.map(|_| now);
             vec![]
         }
         Msg::ShardLoading => {
             m.shard_loading = true;
             m.shard_message_time = Some(std::time::SystemTime::now());
-            m.shard_fetch_started = Some(Instant::now());
+            m.shard_fetch_started = Some(now);
             vec![]
         }
         Msg::ShardRefresh(result) => {
@@ -128,11 +154,11 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
                 .map(|started| started.elapsed());
             match result {
                 Ok(shards) => {
-                    m.observe_app_intervals(&shards, Instant::now());
-                    m.observe_reported_app_heads(&shards, Instant::now());
-                    m.observe_committed_app_heads(&shards, Instant::now());
+                    m.observe_app_intervals(&shards, now);
+                    m.observe_reported_app_heads(&shards, now);
+                    m.observe_committed_app_heads(&shards, now);
                     m.shard_error = None;
-                    m.shard_last_success = Some(Instant::now());
+                    m.shard_last_success = Some(now);
                     m.shard_last_duration = elapsed;
                     // Node status can arrive after shard data on initial load.
                     m.cached_shard_info = Some(shards.clone());
@@ -158,14 +184,14 @@ pub fn apply_msg(m: &mut Model, msg: Msg) -> Vec<Cmd> {
             }
             if let Some(node) = &node_info {
                 m.node_global_cadence = node.frame_cadence.clone();
-                m.observe_global_head(node.last_received_frame, Instant::now());
+                m.observe_global_head(node.last_received_frame, now);
             }
             if let Some(shards) = &shard_info {
-                m.observe_app_intervals(shards, Instant::now());
-                m.observe_reported_app_heads(shards, Instant::now());
-                m.observe_committed_app_heads(shards, Instant::now());
+                m.observe_app_intervals(shards, now);
+                m.observe_reported_app_heads(shards, now);
+                m.observe_committed_app_heads(shards, now);
             }
-            m.last_fetch_success = Some(Instant::now());
+            m.last_fetch_success = Some(now);
             if m.consecutive_failures > 0 && m.status_msg.starts_with("Refresh failed: ") {
                 m.status_msg.clear();
                 m.status_sticky = false;
@@ -554,6 +580,32 @@ fn is_quit(ev: &KeyEvent) -> bool {
         || (ev.code == KeyCode::Char('c') && ev.modifiers.contains(KeyModifiers::CONTROL))
 }
 
+/// A terminal's bracketed paste, delivered whole: text for the input in focus
+/// (a transfer form's field, a filter being edited), as if typed. Anywhere
+/// else it is ignored, so pasted text cannot fire a key or answer a prompt.
+/// Keys read one by one would leave a long paste's tail unread in the
+/// terminal until further keys arrive. A paste never presses Enter or Tab:
+/// its newlines and control characters are dropped.
+pub fn handle_paste(m: &mut Model, text: &str) {
+    if m.coins.shield.stop_pending
+        || m.coins.shield.quit_pending
+        || m.column_picker_active
+        || m.operation_confirmation.is_some()
+    {
+        return;
+    }
+    if m.tab == Tab::Coins {
+        transfer::form_paste(m, text);
+    } else if !m.join_picker_active
+        && !m.show_help
+        && m.filter_edit_active
+        && m.active_filter_col_kind(m.filter_edit_col_idx) != FilterColKind::Select
+    {
+        m.filter_edit_input
+            .extend(text.chars().filter(|c| !c.is_control()));
+    }
+}
+
 pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
     if ev.kind != KeyEventKind::Press {
         return vec![];
@@ -596,6 +648,16 @@ pub fn handle_key(m: &mut Model, ev: KeyEvent) -> Vec<Cmd> {
         }
         if matches!(m.coins.mint.dialog, Some(mint::Dialog::Confirm(_))) {
             return mint::dialog_key(m, ev);
+        }
+        // A form takes every key as text but Ctrl+C, which quits.
+        if matches!(m.coins.transfer.dialog, Some(transfer::Dialog::Form(_))) {
+            if ev.code == KeyCode::Char('c') && ev.modifiers.contains(KeyModifiers::CONTROL) {
+                return vec![Cmd::Quit];
+            }
+            return transfer::form_key(m, ev);
+        }
+        if matches!(m.coins.transfer.dialog, Some(transfer::Dialog::Confirm(_))) {
+            return transfer::dialog_key(m, ev);
         }
         if m.show_help {
             return handle_help_key(m, ev);
@@ -3030,5 +3092,55 @@ mod tests {
         handle_key(&mut m, key(KeyCode::Char(' ')));
         assert!(!m.header_kpi_visible("Notification level"));
         assert!(m.header_kpi_visible("Notification position"));
+    }
+
+    /// A paste lands in the filter being edited, as typed: spaces stay, line
+    /// breaks and control characters go, and it applies nothing.
+    #[test]
+    fn a_paste_lands_in_the_filter_being_edited() {
+        let mut m = operational_model(2);
+        m.filter_edit_active = true;
+        m.filter_edit_col_idx = 1;
+        handle_paste(&mut m, "ab\r\ncd e\t\x1b");
+        assert_eq!(m.filter_edit_input, "abcd e");
+        assert!(m.filter_edit_active);
+        assert!(m.active_filter_col(1).text.is_empty());
+    }
+
+    /// Outside an input a paste changes nothing: its letters fire no key and
+    /// answer no prompt, on either tab.
+    #[test]
+    fn a_paste_outside_an_input_changes_nothing() {
+        let text = "qsfJhy TPESMCj";
+        let mut m = operational_model(2);
+        m.status_msg.clear();
+        let cursor = m.alloc_cursor;
+        handle_paste(&mut m, text);
+        assert!(!m.sort_mode && !m.alloc_filter_mode && !m.avail_filter_mode);
+        assert!(!m.show_help && !m.join_picker_active);
+        assert!(m.filter_edit_input.is_empty() && m.status_msg.is_empty());
+        assert_eq!(m.alloc_cursor, cursor);
+        // A filter column of fixed choices takes no text.
+        m.filter_edit_active = true;
+        m.filter_edit_col_idx = 9;
+        handle_paste(&mut m, text);
+        assert!(m.filter_edit_input.is_empty() && m.filter_edit_select_state.is_empty());
+        m.filter_edit_active = false;
+        // A prompt keeps waiting for its own key.
+        m.operation_confirmation = Some(('y', Vec::new()));
+        handle_paste(&mut m, text);
+        assert!(m.operation_confirmation.is_some());
+        m.operation_confirmation = None;
+        coins::open(&mut m);
+        m.status_msg.clear();
+        m.coins.shield.stop_pending = true;
+        handle_paste(&mut m, text);
+        assert!(m.coins.shield.stop_pending);
+        m.coins.shield.stop_pending = false;
+        handle_paste(&mut m, text);
+        assert!(m.coins.transfer.dialog.is_none());
+        assert!(m.coins.shield.dialog.is_none() && m.coins.mint.dialog.is_none());
+        assert_eq!(m.tab, Tab::Coins);
+        assert!(m.status_msg.is_empty());
     }
 }

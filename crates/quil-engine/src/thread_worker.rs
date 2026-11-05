@@ -171,8 +171,6 @@ pub struct WorkerConsensusDeps {
     /// testnet=1 (single-prover clusters still progress). See
     /// `AppLeaderProvider::min_active_provers_for_propose`.
     pub min_active_provers_for_propose: u64,
-    /// Drive app-shard consensus with commonware-simplex + Falcon.
-    pub app_consensus_cw: bool,
     /// DB config → persistent per-shard simplex-journal dir (Go parity).
     pub db_config: quil_config::DbConfig,
     /// Callback that publishes finalized canonical FrameHeader bytes
@@ -351,7 +349,10 @@ impl ShardData {
         crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
     ) -> tokio::task::JoinHandle<crate::worker_payload_eviction::Publish> {
         let ticket = self.begin(core_id);
-        tokio::spawn(self.clone().read(core_id, ticket, crdt.clone()))
+        tokio::spawn(probed(
+            ProbeSection::ShardDataRead,
+            self.clone().read(core_id, ticket, crdt.clone()),
+        ))
     }
 
     /// Number a read of worker `core_id`'s shards as its latest.
@@ -809,9 +810,7 @@ impl ThreadWorkerManager {
                 }
 
                 // Create per-thread tokio runtime
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
+                let rt = crate::worker_stall::worker_runtime()
                     .expect("failed to create worker tokio runtime");
 
                 // A watchdog on another thread names what blocks this one
@@ -862,12 +861,27 @@ impl ThreadWorkerManager {
                     loop {
                         tokio::select! {
                             _ = mem_tick.tick() => {
+                                // Also releases a published generation's store
+                                // snapshot past its window when this worker no
+                                // longer publishes (idle, or its shard halted).
+                                let held = worker_owned
+                                    .as_ref()
+                                    .and_then(|o| o.hypergraph.release_expired_snapshots());
                                 if let Some(db) = worker_db.as_ref() {
                                     let bytes = db.approximate_memory_bytes();
+                                    // Open snapshots keep every later deletion on
+                                    // disk; the generation pins and wallet scans
+                                    // name two holders, any rest is a sync or
+                                    // execution view.
+                                    let snapshots = db.open_snapshots();
                                     info!(
                                         core_id,
                                         worker_db_mb = bytes as f64 / (1024.0 * 1024.0),
                                         filter = hex::encode(&current_filter),
+                                        rocksdb_snapshots = snapshots.map(|s| s.count),
+                                        oldest_snapshot_age_secs = snapshots.map(|s| s.oldest_age_secs),
+                                        generation_pins = held.map(|h| h.generations),
+                                        scan_snapshots = held.map(|h| h.scans),
                                         "worker rocksdb memory",
                                     );
                                 }
@@ -945,7 +959,7 @@ impl ThreadWorkerManager {
                                             };
                                             retained_mempool = Some((application, mempool.clone()));
                                             // TODO
-                                            tokio::spawn(async move {
+                                            tokio::spawn(probed(ProbeSection::EngineSetup, async move {
                                                 info!(core_id, filter = hex::encode(&filter_clone), "app engine spawned");
 
                                                 if let Some(ref deps) = deps {
@@ -1017,7 +1031,6 @@ impl ThreadWorkerManager {
                                                         execution_engine,
                                                         inclusion_prover,
                                                         kv_db,
-                                                        app_consensus_cw: deps.app_consensus_cw,
                                                         db_config: deps.db_config.clone(),
                                                         // Per-worker consolidation hook (bound to this
                                                         // worker's CRDT/store by worker_state_builder).
@@ -1282,7 +1295,7 @@ impl ThreadWorkerManager {
                                                         }
                                                     }
                                                 }
-                                            });
+                                            }));
                                         }
                                         let _ = master_tx
                                             .send(WorkerToMaster::Ready { core_id })
@@ -2114,7 +2127,6 @@ mod tests {
             }),
             reward_greedy: false,
             min_active_provers_for_propose: 1,
-            app_consensus_cw: false,
             db_config: quil_config::DbConfig::default(),
             coverage_publish: None,
             hypergraph: None,

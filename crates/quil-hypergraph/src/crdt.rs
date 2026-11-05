@@ -55,6 +55,57 @@ pub(crate) struct CommitLock {
     global: AtomicBool,
     releases: AtomicU64,
     waiters: AtomicUsize,
+    /// The committed view as of the last release, once a reader asked for
+    /// one ([`HypergraphCrdt::capture_committed_snapshot`]).
+    view: CommittedViews,
+}
+
+type CommittedSnapshot = Arc<dyn quil_types::store::SnapshotReadable>;
+
+/// The committed snapshot as of the last counted release of a [`CommitLock`].
+///
+/// Taking it waits for no holder. A holder may work for a minute on a busy
+/// disk, while worker threads and the master's message loop only need a
+/// committed view, and nothing else runs on them while they wait. A reader
+/// finding the lock held takes the view of the last release, as if it had
+/// read just before the holder began: nothing the holder does is visible, and
+/// every commit that returned before the reader asked is, since a holder
+/// publishes before it releases.
+///
+/// Starts with the first reader, so a store nobody reads this way pins no
+/// snapshot. The one kept pins overwritten data only until the next release.
+#[derive(Default)]
+struct CommittedViews {
+    capture: std::sync::OnceLock<Box<dyn Fn() -> Option<CommittedSnapshot> + Send + Sync>>,
+    latest: std::sync::Mutex<Option<CommittedSnapshot>>,
+}
+
+impl CommittedViews {
+    fn publish(&self) {
+        let Some(capture) = self.capture.get() else {
+            return;
+        };
+        self.keep(capture());
+    }
+
+    fn keep(&self, view: Option<CommittedSnapshot>) {
+        let previous = std::mem::replace(
+            &mut *self
+                .latest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            view,
+        );
+        // Released outside the lock: the last handle frees a store snapshot.
+        drop(previous);
+    }
+
+    fn latest(&self) -> Option<CommittedSnapshot> {
+        self.latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 thread_local! {
@@ -74,11 +125,17 @@ pub fn commit_lock_wait_on_this_thread() -> std::time::Duration {
 pub(crate) struct CommitGuard<'a> {
     _guard: std::sync::MutexGuard<'a, ()>,
     releases: Option<&'a AtomicU64>,
+    view: &'a CommittedViews,
 }
 
 impl Drop for CommitGuard<'_> {
     fn drop(&mut self) {
         if let Some(releases) = self.releases {
+            // A panicking holder may have stopped between its writes; readers
+            // keep the last whole view.
+            if !std::thread::panicking() {
+                self.view.publish();
+            }
             releases.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -91,6 +148,7 @@ impl CommitLock {
         Ok(CommitGuard {
             _guard: guard,
             releases: Some(&self.releases),
+            view: &self.view,
         })
     }
 
@@ -100,6 +158,7 @@ impl CommitLock {
         Ok(CommitGuard {
             _guard: guard,
             releases: None,
+            view: &self.view,
         })
     }
 
@@ -126,6 +185,19 @@ impl CommitLock {
                 COMMIT_LOCK_WAIT.with(|total| total.set(total.get().saturating_add(waited)));
                 guard
             }
+        }
+    }
+
+    /// Take the lock only if it is free, to read; its release is not counted.
+    fn try_lock_to_read(&self) -> std::result::Result<Option<CommitGuard<'_>>, ()> {
+        match self.inner.try_lock() {
+            Ok(guard) => Ok(Some(CommitGuard {
+                _guard: guard,
+                releases: None,
+                view: &self.view,
+            })),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(()),
         }
     }
 
@@ -180,6 +252,8 @@ pub struct ForestSyncPlan {
     next: usize,
     /// A pinned GLOBAL add phase: leaves absent from the source are removed.
     removals: bool,
+    /// See [`Self::hold_view`].
+    hold: bool,
 }
 
 impl ForestSyncPlan {
@@ -195,6 +269,23 @@ impl ForestSyncPlan {
     pub fn resumable(&self) -> bool {
         !self.repair_existing
     }
+    /// Withhold the shard's committed state from the first chunk this plan
+    /// installs, in that chunk's commit, until
+    /// [`HypergraphCrdt::checkpoint_synced_view`] records the frame the
+    /// synced state belongs to. A sync's last chunk otherwise publishes the
+    /// synced records with the cursor of the state before them.
+    pub fn hold_view(&mut self) {
+        self.hold = true;
+    }
+}
+
+/// What [`HypergraphCrdt::checkpoint_synced_view`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncedViewCheckpoint {
+    /// The cursor before; `None` when absent.
+    pub previous: Option<u64>,
+    /// Whether a held sync's records were withheld until this checkpoint.
+    pub held: bool,
 }
 
 /// The local tree moved under a sync in progress (see
@@ -315,6 +406,11 @@ fn encode_sync_scopes(scopes: &[(u8, Vec<bool>)]) -> Vec<u8> {
     bytes
 }
 
+/// The scope a held sync ([`ForestSyncPlan::hold_view`]) lists from its
+/// first chunk until [`HypergraphCrdt::checkpoint_synced_view`]: no phase
+/// has this index, and its empty bit path overlaps every scope.
+const SYNC_HOLD_SCOPE: usize = 0xff;
+
 /// List or unlist `(phase, bit_path)` among `shard_id`'s incomplete scopes
 /// in `txn`. Callers hold the commit lock, so the read is current.
 fn mark_sync_incomplete(
@@ -324,17 +420,54 @@ fn mark_sync_incomplete(
     bit_path: &[bool],
     incomplete: bool,
 ) -> Result<bool> {
+    mark_sync_scopes(txn, shard_id, &[(phase_idx, bit_path, incomplete)])
+}
+
+/// Stage [`HypergraphCrdt::checkpoint_synced_view`] in `txn`, under the
+/// commit lock.
+fn stage_synced_view(
+    txn: &dyn quil_types::store::Transaction,
+    shard_id: &[u8],
+    frame: u64,
+    cursor_key: &[u8],
+) -> Result<SyncedViewCheckpoint> {
+    let previous = txn
+        .get(cursor_key)?
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+        .map(u64::from_be_bytes);
+    if previous.is_none_or(|previous| previous < frame) {
+        txn.set(cursor_key, &frame.to_be_bytes())?;
+    }
+    let hold: [(usize, &[bool], bool); 1] = [(SYNC_HOLD_SCOPE, &[], false)];
+    let held = mark_sync_scopes(txn, shard_id, &hold)?;
+    Ok(SyncedViewCheckpoint { previous, held })
+}
+
+/// [`mark_sync_incomplete`] for several scopes in one write: a store
+/// transaction does not read its own writes.
+fn mark_sync_scopes(
+    txn: &dyn quil_types::store::Transaction,
+    shard_id: &[u8],
+    changes: &[(usize, &[bool], bool)],
+) -> Result<bool> {
     let key = sync_incomplete_key(shard_id);
     let mut scopes = txn
         .get(&key)?
         .map(|bytes| decode_sync_scopes(&bytes))
         .unwrap_or_default();
-    let scope = (phase_idx as u8, bit_path.to_vec());
-    let listed = scopes.contains(&scope);
-    match (incomplete, listed) {
-        (true, false) => scopes.push(scope),
-        (false, true) => scopes.retain(|listed| *listed != scope),
-        _ => return Ok(false),
+    let mut changed = false;
+    for &(phase_idx, bit_path, incomplete) in changes {
+        let scope = (phase_idx as u8, bit_path.to_vec());
+        let listed = scopes.contains(&scope);
+        match (incomplete, listed) {
+            (true, false) => scopes.push(scope),
+            (false, true) => scopes.retain(|listed| *listed != scope),
+            _ => continue,
+        }
+        changed = true;
+    }
+    if !changed {
+        return Ok(false);
     }
     if scopes.is_empty() {
         txn.delete(&key)?;
@@ -1801,6 +1934,35 @@ impl HypergraphCrdt {
             return Err(error);
         }
         txn.commit()
+    }
+
+    /// Record `frame` at `cursor_key` as the frame of `shard_id`'s synced
+    /// state and end the hold of its held syncs ([`ForestSyncPlan::hold_view`])
+    /// in one commit: a committed snapshot shows their records withheld or
+    /// with this cursor, never with the cursor from before them. The cursor
+    /// never moves back (a malformed one is replaced); a lower `frame` ends
+    /// the hold all the same. On failure the hold stays until a later
+    /// checkpoint succeeds.
+    pub fn checkpoint_synced_view(
+        &self,
+        shard_id: &[u8],
+        frame: u64,
+        cursor_key: &[u8],
+    ) -> Result<SyncedViewCheckpoint> {
+        let _guard = self.commit_lock.lock().map_err(|_| {
+            QuilError::ExecutionUnavailable("synced view commit lock poisoned".into())
+        })?;
+        let txn = self.store.new_transaction(false)?;
+        match stage_synced_view(txn.as_ref(), shard_id, frame, cursor_key) {
+            Ok(checkpoint) => {
+                txn.commit()?;
+                Ok(checkpoint)
+            }
+            Err(error) => {
+                let _ = txn.abort();
+                Err(error)
+            }
+        }
     }
 
     /// Read the cursor from the same store that publishes the state. Absence
@@ -3670,6 +3832,7 @@ impl HypergraphCrdt {
                 && shard_id == [0xff; 32]
                 && bit_path.is_empty()
                 && anchor.is_some(),
+            hold: false,
         })
     }
 
@@ -3858,14 +4021,14 @@ impl HypergraphCrdt {
             )?;
         }
         // Each chunk's blobs match its leaves, but the subtree holds the
-        // state it commits to only once the last chunk is in.
-        mark_sync_incomplete(
-            txn.as_ref(),
-            &plan.shard_id,
-            plan.phase_idx,
-            &plan.bit_path,
-            !final_chunk,
-        )?;
+        // state it commits to only once the last chunk is in. A held sync
+        // withholds it until its cursor is recorded as well.
+        let scope = (plan.phase_idx, plan.bit_path.as_slice(), !final_chunk);
+        let mut scopes = vec![scope];
+        if plan.hold {
+            scopes.push((SYNC_HOLD_SCOPE, &[][..], true));
+        }
+        mark_sync_scopes(txn.as_ref(), &plan.shard_id, &scopes)?;
         txn.commit()?;
         staged
             .publish_memory()
@@ -6299,19 +6462,47 @@ impl HypergraphCrdt {
         self.snapshot_mgr.acquire(expected_root)
     }
 
+    /// Hold the commit lock, as a long commit does, until the guard drops;
+    /// test utility only.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn hold_commit_lock(&self) -> impl Drop + '_ {
+        self.commit_lock.lock().unwrap()
+    }
+
     /// Capture committed state and metadata together, excluding execution's
     /// staged blobs and records. The caller owns the handle and must release it
     /// promptly; this does not add a retained snapshot to the serving cache.
+    ///
+    /// Waits for no holder once a first capture has returned: with the commit
+    /// lock held, it is the view of the lock's last release
+    /// ([`CommittedViews`]).
     pub fn capture_committed_snapshot(
         &self,
     ) -> Result<Arc<dyn quil_types::store::SnapshotReadable>> {
-        let _guard = self
-            .commit_lock
-            .lock()
-            .map_err(|_| QuilError::ExecutionUnavailable("snapshot commit lock poisoned".into()))?;
-        self.store.capture_tree_snapshot()?.ok_or_else(|| {
+        let poisoned =
+            |_: ()| QuilError::ExecutionUnavailable("snapshot commit lock poisoned".into());
+        let free = self.commit_lock.try_lock_to_read().map_err(poisoned)?;
+        if free.is_none() {
+            if let Some(view) = self.commit_lock.view.latest() {
+                return Ok(view);
+            }
+        }
+        // The lock is free, or there is no view yet: the first reader, or the
+        // last capture failed.
+        let _guard = match free {
+            Some(guard) => guard,
+            None => self.commit_lock.lock_to_read().map_err(poisoned)?,
+        };
+        let view = self.store.capture_tree_snapshot()?.ok_or_else(|| {
             QuilError::ExecutionUnavailable("committed snapshots unsupported by this store".into())
-        })
+        })?;
+        let views = &self.commit_lock.view;
+        views.capture.get_or_init(|| {
+            let store = self.store.clone();
+            Box::new(move || store.capture_tree_snapshot().ok().flatten())
+        });
+        views.keep(Some(view.clone()));
+        Ok(view)
     }
 
     /// Capture a full-filter checkpoint without interpreting read failures as
@@ -6476,6 +6667,13 @@ impl HypergraphCrdt {
     /// (see [`SnapshotManager::set_pinned_limit`]).
     pub fn set_snapshot_pinned_limit(&self, limit: usize) {
         self.snapshot_mgr.set_pinned_limit(limit);
+    }
+
+    /// Release published-generation snapshots past their pin window and
+    /// expired scans, then count those held (see
+    /// [`SnapshotManager::release_expired`]). For a periodic caller.
+    pub fn release_expired_snapshots(&self) -> Option<crate::snapshot::HeldSnapshots> {
+        self.snapshot_mgr.release_expired()
     }
 
     pub fn close_snapshots(&self) {
@@ -7119,6 +7317,129 @@ mod phase_wipe_tests {
             0,
             "an emptied phase has nothing left"
         );
+    }
+}
+
+#[cfg(test)]
+mod committed_view_tests {
+    use super::*;
+    use crate::testing::{MemStore, StubProver};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const KEY: &[u8] = b"cursor";
+
+    fn crdt() -> (Arc<MemStore>, HypergraphCrdt) {
+        let store = Arc::new(MemStore::new());
+        store.capture_snapshots();
+        let crdt = HypergraphCrdt::new(store.clone(), Arc::new(StubProver));
+        (store, crdt)
+    }
+
+    fn commit(store: &MemStore, value: &[u8]) {
+        let txn = store.new_transaction(false).unwrap();
+        txn.set(KEY, value).unwrap();
+        txn.commit().unwrap();
+    }
+
+    fn read(hg: &HypergraphCrdt) -> Option<Vec<u8>> {
+        hg.capture_committed_snapshot()
+            .unwrap()
+            .read_record(KEY)
+            .unwrap()
+    }
+
+    /// With a holder at work, a reader neither waits for it nor sees its
+    /// writes: it gets every commit that returned before it asked. Once the
+    /// holder releases, the holder's commit shows.
+    #[test]
+    fn a_reader_during_a_held_commit_gets_the_last_release_without_waiting() {
+        let (store, hg) = crdt();
+        commit(&store, b"0");
+        assert_eq!(read(&hg).as_deref(), Some(&b"0"[..]));
+        // A commit nobody read: only its release can have published it.
+        drop({
+            let guard = hg.commit_lock.lock().unwrap();
+            commit(&store, b"1");
+            guard
+        });
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            // Moved in: a channel's receiver cannot be shared between threads.
+            let (holder, written) = (&hg, &store);
+            scope.spawn(move || {
+                let _guard = holder.commit_lock.lock().unwrap();
+                commit(written, b"2");
+                held_tx.send(()).unwrap();
+                done_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            });
+            held_rx.recv().unwrap();
+            let before = commit_lock_wait_on_this_thread();
+            let asked = std::time::Instant::now();
+            assert_eq!(
+                read(&hg).as_deref(),
+                Some(&b"1"[..]),
+                "the view of the last release, not the holder's writes"
+            );
+            assert!(asked.elapsed() < Duration::from_secs(5));
+            assert_eq!(commit_lock_wait_on_this_thread(), before);
+            done_tx.send(()).unwrap();
+        });
+        assert_eq!(read(&hg).as_deref(), Some(&b"2"[..]));
+    }
+
+    /// The first reader has no view to take: it waits for the holder, as
+    /// every reader did, and sees its commit.
+    #[test]
+    fn the_first_reader_waits_for_the_holder() {
+        let (store, hg) = crdt();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _guard = hg.commit_lock.lock().unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                commit(&store, b"held");
+            });
+            held_rx.recv().unwrap();
+            assert_eq!(read(&hg).as_deref(), Some(&b"held"[..]));
+        });
+    }
+
+    /// A store nobody reads this way captures nothing; once read, each commit
+    /// captures one view and a read of the lock none, so commits replace one
+    /// kept view.
+    #[test]
+    fn only_commits_of_a_read_store_capture_a_view() {
+        let (store, hg) = crdt();
+        drop(hg.commit_lock.lock().unwrap());
+        drop(hg.commit_lock.lock_to_read().unwrap());
+        assert_eq!(store.snapshots_captured(), 0);
+        read(&hg);
+        assert_eq!(store.snapshots_captured(), 1);
+        drop(hg.commit_lock.lock().unwrap());
+        assert_eq!(store.snapshots_captured(), 2);
+        drop(hg.commit_lock.lock_to_read().unwrap());
+        assert_eq!(store.snapshots_captured(), 2);
+    }
+
+    /// A holder that panicked leaves readers the last whole view, and the
+    /// poisoned lock still refuses them once it is free.
+    #[test]
+    fn a_panicking_holder_publishes_nothing() {
+        let (store, hg) = crdt();
+        commit(&store, b"whole");
+        read(&hg);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = hg.commit_lock.lock().unwrap();
+            commit(&store, b"half");
+            panic!("a holder stops between its writes");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(store.snapshots_captured(), 1);
+        assert!(hg.capture_committed_snapshot().is_err());
     }
 }
 
