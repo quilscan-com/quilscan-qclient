@@ -42,16 +42,39 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 ARG PROTOC_VERSION=25.1
-RUN ARCH=$(dpkg --print-architecture) && \
+# Maven's protobuf 3.25.1 publishes the same protoc 25.1 release. Keep
+# versions and fallback pins together; GitHub release downloads may fail.
+ARG PROTOC_MAVEN_VERSION=3.25.1
+RUN set -eu; \
+    ARCH=$(dpkg --print-architecture); \
     case ${ARCH} in \
-    amd64) PROTOC_ARCH=x86_64 ;; \
-    arm64) PROTOC_ARCH=aarch_64 ;; \
+    amd64) PROTOC_ARCH=x86_64; PROTOC_SHA256=936e423041c6977036208366507964d5615782b5a450ec8d3d52ff557ffc7101 ;; \
+    arm64) PROTOC_ARCH=aarch_64; PROTOC_SHA256=805a11a4de6985f135a708356742234e23140ae46367d31c2062160ad314020e ;; \
     *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
-    esac && \
-    curl -fsSL -o /tmp/protoc.zip \
-        https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip && \
-    unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' && \
-    rm /tmp/protoc.zip
+    esac; \
+    if curl -fsSL --retry 2 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 60 \
+        -o /tmp/protoc.zip \
+        "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" \
+        && unzip -tq /tmp/protoc.zip >/dev/null; then \
+      unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'; \
+    else \
+      echo "GitHub protoc download unavailable; using verified same-version Maven artifacts"; \
+      MAVEN_PROTOBUF=https://repo.maven.apache.org/maven2/com/google/protobuf; \
+      curl -fsSL --retry 2 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 60 \
+        -o /tmp/protoc-maven.exe \
+        "${MAVEN_PROTOBUF}/protoc/${PROTOC_MAVEN_VERSION}/protoc-${PROTOC_MAVEN_VERSION}-linux-${PROTOC_ARCH}.exe"; \
+      printf '%s  %s\n' "${PROTOC_SHA256}" /tmp/protoc-maven.exe | sha256sum -c -; \
+      curl -fsSL --retry 2 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 60 \
+        -o /tmp/protobuf-java.jar \
+        "${MAVEN_PROTOBUF}/protobuf-java/${PROTOC_MAVEN_VERSION}/protobuf-java-${PROTOC_MAVEN_VERSION}.jar"; \
+      printf '%s  %s\n' 48a8e58a1a8f82eff141a7a388d38dfe77d7a48d5e57c9066ee37f19147e20df /tmp/protobuf-java.jar | sha256sum -c -; \
+      install -d /usr/local/bin /usr/local/include; \
+      install -m 0755 /tmp/protoc-maven.exe /usr/local/bin/protoc; \
+      unzip -o /tmp/protobuf-java.jar 'google/protobuf/*.proto' -d /usr/local/include; \
+    fi; \
+    installed_protoc_version=$(/usr/local/bin/protoc --version); \
+    test "${installed_protoc_version}" = "libprotoc ${PROTOC_VERSION}"; \
+    rm -f /tmp/protoc.zip /tmp/protoc-maven.exe /tmp/protobuf-java.jar
 
 # -----------------------------------------------------------------------------
 # Stage: gmp-builder
