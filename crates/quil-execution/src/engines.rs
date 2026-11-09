@@ -586,12 +586,21 @@ pub struct TokenExecutionEngine {
     #[cfg(feature = "native-proof")]
     token_worker:
         Option<quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier>,
+    /// Network selector whose first citable global frame bounds the
+    /// settlement claims this engine admits without a token policy (mainnet
+    /// unless [`Self::set_network`] names another).
+    #[cfg(feature = "native-proof")]
+    network: u8,
     inclusion_prover: Arc<dyn InclusionProver>,
     state: Option<Arc<crate::hypergraph_state::HypergraphState>>,
     key_manager: Arc<dyn quil_types::crypto::KeyManager>,
     clock_store: Arc<dyn quil_types::store::ClockStore>,
     config_resolver: Arc<dyn crate::token_intrinsic::config_resolver::TokenConfigResolver>,
 }
+
+/// Whether a confidential operation `(address, bytes, type)` is refused
+/// before its proof, so no verification of it is needed.
+pub type RefusedBeforeProof<'a> = dyn Fn(&[u8], &[u8], u32) -> bool + 'a;
 
 impl TokenExecutionEngine {
     /// Select the token suite explicitly for this engine. Requires real
@@ -646,6 +655,24 @@ impl TokenExecutionEngine {
         Ok(())
     }
 
+    /// The network selector this engine executes for; every node of a
+    /// network sets the same one.
+    #[cfg(feature = "native-proof")]
+    pub fn set_network(&mut self, network: u8) {
+        self.network = network;
+    }
+
+    /// The network whose first citable global frame bounds the settlement
+    /// claims this engine admits: the token policy's, else the one set by
+    /// [`Self::set_network`] (a node without the token proof suite).
+    #[cfg(feature = "native-proof")]
+    fn citation_network(&self) -> [u8; 32] {
+        self.token_policy.map_or_else(
+            || crate::token_intrinsic::state::network_identifier(self.network),
+            |policy| policy.network,
+        )
+    }
+
     /// Confidential operations inside canonical bundles: `(address, inner bytes,
     /// type prefix)` for every request the token suite would verify.
     #[cfg(feature = "native-proof")]
@@ -685,6 +712,7 @@ impl TokenExecutionEngine {
                 &worker,
                 bundles,
                 &crate::manager::PreverifyPacing::default(),
+                &|_, _, _| false,
             ),
             None => Default::default(),
         }
@@ -704,21 +732,25 @@ impl TokenExecutionEngine {
 
     /// [`Self::preverify_bundles`] with `policy` and `worker`, paced by
     /// `pacing`: at most its parallelism at once, each operation counted
-    /// into its progress, and none started while its pause holds.
+    /// into its progress, and none started while its pause holds. An
+    /// operation `refused(address, bytes, type)` is not verified (it counts
+    /// in `operations` only): execution refuses it before its proof.
     #[cfg(feature = "native-proof")]
     pub fn preverify_with(
         policy: crate::token_intrinsic::dispatch::TokenPolicy,
         worker: &quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier,
         bundles: &[(Vec<u8>, Vec<u8>)],
         pacing: &crate::manager::PreverifyPacing<'_>,
+        refused: &RefusedBeforeProof<'_>,
     ) -> crate::manager::PreverifyCounts {
         use crate::token_intrinsic::dispatch::Preverified;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let operations = Self::confidential_operations(bundles);
+        let mut operations = Self::confidential_operations(bundles);
         let mut counts = crate::manager::PreverifyCounts {
             operations: operations.len(),
             ..Default::default()
         };
+        operations.retain(|(address, bytes, tp)| !refused(address, bytes, *tp));
         if operations.is_empty() {
             return counts;
         }
@@ -780,15 +812,19 @@ impl TokenExecutionEngine {
 
     /// The confidential operations in `bundles` whose verdicts `policy` has
     /// not cached yet, with their structure's verification floor: what
-    /// executing them would still verify.
+    /// executing them would still verify (not those `refused`, which
+    /// execution refuses before their proof).
     #[cfg(feature = "native-proof")]
     pub fn unverified_operation_estimates(
         policy: &crate::token_intrinsic::dispatch::TokenPolicy,
         bundles: &[(Vec<u8>, Vec<u8>)],
+        refused: &RefusedBeforeProof<'_>,
     ) -> Vec<crate::manager::OperationEstimate> {
         Self::confidential_operations(bundles)
             .into_iter()
-            .filter(|(address, bytes, tp)| !policy.verdict_cached(address, bytes, *tp))
+            .filter(|(address, bytes, tp)| {
+                !policy.verdict_cached(address, bytes, *tp) && !refused(address, bytes, *tp)
+            })
             .map(|(_, bytes, tp)| crate::manager::OperationEstimate {
                 bytes: bytes.len(),
                 floor_secs: crate::token_intrinsic::dispatch::verify_floor_secs(&bytes, tp),
@@ -836,6 +872,8 @@ impl TokenExecutionEngine {
             token_execution: std::sync::Mutex::new(()),
             #[cfg(feature = "native-proof")]
             token_worker: None,
+            #[cfg(feature = "native-proof")]
+            network: crate::pricing::MAINNET_NETWORK,
             inclusion_prover,
             state: None,
             key_manager,
@@ -864,6 +902,8 @@ impl TokenExecutionEngine {
             token_execution: std::sync::Mutex::new(()),
             #[cfg(feature = "native-proof")]
             token_worker: None,
+            #[cfg(feature = "native-proof")]
+            network: crate::pricing::MAINNET_NETWORK,
             inclusion_prover,
             state: Some(state),
             key_manager,
@@ -921,6 +961,14 @@ impl InclusionProver for NoopInclusionProver {
     ) -> bool {
         true
     }
+}
+
+/// A confidential token operation reached an engine without a proof policy
+/// (`proofWorker.disabled`, or a build without the native verifier). This
+/// node cannot tell whether the operation is valid, so it must not skip it as
+/// invalid while verifying replicas apply it: the frame fails here instead.
+fn token_proofs_unconfigured() -> QuilError {
+    QuilError::ExecutionUnavailable("token proof verification is not configured".into())
 }
 
 impl ShardExecutionEngine for TokenExecutionEngine {
@@ -992,10 +1040,9 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 | crate::token_engine::TYPE_LATTICE_PENDING_CLAIM
                 | crate::token_engine::TYPE_LATTICE_SHIELD
                 | crate::token_engine::TYPE_LATTICE_MINT_CLAIM
-                | crate::token_engine::TYPE_LATTICE_SETTLEMENT => {
-                    return Err(QuilError::InvalidArgument(
-                        "token proof verification is not configured".into(),
-                    ));
+                | crate::token_engine::TYPE_LATTICE_SETTLEMENT
+                | crate::token_intrinsic::constants::TYPE_COIN_DELIVERY => {
+                    return Err(token_proofs_unconfigured());
                 }
                 _ => {
                     crate::token_engine::peek_token_message_kind(inner_bytes)?;
@@ -1093,11 +1140,10 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         | crate::token_engine::TYPE_LATTICE_SHIELD
                         | crate::token_engine::TYPE_LATTICE_MINT_CLAIM
                         | crate::token_engine::TYPE_LATTICE_SETTLEMENT
+                        | crate::token_intrinsic::constants::TYPE_COIN_DELIVERY
                 ) =>
                 {
-                    return Err(QuilError::InvalidArgument(
-                        "token proof verification is not configured".into(),
-                    ));
+                    return Err(token_proofs_unconfigured());
                 }
                 None => return Ok(()), // other stateless operations skip materialization
             };
@@ -1216,10 +1262,9 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 | crate::token_engine::TYPE_LATTICE_PENDING_CLAIM
                 | crate::token_engine::TYPE_LATTICE_SHIELD
                 | crate::token_engine::TYPE_LATTICE_MINT_CLAIM
-                | crate::token_engine::TYPE_LATTICE_SETTLEMENT => {
-                    return Err(QuilError::InvalidArgument(
-                        "token proof verification is not configured".into(),
-                    ));
+                | crate::token_engine::TYPE_LATTICE_SETTLEMENT
+                | crate::token_intrinsic::constants::TYPE_COIN_DELIVERY => {
+                    return Err(token_proofs_unconfigured());
                 }
                 crate::token_engine::TYPE_MINT_TRANSACTION => {
                     // Retired (decaf448): the confidential-value path is now
@@ -1260,6 +1305,13 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             &deploy.config,
                         )?;
                         check_post_quantum_token_config(&cfg)?;
+                        if crate::config_replay::config_replay_guarded(context) {
+                            crate::config_replay::refuse_redeploy(
+                                state,
+                                &crate::token_intrinsic::materialize::token_deploy_domain(&cfg)?,
+                                "token",
+                            )?;
+                        }
                         let derived =
                             crate::token_intrinsic::materialize::materialize_token_deploy_init(
                                 state,
@@ -1315,7 +1367,10 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             // The signed message is the canonical-bytes
                             // encoding of the TokenUpdate with its
                             // signature field cleared, domain
-                            // `address || "TOKEN_UPDATE"`.
+                            // `address || "TOKEN_UPDATE"`, followed from
+                            // the config replay frame by the digest of the
+                            // metadata vertex it replaces, so an update
+                            // applies once.
                             let prior = prior_cfg.as_ref().ok_or_else(|| {
                                 QuilError::InvalidArgument(
                                     "token update: prior config not found — \
@@ -1342,9 +1397,17 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                                     "token update: missing signature".into(),
                                 ));
                             }
-                            let mut domain = Vec::with_capacity(32 + b"TOKEN_UPDATE".len());
-                            domain.extend_from_slice(_address);
-                            domain.extend_from_slice(b"TOKEN_UPDATE");
+                            let guarded = crate::config_replay::config_replay_guarded(context);
+                            let binding = if guarded {
+                                crate::config_replay::stored_binding(state, _address)?
+                            } else {
+                                None
+                            };
+                            let domain = crate::config_replay::update_signing_domain(
+                                _address,
+                                crate::config_replay::TOKEN_UPDATE_TAG,
+                                binding.as_deref(),
+                            );
                             let ok = self.key_manager.validate_signature(
                                 quil_types::crypto::KeyType::Falcon512,
                                 &prior.owner_public_key,
@@ -1384,6 +1447,13 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                                 _frame_number,
                                 self.inclusion_prover.as_ref(),
                             )?;
+                            if guarded {
+                                crate::config_replay::advance_update_sequence(
+                                    state,
+                                    _address,
+                                    _frame_number,
+                                )?;
+                            }
                         }
                         self.config_resolver.invalidate(_address);
                     }
@@ -1428,11 +1498,16 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                 // price must open with a settlement claim covering that growth
                 // (paid to the executing shard's provers); the claim may also
                 // carry a paid mint's price to the token's payment address.
+                // Every engine that writes state admits it, with or without
+                // the token proof suite: one that skipped the claim applied
+                // a priced deploy or update the others refused, and left the
+                // claim's record unconsumed.
                 #[cfg(feature = "native-proof")]
-                if self.token_policy.is_some()
+                if self.state.is_some()
                     && _address.len() >= 32
                     && _address[..32] != crate::domains::QUIL_TOKEN
                 {
+                    let network = self.citation_network();
                     let growth = bundle
                         .requests
                         .iter()
@@ -1444,6 +1519,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         &crate::token_intrinsic::settlement_claim::PaymentContext {
                             state: self.state.as_deref(),
                             clock: Some(self.clock_store.as_ref()),
+                            network: &network,
                             global_bound: settlement_global_bound(
                                 effective_mode(self.mode, context),
                                 context,
@@ -1482,13 +1558,23 @@ impl ShardExecutionEngine for TokenExecutionEngine {
             }
             TYPE_MESSAGE_REQUEST => {
                 let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
-                // A lone custom-token request cannot carry a claim, so it is
-                // admitted only when it grows no state or the price is zero.
+                // A claim funds the bundle it opens, so a lone custom-token
+                // request carrying one is refused by every replica alike. Any
+                // other is admitted only when it grows no state or the price
+                // is zero, with or without the token proof suite, as a bundle is.
                 #[cfg(feature = "native-proof")]
-                if self.token_policy.is_some()
+                if self.state.is_some()
                     && _address.len() >= 32
                     && _address[..32] != crate::domains::QUIL_TOKEN
                 {
+                    if req.inner_type_prefix
+                        == crate::token_intrinsic::settlement_claim::TYPE_SETTLEMENT_CLAIM
+                    {
+                        return Err(QuilError::InvalidArgument(
+                            "token: a settlement claim must open a bundle".into(),
+                        ));
+                    }
+                    let network = self.citation_network();
                     let growth = token_consumer_cost(&req)?;
                     let single = CanonicalMessageBundle {
                         requests: vec![Some(req.clone())],
@@ -1498,6 +1584,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         &crate::token_intrinsic::settlement_claim::PaymentContext {
                             state: None,
                             clock: None,
+                            network: &network,
                             global_bound: None,
                             frame_number: _frame_number,
                             multiplier: _fee_multiplier,
@@ -1956,6 +2043,9 @@ pub struct ComputeExecutionEngine {
     circuit_compiler: Arc<dyn quil_types::execution::CircuitCompiler>,
     /// Canonical global frames, for settlement claims funding compute writes.
     global_clock: Option<Arc<dyn quil_types::store::ClockStore>>,
+    /// Network selector whose first citable global frame bounds those claims
+    /// (mainnet unless [`Self::set_network`] names another).
+    network: u8,
 }
 
 impl TokenExecutionEngine {
@@ -2003,6 +2093,7 @@ impl ComputeExecutionEngine {
             key_manager,
             circuit_compiler,
             global_clock: None,
+            network: crate::pricing::MAINNET_NETWORK,
         }
     }
 
@@ -2021,6 +2112,7 @@ impl ComputeExecutionEngine {
             key_manager,
             circuit_compiler,
             global_clock: None,
+            network: crate::pricing::MAINNET_NETWORK,
         }
     }
 }
@@ -2059,6 +2151,12 @@ impl ComputeExecutionEngine {
     /// Store holding canonical global frames (settlement claim citations).
     pub fn set_global_clock_store(&mut self, store: Arc<dyn quil_types::store::ClockStore>) {
         self.global_clock = Some(store);
+    }
+
+    /// The network selector this engine executes for; every node of a
+    /// network sets the same one.
+    pub fn set_network(&mut self, network: u8) {
+        self.network = network;
     }
 }
 
@@ -2110,6 +2208,7 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
                 &crate::token_intrinsic::settlement_claim::PaymentContext {
                     state: self.state.as_deref(),
                     clock: self.global_clock.as_deref(),
+                    network: &crate::token_intrinsic::state::network_identifier(self.network),
                     global_bound: settlement_global_bound(
                         effective_mode(self.mode, context),
                         context,
@@ -2123,7 +2222,7 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
             )?;
             #[cfg(not(feature = "confidential-tokens"))]
             let _ = fee_multiplier;
-            self.process_unpaid(context.frame_number, address, message)
+            self.process_unpaid(context, address, message)
         })();
         match (self.state.as_ref(), result) {
             (Some(state), Ok(outcome)) => {
@@ -2204,10 +2303,11 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
 impl ComputeExecutionEngine {
     fn process_unpaid(
         &self,
-        frame_number: u64,
+        context: quil_types::execution::FrameExecutionContext,
         address: &[u8],
         message: &[u8],
     ) -> Result<ProcessMessageResult> {
+        let frame_number = context.frame_number;
         if message.len() < 4 {
             return Ok(ProcessMessageResult {
                 messages: Vec::new(),
@@ -2334,6 +2434,15 @@ impl ComputeExecutionEngine {
                                 "compute deploy: hypergraph state not installed".into(),
                             )
                         })?;
+                        if crate::config_replay::config_replay_guarded(context) {
+                            crate::config_replay::refuse_redeploy(
+                                s,
+                                &crate::compute_intrinsic::materialize::compute_deploy_domain(
+                                    &cfg,
+                                )?,
+                                "compute",
+                            )?;
+                        }
                         // The compute engine has no inclusion_prover field
                         // of its own; commit metadata sub-trees with the
                         // CRDT's prover (same one the frame commit uses).
@@ -2395,9 +2504,15 @@ impl ComputeExecutionEngine {
                         ));
                     }
                     // Post-quantum owner auth: a single FALCON signature.
-                    let mut domain_bytes = Vec::with_capacity(32 + b"COMPUTE_UPDATE".len());
-                    domain_bytes.extend_from_slice(address);
-                    domain_bytes.extend_from_slice(b"COMPUTE_UPDATE");
+                    // From the config replay frame the owner signs the
+                    // digest of the metadata vertex the update replaces.
+                    let guarded = crate::config_replay::config_replay_guarded(context);
+                    let domain_bytes = crate::config_replay::update_separator(
+                        s,
+                        address,
+                        crate::config_replay::COMPUTE_UPDATE_TAG,
+                        context,
+                    )?;
                     let ok = km.validate_signature(
                         quil_types::crypto::KeyType::Falcon512,
                         &prior_owner_key,
@@ -2428,6 +2543,9 @@ impl ComputeExecutionEngine {
                         frame_number,
                         prover.as_ref(),
                     )?;
+                    if guarded {
+                        crate::config_replay::advance_update_sequence(s, address, frame_number)?;
+                    }
                 }
                 _ => {
                     crate::compute_engine::peek_compute_message_kind(inner_bytes)?;
@@ -2488,12 +2606,21 @@ pub struct HypergraphExecutionEngine {
     key_manager: Option<Arc<dyn quil_types::crypto::KeyManager>>,
     /// Canonical global frames, for settlement claims funding writes.
     global_clock: Option<Arc<dyn quil_types::store::ClockStore>>,
+    /// Network selector whose first citable global frame bounds those claims
+    /// (mainnet unless [`Self::set_network`] names another).
+    network: u8,
 }
 
 impl HypergraphExecutionEngine {
     /// Store holding canonical global frames (settlement claim citations).
     pub fn set_global_clock_store(&mut self, store: Arc<dyn quil_types::store::ClockStore>) {
         self.global_clock = Some(store);
+    }
+
+    /// The network selector this engine executes for; every node of a
+    /// network sets the same one.
+    pub fn set_network(&mut self, network: u8) {
+        self.network = network;
     }
 
     pub fn new(
@@ -2507,6 +2634,7 @@ impl HypergraphExecutionEngine {
             config_resolver,
             key_manager: None,
             global_clock: None,
+            network: crate::pricing::MAINNET_NETWORK,
         }
     }
 
@@ -2523,6 +2651,7 @@ impl HypergraphExecutionEngine {
             config_resolver,
             key_manager: None,
             global_clock: None,
+            network: crate::pricing::MAINNET_NETWORK,
         }
     }
 
@@ -2740,11 +2869,12 @@ impl HypergraphExecutionEngine {
     /// silently no-op past their verify gate.
     fn process_inner_op(
         &self,
-        frame_number: u64,
+        context: quil_types::execution::FrameExecutionContext,
         address: &[u8],
         inner_type_prefix: u32,
         inner_bytes: &[u8],
     ) -> Result<()> {
+        let frame_number = context.frame_number;
         use crate::hypergraph_intrinsic::canonical::{
             TYPE_HYPERGRAPH_DEPLOYMENT, TYPE_HYPERGRAPH_UPDATE,
         };
@@ -2754,7 +2884,7 @@ impl HypergraphExecutionEngine {
         // Defense-in-depth: re-verify before materializing. The
         // frame boundary wires validate_message before process_message,
         // but engines should not assume the caller has done that check.
-        self.validate_inner_op(address, inner_type_prefix, inner_bytes)?;
+        self.validate_inner_op(address, inner_type_prefix, inner_bytes, Some(context))?;
         match inner_type_prefix {
             TYPE_HYPERGRAPH_DEPLOYMENT => {
                 // Derive the new hypergraph app's domain and write the
@@ -2767,6 +2897,13 @@ impl HypergraphExecutionEngine {
                 if let (Some(cfg), Some(state)) =
                     (dispatched.deploy.config.as_ref(), self.state.as_ref())
                 {
+                    if crate::config_replay::config_replay_guarded(context) {
+                        crate::config_replay::refuse_redeploy(
+                            state,
+                            &crate::hypergraph_intrinsic::hypergraph_deploy_domain(cfg)?,
+                            "hypergraph",
+                        )?;
+                    }
                     let _derived = crate::hypergraph_intrinsic::materialize_hypergraph_deploy_init(
                         state,
                         cfg,
@@ -2793,6 +2930,13 @@ impl HypergraphExecutionEngine {
                         frame_number,
                         self.inclusion_prover.as_ref(),
                     )?;
+                    if crate::config_replay::config_replay_guarded(context) {
+                        crate::config_replay::advance_update_sequence(
+                            state,
+                            address,
+                            frame_number,
+                        )?;
+                    }
                 }
                 Ok(())
             }
@@ -2815,6 +2959,7 @@ impl HypergraphExecutionEngine {
         address: &[u8],
         inner_type_prefix: u32,
         inner_bytes: &[u8],
+        context: Option<quil_types::execution::FrameExecutionContext>,
     ) -> Result<()> {
         use crate::hypergraph_intrinsic::canonical::{
             TYPE_HYPERGRAPH_DEPLOYMENT, TYPE_HYPERGRAPH_UPDATE,
@@ -2843,7 +2988,9 @@ impl HypergraphExecutionEngine {
                 }
                 Ok(())
             }
-            TYPE_HYPERGRAPH_UPDATE => self.validate_hypergraph_update(address, inner_bytes),
+            TYPE_HYPERGRAPH_UPDATE => {
+                self.validate_hypergraph_update(address, inner_bytes, context)
+            }
             _ => {
                 // Vertex add/remove, hyperedge add/remove — existing
                 // dispatch path (structural decode + per-op validate).
@@ -2873,8 +3020,17 @@ impl HypergraphExecutionEngine {
     /// `domain || "HYPERGRAPH_UPDATE"` as the BLS domain separator.
     /// `domain` is the routing address — the hypergraph being updated.
     /// The resolver looks up the existing owner key for that domain.
-    fn validate_hypergraph_update(&self, domain: &[u8], inner_bytes: &[u8]) -> Result<()> {
-        use crate::hypergraph_intrinsic::auth::verify_update_signature;
+    /// Verify a hypergraph update. In a frame (`context`) the owner's
+    /// signature must bind exactly as the frame requires: from the config
+    /// replay frame, to the digest of the metadata vertex the update
+    /// replaces. Admission, which knows no frame, accepts either form.
+    fn validate_hypergraph_update(
+        &self,
+        domain: &[u8],
+        inner_bytes: &[u8],
+        context: Option<quil_types::execution::FrameExecutionContext>,
+    ) -> Result<()> {
+        use crate::hypergraph_intrinsic::auth::{verify_update_signature, AuthCheck};
         let dispatched = crate::hypergraph_intrinsic::decode_and_validate_update(inner_bytes)?;
         let update = &dispatched.update;
         // Re-assert config key lengths after dispatch's structural
@@ -2896,13 +3052,31 @@ impl HypergraphExecutionEngine {
             )
         })?;
         let bytes_without_sig = update.to_canonical_bytes_without_signature()?;
-        let check = verify_update_signature(
-            &self.config_resolver,
-            domain,
-            &bytes_without_sig,
-            &sig.signature,
-            key_manager.as_ref(),
-        )?;
+        let stored = || match self.state.as_ref() {
+            Some(state) => crate::config_replay::stored_binding(state, domain),
+            None => Ok(None),
+        };
+        let bindings = match context.map(crate::config_replay::config_replay_guarded) {
+            Some(true) => vec![Some(stored()?.ok_or_else(|| {
+                QuilError::InvalidArgument("hypergraph update: no metadata vertex to bind".into())
+            })?)],
+            Some(false) => vec![None],
+            None => vec![None, stored()?],
+        };
+        let mut check = AuthCheck::Invalid;
+        for binding in &bindings {
+            check = verify_update_signature(
+                &self.config_resolver,
+                domain,
+                &bytes_without_sig,
+                &sig.signature,
+                key_manager.as_ref(),
+                binding.as_deref(),
+            )?;
+            if check == AuthCheck::Verified {
+                break;
+            }
+        }
         Self::auth_check_to_result(check, "hypergraph_update")?;
         // Schema-evolution check. The new schema must be a strict
         // superset of the prior schema (no removed classes or fields,
@@ -2962,14 +3136,14 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
                 for req in &bundle.requests {
                     if let Some(r) = req {
-                        self.validate_inner_op(address, r.inner_type_prefix, &r.inner_bytes)?;
+                        self.validate_inner_op(address, r.inner_type_prefix, &r.inner_bytes, None)?;
                     }
                 }
                 Ok(())
             }
             crate::hypergraph_engine::MessageKindTopLevel::Request => {
                 let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
-                self.validate_inner_op(address, req.inner_type_prefix, &req.inner_bytes)?;
+                self.validate_inner_op(address, req.inner_type_prefix, &req.inner_bytes, None)?;
                 Ok(())
             }
         }
@@ -3019,6 +3193,7 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
                 &crate::token_intrinsic::settlement_claim::PaymentContext {
                     state: self.state.as_deref(),
                     clock: self.global_clock.as_deref(),
+                    network: &crate::token_intrinsic::state::network_identifier(self.network),
                     global_bound: settlement_global_bound(
                         effective_mode(self.mode, context),
                         context,
@@ -3038,7 +3213,7 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
                     for req in &bundle.requests {
                         if let Some(r) = req {
                             self.process_inner_op(
-                                frame_number,
+                                context,
                                 address,
                                 r.inner_type_prefix,
                                 &r.inner_bytes,
@@ -3049,7 +3224,7 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
                 crate::hypergraph_engine::MessageKindTopLevel::Request => {
                     let req = CanonicalMessageRequest::from_canonical_bytes(message)?;
                     self.process_inner_op(
-                        frame_number,
+                        context,
                         address,
                         req.inner_type_prefix,
                         &req.inner_bytes,
@@ -3532,9 +3707,9 @@ mod tests {
         )));
         let mut engine = token_engine_test(ExecutionMode::Application);
         engine.state = Some(state.clone());
-        let mut unsupported = crate::token_engine::TYPE_LATTICE_TRANSACTION
-            .to_be_bytes()
-            .to_vec();
+        // A retired type is a deterministic rejection with or without a
+        // proof policy; an unverifiable confidential type fails the frame.
+        let mut unsupported = Vec::from(crate::token_engine::TYPE_TRANSACTION.to_be_bytes());
         unsupported.extend_from_slice(b"QCT3");
         let request = CanonicalMessageRequest::wrap(unsupported.clone())
             .unwrap()
@@ -3550,7 +3725,7 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_token_engine_rejects_all_confidential_types_before_decoding() {
+    fn unconfigured_token_engine_fails_on_all_confidential_types_before_decoding() {
         use crate::token_engine::*;
         for (mode, stateful) in [
             (ExecutionMode::Application, false),
@@ -3575,6 +3750,8 @@ mod tests {
                 TYPE_LATTICE_PENDING_CLAIM,
                 TYPE_LATTICE_SHIELD,
                 TYPE_LATTICE_MINT_CLAIM,
+                TYPE_LATTICE_SETTLEMENT,
+                crate::token_intrinsic::constants::TYPE_COIN_DELIVERY,
             ] {
                 for body in [b"QLCT".as_slice(), b"QCT3".as_slice(), b"".as_slice()] {
                     let mut inner = tp.to_be_bytes().to_vec();
@@ -3595,11 +3772,102 @@ mod tests {
                                 )
                                 .map(|_| ()),
                         ] {
-                            assert!(matches!(result, Err(QuilError::InvalidArgument(ref reason))
-                                if reason == "token proof verification is not configured"));
+                            assert!(
+                                matches!(result, Err(QuilError::ExecutionUnavailable(ref reason))
+                                if reason == "token proof verification is not configured")
+                            );
                         }
                         assert_eq!(state.changeset_len(), 0);
                     }
+                }
+            }
+        }
+    }
+
+    /// A/B reproducer for unverifiable confidential operations: a node
+    /// without a token proof policy (`proofWorker.disabled`) rejected them as
+    /// invalid, so its materialization skipped what verifying replicas apply
+    /// and its state forked silently. A build that fails the frame instead
+    /// returns an execution failure.
+    #[test]
+    fn reproduces_unverifiable_confidential_operation_skipped() {
+        let state = Arc::new(crate::hypergraph_state::HypergraphState::new(Arc::new(
+            quil_hypergraph::HypergraphCrdt::new(
+                Arc::new(quil_hypergraph::testing::MemStore::new()),
+                Arc::new(quil_types::crypto::NoopInclusionProver),
+            ),
+        )));
+        let mut engine = token_engine_test(ExecutionMode::Application);
+        engine.state = Some(state);
+        let mut inner = crate::token_engine::TYPE_LATTICE_TRANSACTION
+            .to_be_bytes()
+            .to_vec();
+        inner.extend_from_slice(b"QCT3");
+        let message = CanonicalMessageRequest::wrap(inner)
+            .unwrap()
+            .to_canonical_bytes()
+            .unwrap();
+        for result in [
+            engine.validate_message(1, &domains::QUIL_TOKEN, &message),
+            engine
+                .process_message(1, &BigInt::from(1), &domains::QUIL_TOKEN, &message)
+                .map(|_| ()),
+        ] {
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(QuilError::is_execution_unavailable),
+                "a confidential operation this node cannot verify was skipped as invalid \
+                 ({result:?}) while verifying replicas apply it"
+            );
+        }
+    }
+
+    /// Class guard for unverifiable operations: every token type a proof
+    /// policy verifies (the types `validate_message` hands to the policy)
+    /// fails the frame on an engine without one, in every mode, instead of
+    /// being rejected or skipped. A newly verified type fails here until the
+    /// unconfigured arms list it.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn unconfigured_token_engine_fails_on_every_policy_verified_type() {
+        let verified: Vec<u32> = (0x0500u32..=0x05ff)
+            .filter(|tp| {
+                crate::token_intrinsic::dispatch::is_confidential_type(*tp)
+                    || *tp == crate::token_intrinsic::constants::TYPE_COIN_DELIVERY
+            })
+            .collect();
+        assert!(!verified.is_empty());
+        for (mode, stateful) in [
+            (ExecutionMode::Application, false),
+            (ExecutionMode::Application, true),
+            (ExecutionMode::Global, false),
+            (ExecutionMode::Global, true),
+        ] {
+            let mut engine = token_engine_test(mode);
+            if stateful {
+                engine.state = Some(Arc::new(crate::hypergraph_state::HypergraphState::new(
+                    Arc::new(quil_hypergraph::HypergraphCrdt::new(
+                        Arc::new(quil_hypergraph::testing::MemStore::new()),
+                        Arc::new(quil_types::crypto::NoopInclusionProver),
+                    )),
+                )));
+            }
+            for &tp in &verified {
+                let message = make_bundle(vec![tp.to_be_bytes().to_vec()]);
+                for result in [
+                    engine.validate_message(1, &domains::QUIL_TOKEN, &message),
+                    engine
+                        .process_message(1, &BigInt::from(1), &domains::QUIL_TOKEN, &message)
+                        .map(|_| ()),
+                ] {
+                    assert!(
+                        result
+                            .as_ref()
+                            .is_err_and(QuilError::is_execution_unavailable),
+                        "token type {tp:#06x} is verified by a proof policy, but an engine \
+                         without one returned {result:?} instead of failing the frame"
+                    );
                 }
             }
         }
@@ -4100,6 +4368,8 @@ mod tests {
         );
         let clock = Arc::new(quil_store::testing::InMemoryClockStore::new());
         engine.set_global_clock_store(clock.clone());
+        // A test network: its claims may cite frames from 0, like this frame 9.
+        engine.set_network(1);
 
         // The consumer write: a signed vertex add, bound by the payer's context.
         let kp = quil_crypto::sntrup761::Sntrup761KeyPair::generate();
@@ -4564,3 +4834,15 @@ mod tests {
     // TYPE_TRANSACTION arm for the full attack chain.
     // =================================================================
 }
+
+#[cfg(all(test, feature = "native-proof"))]
+#[path = "token_settlement_parity_tests.rs"]
+mod token_settlement_parity_tests;
+
+#[cfg(test)]
+#[path = "token_deploy_replay_tests.rs"]
+mod token_deploy_replay_tests;
+
+#[cfg(test)]
+#[path = "update_replay_tests.rs"]
+mod update_replay_tests;

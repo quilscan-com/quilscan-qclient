@@ -7,6 +7,10 @@ use std::time::{Duration, Instant};
 
 use crate::prover_tree_syncer::{ArchiveGap, ReplayTurn, ShardRecoveryProgress};
 use crate::recovery_turns::{RecoveryKind, MAX_TURN_HOLD};
+use crate::replay_split::{SlowReplayLog, SlowReplays};
+
+/// This process's workers' slow replays, warned about once between them.
+static SLOW_REPLAYS: SlowReplays = SlowReplays::new();
 
 tokio::task_local! {
     /// The record of the worker whose archive recovery runs on this task.
@@ -22,7 +26,7 @@ pub const STATES: [&str; 9] = [
 
 /// Every reason a record gives for its phase (`WorkerExecution.blocker`),
 /// besides none.
-pub const BLOCKERS: [&str; 14] = [
+pub const BLOCKERS: [&str; 17] = [
     "waiting for transport",
     "restarting consensus host",
     "engine exited",
@@ -30,6 +34,9 @@ pub const BLOCKERS: [&str; 14] = [
     "staging shard data",
     "awaiting closing certificate",
     "awaiting allocation activation",
+    "awaiting committee session",
+    "awaiting shard re-anchor",
+    "awaiting GLOBAL state sync",
     "checkpoint mismatch",
     "state unavailable",
     "committee admission unavailable",
@@ -103,6 +110,23 @@ pub fn with_renewal_state(
         && crate::provers::session_hosting::silent_renewal_withheld(filter)
     {
         execution.blocker = quil_types::consensus::SILENT_RENEWAL_BLOCKER.into();
+    }
+    Some(execution)
+}
+
+/// A worker's report as the worker view shows it, with what restarting the
+/// node now costs the worker's seat ([`crate::restart_readiness`]). A worker
+/// without a seat has none.
+pub fn with_restart_readiness(
+    filter: &[u8],
+    execution: Option<WorkerExecution>,
+) -> Option<WorkerExecution> {
+    let mut execution = execution?;
+    if !filter.is_empty() {
+        execution.restart = Some(crate::restart_readiness::seat_readiness(
+            filter,
+            crate::restart_readiness::margin_of(&execution, now_ms()),
+        ));
     }
     Some(execution)
 }
@@ -285,6 +309,17 @@ impl SharedWorkerExecution {
         self.departing.clone()
     }
 
+    /// The archive recovery attempts this worker made, deferred ones apart
+    /// ([`Self::recovering`]).
+    pub(crate) fn recovery_attempts(&self) -> u32 {
+        self.record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recovery
+            .as_ref()
+            .map_or(0, |recovery| recovery.attempts)
+    }
+
     /// A replay of `filter` ended its turn behind its target: its next
     /// recovery of the shard queues again at `ticket`, its place, rather
     /// than behind every waiter.
@@ -448,6 +483,21 @@ impl SharedWorkerExecution {
         s.silent_ms = votes.silent_ms;
     }
 
+    /// The running committee session as consensus last saw it
+    /// (`WorkerExecution.committee_members` and its companions); all zero
+    /// clears it when no session host runs.
+    pub(crate) fn committee(&self, members: usize, quorum: usize, voters: usize) {
+        let mut s = self.record.lock().unwrap();
+        let to_u32 = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        if members == 0 && s.committee_members == 0 {
+            return;
+        }
+        s.committee_members = to_u32(members);
+        s.committee_quorum = to_u32(quorum);
+        s.committee_voters = to_u32(voters);
+        s.committee_observed_unix_ms = if members == 0 { 0 } else { now_ms() };
+    }
+
     /// The engine this record belongs to started now
     /// (`WorkerExecution.engine_started_unix_ms`).
     pub fn engine_started(&self) {
@@ -594,12 +644,24 @@ impl SharedWorkerExecution {
                 "archive recovery attempt waited for this node's proof verification; not counted as a failure");
             return result;
         }
-        let (logged, classes, failed_before, first_failure) = {
+        // A recovery holding at a frame a session fence discarded succeeds
+        // on every attempt: it logs its hold, not each attempt.
+        let (discarded, materialized, committed) = match &result {
+            Ok(ShardRecoveryProgress::Replayed {
+                discarded_tip,
+                materialized,
+                committed_tip,
+                ..
+            }) => (*discarded_tip, *materialized, *committed_tip),
+            _ => (None, 0, None),
+        };
+        let (logged, classes, failed_before, first_failure, hold) = {
             let mut streaks = self
                 .streaks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let streak = streaks.entry(filter.to_vec()).or_default();
+            let hold = streak.held(discarded, now);
             // The failures a success ends, warned about or not: one or two
             // failures between successes never reach the warning.
             let failed_before = match streak.failures {
@@ -623,7 +685,7 @@ impl SharedWorkerExecution {
             let first_failure = logged.is_none()
                 && class.is_some_and(|class| class != NO_ARCHIVE)
                 && streak.first_failure_due(now);
-            (logged, streak.classes(), failed_before, first_failure)
+            (logged, streak.classes(), failed_before, first_failure, hold)
         };
         // An attempt stopped at a shard frame no archive serves backs off the
         // next while it stops there again.
@@ -652,17 +714,53 @@ impl SharedWorkerExecution {
         };
         note_archive_known(filter, class != Some(NO_ARCHIVE), failure.as_deref(), now);
         let filter = hex::encode(filter);
+        if let Some(HoldLog::Ended { attempts, duration }) = hold {
+            let outcome = failure.as_deref().unwrap_or(ended.last_outcome.as_str());
+            tracing::info!(%filter, attempts, holding_secs = duration.as_secs(), %outcome, source,
+                "archive recovery no longer holds at frames a session fence discarded");
+        }
+        let holding = match hold {
+            Some(HoldLog::Began) => Some((1, Duration::ZERO)),
+            Some(HoldLog::Holding { attempts, duration }) => Some((attempts, duration)),
+            _ => None,
+        };
+        if let Some((attempts, duration)) = holding {
+            let committed =
+                committed.map_or_else(|| "unknown".to_string(), |frame| frame.to_string());
+            tracing::info!(%filter, discarded_frame = discarded.unwrap_or_default(), materialized,
+                committed_tip = %committed, source, attempts, holding_secs = duration.as_secs(),
+                scope = "archive",
+                action = "expected: archives serve the frames a session fence discarded as the latest until the \
+                    successor session produces past them; this worker is current where it holds; it ends when the \
+                    successor produces",
+                "archive recovery holds at frames a session fence discarded");
+        }
         match failure {
             None => {
                 let turn = match &result {
                     Ok(ShardRecoveryProgress::Replayed { turn, .. }) => *turn,
                     _ => ReplayTurn::default(),
                 };
-                tracing::info!(%filter, outcome = %ended.last_outcome, source,
-                    attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
-                    installed_leaves = ended.attempt_installed_leaves, frames = turn.frames, batches = turn.batches,
-                    fetch_ms = turn.fetch_ms, replay_ms = turn.replay_ms, turn_back_ms = turn.turn_back_ms, failed_attempts = failed_before.0,
-                    failed_classes = %failed_before.1, "archive recovery batch complete");
+                // A hold logs at info above.
+                if discarded.is_some() {
+                    tracing::debug!(%filter, outcome = %ended.last_outcome, source,
+                        attempt_secs = ended.attempt_ms / 1000, "archive recovery batch complete");
+                } else {
+                    tracing::info!(%filter, outcome = %ended.last_outcome, source,
+                        attempt_secs = ended.attempt_ms / 1000, permit_wait_secs = ended.permit_wait_ms / 1000,
+                        installed_leaves = ended.attempt_installed_leaves, frames = turn.frames, batches = turn.batches,
+                        fetch_ms = turn.fetch_ms, replay_ms = turn.replay_ms, turn_back_ms = turn.turn_back_ms, failed_attempts = failed_before.0,
+                        failed_classes = %failed_before.1,
+                        global_sync_wait_ms = turn.split.global_sync_wait_ms, engine_queue_ms = turn.split.engine_queue_ms,
+                        prepare_ms = turn.split.prepare_ms, preverify_ms = turn.split.preverify_ms,
+                        store_write_ms = turn.split.store_write_ms, store_wait_ms = turn.split.store_wait_ms,
+                        commit_wait_ms = turn.split.commit_wait_ms, cpu_ms = turn.split.cpu_ms,
+                        run_wait_ms = turn.split.run_wait_ms, other_ms = turn.split.other_ms,
+                        replay_mostly = turn.split.mostly().map_or("none", |part| part.label()),
+                        parallel_replays = turn.load.parallel_replays, lent_turns = turn.load.lent_turns,
+                        queue_len = turn.load.queue_len, "archive recovery batch complete");
+                }
+                log_slow_replays(&filter, &turn);
                 if let Some(StreakLog::Ended { failures, duration }) = logged {
                     tracing::info!(%filter, failures, failing_secs = duration.as_secs(), source,
                         "archive recovery succeeded after a failure streak");
@@ -972,6 +1070,32 @@ pub(crate) struct FailureStreak {
     classes: BTreeMap<&'static str, u64>,
     /// When a streak's first failure was last noted at info.
     noted: Option<Instant>,
+    /// Successful recoveries holding at a frame a session fence discarded.
+    held: Option<DiscardedHold>,
+}
+
+/// Recoveries of one shard that held at the same frame a session fence
+/// discarded (`ShardRecoveryProgress::Replayed { discarded_tip: Some(_) }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiscardedHold {
+    discarded: u64,
+    since: Instant,
+    /// When it was last logged at info.
+    logged: Instant,
+    attempts: u64,
+}
+
+/// What a recovery's hold at discarded frames logs ([`FailureStreak::held`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldLog {
+    /// A hold began, or moved to another discarded frame.
+    Began,
+    /// The same hold, again after [`STREAK_REPEAT`].
+    Holding { attempts: u64, duration: Duration },
+    /// The same hold within [`STREAK_REPEAT`]: nothing at info.
+    Quiet,
+    /// The hold ended with another outcome.
+    Ended { attempts: u64, duration: Duration },
 }
 
 /// What a [`FailureStreak`] change logs.
@@ -993,6 +1117,38 @@ impl FailureStreak {
             failures: 0,
             classes: BTreeMap::new(),
             noted: None,
+            held: None,
+        }
+    }
+
+    /// A recovery ended at `now`, holding at discarded frame `discarded`
+    /// (`Some`) or with any other outcome (`None`): what it logs.
+    pub(crate) fn held(&mut self, discarded: Option<u64>, now: Instant) -> Option<HoldLog> {
+        match (discarded, self.held.as_mut()) {
+            (Some(frame), Some(hold)) if hold.discarded == frame => {
+                hold.attempts += 1;
+                if now.saturating_duration_since(hold.logged) < STREAK_REPEAT {
+                    return Some(HoldLog::Quiet);
+                }
+                hold.logged = now;
+                Some(HoldLog::Holding {
+                    attempts: hold.attempts,
+                    duration: now.saturating_duration_since(hold.since),
+                })
+            }
+            (Some(frame), _) => {
+                self.held = Some(DiscardedHold {
+                    discarded: frame,
+                    since: now,
+                    logged: now,
+                    attempts: 1,
+                });
+                Some(HoldLog::Began)
+            }
+            (None, _) => self.held.take().map(|hold| HoldLog::Ended {
+                attempts: hold.attempts,
+                duration: now.saturating_duration_since(hold.since),
+            }),
         }
     }
 
@@ -1271,6 +1427,33 @@ pub fn recovery_installed(leaves: u64) {
     let _ = RECOVERING.try_with(|s| s.recovery(|r, _| r.attempt_installed_leaves += leaves));
 }
 
+/// Warn about replays slow while workers wait for a turn, at most once per
+/// repeat interval across this process's workers ([`SlowReplays`]). Each
+/// turn's batch line has the numbers; this says what to check.
+fn log_slow_replays(filter: &str, turn: &ReplayTurn) {
+    match SLOW_REPLAYS.observe(turn.frames, turn.replay_ms, turn.load.queue_len, now_ms()) {
+        Some(SlowReplayLog::Slow { turns, duration }) => {
+            let part = turn.split.mostly();
+            let (scope, action) = part.map_or(("this node", "report it with this line"), |part| {
+                part.guidance()
+            });
+            tracing::warn!(%filter, frames = turn.frames, replay_ms = turn.replay_ms,
+                ms_per_frame = turn.replay_ms / turn.frames.max(1),
+                replay_mostly = part.map_or("none", |part| part.label()),
+                parallel_replays = turn.load.parallel_replays, queue_len = turn.load.queue_len,
+                slow_turns = turns, slow_secs = duration.as_secs(), scope, action,
+                "archive recovery replays slowly while workers wait for a turn, so seats whose \
+                session needs their predecessor's state stay blocked; repeats every 10 minutes \
+                while it holds, and each batch line splits the time");
+        }
+        Some(SlowReplayLog::Ended { duration }) => {
+            tracing::info!(%filter, slow_secs = duration.as_secs(),
+                "archive recovery replays no longer slow while workers wait");
+        }
+        None => {}
+    }
+}
+
 /// Enter `phase` of the recovery running on this task; elsewhere nothing.
 pub fn recovery_phase(phase: &'static str) {
     let _ = RECOVERING.try_with(|s| s.recovery(|r, now| enter(r, phase, now)));
@@ -1377,6 +1560,68 @@ mod renewal_state_tests {
             "state unavailable"
         );
         assert_eq!(with_renewal_state(&held, None), None);
+    }
+}
+
+#[cfg(test)]
+mod restart_readiness_tests {
+    use super::*;
+
+    /// A worker records its committee's members, quorum and voters, and
+    /// clears them when no session host runs.
+    #[test]
+    fn a_worker_records_and_clears_its_committee_reading() {
+        let shared = SharedWorkerExecution::default();
+        shared.committee(28, 19, 22);
+        let seen = shared.snapshot();
+        assert_eq!(
+            (
+                seen.committee_members,
+                seen.committee_quorum,
+                seen.committee_voters
+            ),
+            (28, 19, 22)
+        );
+        assert!(seen.committee_observed_unix_ms > 0);
+        shared.committee(0, 0, 0);
+        let seen = shared.snapshot();
+        assert_eq!(
+            (seen.committee_members, seen.committee_observed_unix_ms),
+            (0, 0)
+        );
+    }
+
+    /// The worker view gives a seat's worker its restart readiness, with the
+    /// committee margin the worker reports, and a worker without a seat none.
+    #[test]
+    fn the_worker_view_adds_restart_readiness_for_a_seat_only() {
+        let report = Some(WorkerExecution {
+            state: "serving".into(),
+            own_votes: Some(4),
+            committee_members: 28,
+            committee_quorum: 19,
+            committee_voters: 19,
+            committee_observed_unix_ms: now_ms(),
+            ..Default::default()
+        });
+        let view = with_restart_readiness(&[0xe1; 32], report.clone()).unwrap();
+        let restart = view.restart.expect("a seat has a verdict");
+        assert_eq!(restart.verdict, "stops_shard");
+        assert_eq!(restart.committee_margin, Some(0));
+        let roomy = WorkerExecution {
+            committee_voters: 22,
+            ..report.clone().unwrap()
+        };
+        let restart = with_restart_readiness(&[0xe1; 32], Some(roomy))
+            .unwrap()
+            .restart
+            .unwrap();
+        assert_eq!(
+            (restart.verdict.as_str(), restart.committee_margin),
+            ("ok", Some(3))
+        );
+        assert_eq!(with_restart_readiness(&[], report).unwrap().restart, None);
+        assert_eq!(with_restart_readiness(&[0xe1; 32], None), None);
     }
 }
 
@@ -1852,6 +2097,75 @@ mod tests {
         assert_eq!(streaks[&vec![2; 32]].failures, 0);
     }
 
+    /// A recovery holding at a frame a session fence discarded is named at
+    /// its start, then only every repeat interval with its count and
+    /// duration, and once at its end; another discarded frame starts anew.
+    #[test]
+    fn a_hold_at_discarded_frames_is_named_once_then_every_repeat_and_at_its_end() {
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut streak = FailureStreak::default();
+        assert_eq!(streak.held(None, at(0)), None);
+        assert_eq!(streak.held(Some(506), at(0)), Some(HoldLog::Began));
+        for tick in 1..60u64 {
+            assert_eq!(
+                streak.held(Some(506), at(10 * tick)),
+                Some(HoldLog::Quiet),
+                "tick {tick}"
+            );
+        }
+        assert_eq!(
+            streak.held(Some(506), at(600)),
+            Some(HoldLog::Holding {
+                attempts: 61,
+                duration: MINUTE * 10
+            })
+        );
+        assert_eq!(streak.held(Some(506), at(610)), Some(HoldLog::Quiet));
+        assert_eq!(
+            streak.held(Some(508), at(620)),
+            Some(HoldLog::Began),
+            "another discarded frame"
+        );
+        assert_eq!(
+            streak.held(None, at(700)),
+            Some(HoldLog::Ended {
+                attempts: 1,
+                duration: Duration::from_secs(80)
+            })
+        );
+        assert_eq!(streak.held(None, at(710)), None, "ended once");
+    }
+
+    /// The recovery record holds a hold per shard, from the outcome itself.
+    #[tokio::test]
+    async fn a_recovery_outcome_at_discarded_frames_is_a_hold() {
+        let worker = SharedWorkerExecution::default();
+        let held = || async {
+            Ok(ShardRecoveryProgress::Replayed {
+                materialized: 505,
+                archive_tip: None,
+                committed_tip: Some(505),
+                discarded_tip: Some(506),
+                turn: ReplayTurn::default(),
+            })
+        };
+        let _ = worker.recovering(&[1; 32], held()).await;
+        let _ = worker.recovering(&[1; 32], held()).await;
+        let hold = |worker: &SharedWorkerExecution| {
+            worker.streaks.lock().unwrap()[&vec![1; 32]]
+                .held
+                .map(|hold| (hold.discarded, hold.attempts))
+        };
+        assert_eq!(hold(&worker), Some((506, 2)));
+        let _ = worker
+            .recovering(&[1; 32], async {
+                Ok(ShardRecoveryProgress::Anchored { frame: 507 })
+            })
+            .await;
+        assert_eq!(hold(&worker), None);
+    }
+
     #[test]
     fn failures_are_classed_by_whose_problem_they_are() {
         for (error, class) in [
@@ -2158,12 +2472,12 @@ mod tests",
             )
             .unwrap()];
         let phase = region(own, "pub fn consensus_phase", "self.state(state, reason)");
-        let chain = region(engine, "let blocker = ", ";");
+        let chain = region(engine, "fn refused_check(", "\n}");
         let mut written: Vec<Vec<&str>> = [engine, thread]
             .iter()
             .flat_map(|s| literals(s, "state(", ')'))
             .collect();
-        assert!(written.len() >= 10, "{written:?}");
+        assert!(written.len() >= 8, "{written:?}");
         written.extend(literals(phase, "(", ')'));
         let chained = literals(chain, "{", '}');
         assert_eq!(chained.len(), 4, "{chain}");
@@ -2172,6 +2486,10 @@ mod tests",
                 .into_iter()
                 .map(|blocker| vec!["blocked", blocker[0]]),
         );
+        // The events a refused start awaits, which it reports as waiting.
+        let awaited = literals(engine, "Awaited::Event(", ')');
+        assert!(awaited.len() >= 5, "{awaited:?}");
+        written.extend(awaited.into_iter().map(|event| vec!["waiting", event[0]]));
         // A store's state, which no engine writes (`with_store_state`).
         written.push(vec!["blocked", STORAGE_WRITE_FAILED]);
         let states: BTreeSet<&str> = written.iter().map(|args| args[0]).collect();

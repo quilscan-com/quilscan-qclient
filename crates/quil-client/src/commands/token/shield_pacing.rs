@@ -4,12 +4,12 @@
 //! on GLOBAL's critical path, so a run must not load GLOBAL faster than the
 //! archives verify. The run therefore (1) proves and submits one batch at a
 //! time and waits for its inclusion before starting the next, (2) keeps a
-//! minimum spacing between submissions, and (3) pauses while GLOBAL is
-//! degraded. The driver is generic over [`ShieldIo`] so a fake clock and fake
-//! reads test every path; the CLI prints its events, the node manager shows
-//! them as notices.
-
-use std::collections::VecDeque;
+//! minimum spacing between submissions, and (3) pauses while the node reports
+//! GLOBAL's progress degraded: its health conditions `Global head unchanged`
+//! and `Global frames slow` (`quil_rpc::health_conditions`), the node's one
+//! judgement of GLOBAL progress. The driver is generic over [`ShieldIo`] so a
+//! fake clock and fake reads test every path; the CLI prints its events, the
+//! node manager shows them as notices.
 
 /// Default minimum spacing between two submissions (at most 12 per hour).
 pub(crate) const DEFAULT_MIN_INTERVAL_SECS: u64 = 300;
@@ -25,18 +25,21 @@ pub(crate) const DEFAULT_INCLUSION_TIMEOUT_SECS: u64 = 3_600;
 /// A submitted batch's coins stay out of new runs this long (the journal
 /// that `token legacy`, the node manager and shield-all read).
 pub(crate) use super::legacy::SUBMITTED_EXCLUSION_SECS;
-/// GLOBAL is degraded below this many frames per hour (10 s frames = 360).
-pub(crate) const MIN_FRAMES_PER_HOUR: u64 = 330;
-/// GLOBAL is degraded when its head has not advanced for this long.
-pub(crate) const STALL_SECS: u64 = 60;
-/// GLOBAL must be healthy this long before a paused run resumes.
+/// The node's GLOBAL judgement unreadable this long pauses the run: nothing
+/// says GLOBAL is healthy.
+pub(crate) const UNREAD_SECS: u64 = 60;
+/// The node must report GLOBAL healthy this long before a paused run resumes.
 pub(crate) const RECOVERY_SECS: u64 = 600;
-/// The hourly rate is judged over at most this window, and only once the
-/// samples span [`MIN_RATE_SPAN_SECS`].
-const HEALTH_WINDOW_SECS: u64 = 3_600;
-const MIN_RATE_SPAN_SECS: u64 = 600;
 /// Spacing of head reads and inclusion reads while waiting.
 pub(crate) const POLL_SECS: u64 = 15;
+/// While a batch waits for inclusion, its shard is read this often in the
+/// node's shard list (every 8th poll): a shard without an active prover
+/// makes no frame, so its batch cannot commit.
+pub(crate) const SHARD_CHECK_SECS: u64 = 120;
+/// Reads in a row showing the shard without an active prover before the
+/// run leaves its batch, so one odd read does not leave a batch that could
+/// still commit.
+const SHARD_GONE_READS: u32 = 2;
 /// A pause repeats its notice this often; a wait for inclusion reports this often.
 const NOTICE_SECS: u64 = 600;
 const WAIT_NOTICE_SECS: u64 = 300;
@@ -57,90 +60,61 @@ pub(crate) enum Change {
     },
 }
 
+/// What the node says of GLOBAL at one read ([`ShieldIo::global`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GlobalRead {
+    /// The node's GLOBAL head.
+    pub head: u64,
+    /// The node's current GLOBAL progress condition, if any, as a clause.
+    pub degraded: Option<String>,
+}
+
 #[derive(Debug)]
 struct Degraded {
     /// What started the pause.
     reason: String,
     since: u64,
     notice_at: u64,
-    /// `(time, head)` from which GLOBAL has been continuously advancing.
-    healthy_since: Option<(u64, u64)>,
+    /// From when the node has reported GLOBAL healthy without a gap.
+    healthy_since: Option<u64>,
 }
 
-/// GLOBAL's health from sampled head frames. The node RPC reports the head
-/// only, so the hourly frame count is the head's advance across the sampled
-/// window (judged once the samples span 10 minutes).
+/// The run's pause, from the node's GLOBAL judgement read before each step.
+/// The node judges; the run only decides when to submit: it pauses while
+/// the node reports a GLOBAL progress condition, or its judgement cannot be
+/// read for [`UNREAD_SECS`], and resumes after [`RECOVERY_SECS`] without.
 #[derive(Debug, Default)]
 pub(crate) struct Health {
-    samples: VecDeque<(u64, u64)>,
-    /// When the current head was first seen: `(time, head)`.
-    advanced: Option<(u64, u64)>,
+    head: Option<u64>,
     degraded: Option<Degraded>,
-    /// Set when the last two reads, at least [`STALL_SECS`] apart, show GLOBAL
-    /// advancing too slowly: reads are sparse while a batch is being proved,
-    /// so a stall inside the gap shows only as a small advance.
-    sparse_gap: Option<String>,
+    /// Since when the node's judgement could not be read.
+    unread_since: Option<u64>,
 }
 
 impl Health {
-    /// Record a head read at `now` (seconds on any monotonic clock).
-    pub(crate) fn observe(&mut self, now: u64, head: u64) -> Option<Change> {
-        if self.advanced.map(|(_, h)| h) != Some(head) {
-            self.advanced = Some((now, head));
-        }
-        // One frame of slack: reads fall anywhere inside the 10 s frame.
-        self.sparse_gap = self
-            .samples
-            .back()
-            .filter(|(t, _)| now.saturating_sub(*t) >= STALL_SECS)
-            .and_then(|&(t, h)| {
-                let (span, frames) = (now - t, head.saturating_sub(h));
-                (!rate_ok(frames + 1, span)).then(|| {
-                    format!("GLOBAL advanced only {frames} frames in {span} s between reads")
+    /// Record the node's judgement read at `now` (seconds on any monotonic
+    /// clock), or why it could not be read.
+    pub(crate) fn observe(&mut self, now: u64, read: Result<GlobalRead, String>) -> Option<Change> {
+        // `Some(reason)`: degraded; `None`: healthy; unknown below the
+        // unread time.
+        let state = match read {
+            Ok(read) => {
+                self.head = Some(read.head);
+                self.unread_since = None;
+                Some(read.degraded)
+            }
+            Err(why) => {
+                let since = *self.unread_since.get_or_insert(now);
+                let secs = now - since;
+                (secs >= UNREAD_SECS).then(|| {
+                    Some(format!(
+                        "this node's GLOBAL judgement unreadable for {secs} s ({why})"
+                    ))
                 })
-            });
-        self.samples.push_back((now, head));
-        while self
-            .samples
-            .front()
-            .is_some_and(|(t, _)| t + HEALTH_WINDOW_SECS < now)
-        {
-            self.samples.pop_front();
-        }
-        self.evaluate(now)
-    }
-
-    /// The head could not be read at `now`: time passes with no advance.
-    pub(crate) fn unreadable(&mut self, now: u64) -> Option<Change> {
-        self.sparse_gap = None;
-        self.evaluate(now)
-    }
-
-    /// What started the run's pause, if it is paused.
-    pub(crate) fn degraded(&self) -> Option<&str> {
-        self.degraded.as_ref().map(|d| d.reason.as_str())
-    }
-
-    /// The latest head seen.
-    pub(crate) fn head(&self) -> Option<u64> {
-        self.advanced.map(|(_, h)| h)
-    }
-
-    fn evaluate(&mut self, now: u64) -> Option<Change> {
-        let (advanced_at, head) = self.advanced?;
-        let silent = now.saturating_sub(advanced_at) >= STALL_SECS;
-        let stalled = silent || self.sparse_gap.is_some();
+            }
+        };
         let Some(degraded) = self.degraded.as_mut() else {
-            let reason = if silent {
-                format!(
-                    "GLOBAL head {head} has not advanced for {} s",
-                    now - advanced_at
-                )
-            } else if let Some(gap) = self.sparse_gap.clone() {
-                gap
-            } else {
-                self.slow(now, head)?
-            };
+            let reason = state.flatten()?;
             self.degraded = Some(Degraded {
                 reason: reason.clone(),
                 since: now,
@@ -149,73 +123,50 @@ impl Health {
             });
             return Some(Change::Paused(reason));
         };
-        // Where the recovery stands: `(seconds, frames)` advancing since it
-        // (re)started, none while GLOBAL stalls.
-        let recovery = if stalled {
-            degraded.healthy_since = None;
-            None
-        } else {
-            let (from, from_head) = *degraded.healthy_since.get_or_insert((now, head));
-            let span = now - from;
-            if span >= RECOVERY_SECS {
-                if rate_ok(head.saturating_sub(from_head), span) {
+        // Recovery counts only time the node reports GLOBAL healthy.
+        let now_reason = match &state {
+            Some(None) => {
+                let from = *degraded.healthy_since.get_or_insert(now);
+                if now - from >= RECOVERY_SECS {
                     let paused_secs = now - degraded.since;
-                    // The pause's own samples must not re-trigger the rule.
                     self.degraded = None;
-                    self.samples.clear();
-                    self.samples.push_back((now, head));
                     return Some(Change::Resumed { paused_secs });
                 }
-                // Advancing, but too slowly: judge again from here.
-                degraded.healthy_since = Some((now, head));
-                Some((0, 0))
-            } else {
-                Some((span, head.saturating_sub(from_head)))
+                format!(
+                    "the node reports GLOBAL healthy for {} s of the {RECOVERY_SECS} s needed",
+                    now - from
+                )
+            }
+            Some(Some(reason)) => {
+                degraded.healthy_since = None;
+                reason.clone()
+            }
+            None => {
+                degraded.healthy_since = None;
+                "this node's GLOBAL judgement could not be read".to_string()
             }
         };
         if now.saturating_sub(degraded.notice_at) >= NOTICE_SECS {
             degraded.notice_at = now;
             // The state the decision uses now; the pause's start was
             // reported when it began.
-            let reason = match (recovery, self.sparse_gap.clone()) {
-                (Some((span, frames)), _) => format!(
-                    "GLOBAL head {head}, advancing for {span} s ({frames} frames) of the \
-                     {RECOVERY_SECS} s needed"
-                ),
-                (None, Some(gap)) if !silent => gap,
-                (None, _) => format!(
-                    "GLOBAL head {head} has not advanced for {} s",
-                    now - advanced_at
-                ),
-            };
             return Some(Change::StillPaused {
                 secs: now - degraded.since,
-                reason,
+                reason: now_reason,
             });
         }
         None
     }
 
-    fn slow(&self, now: u64, head: u64) -> Option<String> {
-        let &(first, first_head) = self.samples.front()?;
-        let span = now.saturating_sub(first);
-        if span < MIN_RATE_SPAN_SECS {
-            return None;
-        }
-        let frames = head.saturating_sub(first_head);
-        (!rate_ok(frames, span)).then(|| {
-            format!(
-                "GLOBAL advanced {frames} frames in {} min (~{}/h, below {MIN_FRAMES_PER_HOUR}/h)",
-                span / 60,
-                frames * 3_600 / span
-            )
-        })
+    /// What started the run's pause, if it is paused.
+    pub(crate) fn degraded(&self) -> Option<&str> {
+        self.degraded.as_ref().map(|d| d.reason.as_str())
     }
-}
 
-/// Whether `frames` over `span` seconds reach [`MIN_FRAMES_PER_HOUR`].
-fn rate_ok(frames: u64, span: u64) -> bool {
-    u128::from(frames) * 3_600 >= u128::from(MIN_FRAMES_PER_HOUR) * u128::from(span)
+    /// The latest head read.
+    pub(crate) fn head(&self) -> Option<u64> {
+        self.head
+    }
 }
 
 /// What a run reports; `line` is the text the CLI prints. Indexes are
@@ -276,6 +227,15 @@ pub(crate) enum ShieldEvent {
         waited: u64,
         head: Option<u64>,
     },
+    /// The batch's shard has no active prover in the node's shard list, so
+    /// the batch cannot commit until provers return: the run leaves it and
+    /// goes on. `submitted` is set when it was left waiting for inclusion.
+    ShardGone {
+        index: usize,
+        total: usize,
+        shard: String,
+        submitted: Option<Unconfirmed>,
+    },
     /// After each batch: how many are done and the projected end.
     Progress {
         done: usize,
@@ -285,6 +245,16 @@ pub(crate) enum ShieldEvent {
     /// The run was asked to stop ([`ShieldIo::stop_requested`]) and ended
     /// before submitting anything more.
     Stopped { submitted: usize, total: usize },
+}
+
+/// A submitted batch the run stopped waiting for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Unconfirmed {
+    /// Seconds since its submission.
+    pub waited: u64,
+    /// When new runs include its coins again, in Unix seconds
+    /// ([`SUBMITTED_EXCLUSION_SECS`] after its submission).
+    pub rejoins: u64,
 }
 
 impl ShieldEvent {
@@ -375,6 +345,34 @@ impl ShieldEvent {
                 index + 1,
                 frame(*head)
             ),
+            Self::ShardGone {
+                index,
+                total,
+                shard,
+                submitted,
+            } => {
+                let next = if index + 1 < *total {
+                    " The run goes on with the next batch."
+                } else {
+                    ""
+                };
+                match submitted {
+                    Some(Unconfirmed { waited, rejoins }) => format!(
+                        "Batch {}/{total}: shard {shard} has no active provers in the node's \
+                         shard list, so the batch cannot commit; stopped waiting after {waited} \
+                         s. It may still land if provers return; a new run includes its coins \
+                         from {} and plans them onto the live shard covering them.{next}",
+                        index + 1,
+                        utc(*rejoins)
+                    ),
+                    None => format!(
+                        "Batch {}/{total}: shard {shard} has no active provers in the node's \
+                         shard list; not proved. A rerun plans its coins onto the live shard \
+                         covering them.{next}",
+                        index + 1
+                    ),
+                }
+            }
             Self::Progress {
                 done,
                 total,
@@ -444,8 +442,10 @@ pub(crate) trait ShieldIo {
     /// Wall-clock Unix seconds.
     fn unix(&self) -> u64;
     async fn sleep(&mut self, secs: u64);
-    /// The node's GLOBAL head.
-    async fn head(&mut self) -> anyhow::Result<u64>;
+    /// The node's GLOBAL head and its GLOBAL progress condition, if one is
+    /// current; an error when they cannot be read, or the node predates
+    /// health conditions.
+    async fn global(&mut self) -> anyhow::Result<GlobalRead>;
     /// Legacy coins in batch `index`.
     fn coins(&self, index: usize) -> usize;
     /// The shard whose members verify batch `index` ([`shard_label`]).
@@ -455,6 +455,9 @@ pub(crate) trait ShieldIo {
     async fn submit(&mut self, index: usize, proof: Self::Proof) -> anyhow::Result<()>;
     /// Whether none of batch `index`'s coins still reads unshielded.
     async fn included(&mut self, index: usize) -> anyhow::Result<bool>;
+    /// Whether batch `index`'s shard has an active prover in the node's
+    /// shard list. An error is no evidence either way.
+    async fn shard_live(&mut self, index: usize) -> anyhow::Result<bool>;
     fn event(&mut self, event: &ShieldEvent);
     /// Whether the run should end before its next submission (the node
     /// manager's stop key). Checked before each proof, before each
@@ -472,10 +475,8 @@ fn stopped<I: ShieldIo>(io: &mut I, submitted: usize, total: usize) -> anyhow::R
 
 async fn sample<I: ShieldIo>(io: &mut I, health: &mut Health, index: usize, total: usize) {
     let now = io.now();
-    let change = match io.head().await {
-        Ok(head) => health.observe(now, head),
-        Err(_) => health.unreadable(now),
-    };
+    let read = io.global().await.map_err(|e| format!("{e:#}"));
+    let change = health.observe(now, read);
     match change {
         None => {}
         Some(Change::Paused(reason)) => io.event(&ShieldEvent::Paused {
@@ -497,7 +498,50 @@ async fn sample<I: ShieldIo>(io: &mut I, health: &mut Health, index: usize, tota
     }
 }
 
-/// Run `total` batches under `pacing`. Returns the batches submitted.
+/// A batch the run left: its index, shard and, if it was submitted, the
+/// wait it stopped.
+type Left = (usize, String, Option<Unconfirmed>);
+
+/// The run's end when it left batches for shards without provers
+/// ([`ShieldEvent::ShardGone`]): which, and what a rerun does with them.
+fn left_error(left: &[Left], total: usize, unix: u64) -> String {
+    let mut shards: Vec<&str> = left.iter().map(|(_, shard, _)| shard.as_str()).collect();
+    shards.sort_unstable();
+    shards.dedup();
+    let batches: Vec<String> = left
+        .iter()
+        .map(|(index, ..)| (index + 1).to_string())
+        .collect();
+    let rejoins = left
+        .iter()
+        .filter_map(|(.., submitted)| submitted.map(|s| s.rejoins))
+        .max()
+        .filter(|rejoins| *rejoins > unix)
+        .map_or(String::new(), |rejoins| {
+            format!(
+                "; coins of the submitted ones rejoin new runs from {}, unless provers return \
+                 and they land first",
+                utc(rejoins)
+            )
+        });
+    format!(
+        "{} of {total} left (batch {}): shard {} had no active provers in the node's shard \
+         list. Check `qclient token legacy`, then rerun: it plans their coins onto the live \
+         shard covering them{rejoins}.",
+        if left.len() == 1 {
+            "1 batch".to_owned()
+        } else {
+            format!("{} batches", left.len())
+        },
+        batches.join(", "),
+        shards.join(", ")
+    )
+}
+
+/// Run `total` batches under `pacing`. Returns the batches submitted. A
+/// batch whose shard has no active prover is left, before its proof or
+/// while it waits for inclusion, and the run goes on with the next; a run
+/// that left any ends with an error naming them.
 pub(crate) async fn run<I: ShieldIo>(
     io: &mut I,
     total: usize,
@@ -511,11 +555,25 @@ pub(crate) async fn run<I: ShieldIo>(
     let mut health = Health::default();
     let mut last_submit: Option<u64> = None;
     let mut submitted = 0usize;
+    let mut left: Vec<Left> = Vec::new();
     for index in 0..total {
         if io.stop_requested() {
             return stopped(io, submitted, total);
         }
         sample(io, &mut health, index, total).await;
+        // The shard may have lost its provers since the plan: its batch
+        // could not commit, and a rerun plans its coins onto a live one.
+        if matches!(io.shard_live(index).await, Ok(false)) {
+            let shard = io.shard(index);
+            io.event(&ShieldEvent::ShardGone {
+                index,
+                total,
+                shard: shard.clone(),
+                submitted: None,
+            });
+            left.push((index, shard, None));
+            continue;
+        }
         let Some(proof) = io.prove(index).await? else {
             continue;
         };
@@ -564,6 +622,8 @@ pub(crate) async fn run<I: ShieldIo>(
         let mut noticed = sent;
         let mut last = sent;
         let mut last_error: Option<String>;
+        let mut shard_read = sent;
+        let mut gone_reads = 0u32;
         loop {
             io.sleep(POLL_SECS).await;
             if io.stop_requested() {
@@ -588,6 +648,29 @@ pub(crate) async fn run<I: ShieldIo>(
                 Ok(false) => last_error = None,
                 Err(error) => last_error = Some(error.to_string()),
             }
+            if now - shard_read >= SHARD_CHECK_SECS {
+                shard_read = now;
+                gone_reads = match io.shard_live(index).await {
+                    Ok(true) => 0,
+                    Ok(false) => gone_reads + 1,
+                    Err(_) => gone_reads,
+                };
+                if gone_reads >= SHARD_GONE_READS {
+                    let shard = io.shard(index);
+                    let unconfirmed = Unconfirmed {
+                        waited: now - sent,
+                        rejoins: sent_unix + SUBMITTED_EXCLUSION_SECS,
+                    };
+                    io.event(&ShieldEvent::ShardGone {
+                        index,
+                        total,
+                        shard: shard.clone(),
+                        submitted: Some(unconfirmed),
+                    });
+                    left.push((index, shard, Some(unconfirmed)));
+                    break;
+                }
+            }
             if active >= pacing.inclusion_timeout {
                 let excluded_until = sent_unix + SUBMITTED_EXCLUSION_SECS;
                 let exclusion = if io.unix() < excluded_until {
@@ -601,15 +684,26 @@ pub(crate) async fn run<I: ShieldIo>(
                         utc(excluded_until)
                     )
                 };
+                let shard = io.shard(index);
+                let why = if matches!(io.shard_live(index).await, Ok(false)) {
+                    format!(
+                        "Shard {shard} has no active provers in the node's shard list now, so \
+                         it makes no frame to commit the batch; the batch may still land if \
+                         provers return. Check `qclient token legacy` before rerunning; \
+                         {exclusion}, and a rerun plans them onto the live shard covering them."
+                    )
+                } else {
+                    format!(
+                        "The batch may still land: it commits with shard {shard}'s next frame, \
+                         and shards have stalled 30 min or more after a frame carrying a batch. \
+                         Check `qclient token legacy` before rerunning; {exclusion}."
+                    )
+                };
                 anyhow::bail!(
                     "batch {}/{total}: its coins still read unshielded after {active} s of \
-                     healthy GLOBAL since submission{}; stopping. The batch may still land: it \
-                     commits with shard {}'s next frame, and shards have stalled 30 min or more \
-                     after a frame carrying a batch. Check `qclient token legacy` before \
-                     rerunning; {exclusion}.",
+                     healthy GLOBAL since submission{}; stopping. {why}",
                     index + 1,
                     last_error.map_or(String::new(), |e| format!(" (last read error: {e})")),
-                    io.shard(index)
                 );
             }
             if now - noticed >= WAIT_NOTICE_SECS {
@@ -629,7 +723,29 @@ pub(crate) async fn run<I: ShieldIo>(
             projected_end: io.unix() + per_batch * (total - done) as u64,
         });
     }
+    if !left.is_empty() {
+        anyhow::bail!(left_error(&left, total, io.unix()));
+    }
     Ok(submitted)
+}
+
+/// For tests: a node whose GLOBAL advances one frame per 10 s and stands
+/// still on `[from, to)`, which it reports as its GLOBAL head condition from
+/// 120 s into the stall until GLOBAL advances again.
+#[cfg(test)]
+pub(crate) fn node_with_stall(from: u64, to: u64) -> impl Fn(u64) -> GlobalRead {
+    move |t| GlobalRead {
+        head: 1_000
+            + if t < from {
+                t / 10
+            } else if t < to {
+                from / 10
+            } else {
+                from / 10 + (t - to) / 10
+            },
+        degraded: (t >= from.saturating_add(120) && t < to)
+            .then(|| "Global head unchanged >120s".to_string()),
+    }
 }
 
 #[cfg(test)]

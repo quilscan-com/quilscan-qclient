@@ -564,6 +564,16 @@ impl InMemoryProverRegistry {
         self.resource_usage
     }
 
+    /// Whether this cache's rows were read at a later state of the same
+    /// database than `other`'s: every sequence in its scan interval is past
+    /// every one in `other`'s. Unknown without both scan points.
+    fn scanned_after(&self, other: &Self) -> bool {
+        match (self.scanned, other.scanned) {
+            (Some(held), Some(read)) => held.database == read.database && held.from > read.to,
+            _ => false,
+        }
+    }
+
     /// Everything a refresh determines, in a fixed order (not the scan point).
     #[cfg(test)]
     fn content(&self) -> String {
@@ -633,6 +643,18 @@ impl InMemoryProverRegistry {
         out
     }
 
+    fn storage_eligible(&self, member: &[u8], filter: &[u8], frame: u64) -> bool {
+        if filter.is_empty() || !quil_types::consensus::sealed_storage_required_at(frame) {
+            return true;
+        }
+        let slot = self.get_storage_seat_slot(
+            member,
+            filter,
+            quil_types::consensus::epoch_for_frame(frame),
+        );
+        quil_types::consensus::storage_seat_eligible(filter, frame, slot)
+    }
+
     pub fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Vec<&ProverInfo> {
         let Some(addrs) = self.filter_cache.get(filter) else {
             return Vec::new();
@@ -641,6 +663,7 @@ impl InMemoryProverRegistry {
             addrs
                 .iter()
                 .filter_map(|a| self.prover_cache.get(a))
+                .filter(|p| self.storage_eligible(&p.address, filter, frame_number))
                 .filter(|p| {
                     p.allocations.iter().any(|alloc| {
                         alloc.confirmation_filter == filter
@@ -728,6 +751,7 @@ impl InMemoryProverRegistry {
             let pick = |lenient: bool| -> Vec<Vec<u8>> {
                 addrs
                     .iter()
+                    .filter(|a| self.storage_eligible(a, filter, frame_number))
                     .filter(|a| {
                         self.prover_cache
                             .get(*a)
@@ -917,7 +941,7 @@ impl InMemoryProverRegistry {
             frame_number,
             inactivity_threshold,
             shard_halt_durations,
-            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+            quil_types::consensus::signed_frame_activation_frame(),
         )
     }
 
@@ -952,7 +976,7 @@ impl InMemoryProverRegistry {
             frame_number,
             inactivity_threshold,
             shard_halt_durations,
-            quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+            quil_types::consensus::signed_frame_activation_frame(),
         )
     }
 
@@ -1344,7 +1368,7 @@ pub fn signed_frame_census_governs(
 /// The credit is `LastActiveFrameNumber` until
 /// [`signed_frame_census_governs`], then `LastSignedFrameNumber`, which only
 /// the signers of an included app frame record. Public paths pass
-/// `SIGNED_FRAME_ACTIVATION_FRAME`; reads committed registry fields only.
+/// `signed_frame_activation_frame()`; reads committed registry fields only.
 pub fn allocation_fresh_at(
     alloc: &ProverAllocationInfo,
     frame_number: u64,
@@ -1498,9 +1522,10 @@ fn live_allocation_status(
 /// The committee is evaluated at the frame it serves, so the rule changes
 /// committee seating, leader rotation and quorum alike: consensus-affecting,
 /// and every archive and prover must run a build with it before the frame.
-/// Not scheduled on mainnet; `QUIL_LEAVER_CURRENCY_FRAME` elsewhere, never
-/// by default.
-pub const MAINNET_LEAVER_CURRENCY_FRAME: Option<u64> = None;
+/// Mainnet: 1,024,560, the first frame of epoch 1423, which GLOBAL cannot reach
+/// before 2026-11-07 00:00 UTC even at ten seconds a frame;
+/// `QUIL_LEAVER_CURRENCY_FRAME` elsewhere, never by default.
+pub const MAINNET_LEAVER_CURRENCY_FRAME: Option<u64> = Some(1_024_560);
 
 static LEAVER_CURRENCY_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -1651,6 +1676,7 @@ fn initial_load_signal(loaded: bool) -> Arc<tokio::sync::watch::Sender<bool>> {
 struct RefreshGate {
     serial: std::sync::Mutex<()>,
     edits: std::sync::atomic::AtomicU64,
+    slow: std::sync::Mutex<SlowRefreshes>,
 }
 
 impl RefreshGate {
@@ -1662,6 +1688,77 @@ impl RefreshGate {
     fn edits(&self) -> u64 {
         self.edits.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// Warn about a refresh over [`SLOW_REFRESH`], at most once per
+    /// [`SLOW_REFRESH_WARN_INTERVAL`]; the next warning counts the slow
+    /// refreshes in between.
+    fn report(&self, timing: &RefreshTiming) {
+        if timing.total <= SLOW_REFRESH {
+            return;
+        }
+        let mut slow = self
+            .slow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slow.since_warn += 1;
+        if slow
+            .warned
+            .is_some_and(|at| at.elapsed() < SLOW_REFRESH_WARN_INTERVAL)
+        {
+            return;
+        }
+        let slow_refreshes = std::mem::take(&mut slow.since_warn);
+        slow.warned = Some(std::time::Instant::now());
+        drop(slow);
+        tracing::warn!(
+            total_ms = timing.total.as_millis() as u64,
+            serial_wait_ms = timing.serial_wait.as_millis() as u64,
+            read_ms = timing.read.as_millis() as u64,
+            reads = timing.reads,
+            vertices = timing.vertices,
+            write_wait_ms = timing.write_wait.as_millis() as u64,
+            provers = timing.provers,
+            kept_newer = timing.kept_newer,
+            slow_refreshes,
+            scope = "this node",
+            "prover registry refresh took over 30 s; readers kept the previous registry \
+             meanwhile. serial_wait_ms is the wait behind another refresh, read_ms the store \
+             read (a second read, reads=2, runs under the registry lock after an edit), \
+             write_wait_ms the wait for readers to release the registry; a slow read with few \
+             vertices points at this node's store"
+        );
+    }
+}
+
+/// A refresh this long warns; mainnet refreshes take 6-65 s (2026-11-07).
+const SLOW_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+/// At most one slow-refresh warning per interval.
+const SLOW_REFRESH_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+#[derive(Default)]
+struct SlowRefreshes {
+    warned: Option<std::time::Instant>,
+    since_warn: u64,
+}
+
+/// Where a full refresh of the canonical registry spent its time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RefreshTiming {
+    total: std::time::Duration,
+    /// Waiting for another refresh of the same cache to end.
+    serial_wait: std::time::Duration,
+    /// Reading the store, both reads together.
+    read: std::time::Duration,
+    /// 2 when an edit overlapped the first read.
+    reads: u32,
+    /// Prover vertices the reads visited.
+    vertices: usize,
+    /// Waiting for readers to release the registry before the install.
+    write_wait: std::time::Duration,
+    /// Provers in the registry after the install.
+    provers: usize,
+    /// The cache already held rows read at a later state, and was kept.
+    kept_newer: bool,
 }
 
 pub(crate) struct PreparedRegistryAdoption<'a> {
@@ -1931,6 +2028,40 @@ impl SharedProverRegistry {
         Ok(())
     }
 
+    /// [`Self::refresh_from_store`] from `snapshot`, a capture of
+    /// `hg_store` taken earlier: a caller that captured the store as one
+    /// write left it reads that state, whatever was written since. A cache
+    /// that already holds rows read at a later state of the same database
+    /// is kept, so readers never go back to an older registry. When another
+    /// write reached the cache during the read, `hg_store` is read again
+    /// under the lock, as [`Self::refresh_from_store`] does.
+    pub fn refresh_from_capture(
+        &self,
+        hg_store: &dyn HypergraphStore,
+        snapshot: &dyn SnapshotReadable,
+    ) -> QuilResult<()> {
+        self.check_execution_store(hg_store.backing_store_identity())?;
+        if self.execution_binding.is_some() {
+            return self.refresh_from_store(hg_store);
+        }
+        let before = self.snapshot_local_prover();
+        self.install_read(
+            || {
+                let mut fresh = InMemoryProverRegistry::new();
+                fresh.refresh_from_snapshot(snapshot)?;
+                Ok(fresh)
+            },
+            || {
+                let mut fresh = InMemoryProverRegistry::new();
+                fresh.refresh(hg_store)?;
+                Ok(fresh)
+            },
+        )?;
+        let after = self.snapshot_local_prover();
+        log_local_prover_diff(before.as_ref(), after.as_ref());
+        Ok(())
+    }
+
     /// Install the registry `read` builds from the store. Reading every
     /// prover vertex takes 18-29 s on a regular node's store (2026-10-24);
     /// under the write lock, every worker thread reading the registry
@@ -1941,27 +2072,62 @@ impl SharedProverRegistry {
     fn refresh_canonical(
         &self,
         read: impl Fn() -> QuilResult<InMemoryProverRegistry>,
-    ) -> QuilResult<()> {
+    ) -> QuilResult<RefreshTiming> {
+        self.install_read(&read, &read)
+    }
+
+    /// [`Self::refresh_canonical`], reading with `again` when an edit
+    /// overlapped `first`. Keeps a cache whose rows were read at a later
+    /// state of the same database than the read's, and warns when the
+    /// whole refresh took over [`SLOW_REFRESH`].
+    fn install_read(
+        &self,
+        first: impl FnOnce() -> QuilResult<InMemoryProverRegistry>,
+        again: impl FnOnce() -> QuilResult<InMemoryProverRegistry>,
+    ) -> QuilResult<RefreshTiming> {
+        let started = std::time::Instant::now();
         let _serial = self
             .refresh
             .serial
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut timing = RefreshTiming {
+            serial_wait: started.elapsed(),
+            reads: 1,
+            ..RefreshTiming::default()
+        };
         let edits = self.refresh.edits();
-        let fresh = read()?;
+        let read_started = std::time::Instant::now();
+        let fresh = first()?;
+        timing.read = read_started.elapsed();
+        timing.vertices = fresh.resource_usage.vertices;
         {
+            let lock_started = std::time::Instant::now();
             let mut guard = self
                 .inner
                 .write()
                 .map_err(|_| QuilError::Internal("prover registry lock poisoned".into()))?;
-            *guard = if self.refresh.edits() == edits {
+            timing.write_wait = lock_started.elapsed();
+            let fresh = if self.refresh.edits() == edits {
                 fresh
             } else {
-                read()?
+                let reread_started = std::time::Instant::now();
+                let fresh = again()?;
+                timing.reads = 2;
+                timing.read += reread_started.elapsed();
+                timing.vertices += fresh.resource_usage.vertices;
+                fresh
             };
+            timing.kept_newer = guard.scanned_after(&fresh);
+            if !timing.kept_newer {
+                *guard = fresh;
+            }
+            timing.provers = guard.distinct_provers();
         }
         self.note_initial_load();
-        Ok(())
+        timing.total = started.elapsed();
+        self.refresh.report(&timing);
+        Ok(timing)
     }
 
     /// Bring an execution branch's registry up to date with the registry rows
@@ -3033,6 +3199,8 @@ pub struct CommittedProverScan {
     releases: Vec<Option<crate::global_intrinsic::prover_release::Release>>,
     /// Each prover's committed seniority, by address.
     seniority: HashMap<Vec<u8>, u64>,
+    /// Sealed epochs only; scheduling never retains the full opening chains.
+    seats: HashMap<(Vec<u8>, Vec<u8>), Vec<u64>>,
 }
 
 impl CommittedProverScan {
@@ -3057,6 +3225,7 @@ impl CommittedProverScan {
             ring_keys,
             releases,
             seniority: HashMap::new(),
+            seats: HashMap::new(),
         }
     }
 
@@ -3083,6 +3252,7 @@ impl CommittedProverScan {
             ring_keys,
             releases,
             seniority,
+            seats: HashMap::new(),
         }
     }
 
@@ -3119,10 +3289,9 @@ impl CommittedProverScan {
             l2: [0xffu8; 32],
         };
         let mut addr_to_pubkey: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-        let mut allocations: Vec<(Vec<u8>, ProverAllocationInfo)> = Vec::new();
-        let mut ring_keys = Vec::new();
-        let mut releases = Vec::new();
+        let mut rows = Vec::new();
         let mut seniority: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut seats = HashMap::new();
 
         // Tombstones first: `remove_vertex` leaves the "adds" blob in place, so
         // an adds-only walk resurrects deleted records (the provers the split
@@ -3148,7 +3317,10 @@ impl CommittedProverScan {
                 // leaf-root registrations, rewards, authorization records). A type
                 // hash is stored as a raw leaf value, so a vertex whose bytes hold
                 // neither hash cannot be one: skip it without parsing its tree.
-                if !holds_scanned_type(&data) {
+                if !holds_scanned_type(&data)
+                    && memchr::memmem::find(&data, &crate::global_schema::type_hash_storage_seat())
+                        .is_none()
+                {
                     return;
                 }
                 let root = match deserialize_go_tree(&data) {
@@ -3158,15 +3330,32 @@ impl CommittedProverScan {
                 let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
                     return;
                 };
+                if type_hash == crate::global_schema::type_hash_storage_seat() {
+                    use crate::global_intrinsic::storage_seat;
+                    let member = read_bytes(&root, storage_seat::CLASS, "Member");
+                    let filter = read_bytes(&root, storage_seat::CLASS, "ShardFilter");
+                    if member.len() == 32 {
+                        if let Ok(epochs) = storage_seat::decode_sealed_epochs(&read_bytes(
+                            &root,
+                            storage_seat::CLASS,
+                            "Slots",
+                        )) {
+                            seats.insert((member, filter), epochs);
+                        }
+                    }
+                    return;
+                }
                 if type_hash == TYPE_HASH_ALLOCATION {
                     if let Some((prover_ref, alloc)) = decode_allocation(&vk, &root) {
-                        allocations.push((prover_ref, alloc));
-                        ring_keys.push(decode_ring_key(&root));
-                        releases.push(
+                        rows.push((
+                            vk,
+                            prover_ref,
+                            alloc,
+                            decode_ring_key(&root),
                             crate::global_intrinsic::prover_release::Release::from_bytes(
                                 &read_bytes(&root, "allocation:ProverAllocation", "Release"),
                             ),
-                        );
+                        ));
                     }
                     return;
                 }
@@ -3178,6 +3367,18 @@ impl CommittedProverScan {
                 }
             };
         let adds = hg.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut cb);
+        // Vertex-key order, whatever order the store yields: it walks the
+        // versioned keyspace before the legacy one, and collects versioned
+        // keys of differing lengths through a hash map.
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut allocations = Vec::with_capacity(rows.len());
+        let mut ring_keys = Vec::with_capacity(rows.len());
+        let mut releases = Vec::with_capacity(rows.len());
+        for (_, prover_ref, alloc, ring_key, release) in rows {
+            allocations.push((prover_ref, alloc));
+            ring_keys.push(ring_key);
+            releases.push(release);
+        }
         (
             Self {
                 addr_to_pubkey,
@@ -3185,6 +3386,7 @@ impl CommittedProverScan {
                 ring_keys,
                 releases,
                 seniority,
+                seats,
             },
             removes.and(adds),
         )
@@ -3238,7 +3440,7 @@ impl CommittedProverScan {
     }
 
     /// Every allocation, with its prover's public key and its ring key
-    /// ([`Self::ring_key`]), in scan order.
+    /// ([`Self::ring_key`]), in vertex-key order.
     pub fn allocations_with_keys(
         &self,
     ) -> impl Iterator<
@@ -3346,6 +3548,15 @@ impl CommittedProverScan {
             for (prover_ref, alloc) in &self.allocations {
                 if alloc.confirmation_filter != filter
                     || !committee_eligible(alloc, frame_number, lenient)
+                    || (!filter.is_empty()
+                        && quil_types::consensus::sealed_storage_required_at(frame_number)
+                        && !self
+                            .seats
+                            .get(&(prover_ref.clone(), filter.to_vec()))
+                            .is_some_and(|epochs| {
+                                epochs
+                                    .contains(&quil_types::consensus::epoch_for_frame(frame_number))
+                            }))
                 {
                     continue;
                 }
@@ -3735,6 +3946,22 @@ mod tests {
     use num_bigint::BigInt;
     use quil_tries::{serialize_go_tree, LeafNode, VectorCommitmentTree};
 
+    /// The split proposer treats regions at or above this bound as never
+    /// receiving an output (`quil_forest::bit_path_reaches_outputs`): it must
+    /// be the field coin and escrow addresses are Poseidon images in.
+    #[test]
+    fn the_output_address_bound_is_the_bn254_modulus() {
+        let (_, modulus) = bn254_modulus().to_bytes_be();
+        assert_eq!(
+            modulus.as_slice(),
+            quil_forest::POSEIDON_ADDRESS_BOUND.as_slice()
+        );
+        for seed in 0u32..256 {
+            let address = quil_crypto::poseidon::hash_bytes_to_32(&seed.to_be_bytes()).unwrap();
+            assert!(address < quil_forest::POSEIDON_ADDRESS_BOUND, "{seed}");
+        }
+    }
+
     fn make_vertex_key(address_byte: u8) -> Vec<u8> {
         // 32-byte domain (global intrinsic) + 32-byte address.
         let mut key = vec![0xFFu8; 32];
@@ -3903,6 +4130,113 @@ mod tests {
             shared.read(|r| r.largest_row),
             2,
             "the repeated read is installed"
+        );
+    }
+
+    /// A prover-tree sync refreshes the registry from the store as the sync
+    /// left it, and that refresh can end after a later read was installed
+    /// (the startup load, a state jump): it must not put the older registry
+    /// back.
+    #[test]
+    fn a_refresh_from_an_older_capture_keeps_the_newer_registry() {
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: [0xFF; 32],
+        };
+        seed_prover(&store, &shard, 0x11, 0);
+        let older = store.capture_tree_snapshot().unwrap().unwrap();
+        seed_prover(&store, &shard, 0x12, 0);
+        let shared = SharedProverRegistry::new();
+        shared.refresh_from_store(store.as_ref()).unwrap();
+        assert_eq!(shared.read(|r| r.distinct_provers()), 2);
+        shared
+            .refresh_from_capture(store.as_ref(), older.as_ref())
+            .unwrap();
+        assert_eq!(
+            shared.read(|r| r.distinct_provers()),
+            2,
+            "registry refresh from an older capture put back a registry older than the last completed refresh"
+        );
+        assert!(shared.initial_load_complete());
+        seed_prover(&store, &shard, 0x13, 0);
+        let newer = store.capture_tree_snapshot().unwrap().unwrap();
+        seed_prover(&store, &shard, 0x14, 0);
+        shared
+            .refresh_from_capture(store.as_ref(), newer.as_ref())
+            .unwrap();
+        assert_eq!(
+            shared.read(|r| r.distinct_provers()),
+            3,
+            "registry refresh from a later capture installs exactly that capture"
+        );
+    }
+
+    /// The slow-refresh warning names where the time went: both reads when
+    /// an edit overlapped the first, the vertices they visited and the
+    /// provers installed.
+    #[test]
+    fn a_refresh_overlapped_by_an_edit_reports_both_reads() {
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: [0xFF; 32],
+        };
+        seed_prover(&store, &shard, 0x21, 0);
+        seed_prover(&store, &shard, 0x22, 0);
+        let shared = SharedProverRegistry::new();
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let timing = shared
+            .refresh_canonical(|| {
+                if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    shared
+                        .update_prover_activity(&[1; 32], &[2; 32], 5)
+                        .unwrap();
+                }
+                let mut fresh = InMemoryProverRegistry::new();
+                fresh.refresh(store.as_ref())?;
+                Ok(fresh)
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                timing.reads,
+                timing.vertices,
+                timing.provers,
+                timing.kept_newer
+            ),
+            (2, 4, 2, false),
+            "refresh timing miscounts its reads"
+        );
+        assert!(timing.total >= timing.serial_wait + timing.read);
+    }
+
+    /// One warning per interval at most, counting the slow refreshes since
+    /// the last one; a refresh of exactly 30 s is not slow.
+    #[test]
+    fn slow_refreshes_warn_once_per_interval() {
+        let gate = RefreshGate::default();
+        let state = |gate: &RefreshGate| {
+            let slow = gate.slow.lock().unwrap();
+            (slow.warned.is_some(), slow.since_warn)
+        };
+        gate.report(&RefreshTiming {
+            total: SLOW_REFRESH,
+            ..RefreshTiming::default()
+        });
+        assert_eq!(state(&gate), (false, 0), "a 30 s refresh is not slow");
+        let slow = RefreshTiming {
+            total: SLOW_REFRESH + std::time::Duration::from_millis(1),
+            ..RefreshTiming::default()
+        };
+        gate.report(&slow);
+        assert_eq!(state(&gate), (true, 0), "the first slow refresh warns");
+        gate.report(&slow);
+        gate.report(&slow);
+        assert_eq!(
+            state(&gate),
+            (true, 2),
+            "slow refreshes within the interval warn again"
         );
     }
 
@@ -4955,6 +5289,82 @@ mod tests {
         assert_eq!(
             scan.all_on_filter(&fa[0]),
             vec![(pk_a.clone(), addr_a.clone())]
+        );
+    }
+
+    /// A/B reproducer for the scan's allocation order: the store yields its
+    /// versioned vertices before its legacy ones, so the scan listed
+    /// allocations in an order that depends on how each node's store was
+    /// written rather than on committed state. A build that sorts the scan
+    /// lists them by vertex key.
+    #[test]
+    fn reproduces_allocations_in_store_order() {
+        use crate::global_intrinsic::materialize::{
+            allocation_address, prover_address_from_pubkey,
+        };
+        use quil_hypergraph::HypergraphCrdt;
+        use quil_types::crypto::NoopInclusionProver;
+
+        let (_tmp, store) = temp_store();
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: [0xFF; 32],
+        };
+        let pk = vec![0xA1u8; 57];
+        let paddr = prover_address_from_pubkey(&pk).unwrap();
+        let mut vertices: Vec<(Vec<u8>, Vec<u8>)> = (0u8..2)
+            .map(|suffix| {
+                let mut filter = crate::domains::QUIL_TOKEN.to_vec();
+                filter.push(suffix);
+                let blob = build_sub_tree(vec![
+                    type_hash_leaf("allocation:ProverAllocation"),
+                    field_leaf("allocation:ProverAllocation", "Prover", paddr.to_vec()),
+                    field_leaf("allocation:ProverAllocation", "Status", vec![1u8]),
+                    field_leaf(
+                        "allocation:ProverAllocation",
+                        "ConfirmationFilter",
+                        filter.clone(),
+                    ),
+                ]);
+                let mut key = vec![0xFFu8; 32];
+                key.extend_from_slice(&allocation_address(&pk, &filter).unwrap());
+                (key, blob)
+            })
+            .collect();
+        vertices.sort();
+        // The higher vertex key in the versioned keyspace, the lower one in
+        // the legacy keyspace a node keeps until it rewrites the vertex.
+        let (low, high) = (&vertices[0], &vertices[1]);
+        store
+            .save_vertex_underlying("vertex", "adds", &shard, &low.0, &low.1)
+            .unwrap();
+        let txn = store.new_transaction(false).unwrap();
+        store
+            .save_vertex_underlying_versioned(
+                txn.as_ref(),
+                "vertex",
+                "adds",
+                &shard,
+                &high.0,
+                &high.1,
+                1,
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        let crdt = HypergraphCrdt::new(
+            store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+            Arc::new(NoopInclusionProver),
+        );
+        let scan = CommittedProverScan::try_scan(&crdt).unwrap();
+        let listed: Vec<Vec<u8>> = scan
+            .allocations_with_keys()
+            .map(|(_, alloc, _, _)| alloc.vertex_address.clone())
+            .collect();
+        let by_key: Vec<Vec<u8>> = vertices.iter().map(|(key, _)| key[32..].to_vec()).collect();
+        assert_eq!(listed.len(), 2, "both allocations scanned");
+        assert_eq!(
+            listed, by_key,
+            "allocations listed in store order, not by vertex key"
         );
     }
 
@@ -6079,7 +6489,7 @@ mod tests {
                         };
                         for frame in below.iter().chain(after.iter()).copied() {
                             let expected = last_active_rule(&alloc, frame, halt);
-                            let default = quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME;
+                            let default = quil_types::consensus::signed_frame_activation_frame();
                             assert_eq!(
                                 allocation_fresh_at(&alloc, frame, halt, threshold, default),
                                 expected,
@@ -6694,12 +7104,14 @@ mod tests {
         set_leaver_currency_frame_for_thread(None);
     }
 
-    /// Leaver currency is consensus and not scheduled on mainnet.
+    /// Leaver currency is consensus: on mainnet from its own frame, the
+    /// first of an epoch, whatever the environment says.
     #[test]
-    fn leaver_currency_is_not_scheduled_by_default() {
-        assert_eq!(MAINNET_LEAVER_CURRENCY_FRAME, None);
-        assert_eq!(leaver_currency_frame_for(0, None), u64::MAX);
-        assert_eq!(leaver_currency_frame_for(0, Some("7")), u64::MAX);
+    fn leaver_currency_is_scheduled_on_mainnet_only() {
+        let mainnet = 1423 * quil_types::consensus::EPOCH_LENGTH_FRAMES;
+        assert_eq!(MAINNET_LEAVER_CURRENCY_FRAME, Some(mainnet));
+        assert_eq!(leaver_currency_frame_for(0, None), mainnet);
+        assert_eq!(leaver_currency_frame_for(0, Some("7")), mainnet);
         assert_eq!(leaver_currency_frame_for(1, Some("7")), 7);
         assert_eq!(leaver_currency_frame_for(1, Some("soon")), u64::MAX);
         assert_eq!(leaver_currency_frame_for(1, None), u64::MAX);
@@ -8243,4 +8655,109 @@ mod tests {
     include!("prover_registry_storage_tests.rs");
     include!("prover_registry_penalties_tests.rs");
     include!("registry_rows_tests.rs");
+    #[test]
+    fn sealed_storage_membership_has_no_empty_committee_bypass() {
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1393));
+        let boundary = quil_types::consensus::epoch_start_frame(1393);
+        let filter = vec![0x71; 32];
+        let mut registry = InMemoryProverRegistry::new();
+        for id in 1..=3 {
+            let address = vec![id; 32];
+            let mut alloc = leaving_alloc(filter.clone(), 1393, 0, 0);
+            alloc.status = ProverStatus::Active;
+            registry.prover_cache.insert(
+                address.clone(),
+                ProverInfo {
+                    public_key: vec![id; 897],
+                    address: address.clone(),
+                    status: ProverStatus::Active,
+                    kick_frame_number: 0,
+                    allocations: vec![alloc],
+                    available_storage: 0,
+                    seniority: 0,
+                    delegate_address: vec![],
+                },
+            );
+            registry
+                .filter_cache
+                .entry(filter.clone())
+                .or_default()
+                .push(address.clone());
+            if id > 1 {
+                registry.seat_cache.insert(
+                    (address, filter.clone()),
+                    vec![quil_types::consensus::StorageSeatSlot {
+                        epoch: 1393,
+                        leaves: vec![vec![]],
+                        registered_at: boundary - 10,
+                        sealed_at: (id == 3).then_some(boundary - 1),
+                        frames: 0,
+                        accumulator: [0; 32],
+                        chained: vec![],
+                        open: true,
+                    }],
+                );
+            }
+        }
+        let mut scan = CommittedProverScan::from_parts(
+            registry
+                .prover_cache
+                .iter()
+                .map(|(a, p)| (a.clone(), p.public_key.clone()))
+                .collect(),
+            registry
+                .prover_cache
+                .iter()
+                .map(|(a, p)| (a.clone(), p.allocations[0].clone()))
+                .collect(),
+        );
+        scan.seats = registry
+            .seat_cache
+            .iter()
+            .map(|(key, slots)| {
+                (
+                    key.clone(),
+                    slots
+                        .iter()
+                        .filter(|slot| {
+                            !slot.leaves.is_empty()
+                                && slot.sealed_at.is_some_and(|at| {
+                                    at < quil_types::consensus::epoch_start_frame(slot.epoch)
+                                })
+                        })
+                        .map(|slot| slot.epoch)
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(registry.get_active_provers(&filter, boundary - 1).len(), 3);
+        assert_eq!(scan.active_on_filter(&filter, boundary - 1).len(), 3);
+        assert_eq!(
+            registry
+                .get_active_provers(&filter, boundary)
+                .iter()
+                .map(|p| p.address.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![3; 32]]
+        );
+        assert_eq!(
+            registry.get_ordered_provers(&[0; 32], &filter, boundary),
+            vec![vec![3; 32]]
+        );
+        assert_eq!(
+            scan.active_on_filter(&filter, boundary)
+                .iter()
+                .map(|(_, a)| a.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![3; 32]]
+        );
+        registry.seat_cache.clear();
+        scan.seats.clear();
+        assert!(registry.get_active_provers(&filter, boundary).is_empty());
+        assert!(registry
+            .get_ordered_provers(&[0; 32], &filter, boundary)
+            .is_empty());
+        assert!(scan.active_on_filter(&filter, boundary).is_empty());
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+    }
 }

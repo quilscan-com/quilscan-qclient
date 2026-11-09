@@ -420,6 +420,68 @@ fn projected_snapshot_frame(frame_number: u64, remaining: std::time::Duration) -
     frame_number.saturating_add(u64::try_from(frames).unwrap_or(u64::MAX))
 }
 
+/// What restarting now costs the pending seats, summed for one log line: the
+/// worst verdict, how many seats it costs or stops, and the encode's least
+/// advanced layers and longest restart cost.
+struct RestartSummary {
+    worst: crate::restart_readiness::Verdict,
+    costs_share: usize,
+    stops_shard: usize,
+    labels_kept: bool,
+    layers_done: u32,
+    layers: u32,
+    cost_minutes: u32,
+    minutes_to_grace: u32,
+    encoding: bool,
+}
+
+impl Default for RestartSummary {
+    fn default() -> Self {
+        Self {
+            worst: crate::restart_readiness::Verdict::Ok,
+            costs_share: 0,
+            stops_shard: 0,
+            labels_kept: true,
+            layers_done: 0,
+            layers: 0,
+            cost_minutes: 0,
+            minutes_to_grace: 0,
+            encoding: false,
+        }
+    }
+}
+
+impl RestartSummary {
+    fn add(
+        &mut self,
+        (seat, verdict): (
+            quil_types::proto::node::RestartReadiness,
+            crate::restart_readiness::Verdict,
+        ),
+    ) {
+        use crate::restart_readiness::Verdict;
+        self.worst = self.worst.max(verdict);
+        self.costs_share += usize::from(verdict == Verdict::CostsShare);
+        self.stops_shard += usize::from(verdict == Verdict::StopsShard);
+        self.cost_minutes = self.cost_minutes.max(seat.restart_cost_minutes);
+        if seat.encoding {
+            self.labels_kept &= seat.labels_kept;
+            self.layers_done = if self.encoding {
+                self.layers_done.min(seat.layers_done)
+            } else {
+                seat.layers_done
+            };
+            self.layers = self.layers.max(seat.layers);
+            self.minutes_to_grace = if self.encoding {
+                self.minutes_to_grace.min(seat.minutes_to_grace)
+            } else {
+                seat.minutes_to_grace
+            };
+            self.encoding = true;
+        }
+    }
+}
+
 /// Report the seats a confirm leaves out because their storage snapshot is
 /// not encoded yet: one line when the pending seats change, and again every
 /// [`PENDING_SNAPSHOT_REPORT`] while they stay, with the seats ready and the
@@ -450,10 +512,16 @@ fn report_pending_snapshots(frame_number: u64, prepared: &PreparedConfirm) {
     filters.sort();
     let mut encoding = 0usize;
     let mut late: Vec<(Vec<u8>, u64, bool)> = Vec::new();
+    // What restarting now costs the pending seats (`crate::restart_readiness`).
+    let mut restart = RestartSummary::default();
     for seat in &pending {
         let shards: Vec<Vec<u8>> = std::iter::once(seat.filter.clone())
             .chain(seat.targets.iter().cloned())
             .collect();
+        restart.add(crate::restart_readiness::shards_readiness(
+            &shards,
+            crate::restart_readiness::noted_margin(&seat.filter),
+        ));
         let Some(progress) = crate::storage_snapshot::snapshot_progress(&shards, epoch) else {
             continue;
         };
@@ -482,11 +550,16 @@ fn report_pending_snapshots(frame_number: u64, prepared: &PreparedConfirm) {
                 .join(",");
             info!(frame = frame_number, epoch, ready = prepared.filters.len(), pending = filters.len(),
                 encoding, not_started = filters.len() - encoding, grace_frame,
-                frames_to_grace = grace_frame.saturating_sub(frame_number), pending_filters = %listed,
+                frames_to_grace = grace_frame.saturating_sub(frame_number),
+                labels_kept = restart.labels_kept, layers_done = restart.layers_done,
+                layers = restart.layers, restart_cost_minutes = restart.cost_minutes,
+                minutes_to_grace = restart.minutes_to_grace, restart_costs_share = restart.costs_share,
+                restart_stops_shard = restart.stops_shard, restart = restart.worst.text(),
+                pending_filters = %listed,
                 more_pending = filters.len().saturating_sub(LISTED), scope = "local",
                 "confirmation submits the seats whose storage snapshot is encoded and retries the pending \
                  ones each cycle: an expected wait while their snapshots encode; a seat still pending at the \
-                 grace frame renews without a storage registration and earns no storage share on its shard \
+                 grace frame renews without a storage registration, so its frames carry no storage attestation \
                  that epoch");
         }
     }
@@ -515,7 +588,7 @@ fn report_pending_snapshots(frame_number: u64, prepared: &PreparedConfirm) {
         warn!(frame = frame_number, epoch, filter = %hex::encode(&filter), projected_frame = projected,
             grace_frame, scope = "local", action,
             "storage snapshot of a seat is projected to finish after its renewal's grace frame: past it the \
-             seat renews without a storage registration and earns no storage share on its shard that epoch \
+             seat renews without a storage registration and carries no storage attestation that epoch \
              (reported once a seat per epoch)");
     }
 }
@@ -2387,21 +2460,25 @@ impl ProverPipeline {
         self.publish_prover_message(bytes, frame_number).await
     }
 
-    /// Submit a `ShardSplit` proposal for the given shard → child set.
-    /// Go signs `u64_be(frame) || shard_address` under the
-    /// `SHARD_SPLIT` domain. See `global_shard_split.go:205-230`.
+    /// Submit a `ShardSplit` proposal for the given shard → child set,
+    /// signed over what its verifier checks
+    /// (`verify::shard_op_signing_payload`): from the shard op binding epoch
+    /// the frame, the parent and every child; before it, as Go
+    /// (`global_shard_split.go:205-230`), the frame and parent only.
     pub async fn submit_shard_split(
         &self,
         shard_address: Vec<u8>,
         proposed_shards: Vec<Vec<u8>>,
         frame_number: u64,
     ) -> Result<()> {
-        let mut msg = Vec::with_capacity(8 + shard_address.len());
-        msg.extend_from_slice(&frame_number.to_be_bytes());
-        msg.extend_from_slice(&shard_address);
-
+        let (msg, domain) = quil_execution::global_intrinsic::verify::shard_op_signing_payload(
+            quil_execution::global_intrinsic::verify::ShardOpKind::Split,
+            frame_number,
+            frame_number,
+            &shard_address,
+            &proposed_shards,
+        )?;
         let signer = self.bls_signer()?;
-        let domain = Self::domain(b"SHARD_SPLIT")?;
         let signature = signer.sign_with_domain(&msg, &domain)?;
 
         let split = ShardSplit {
@@ -2424,21 +2501,23 @@ impl ProverPipeline {
             .await
     }
 
-    /// Submit a `ShardMerge` proposal for the given shard list →
-    /// parent. Go signs `u64_be(frame) || parent_address` under the
-    /// `SHARD_MERGE` domain. See `global_shard_merge.go:203-230`.
+    /// Submit a `ShardMerge` proposal for the given shard list → parent,
+    /// signed like [`Self::submit_shard_split`] (before the shard op binding
+    /// epoch as Go, `global_shard_merge.go:203-230`: frame and parent only).
     pub async fn submit_shard_merge(
         &self,
         shard_addresses: Vec<Vec<u8>>,
         parent_address: Vec<u8>,
         frame_number: u64,
     ) -> Result<()> {
-        let mut msg = Vec::with_capacity(8 + parent_address.len());
-        msg.extend_from_slice(&frame_number.to_be_bytes());
-        msg.extend_from_slice(&parent_address);
-
+        let (msg, domain) = quil_execution::global_intrinsic::verify::shard_op_signing_payload(
+            quil_execution::global_intrinsic::verify::ShardOpKind::Merge,
+            frame_number,
+            frame_number,
+            &parent_address,
+            &shard_addresses,
+        )?;
         let signer = self.bls_signer()?;
-        let domain = Self::domain(b"SHARD_MERGE")?;
         let signature = signer.sign_with_domain(&msg, &domain)?;
 
         let merge = ShardMerge {
@@ -4587,5 +4666,86 @@ mod tests {
             103,
             "a seat's remaining encode in frames, rounded up"
         );
+    }
+
+    /// A seat whose leaf is labelled now from most of its layers kept ahead
+    /// is projected by the layers left from the leaf's start, while its kept
+    /// layers are checked, and is not warned late (2026-11-05: with 8 of a
+    /// leaf's 11 layers kept, 158 frames past the snapshot frame it was
+    /// projected 481 frames on, past its grace, and landed before it).
+    #[test]
+    fn a_seat_resuming_most_layers_kept_is_not_projected_late() {
+        use crate::storage_snapshot::{
+            label_estimate, leaf_started_from, snapshot_progress, LeafOutcome, LeafWork,
+        };
+        let epoch = 1408;
+        let snapshot = quil_types::consensus::storage_snapshot_frame(epoch);
+        let grace = snapshot + crate::app_shard_metadata::storage_snapshot_grace();
+        assert_eq!((snapshot, grace), (1_013_056, 1_013_376));
+        let (filter, nodes, frame) = ([0x5Au8; 35], 32_304_146, snapshot + 158);
+        let projected = || {
+            let seat = snapshot_progress(&[filter.to_vec()], epoch).expect("its leaf runs");
+            let at = super::projected_snapshot_frame(frame, seat.remaining);
+            (seat.remaining, at)
+        };
+        let whole = leaf_started_from(epoch, &filter, b"whole", nodes, 0, LeafWork::LabellingNow);
+        assert!(projected().1 > grace, "labelled whole, it is late");
+        whole.end(LeafOutcome::Completed);
+        let leaf = leaf_started_from(epoch, &filter, b"resumed", nodes, 8, LeafWork::LabellingNow);
+        let at = projected().1;
+        assert!(
+            at <= grace,
+            "from 8 of 11 layers kept it ends at frame {at}, by its grace frame {grace}"
+        );
+        // Its first note of its layers, once they are checked, counts the
+        // same 3 layers left, not fewer.
+        leaf.layers(8, 11);
+        let (checked, three) = (projected().0, label_estimate(nodes) * 3 / 11);
+        assert!(
+            checked > label_estimate(nodes) * 2 / 11
+                && checked <= three + std::time::Duration::from_secs(1),
+            "3 of 11 layers left: {checked:?} of {three:?}"
+        );
+        leaf.end(LeafOutcome::Completed);
+    }
+
+    /// The pipeline line's restart summary takes the worst verdict, counts the
+    /// seats it costs or stops, and keeps the least advanced encode.
+    #[test]
+    fn the_restart_summary_takes_the_worst_seat() {
+        use crate::restart_readiness::Verdict;
+        use quil_types::proto::node::RestartReadiness;
+        let seat = |verdict: Verdict, encoding: bool, done: u32, cost: u32, grace: u32| {
+            (
+                RestartReadiness {
+                    verdict: verdict.name().into(),
+                    encoding,
+                    labels_kept: done > 2,
+                    layers_done: done,
+                    layers: 11,
+                    restart_cost_minutes: cost,
+                    minutes_to_grace: grace,
+                    committee_margin: None,
+                },
+                verdict,
+            )
+        };
+        let mut summary = super::RestartSummary::default();
+        summary.add(seat(Verdict::Ok, false, 0, 0, 0));
+        assert_eq!(summary.worst, Verdict::Ok);
+        summary.add(seat(Verdict::CostsShare, true, 6, 20, 30));
+        summary.add(seat(Verdict::StopsShard, true, 3, 12, 50));
+        summary.add(seat(Verdict::CostsShare, true, 1, 35, 40));
+        assert_eq!(summary.worst, Verdict::StopsShard);
+        assert_eq!((summary.costs_share, summary.stops_shard), (2, 1));
+        assert_eq!(
+            (
+                summary.layers_done,
+                summary.cost_minutes,
+                summary.minutes_to_grace
+            ),
+            (1, 35, 30)
+        );
+        assert!(!summary.labels_kept, "one seat's labels are not kept");
     }
 }

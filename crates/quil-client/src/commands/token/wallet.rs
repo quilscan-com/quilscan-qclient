@@ -5,7 +5,7 @@ use quil_crypto::sntrup761;
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use quil_lattice_ct::confidential::{
     address::RecipientAddress,
-    memo::{open_output, OpenedOutput},
+    memo::{open_output_with_keys, OpenedOutput, OpeningKeys},
     relation::membership::RecipientSecret,
     transfer::{parameter_context, Output},
 };
@@ -22,12 +22,19 @@ mod native_tests;
 #[cfg(test)]
 #[path = "wallet_submission_tests.rs"]
 mod submission_tests;
+#[cfg(all(test, feature = "native-proof"))]
+pub(crate) use submission_tests::{serve_left_out, serve_left_out_expiring, serve_left_out_with};
 
 #[cfg(feature = "native-proof")]
 #[path = "wallet_mint_status.rs"]
 mod mint_status;
 #[cfg(feature = "native-proof")]
 pub(super) use mint_status::run_mint_status;
+#[cfg(feature = "native-proof")]
+#[path = "wallet_paid_bundle.rs"]
+mod paid_bundle;
+#[cfg(feature = "native-proof")]
+pub(super) use paid_bundle::run_custom_mint_resume;
 #[path = "wallet_inclusion.rs"]
 pub(super) mod inclusion;
 #[cfg(feature = "native-proof")]
@@ -45,12 +52,21 @@ pub(super) struct RecipientWallet {
     kem_secret: Zeroizing<Vec<u8>>,
     recipient: RecipientSecret,
     address: RecipientAddress,
-    /// Page budget of the full scan a spend's witness rebuild makes: the last
-    /// balance scan's, else the CLI default.
+    /// Page cap of the full scan a spend's witness rebuild makes: the last
+    /// balance scan's, else none.
     scan_pages: std::sync::atomic::AtomicUsize,
     /// What the last spend scan kept for its witnesses; the next witness
     /// rebuild takes it, so a spend lists the coins once.
     prepared: std::sync::Mutex<Option<SpendScan>>,
+    /// The keys that open this wallet's coins, derived on first use: a scan
+    /// opens every coin of the application with them.
+    opening: std::sync::OnceLock<OpeningKeys>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Derivations of a wallet's opening keys on this thread.
+    static KEY_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// What a settlement binds: the bundle it funds, or — when the payer does not
@@ -122,6 +138,47 @@ pub(super) struct OwnedCoin {
     image: [u8; IDENTITY_BYTES],
 }
 
+/// Of two unspent coins of this wallet sharing a spend image, each with its
+/// creation frame, whether `coin` is the one to keep over `kept`: the larger
+/// amount, then the older frame, then the lower address. Only one of them can
+/// be spent, so the choice must not depend on the order a node lists coins
+/// in; and an older coin is the likelier to sit where a spend's witness can
+/// already be built.
+fn keeps_over(coin: (&OwnedCoin, u64), kept: (&OwnedCoin, u64)) -> bool {
+    coin_rank(coin.0, coin.1) < coin_rank(kept.0, kept.1)
+}
+
+/// The order a scan keeps coins in: the larger amount, then the older
+/// frame, then the lower address.
+fn coin_rank(coin: &OwnedCoin, frame: u64) -> (std::cmp::Reverse<u128>, u64, [u8; 32]) {
+    (std::cmp::Reverse(*coin.amount), frame, coin.address)
+}
+
+/// Keeps the `max` coins of `coins` (each with its creation frame) that
+/// rank first, in address order, names the rest in `report`, and indexes
+/// the kept ones' images in `by_image`. Anyone can send a wallet coins, so
+/// past its limit a scan goes on: hiding a coin takes more than `max`
+/// larger ones.
+fn keep_largest_coins(
+    coins: &mut Vec<(OwnedCoin, u64)>,
+    by_image: &mut std::collections::HashMap<[u8; IDENTITY_BYTES], usize>,
+    max: usize,
+    report: &mut ScanReport,
+) {
+    if coins.len() <= max {
+        return;
+    }
+    coins.sort_by_key(|(coin, frame)| coin_rank(coin, *frame));
+    for (coin, _) in coins.drain(max..) {
+        report.skip_limited(coin.address);
+    }
+    coins.sort_by_key(|(coin, _)| coin.address);
+    by_image.clear();
+    for (index, (coin, _)) in coins.iter().enumerate() {
+        by_image.insert(coin.image, index);
+    }
+}
+
 fn select_coins(
     mut coins: Vec<OwnedCoin>,
     amount: u128,
@@ -165,10 +222,24 @@ fn select_coins(
     anyhow::bail!("insufficient node-reported unspent funds")
 }
 
-/// Coins or escrows a scan page asks for: the most a node serves, so the
-/// page budget covers eight times the coins it did. A node without
-/// `max_coins` answers pages of eight, which the page checks accept too.
+/// Coins or escrows a scan page asks for: the most a node serves, so a
+/// scan takes an eighth of the pages it did. A node without `max_coins`
+/// answers pages of eight, which the page checks accept too.
 const SCAN_PAGE_ENTRIES: usize = quil_types::store::MAX_SCAN_PAGE_ENTRIES;
+
+#[cfg(test)]
+thread_local! {
+    /// How long before its start a scan on this thread counts as begun:
+    /// the expiry tests run a scan as if it had already lasted that long.
+    static SCAN_STARTED_AGO: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// Makes this thread's later scans count as begun `ago` before they start.
+#[cfg(all(test, feature = "native-proof"))]
+pub(crate) fn scans_begin_ago(ago: std::time::Duration) {
+    SCAN_STARTED_AGO.with(|started| started.set(ago));
+}
 
 /// Times a scan's read is asked again after the node could not deliver it,
 /// and the wait before each. A failed page leaves the scan where it was, so
@@ -211,7 +282,7 @@ where
             return Err(status);
         }
         retries += 1;
-        super::output::err_line(format!(
+        super::output::err_detail(format!(
             "confidential scan: {what} failed ({}); asking again in {} s ({retries}/{SCAN_READ_RETRIES})",
             status.message(),
             SCAN_READ_RETRY_DELAY.as_secs()
@@ -220,9 +291,9 @@ where
     }
 }
 
-/// Page budget of a witness rebuild's scan until a balance scan sets one: the
-/// `--max-pages` default.
-const DEFAULT_SCAN_PAGES: usize = 2048;
+/// Page cap of a witness rebuild's scan until a balance scan sets one: none,
+/// as `--max-pages` sets none by default.
+const DEFAULT_SCAN_PAGES: usize = super::SCAN_PAGES_UNCAPPED;
 /// Most coins a witness rebuild keeps: those under the subtrees the selected
 /// coins' addresses can sit in. One full block holds 65,536.
 const MAX_WITNESS_SUBTREE_COINS: usize = 1 << 16;
@@ -504,43 +575,173 @@ impl SpendScanCollector {
 }
 
 /// Each coin's leaf, off the async runtime: the hash a witness rebuild
-/// places it by.
+/// places it by, the one the chain committed. A coin whose owner is not a
+/// canonical identity is burned (`coin_tree::committed_leaf`): it takes the
+/// empty leaf, and the coins beside it stay spendable.
 async fn hash_kept(
     key: std::sync::Arc<quil_lattice_ct::confidential::relation::membership::MembershipKey>,
     batch: Vec<(usize, ScannedCoin)>,
 ) -> anyhow::Result<Vec<KeptCoin>> {
-    use quil_lattice_ct::confidential::relation::membership::Node;
+    use quil_lattice_ct::confidential::coin_tree::committed_leaf;
     if batch.is_empty() {
         return Ok(Vec::new());
     }
-    tokio::task::spawn_blocking(move || {
+    Ok(tokio::task::spawn_blocking(move || {
         batch
             .into_iter()
-            .map(|(subtree, coin)| {
-                let owner = Node::from_identity_bytes(&coin.output.owner)
-                    .map_err(|e| anyhow::anyhow!("scanned owner: {e:?}"))?;
-                Ok(KeptCoin {
-                    subtree,
-                    position: coin.position,
-                    frame: coin.frame,
-                    leaf: key.leaf(&owner, &coin.output.commitment).to_bytes(),
-                })
+            .map(|(subtree, coin)| KeptCoin {
+                subtree,
+                position: coin.position,
+                frame: coin.frame,
+                leaf: committed_leaf(&key, &coin.output.owner, &coin.output.commitment).to_bytes(),
             })
-            .collect::<anyhow::Result<Vec<_>>>()
+            .collect()
     })
-    .await?
+    .await?)
 }
 
-/// Bounded scan state. A failed page leaves it unchanged; an expired snapshot
+/// Scan state. A failed page leaves it unchanged; an expired snapshot
 /// requires a fresh scan, never an implicit jump to a new database generation.
+/// Every page must move the cursor forward under one snapshot, so a scan
+/// ends with the snapshot; nothing counts the pages of other users' records.
+///
+/// The snapshot is the one bound other users' records still reach: the node
+/// releases it [`SCAN_SNAPSHOT_MAX_AGE`] after the scan starts, so a scan
+/// that cannot read the whole application in that hour (about 320,000 coins
+/// at the ~90 coins/s a regular node served) fails each time it runs, and
+/// its error says so ([`scan_stopped`]).
 pub(super) struct CoinScan {
     snapshot_id: Option<[u8; 32]>,
     root: Option<quil_lattice_ct::confidential::coin_tree::RootRecord>,
     after: Option<[u8; 32]>,
+    /// Pages left under the caller's cap: `--max-pages`, none by default
+    /// ([`super::SCAN_PAGES_UNCAPPED`]).
     remaining_pages: usize,
     finished: bool,
     /// The node answered that the application has no coin root yet.
     rootless: bool,
+    /// Pages and records read so far, for the progress lines.
+    pages: usize,
+    records: usize,
+    /// When the scan started, against [`SCAN_SNAPSHOT_MAX_AGE`].
+    started: std::time::Instant,
+}
+
+/// How long a node keeps a scan's snapshot after the scan starts, however
+/// often it is paged.
+const SCAN_SNAPSHOT_MAX_AGE: std::time::Duration = quil_hypergraph::snapshot::SCAN_MAX_AGE;
+
+/// Pages between a scan's progress lines. A full page holds 64 coins, which
+/// a regular node serves in about 0.7 s (~90 coins/s), so a line comes about
+/// every 45 s: inside the minute after which a silent command looks hung,
+/// and about 80 lines in the hour a scan can last. A scan of fewer than
+/// 4,096 coins prints none.
+const SCAN_PROGRESS_PAGES: usize = 64;
+
+/// Whether a scan read failed with `error` because the node released the
+/// scan's snapshot at its maximum age: the scan ran that long, so at the
+/// same pace every new scan stops the same way. A snapshot released sooner
+/// (left idle, a node restart) or a lost pin does not repeat.
+fn outlived_snapshot(error: &anyhow::Error, elapsed: std::time::Duration) -> bool {
+    elapsed >= SCAN_SNAPSHOT_MAX_AGE
+        && error
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|status| status.message().contains("expired"))
+}
+
+/// A scan that could not read a page: where it stopped, the node's own
+/// reason, and whether the node had released the scan's snapshot at its
+/// maximum age ([`outlived_snapshot`]). A scan only reads, so nothing was
+/// lost.
+#[derive(Debug)]
+pub(crate) struct ScanStopped {
+    /// What the scan reads: coins or escrows.
+    what: &'static str,
+    /// The page it could not read.
+    page: usize,
+    /// Records and pages read before it.
+    read: usize,
+    pages: usize,
+    /// The node's own reason.
+    reason: String,
+    /// Whole minutes the scan ran.
+    minutes: u64,
+    outlived: bool,
+}
+
+impl ScanStopped {
+    /// The minutes the node keeps a scan's snapshot, where their end
+    /// stopped this scan: a new scan on that node stops the same way, so
+    /// reading again cannot help.
+    pub(crate) fn outlived(&self) -> Option<u64> {
+        self.outlived
+            .then_some(SCAN_SNAPSHOT_MAX_AGE.as_secs() / 60)
+    }
+
+    /// Where the scan stopped and the node's reason, without what to do.
+    pub(crate) fn cause(&self) -> String {
+        format!("{}: {}", self.at(), self.reason)
+    }
+
+    fn at(&self) -> String {
+        let (page, read, what, pages) = (self.page, self.read, self.what, self.pages);
+        format!("scan stopped at page {page} after {read} {what} in {pages} pages")
+    }
+}
+
+/// The command line's error: the cause, then what to do. Where the node
+/// released the snapshot at its maximum age it says so, and that the scan
+/// fails the same way when run again on that node; otherwise, to run it
+/// again.
+impl std::fmt::Display for ScanStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (stopped, reason, what) = (self.at(), &self.reason, self.what);
+        if self.outlived {
+            let minutes = self.minutes;
+            let kept = SCAN_SNAPSHOT_MAX_AGE.as_secs() / 60;
+            write!(
+                f,
+                "{stopped} and {minutes} min: {reason}; the node releases a scan's snapshot \
+                 {kept} min after the scan starts, and the application holds more {what} than \
+                 this scan read in that time, so running the scan again here fails the same \
+                 way; nothing is lost, and your own node on faster hardware may finish it"
+            )
+        } else {
+            write!(
+                f,
+                "{stopped}: {reason}; a scan only reads, so nothing is lost: run it again"
+            )
+        }
+    }
+}
+
+impl std::error::Error for ScanStopped {}
+
+/// The error ending a scan that could not read page `page` after `read`
+/// `what` in `pages` pages and `elapsed`, with the node's own reason: a
+/// [`ScanStopped`].
+fn scan_stopped(
+    what: &'static str,
+    page: usize,
+    read: usize,
+    pages: usize,
+    error: anyhow::Error,
+    elapsed: std::time::Duration,
+) -> anyhow::Error {
+    let outlived = outlived_snapshot(&error, elapsed);
+    let reason = match error.downcast_ref::<tonic::Status>() {
+        Some(status) => status.message().to_string(),
+        None => format!("{error:#}"),
+    };
+    anyhow::Error::new(ScanStopped {
+        what,
+        page,
+        read,
+        pages,
+        reason,
+        minutes: elapsed.as_secs() / 60,
+        outlived,
+    })
 }
 
 /// What a balance scan read, for the line `token balance` ends it with.
@@ -552,41 +753,253 @@ pub(super) struct ScanReport {
     opened: usize,
     /// Spent-marker reads for coins that opened as ours.
     spent_checks: usize,
+    /// Coins whose memo opened for this wallet but does not match the coin's
+    /// commitment or owner: skipped, never counted or spent.
+    mismatched: SkipList,
+    /// Coins sharing a spend image with another unspent coin of this wallet:
+    /// only one coin per image can be spent, so the scan keeps the largest.
+    duplicates: SkipList,
+    /// Coins past the scan's coin limit: the smallest, left out.
+    limited: SkipList,
+    /// Coins a command names, each with the kind of skip it met, if any.
+    wanted: Vec<([u8; 32], Option<SkipKind>)>,
+}
+
+/// Why a scan left a coin out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkipKind {
+    Mismatched,
+    Duplicate,
+    Limited,
+}
+
+/// Coins a scan's warning names per kind; it counts all of them.
+const SKIPPED_NAMED: usize = 4;
+
+/// Coins of one kind a scan skipped: how many, and the first
+/// [`SKIPPED_NAMED`] addresses.
+#[derive(Default)]
+struct SkipList {
+    count: usize,
+    named: Vec<[u8; 32]>,
+}
+
+impl SkipList {
+    fn add(&mut self, address: [u8; 32]) {
+        self.count += 1;
+        if self.named.len() < SKIPPED_NAMED {
+            self.named.push(address);
+        }
+    }
+
+    /// The named addresses, then `...` if it skipped more.
+    fn list(&self) -> String {
+        let named: Vec<String> = self
+            .named
+            .iter()
+            .map(|address| format!("0x{}", hex::encode(address)))
+            .collect();
+        let more = if self.count > self.named.len() {
+            ", ..."
+        } else {
+            ""
+        };
+        format!("{}{more}", named.join(", "))
+    }
+}
+
+/// An unconsumed escrow a scan recovered: its address, amount, whether this
+/// wallet holds its refund branch (else its recipient branch), and the GLOBAL
+/// frame from which a refund is admitted.
+type RecoveredEscrow = ([u8; 32], Zeroizing<u128>, bool, u64);
+
+/// The order an escrow scan keeps escrows in at GLOBAL frame `head`: first
+/// those this wallet can act on now (its recipient branch, or its refund
+/// branch from the refund frame), then the larger amount, then the lower
+/// address and the recipient branch. Anyone can name a wallet's key as an
+/// escrow's refund, set a far refund frame and claim the escrow back at
+/// will, so ranking by amount alone would let such escrows push the
+/// wallet's incoming transfers out for little more than fees.
+fn escrow_rank(
+    escrow: &RecoveredEscrow,
+    head: u64,
+) -> (bool, std::cmp::Reverse<u128>, [u8; 32], bool) {
+    let actionable = !escrow.2 || head >= escrow.3;
+    (
+        !actionable,
+        std::cmp::Reverse(*escrow.1),
+        escrow.0,
+        escrow.2,
+    )
+}
+
+/// Keeps the `max` escrows of `escrows` that rank first at GLOBAL frame
+/// `head` ([`escrow_rank`]), in their scan order, and returns how many it
+/// dropped.
+fn keep_first_escrows(escrows: &mut Vec<RecoveredEscrow>, max: usize, head: u64) -> usize {
+    if escrows.len() <= max {
+        return 0;
+    }
+    escrows.sort_by_key(|escrow| escrow_rank(escrow, head));
+    let dropped = escrows.len() - max;
+    escrows.truncate(max);
+    escrows.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+    dropped
+}
+
+/// Unconsumed escrows naming this wallet that an escrow scan left out, by
+/// kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SkippedEscrows {
+    /// Past the scan's limit: those ranked last ([`escrow_rank`]).
+    pub(crate) limited: usize,
+    /// Their memo opens for this wallet but does not match the escrow, so
+    /// this wallet can neither accept nor refund them.
+    pub(crate) mismatched: usize,
+}
+
+/// Coins a scan left out of the balance, by kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SkippedCoins {
+    /// Their memo opens for this wallet but does not match the coin.
+    pub(crate) mismatched: usize,
+    /// They share a spend image with a coin the scan kept.
+    pub(crate) duplicates: usize,
+    /// They are past the scan's coin limit, the smallest.
+    pub(crate) limited: usize,
 }
 
 impl ScanReport {
     pub(super) fn line(&self, elapsed: std::time::Duration) -> String {
         format!(
-            "confidential scan: {} pages (≈{:.1} coins/page, asked {}) in {:.1} s; {} opened, {} spent checks",
+            "confidential scan: {} pages (≈{:.1} coins/page, asked {}) in {:.1} s; {} opened, {} spent checks, {} skipped",
             self.pages,
             self.coins as f64 / self.pages.max(1) as f64,
             SCAN_PAGE_ENTRIES,
             elapsed.as_secs_f64(),
             self.opened,
-            self.spent_checks
+            self.spent_checks,
+            self.mismatched.count + self.duplicates.count + self.limited.count
         )
     }
 
-    /// The error ending a scan: which page it could not read and how far it
-    /// got, with the node's own reason. A wallet scan only reads, so nothing
-    /// was lost; the next scan starts over because it needs a fresh snapshot.
-    fn stopped(&self, error: anyhow::Error) -> anyhow::Error {
-        let reason = match error.downcast_ref::<tonic::Status>() {
-            Some(status) => status.message().to_string(),
-            None => format!("{error:#}"),
-        };
-        anyhow::anyhow!(
-            "scan stopped at page {} after {} coins in {} pages: {reason}; a scan only reads, so nothing is lost: run it again",
+    fn skip_mismatched(&mut self, address: [u8; 32]) {
+        self.mismatched.add(address);
+        self.mark(address, SkipKind::Mismatched);
+    }
+
+    fn skip_duplicate(&mut self, address: [u8; 32]) {
+        self.duplicates.add(address);
+        self.mark(address, SkipKind::Duplicate);
+    }
+
+    fn skip_limited(&mut self, address: [u8; 32]) {
+        self.limited.add(address);
+        self.mark(address, SkipKind::Limited);
+    }
+
+    /// Records why a coin a command names was left out.
+    fn mark(&mut self, address: [u8; 32], kind: SkipKind) {
+        for (wanted, why) in &mut self.wanted {
+            if *wanted == address {
+                *why = Some(kind);
+            }
+        }
+    }
+
+    /// The error for a coin a command names that the scan did not keep: why
+    /// the scan left it out, and what to do, else that it is not an unspent
+    /// coin of this wallet.
+    fn not_kept(&self, address: &[u8; 32]) -> anyhow::Error {
+        let coin = format!("coin 0x{}", hex::encode(address));
+        let why = self
+            .wanted
+            .iter()
+            .find(|(wanted, _)| wanted == address)
+            .and_then(|(_, why)| *why);
+        match why {
+            Some(SkipKind::Limited) => anyhow::anyhow!(
+                "{coin} is past this scan's coin limit, which keeps the largest coins; run \
+                 again with a larger --max-coins"
+            ),
+            Some(SkipKind::Duplicate) => anyhow::anyhow!(
+                "{coin} shares a spend image with another coin of this wallet, which the scan \
+                 kept and `token coins` lists; only one coin per image can be spent"
+            ),
+            Some(SkipKind::Mismatched) => anyhow::anyhow!(
+                "{coin} has a memo that opens for this wallet but does not match the coin; it \
+                 can never be spent"
+            ),
+            None => anyhow::anyhow!("{coin} is not an unspent coin of this wallet"),
+        }
+    }
+
+    fn skipped(&self) -> SkippedCoins {
+        SkippedCoins {
+            mismatched: self.mismatched.count,
+            duplicates: self.duplicates.count,
+            limited: self.limited.count,
+        }
+    }
+
+    /// The warnings a scan that skipped coins ends with, one per kind: how
+    /// many and which, so the wallet's owner can tell what the balance
+    /// leaves out.
+    fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.mismatched.count > 0 {
+            out.push(format!(
+                "warning: skipped {} coin(s) whose memo opens for this wallet but does not match \
+                 the coin's amount or owner; they are not in the balance and are never spent: {}",
+                self.mismatched.count,
+                self.mismatched.list()
+            ));
+        }
+        if self.duplicates.count > 0 {
+            out.push(format!(
+                "warning: skipped {} coin(s) sharing a spend image with another coin of this \
+                 wallet; only one coin per image can be spent, so the balance counts the \
+                 largest: {}",
+                self.duplicates.count,
+                self.duplicates.list()
+            ));
+        }
+        if self.limited.count > 0 {
+            out.push(format!(
+                "warning: left out {} coin(s) past the scan's coin limit; the balance counts the \
+                 largest; a larger --max-coins counts more, and merging coins brings more into \
+                 the count: {}",
+                self.limited.count,
+                self.limited.list()
+            ));
+        }
+        out
+    }
+
+    /// The error ending a scan `elapsed` after it started: which page it
+    /// could not read and how far it got, with the node's own reason
+    /// ([`scan_stopped`]). The next scan starts over because it needs a
+    /// fresh snapshot.
+    fn stopped(&self, error: anyhow::Error, elapsed: std::time::Duration) -> anyhow::Error {
+        scan_stopped(
+            "coins",
             self.pages + 1,
             self.coins,
-            self.pages
+            self.pages,
+            error,
+            elapsed,
         )
     }
 }
 
 impl CoinScan {
     pub(super) fn new(max_pages: usize) -> anyhow::Result<Self> {
-        anyhow::ensure!(max_pages > 0, "scan page budget must be positive");
+        anyhow::ensure!(max_pages > 0, "scan page cap must be positive");
+        let started = std::time::Instant::now();
+        #[cfg(test)]
+        let started = started
+            .checked_sub(SCAN_STARTED_AGO.with(std::cell::Cell::get))
+            .expect("a test's scan start within the clock's range");
         Ok(Self {
             snapshot_id: None,
             root: None,
@@ -594,10 +1007,39 @@ impl CoinScan {
             remaining_pages: max_pages,
             finished: false,
             rootless: false,
+            pages: 0,
+            records: 0,
+            started,
         })
     }
     pub(super) fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// How long ago the scan started.
+    fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    /// A page read: `records` more coins or escrows.
+    fn count_page(&mut self, records: usize) {
+        self.pages += 1;
+        self.records += records;
+    }
+
+    /// The line a scan that goes on prints every [`SCAN_PROGRESS_PAGES`]
+    /// pages: how far it got, in `what` (coins or escrows), and how long it
+    /// took, so a scan that can now run up to an hour is not silent.
+    fn progress(&self, what: &str) -> Option<String> {
+        if self.finished || self.pages == 0 || !self.pages.is_multiple_of(SCAN_PROGRESS_PAGES) {
+            return None;
+        }
+        Some(format!(
+            "confidential scan: {} pages, {} {what} in {} s; still reading",
+            self.pages,
+            self.records,
+            self.elapsed().as_secs()
+        ))
     }
 }
 
@@ -1073,7 +1515,12 @@ impl RecipientWallet {
         // The saved authorization carries the claimed rewards and the fee in
         // the clear: the amount being claimed needs no decryption.
         if let Ok(reward) = mint.statement.total() {
-            super::output::line(mint_amounts_line("Claiming", reward, mint.statement.fee));
+            super::output::line(mint_amounts_line(
+                "Claiming",
+                reward,
+                mint.statement.fee,
+                crate::verbosity::on(),
+            ));
         }
         let receipt = receipt_address(&mint.statement)?;
         #[cfg(feature = "native-proof")]
@@ -1089,7 +1536,7 @@ impl RecipientWallet {
             .await?
             .into_inner();
         if response.found {
-            super::output::line(format!(
+            super::output::detail(format!(
                 "Mint claim cites global frame {}.",
                 response.cited_frame
             ));
@@ -2267,7 +2714,7 @@ impl RecipientWallet {
     ) -> anyhow::Result<quil_types::proto::node::ListCoinsResponse> {
         anyhow::ensure!(
             !scan.finished && scan.remaining_pages > 0,
-            "scan ended or page budget exhausted"
+            "scan ended or reached its --max-pages cap"
         );
         let response = retry_scan_read("a page", || {
             let mut client = client
@@ -2285,15 +2732,32 @@ impl RecipientWallet {
         Ok(response.into_inner())
     }
 
-    fn recover_page(&self, page: Vec<([u8; 32], Output)>) -> anyhow::Result<Vec<OwnedCoin>> {
+    /// The page's coins this wallet owns, and the addresses of those whose
+    /// memo opens for it but does not match the coin's commitment or owner.
+    /// A sender chooses a memo's content and no verifier can open it, so such
+    /// a coin is skipped, never spent, and does not stop the scan.
+    fn recover_page(
+        &self,
+        page: Vec<([u8; 32], Output)>,
+    ) -> anyhow::Result<(Vec<OwnedCoin>, Vec<[u8; 32]>)> {
         use quil_lattice_ct::confidential::{memo::MemoError, relation::membership::MembershipKey};
-        let key = MembershipKey::derive(&self.context);
+        // A page holding no coin needs no key.
+        if page.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let keys = self.opening_keys();
+        let key: &MembershipKey = keys.membership();
         let mut owned = Vec::new();
+        let mut mismatched = Vec::new();
         for (address, output) in page {
             let opened =
-                match open_output(&self.context, &self.kem_secret, &self.recipient, &output) {
+                match open_output_with_keys(keys, &self.kem_secret, &self.recipient, &output) {
                     Ok(opened) => opened,
                     Err(MemoError::Authentication) => continue,
+                    Err(MemoError::InconsistentOutput) => {
+                        mismatched.push(address);
+                        continue;
+                    }
                     Err(error) => anyhow::bail!("coin recovery: {error:?}"),
                 };
             let image = key
@@ -2307,7 +2771,7 @@ impl RecipientWallet {
                 image,
             });
         }
-        Ok(owned)
+        Ok((owned, mismatched))
     }
 
     /// Complete bounded scan. Errors discard partial results. The RPC provider
@@ -2354,24 +2818,67 @@ impl RecipientWallet {
         max_pages: usize,
         max_owned: usize,
     ) -> anyhow::Result<Vec<OwnedCoin>> {
+        self.scan_spendable_with(client, max_pages, max_owned, &mut ScanReport::default())
+            .await
+    }
+
+    /// [`Self::scan_spendable`] for a command that names its coins: each
+    /// must be among the coins the scan keeps, and one it left out is
+    /// refused with the reason (past the limit, a second coin of a spend
+    /// image, a memo that does not match) instead of as unknown.
+    pub(super) async fn scan_spendable_named(
+        self: std::sync::Arc<Self>,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        max_pages: usize,
+        max_owned: usize,
+        named: &[[u8; 32]],
+    ) -> anyhow::Result<Vec<OwnedCoin>> {
+        for (index, address) in named.iter().enumerate() {
+            anyhow::ensure!(
+                !named[..index].contains(address),
+                "coin 0x{} is named twice",
+                hex::encode(address)
+            );
+        }
+        let mut report = ScanReport {
+            wanted: named.iter().map(|address| (*address, None)).collect(),
+            ..Default::default()
+        };
+        let coins = self
+            .scan_spendable_with(client, max_pages, max_owned, &mut report)
+            .await?;
+        match named
+            .iter()
+            .find(|address| !coins.iter().any(|coin| coin.address == **address))
+        {
+            Some(missing) => Err(report.not_kept(missing)),
+            None => Ok(coins),
+        }
+    }
+
+    async fn scan_spendable_with(
+        self: std::sync::Arc<Self>,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        max_pages: usize,
+        max_owned: usize,
+        report: &mut ScanReport,
+    ) -> anyhow::Result<Vec<OwnedCoin>> {
         *self.prepared.lock().expect("spend scan lock") = None;
         let collector = match self.read_accumulator(client).await {
             Ok(accumulator) => Some(SpendScanCollector::new(accumulator, &self.context)),
             Err(error) => {
-                super::output::line(format!(
+                super::output::detail(format!(
                     "Spend witnesses will need a second coin scan: {error}."
                 ));
                 None
             }
         };
         Ok(self
-            .scan_owned(
-                client,
-                max_pages,
-                max_owned,
-                &mut ScanReport::default(),
-                collector,
-            )
+            .scan_owned(client, max_pages, max_owned, report, collector)
             .await?
             .unwrap_or_default())
     }
@@ -2388,18 +2895,28 @@ impl RecipientWallet {
     ) -> anyhow::Result<Option<Vec<OwnedCoin>>> {
         anyhow::ensure!(max_owned > 0, "owned coin limit must be positive");
         let mut scan = CoinScan::new(max_pages)?;
-        // A spend's witness rebuild that must rescan uses the same budget.
+        // A spend's witness rebuild that must rescan uses the same page cap.
         self.scan_pages
             .store(max_pages, std::sync::atomic::Ordering::Relaxed);
-        let mut unspent = Vec::new();
+        // The kept coins, each with its creation frame, and each image's
+        // kept coin by its index there.
+        let mut unspent: Vec<(OwnedCoin, u64)> = Vec::new();
+        let mut by_image = std::collections::HashMap::<[u8; IDENTITY_BYTES], usize>::new();
         while !scan.finished() {
             let records = self
                 .scan_next_records(client, &mut scan)
                 .await
-                .map_err(|error| report.stopped(error))?;
+                .map_err(|error| report.stopped(error, scan.elapsed()))?;
             report.pages += 1;
             report.coins += records.len();
             report.opened += records.len();
+            if let Some(line) = scan.progress("coins") {
+                super::output::err_line(line);
+            }
+            let frames: std::collections::HashMap<[u8; 32], u64> = records
+                .iter()
+                .map(|coin| (coin.address, coin.frame))
+                .collect();
             let (page, records): (Vec<_>, _) = if collector.is_some() {
                 let page = records
                     .iter()
@@ -2414,21 +2931,43 @@ impl RecipientWallet {
                 (page, None)
             };
             let wallet = self.clone();
-            let owned = tokio::task::spawn_blocking(move || wallet.recover_page(page)).await??;
+            let (owned, mismatched) =
+                tokio::task::spawn_blocking(move || wallet.recover_page(page)).await??;
+            for address in mismatched {
+                report.skip_mismatched(address);
+            }
             let mut ours = std::collections::HashSet::new();
             for coin in owned {
                 report.spent_checks += 1;
                 let unspent_hint = self
                     .is_unspent_hint(client, &coin.image)
                     .await
-                    .map_err(|error| report.stopped(error))?;
-                if unspent_hint {
-                    anyhow::ensure!(
-                        unspent.len() < max_owned,
-                        "owned coin limit exceeded; scan incomplete"
-                    );
-                    ours.insert(coin.address);
-                    unspent.push(coin);
+                    .map_err(|error| report.stopped(error, scan.elapsed()))?;
+                if !unspent_hint {
+                    continue;
+                }
+                // A sender can give two coins one spend image (a reused
+                // nonce, or one output again in a later frame). Spending
+                // either consumes the image, so one coin per image counts.
+                let frame = frames.get(&coin.address).copied().unwrap_or(u64::MAX);
+                match by_image.get(&coin.image).copied() {
+                    Some(kept)
+                        if keeps_over((&coin, frame), (&unspent[kept].0, unspent[kept].1)) =>
+                    {
+                        ours.insert(coin.address);
+                        let (dropped, _) = std::mem::replace(&mut unspent[kept], (coin, frame));
+                        report.skip_duplicate(dropped.address);
+                    }
+                    Some(_) => report.skip_duplicate(coin.address),
+                    None => {
+                        ours.insert(coin.address);
+                        by_image.insert(coin.image, unspent.len());
+                        unspent.push((coin, frame));
+                        // Bounded memory: trim once twice the limit is held.
+                        if unspent.len() >= max_owned.saturating_mul(2) {
+                            keep_largest_coins(&mut unspent, &mut by_image, max_owned, report);
+                        }
+                    }
                 }
             }
             if let (Some(collector), Some(records)) = (collector.as_mut(), records) {
@@ -2437,11 +2976,15 @@ impl RecipientWallet {
                 collector.scan.kept.extend(leaves);
             }
         }
+        keep_largest_coins(&mut unspent, &mut by_image, max_owned, report);
+        for warning in report.warnings() {
+            super::output::err_line(warning);
+        }
         if let Some(mut collector) = collector.filter(|_| !scan.rootless) {
             let batch = collector.finish();
             let leaves = hash_kept(collector.key.clone(), batch).await?;
             match collector.unusable {
-                Some(reason) => super::output::line(format!(
+                Some(reason) => super::output::detail(format!(
                     "Spend witnesses will need a second coin scan: {reason}."
                 )),
                 None => {
@@ -2451,7 +2994,7 @@ impl RecipientWallet {
                 }
             }
         }
-        Ok((!scan.rootless).then_some(unspent))
+        Ok((!scan.rootless).then(|| unspent.into_iter().map(|(coin, _)| coin).collect()))
     }
 
     fn decode_escrow_page(
@@ -2466,7 +3009,7 @@ impl RecipientWallet {
     > {
         anyhow::ensure!(
             !scan.finished && scan.remaining_pages > 0,
-            "scan ended or page budget exhausted"
+            "scan ended or reached its --max-pages cap"
         );
         anyhow::ensure!(
             prost::Message::encoded_len(&response)
@@ -2524,9 +3067,16 @@ impl RecipientWallet {
         scan.after = cursor;
         scan.remaining_pages -= 1;
         scan.finished = !response.has_more;
+        scan.count_page(escrows.len());
         Ok(escrows)
     }
 
+    /// The unconsumed escrows naming `authority` whose memo opens for this
+    /// wallet, at most `max_owned` of them, and those the scan left out.
+    /// Anyone can name a wallet in an escrow, so past the limit the scan keeps
+    /// those the wallet can act on now, then the largest ([`escrow_rank`]),
+    /// warns, and goes on; an escrow whose memo opens but does not match is
+    /// counted and warned about, as a coin is.
     pub(super) async fn scan_escrows(
         self: std::sync::Arc<Self>,
         client: &quil_types::proto::node::node_service_client::NodeServiceClient<
@@ -2535,33 +3085,54 @@ impl RecipientWallet {
         authority: Vec<u8>,
         max_pages: usize,
         max_owned: usize,
-    ) -> anyhow::Result<Vec<([u8; 32], Zeroizing<u128>, bool, u64)>> {
-        use quil_lattice_ct::confidential::memo::{open_escrow_recovery, EscrowRecoveryMemo};
+    ) -> anyhow::Result<(Vec<RecoveredEscrow>, SkippedEscrows)> {
+        use quil_lattice_ct::confidential::memo::{
+            open_escrow_recovery, EscrowRecoveryMemo, MemoError,
+        };
         anyhow::ensure!(max_owned > 0, "owned escrow limit must be positive");
         let mut scan = CoinScan::new(max_pages)?;
         let mut owned = Vec::new();
+        let mut skipped = SkippedEscrows::default();
+        // The GLOBAL head the ranking compares refund frames with, read when
+        // the limit first trims.
+        let mut head = None;
         while !scan.finished() {
             anyhow::ensure!(
                 scan.remaining_pages > 0,
-                "escrow scan page budget exhausted"
+                "escrow scan reached its --max-pages cap"
             );
-            let response = client
-                .clone()
-                .max_decoding_message_size(quil_types::store::scan_page_bytes(SCAN_PAGE_ENTRIES))
-                .list_escrows(quil_types::proto::node::ListCoinsRequest {
+            // A page the node could not deliver is asked again, as a coin
+            // page is: a scan can last an hour, and failing costs all of it.
+            let response = retry_scan_read("an escrow page", || {
+                let bytes = quil_types::store::scan_page_bytes(SCAN_PAGE_ENTRIES);
+                let mut client = client.clone().max_decoding_message_size(bytes);
+                let request = quil_types::proto::node::ListCoinsRequest {
                     domain: self.application.to_vec(),
                     snapshot_id: scan.snapshot_id.map(|id| id.to_vec()).unwrap_or_default(),
                     after: scan.after.map(|id| id.to_vec()).unwrap_or_default(),
                     max_coins: SCAN_PAGE_ENTRIES as u32,
-                })
-                .await?
-                .into_inner();
+                };
+                async move { client.list_escrows(request).await }
+            })
+            .await
+            .map_err(|status| {
+                scan_stopped(
+                    "escrows",
+                    scan.pages + 1,
+                    scan.records,
+                    scan.pages,
+                    status.into(),
+                    scan.elapsed(),
+                )
+            })?
+            .into_inner();
             let wallet = self.clone();
             let authority = authority.clone();
-            let (next_scan, recovered) =
+            let (next_scan, recovered, mismatched) =
                 tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                     let page = wallet.decode_escrow_page(&mut scan, response)?;
                     let mut recovered = Vec::new();
+                    let mut mismatched = Vec::new();
                     for (address, escrow) in page {
                         for refund in [false, true] {
                             let key = if refund {
@@ -2581,48 +3152,121 @@ impl RecipientWallet {
                             } else {
                                 &recipient
                             };
-                            if let Ok(opened) = open_escrow_recovery(
+                            match open_escrow_recovery(
                                 &wallet.context,
                                 &wallet.kem_secret,
                                 &wallet.recipient,
                                 &escrow.output.commitment,
                                 memo,
                             ) {
-                                recovered.push((
+                                Ok(opened) => recovered.push((
                                     address,
                                     Zeroizing::new(opened.amount()),
                                     refund,
                                     escrow.policy.refund_after_global_frame,
-                                ));
+                                )),
+                                // Its creator chose a memo this wallet opens
+                                // but whose amount or owner does not match.
+                                Err(MemoError::InconsistentOutput) => mismatched.push(address),
+                                Err(_) => {}
                             }
                         }
                     }
-                    Ok((scan, recovered))
+                    Ok((scan, recovered, mismatched))
                 })
                 .await??;
             scan = next_scan;
+            if let Some(line) = scan.progress("escrows") {
+                super::output::err_line(line);
+            }
+            for address in mismatched {
+                if self.escrow_unconsumed(client, &address).await? {
+                    skipped.mismatched += 1;
+                }
+            }
             for escrow in recovered {
-                // Open only if the global commit holds it unconsumed: an escrow
-                // whose creation never committed has no record at all.
-                let record = quil_execution::token_intrinsic::global_commit::escrow_address(
-                    &self.application,
-                    &escrow.0,
-                )?;
-                let (present, blob) = self.global_record(client, &record).await?;
-                let open = present
-                    && !quil_execution::token_intrinsic::global_commit::parse_escrow_record(&blob)
-                        .map_err(|e| anyhow::anyhow!("escrow record: {e}"))?
-                        .2;
-                if open {
-                    anyhow::ensure!(
-                        owned.len() < max_owned,
-                        "owned escrow limit exceeded; scan incomplete"
-                    );
+                if self.escrow_unconsumed(client, &escrow.0).await? {
                     owned.push(escrow);
+                    // Bounded memory: trim once twice the limit is held.
+                    if owned.len() >= max_owned.saturating_mul(2) {
+                        let now = match head {
+                            Some(now) => now,
+                            None => *head.insert(self.ranking_head(client).await),
+                        };
+                        skipped.limited += keep_first_escrows(&mut owned, max_owned, now);
+                    }
                 }
             }
         }
-        Ok(owned)
+        if owned.len() > max_owned {
+            let now = match head {
+                Some(now) => now,
+                None => self.ranking_head(client).await,
+            };
+            skipped.limited += keep_first_escrows(&mut owned, max_owned, now);
+        }
+        if skipped.limited > 0 {
+            super::output::err_line(format!(
+                "warning: left out {} of {} unconsumed escrow(s) naming this wallet: past the \
+                 limit of {max_owned} the scan keeps those this wallet can act on now, then the \
+                 largest; a larger --max-escrows lists more",
+                skipped.limited,
+                owned.len() + skipped.limited
+            ));
+        }
+        if skipped.mismatched > 0 {
+            super::output::err_line(format!(
+                "warning: skipped {} unconsumed escrow(s) naming this wallet whose memo opens for \
+                 it but does not match the escrow; this wallet can neither accept nor refund them",
+                skipped.mismatched
+            ));
+        }
+        Ok((owned, skipped))
+    }
+
+    /// Whether the global commit holds the escrow at `address` unconsumed:
+    /// an escrow whose creation never committed has no record at all.
+    async fn escrow_unconsumed(
+        &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+        address: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        let record = quil_execution::token_intrinsic::global_commit::escrow_address(
+            &self.application,
+            address,
+        )?;
+        let (present, blob) = self.global_record(client, &record).await?;
+        Ok(present
+            && !quil_execution::token_intrinsic::global_commit::parse_escrow_record(&blob)
+                .map_err(|e| anyhow::anyhow!("escrow record: {e}"))?
+                .2)
+    }
+
+    /// The GLOBAL head the node reports, for the escrow ranking. Without
+    /// one, no refund branch ranks as actionable: the ranking then keeps the
+    /// wallet's incoming transfers first.
+    async fn ranking_head(
+        &self,
+        client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+            tonic::transport::Channel,
+        >,
+    ) -> u64 {
+        match client
+            .clone()
+            .get_node_info(quil_types::proto::node::GetNodeInfoRequest::default())
+            .await
+        {
+            Ok(info) => info.into_inner().last_global_head_frame,
+            Err(status) => {
+                super::output::detail(format!(
+                    "Escrows past their refund frame rank as pending: no GLOBAL head ({}).",
+                    status.message()
+                ));
+                0
+            }
+        }
     }
 
     /// A page's coins without their placement, as the scan tests check them.
@@ -2647,7 +3291,7 @@ impl RecipientWallet {
         use quil_lattice_ct::confidential::{coin_tree::RootRecord, AmountCommitment};
         anyhow::ensure!(
             !scan.finished && scan.remaining_pages > 0,
-            "scan ended or page budget exhausted"
+            "scan ended or reached its --max-pages cap"
         );
         anyhow::ensure!(
             prost::Message::encoded_len(&response)
@@ -2681,6 +3325,7 @@ impl RecipientWallet {
             scan.remaining_pages -= 1;
             scan.finished = true;
             scan.rootless = true;
+            scan.count_page(0);
             return Ok(Vec::new());
         }
         let root = RootRecord::decode(&response.root_record, &self.context)
@@ -2766,6 +3411,7 @@ impl RecipientWallet {
         scan.after = cursor;
         scan.remaining_pages -= 1;
         scan.finished = !response.has_more;
+        scan.count_page(coins.len());
         Ok(coins)
     }
 
@@ -2832,6 +3478,7 @@ impl RecipientWallet {
             address,
             scan_pages: std::sync::atomic::AtomicUsize::new(DEFAULT_SCAN_PAGES),
             prepared: std::sync::Mutex::new(None),
+            opening: std::sync::OnceLock::new(),
         })
     }
 
@@ -2893,14 +3540,14 @@ impl RecipientWallet {
                 {
                     Ok((root, paths)) => {
                         self.verify_paths(coins, &root, &paths)?;
-                        super::output::line(format!(
+                        super::output::detail(format!(
                             "Spend witnesses rebuilt from the selection scan ({kept} coins under the wallet's subtrees, {:.1} s); the node was not told which coins this spends.",
                             started.elapsed().as_secs_f64()
                         ));
                         return Ok((root, paths));
                     }
                     Err(error) if error.downcast_ref::<StaleWitness>().is_some() => {
-                        super::output::line(format!(
+                        super::output::detail(format!(
                             "Spend witnesses from the selection scan not ready ({error})."
                         ));
                     }
@@ -2908,7 +3555,7 @@ impl RecipientWallet {
                 }
             }
         }
-        super::output::line(
+        super::output::detail(
             "Rebuilding spend witnesses from a full coin scan; the node is not told which coins this spends."
                 .into(),
         );
@@ -2923,7 +3570,7 @@ impl RecipientWallet {
                     if attempt < WITNESS_ATTEMPTS
                         && error.downcast_ref::<StaleWitness>().is_some() =>
                 {
-                    super::output::line(format!(
+                    super::output::detail(format!(
                         "Spend witnesses not ready ({error}); rescanning, attempt {} of {WITNESS_ATTEMPTS}.",
                         attempt + 1
                     ));
@@ -3058,6 +3705,9 @@ impl RecipientWallet {
             let page = self.scan_next_records(client, &mut scan).await?;
             pages += 1;
             scanned += page.len();
+            if let Some(line) = scan.progress("coins") {
+                super::output::err_line(line);
+            }
             let mut batch = Vec::new();
             for coin in page {
                 if let Some(i) = coins
@@ -3103,7 +3753,7 @@ impl RecipientWallet {
                 kept,
             )
             .await?;
-        super::output::line(format!(
+        super::output::err_detail(format!(
             "spend witnesses: {pages} scan pages, {scanned} coins, {kept_coins} under the inputs' subtrees, {:.1} s",
             started.elapsed().as_secs_f64()
         ));
@@ -3288,8 +3938,21 @@ impl RecipientWallet {
         &self.address
     }
     pub(super) fn open(&self, output: &Output) -> anyhow::Result<OpenedOutput> {
-        open_output(&self.context, &self.kem_secret, &self.recipient, output)
-            .map_err(|e| anyhow::anyhow!("memo: {e:?}"))
+        open_output_with_keys(
+            self.opening_keys(),
+            &self.kem_secret,
+            &self.recipient,
+            output,
+        )
+        .map_err(|e| anyhow::anyhow!("memo: {e:?}"))
+    }
+
+    fn opening_keys(&self) -> &OpeningKeys {
+        self.opening.get_or_init(|| {
+            #[cfg(test)]
+            KEY_DERIVATIONS.with(|n| n.set(n.get() + 1));
+            OpeningKeys::derive(&self.context, &self.recipient)
+        })
     }
 }
 
@@ -3374,9 +4037,28 @@ pub(super) async fn quoted_quil_fee_for_cost(
     );
     let charge = checked_quil_fee_quote(&quote, &policy.network, cost)?;
     let fee = with_fee_headroom(charge)?;
-    super::output::line(format!("Estimated fee: {fee} base units for {cost} bytes of state growth (snapshot frame {}; {charge} at the snapshot plus {AUTOMATIC_FEE_HEADROOM_PERCENT}% for fee-vote movement before inclusion).", quote.observed_frame));
+    super::output::line(fee_line(
+        fee,
+        cost,
+        charge,
+        quote.observed_frame,
+        crate::verbosity::on(),
+    ));
     check_automatic_fee("estimated fee", fee, tc.max_fee)?;
     Ok(fee)
+}
+
+/// The quoted fee in QUIL; `verbose` adds base units and how the quote was
+/// derived: state growth, snapshot frame, charge and headroom.
+#[cfg(feature = "native-proof")]
+fn fee_line(fee: u128, cost: u64, charge: u128, frame: u64, verbose: bool) -> String {
+    if !verbose {
+        return format!("Estimated fee: {} QUIL", super::balance::quil_brief(fee));
+    }
+    format!(
+        "Estimated fee: {} QUIL ({fee} base units for {cost} bytes of state growth; snapshot frame {frame}; {charge} at the snapshot plus {AUTOMATIC_FEE_HEADROOM_PERCENT}% for fee-vote movement before inclusion)",
+        super::balance::quil_amount(fee)
+    )
 }
 
 /// Refuse a quoted amount above the automatic fee limit. A quote's pricing
@@ -3534,7 +4216,7 @@ async fn refresh_fee_quote(
     {
         Ok(response) => response.into_inner(),
         Err(error) if crate::retry::cannot_quote(error.code()) => {
-            super::output::line(format!(
+            super::output::detail(format!(
                 "Fee refresh unavailable ({}); submitting the supplied fee for node validation.",
                 error.code()
             ));
@@ -3571,6 +4253,17 @@ const FEE_REBUILDS: usize = 3;
 #[cfg(feature = "native-proof")]
 fn fee_moved_rebuild(requested_fee: Option<u128>, attempt: usize, error: &anyhow::Error) -> bool {
     requested_fee.is_none() && attempt < FEE_REBUILDS && error.is::<FeeMoved>()
+}
+
+/// The line a rebuild after a fee move prints; `verbose` adds the amounts.
+#[cfg(feature = "native-proof")]
+fn fee_moved_line(error: &anyhow::Error, verbose: bool) -> String {
+    let line = "The fee rose while proving; re-quoting and proving again.";
+    if verbose {
+        format!("{line} ({error})")
+    } else {
+        line.into()
+    }
 }
 
 #[cfg(feature = "native-proof")]
@@ -3850,36 +4543,58 @@ pub(super) fn merge_selection(
     Ok((selected, total))
 }
 
+/// What `token confidential-address` prints on stderr before each address
+/// line; stdout keeps the bare hex lines for scripts.
+fn address_label(escrow: bool) -> &'static str {
+    if escrow {
+        "Escrow address (token pending-transfer: the recipient accepts; after expiry the sender \
+         may reject to refund):"
+    } else {
+        "Receiving address (token transfer):"
+    }
+}
+
 pub(super) fn run(tc: &TokenCtx, application: &str, escrow: bool) -> anyhow::Result<()> {
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = RecipientWallet::load(tc, &network, &identifier(application)?)?;
-    if escrow {
+    let line = if escrow {
         let authority = tc.key_manager.get_public_key_bytes_by_id("q-prover-key")?;
-        println!("{}", encode_escrow_address(wallet.address(), &authority)?);
+        encode_escrow_address(wallet.address(), &authority)?
     } else {
-        println!("0x{}", hex::encode(wallet.address().encode()));
-    }
+        format!("0x{}", hex::encode(wallet.address().encode()))
+    };
+    // The label only once the address exists: a failure prints neither.
+    super::output::err_line(address_label(escrow).into());
+    println!("{line}");
     Ok(())
 }
 
 /// `token balance`: claimable rewards and legacy coins (QUIL only), then
 /// confidential coins, each on its own line so that one failed read does not
-/// hide the others. The command still fails when any of them failed.
+/// hide the others. A failed read's line says "unavailable"; the command
+/// then fails with each distinct reason once (`balance::incomplete`).
 pub(super) async fn run_balance(
     tc: &TokenCtx,
     application: &str,
     max_pages: usize,
     max_coins: usize,
 ) -> anyhow::Result<()> {
+    use super::balance::{format_confidential_coins, format_legacy_coins, reason};
+    use super::output::{err_detail, slow_phase};
+    let verbose = crate::verbosity::on();
     let application_id = identifier(application)?;
     let quil = application_id == quil_execution::domains::QUIL_TOKEN;
-    let mut failed = Vec::new();
+    let mut failed: Vec<(&str, String)> = Vec::new();
     if quil {
-        let (line, read) = super::balance::claimable_rewards(tc).await;
+        let (line, error) = slow_phase(
+            "Reading claimable rewards",
+            super::balance::claimable_rewards(tc, verbose),
+        )
+        .await;
         println!("{line}");
-        if !read {
-            failed.push("claimable rewards");
+        if let Some(error) = error {
+            failed.push(("claimable rewards", error));
         }
     }
     let network =
@@ -3888,33 +4603,40 @@ pub(super) async fn run_balance(
     // need them; the unreachable node's own error, which names it and the
     // fix, ends the output.
     let client = tc.connect().await;
-    let unreachable = || anyhow::anyhow!("the node did not answer; see the error below");
-    // Each phase's cost goes to stderr: a slow balance shows where it went.
+    let unreachable = |error: &anyhow::Error| anyhow::anyhow!("{error:#}");
+    // Each phase's cost goes to stderr under -v: where a slow balance went.
     if quil {
         let (started, mut pages) = (std::time::Instant::now(), 0);
         let legacy = match &client {
             Ok(client) => super::legacy::unshielded(tc, client, &application_id, &mut pages).await,
-            Err(_) => Err(unreachable()),
+            Err(error) => Err(unreachable(error)),
         };
         if pages > 0 {
-            eprintln!(
+            err_detail(format!(
                 "legacy listing: {pages} pages in {:.1} s",
                 started.elapsed().as_secs_f64()
-            );
+            ));
         }
-        if legacy.is_err() {
-            failed.push("legacy coins");
+        if let Err(error) = &legacy {
+            failed.push(("legacy coins", reason(error)));
         }
-        println!("{}", super::balance::format_legacy_coins(legacy));
+        println!("{}", format_legacy_coins(&legacy, verbose));
     }
     let (started, mut report) = (std::time::Instant::now(), ScanReport::default());
     let confidential = match &client {
-        Err(_) => Err(unreachable()),
+        Err(error) => Err(unreachable(error)),
         Ok(client) => match RecipientWallet::load(tc, &network, &application_id) {
             Err(error) => Err(error),
-            Ok(wallet) => match std::sync::Arc::new(wallet)
-                .scan_unspent_or_rootless(client, max_pages, max_coins, &mut report)
-                .await
+            Ok(wallet) => match slow_phase(
+                "Scanning confidential coins",
+                std::sync::Arc::new(wallet).scan_unspent_or_rootless(
+                    client,
+                    max_pages,
+                    max_coins,
+                    &mut report,
+                ),
+            )
+            .await
             {
                 Ok(Some(coins)) => coins
                     .iter()
@@ -3927,20 +4649,16 @@ pub(super) async fn run_balance(
         },
     };
     if report.pages > 0 {
-        eprintln!("{}", report.line(started.elapsed()));
+        err_detail(report.line(started.elapsed()));
     }
-    if confidential.is_err() {
-        failed.push("confidential coins");
+    if let Err(error) = &confidential {
+        failed.push(("confidential coins", reason(error)));
     }
     println!(
         "{}",
-        super::balance::format_confidential_coins(confidential, quil)
+        format_confidential_coins(&confidential, quil, verbose)
     );
-    let incomplete = || format!("balance incomplete: {} unavailable", failed.join(", "));
-    if let Err(error) = client {
-        return Err(error.context(incomplete()));
-    }
-    anyhow::ensure!(failed.is_empty(), "{}", incomplete());
+    anyhow::ensure!(failed.is_empty(), "{}", super::balance::incomplete(&failed));
     Ok(())
 }
 
@@ -3970,7 +4688,7 @@ pub(crate) async fn merge_preview(tc: &TokenCtx) -> anyhow::Result<(usize, u128)
     )?);
     let client = tc.connect().await?;
     let owned = wallet
-        .scan_unspent(&client, super::SCAN_MAX_PAGES, super::SCAN_MAX_COINS)
+        .scan_unspent(&client, super::SCAN_PAGES_UNCAPPED, super::SCAN_MAX_COINS)
         .await?;
     let (selected, total) = merge_selection(owned, &[], compile_limits().max_inputs)?;
     Ok((selected.len(), total))
@@ -4002,13 +4720,15 @@ impl Escrow {
 }
 
 /// The unconsumed escrows whose recipient or refund authority is this
-/// wallet's prover key: a scan of every escrow, with trial decryption.
+/// wallet's prover key: a scan of every escrow, with trial decryption. Past
+/// `max_escrows` those this wallet can act on now, then the largest; with
+/// the escrows the scan left out.
 pub(crate) async fn list_escrows(
     tc: &TokenCtx,
     application: &str,
     max_pages: usize,
     max_escrows: usize,
-) -> anyhow::Result<Vec<Escrow>> {
+) -> anyhow::Result<(Vec<Escrow>, SkippedEscrows)> {
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(
@@ -4018,9 +4738,10 @@ pub(crate) async fn list_escrows(
     )?);
     let authority = tc.key_manager.get_public_key_bytes_by_id("q-prover-key")?;
     let client = tc.connect().await?;
-    Ok(wallet
+    let (escrows, skipped) = wallet
         .scan_escrows(&client, authority, max_pages, max_escrows)
-        .await?
+        .await?;
+    let escrows = escrows
         .into_iter()
         .map(|(address, amount, refund, refund_after)| Escrow {
             address,
@@ -4028,18 +4749,20 @@ pub(crate) async fn list_escrows(
             refund,
             refund_after,
         })
-        .collect())
+        .collect();
+    Ok((escrows, skipped))
 }
 
 /// This wallet's unspent confidential QUIL coins and their total, as
 /// `token balance` counts them: a full scan of the coins, recovered here,
 /// each recovered coin's spent marker read from the configured node's
-/// GLOBAL state. `None` while the application holds no coin at all.
+/// GLOBAL state. `None` while the application holds no coin at all. With
+/// them, the coins the scan left out of the balance.
 pub(crate) async fn confidential_balance(
     tc: &TokenCtx,
     max_pages: usize,
     max_coins: usize,
-) -> anyhow::Result<Option<(usize, u128)>> {
+) -> anyhow::Result<(Option<(usize, u128)>, SkippedCoins)> {
     let network =
         quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
     let wallet = std::sync::Arc::new(RecipientWallet::load(
@@ -4048,18 +4771,20 @@ pub(crate) async fn confidential_balance(
         &quil_execution::domains::QUIL_TOKEN,
     )?);
     let client = tc.connect().await?;
+    let mut report = ScanReport::default();
     let coins = wallet
-        .scan_unspent_or_rootless(&client, max_pages, max_coins, &mut ScanReport::default())
+        .scan_unspent_or_rootless(&client, max_pages, max_coins, &mut report)
         .await?;
-    coins
+    let balance = coins
         .map(|coins| {
             let total = coins
                 .iter()
                 .try_fold(0u128, |sum, coin| sum.checked_add(*coin.amount))
                 .ok_or_else(|| anyhow::anyhow!("balance overflows u128"))?;
-            Ok((coins.len(), total))
+            anyhow::Ok((coins.len(), total))
         })
-        .transpose()
+        .transpose()?;
+    Ok((balance, report.skipped()))
 }
 
 pub(super) async fn run_escrows(
@@ -4068,7 +4793,7 @@ pub(super) async fn run_escrows(
     max_pages: usize,
     max_escrows: usize,
 ) -> anyhow::Result<()> {
-    let escrows = list_escrows(tc, application, max_pages, max_escrows).await?;
+    let (escrows, _) = list_escrows(tc, application, max_pages, max_escrows).await?;
     println!(
         "{} recovered escrow authorities reported unconsumed by the configured node:",
         escrows.len()
@@ -4093,15 +4818,47 @@ pub(super) async fn run_coins(
         &identifier(application)?,
     )?);
     let client = tc.connect().await?;
-    let coins = wallet.scan_unspent(&client, max_pages, max_coins).await?;
-    println!(
-        "{} recovered coins reported unspent by the configured node:",
-        coins.len()
-    );
+    let coins = super::output::slow_phase(
+        "Scanning confidential coins",
+        wallet.scan_unspent(&client, max_pages, max_coins),
+    )
+    .await?;
+    let quil = identifier(application)? == quil_execution::domains::QUIL_TOKEN;
+    let amounts: Vec<u128> = coins.iter().map(|coin| *coin.amount).collect();
+    println!("{}", coins_header(&amounts, quil, crate::verbosity::on())?);
     for coin in coins {
         println!("0x{} {}", hex::encode(coin.address), *coin.amount);
     }
     Ok(())
+}
+
+/// The line before `token coins` lists one `0x<address> <base units>` line
+/// per coin (that listing is unchanged, for scripts): the count and, for
+/// QUIL, the total; `verbose` adds where the count comes from.
+fn coins_header(amounts: &[u128], quil: bool, verbose: bool) -> anyhow::Result<String> {
+    let total = amounts
+        .iter()
+        .try_fold(0u128, |sum, amount| sum.checked_add(*amount))
+        .ok_or_else(|| anyhow::anyhow!("balance overflows u128"))?;
+    let count = amounts.len();
+    let total = match (quil, verbose) {
+        (true, false) => format!("{} QUIL", super::balance::quil_brief(total)),
+        (true, true) => format!(
+            "{} QUIL ({total} base units)",
+            super::balance::quil_amount(total)
+        ),
+        (false, _) => format!("{total} base units"),
+    };
+    let source = if verbose {
+        ", reported unspent by the configured node"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{count} unspent coin{}, {total}{source}{}",
+        if count == 1 { "" } else { "s" },
+        if count == 0 { "" } else { ":" }
+    ))
 }
 
 #[cfg(feature = "native-proof")]
@@ -4135,40 +4892,43 @@ pub(crate) async fn run_transfer(
     let limits = compile_limits();
     let mut client = tc.connect().await?;
     let mut attempt = 0usize;
-    let bytes = loop {
-        attempt += 1;
-        let fee = transfer_fee(tc, &application, requested_fee, limits.max_inputs).await?;
-        let coins = wallet
-            .clone()
-            .scan_spendable(&client, max_pages, max_coins)
-            .await?;
-        let (selected, change) = select_coins(coins, amount, fee, limits.max_inputs)?;
-        let mut destinations = vec![(recipient.clone(), amount)];
-        if *change != 0 {
-            destinations.push((wallet.address().clone(), *change));
-        }
-        let bytes = wallet
-            .clone()
-            .create_transfer(
-                &client,
-                selected
-                    .into_iter()
-                    .map(|coin| (coin.address, coin.output))
-                    .collect(),
-                destinations,
-                fee,
-                limits,
-                native_budget(),
-            )
-            .await?;
-        match refresh_submission_fee(tc, &mut client, &bytes).await {
-            Ok(()) => break bytes,
-            Err(error) if fee_moved_rebuild(requested_fee, attempt, &error) => {
-                super::output::line(format!("The fee moved while preparing the transfer ({error}); re-quoting and rebuilding."));
+    let bytes = super::output::slow_phase("Scanning coins and proving the transfer", async {
+        loop {
+            attempt += 1;
+            let fee = transfer_fee(tc, &application, requested_fee, limits.max_inputs).await?;
+            let coins = wallet
+                .clone()
+                .scan_spendable(&client, max_pages, max_coins)
+                .await?;
+            let (selected, change) = select_coins(coins, amount, fee, limits.max_inputs)?;
+            let mut destinations = vec![(recipient.clone(), amount)];
+            if *change != 0 {
+                destinations.push((wallet.address().clone(), *change));
             }
-            Err(error) => return Err(error),
+            let bytes = wallet
+                .clone()
+                .create_transfer(
+                    &client,
+                    selected
+                        .into_iter()
+                        .map(|coin| (coin.address, coin.output))
+                        .collect(),
+                    destinations,
+                    fee,
+                    limits,
+                    native_budget(),
+                )
+                .await?;
+            match refresh_submission_fee(tc, &mut client, &bytes).await {
+                Ok(()) => break Ok::<_, anyhow::Error>(bytes),
+                Err(error) if fee_moved_rebuild(requested_fee, attempt, &error) => {
+                    super::output::line(fee_moved_line(&error, crate::verbosity::on()));
+                }
+                Err(error) => return Err(error),
+            }
         }
-    };
+    })
+    .await?;
     let submitted = submit_refreshed_operation(tc, &wallet, bytes).await?;
     let follow = Follow { wait, max_pages };
     inclusion::follow(tc, &wallet, "transfer", submitted, follow).await
@@ -4198,8 +4958,10 @@ pub(crate) async fn transfer_fee(
 /// SHA3-256 (`settlement_claim::bundle_context`), or, for a pre-funded
 /// settlement, the claimant key that names one later. Returns the receipt the
 /// destination bundle's claim spends once the settlement's GLOBAL record is
-/// certified.
+/// certified. `before_submit` gets the receipt once the settlement is built,
+/// before it is sent; its error stops the payment.
 #[cfg(feature = "native-proof")]
+#[allow(clippy::too_many_arguments)] // the settlement's parts, as its callers name them
 pub(super) async fn run_pay(
     tc: &TokenCtx,
     destination: [u8; 32],
@@ -4209,6 +4971,7 @@ pub(super) async fn run_pay(
     payment: Option<(RecipientAddress, u128)>,
     max_pages: usize,
     max_coins: usize,
+    before_submit: Option<&paid_bundle::BeforeSubmit<'_>>,
 ) -> anyhow::Result<[u8; 32]> {
     use quil_lattice_ct::confidential::settlement::Settlement;
     anyhow::ensure!(amount > 0, "settlement amount must be positive");
@@ -4291,7 +5054,7 @@ pub(super) async fn run_pay(
             match refresh_submission_fee(tc, &mut client, &bytes).await {
                 Ok(()) => break (bytes, fee),
                 Err(error) if fee_moved_rebuild(requested_fee, attempt, &error) => {
-                    println!("The fee moved while proving ({error}); re-quoting and rebuilding.");
+                    println!("{}", fee_moved_line(&error, crate::verbosity::on()));
                 }
                 Err(error) => return Err(error),
             }
@@ -4302,6 +5065,9 @@ pub(super) async fn run_pay(
             .map_err(|e| anyhow::anyhow!("settlement decode: {e:?}"))?
             .statement,
     )?;
+    if let Some(before_submit) = before_submit {
+        before_submit(&receipt)?;
+    }
     wallet
         .submit(
             &mut crate::retry::connect(|| tc.connect_submit()).await?,
@@ -4509,6 +5275,7 @@ pub(super) async fn run_prefund(
         None,
         max_pages,
         max_coins,
+        None,
     )
     .await?;
     record_prefunded(
@@ -4572,23 +5339,31 @@ pub(super) async fn run_prefunded(tc: &TokenCtx) -> anyhow::Result<()> {
     write_prefunded(tc, &remaining)
 }
 
-/// Pay, from this wallet's QUIL, for a bundle of operations on another
-/// application and return the claim to place first in that bundle.
-///
-/// `rest` is the destination bundle with its first request left empty. The
-/// settlement covers the destination venue's quoted charge for the bundle's
-/// state growth (plus the claim's marker) with the automatic headroom and goes
-/// to that venue's provers. `payment`, when given, also pays `value` QUIL to the
-/// payee in the same transaction (a paid mint's price). Waits up to `wait` for
-/// the settlement's GLOBAL record to be certified.
+/// Page cap and owned-coin limit of a bundle payment's coin scan: those of
+/// `qclient token` by default, so a payment reads every coin a balance does.
+/// A cap of 128 pages ended every payment once the network held more than
+/// 8,192 coins, which anyone can send for fees.
 #[cfg(feature = "native-proof")]
-pub(super) async fn pay_for_bundle(
+const PAY_SCAN_BUDGET: (usize, usize) = (super::SCAN_PAGES_UNCAPPED, super::SCAN_MAX_COINS);
+
+/// What a destination bundle's settlement is: the amount to pay, the context
+/// it binds, and whether the bundle executes in the global venue.
+#[cfg(feature = "native-proof")]
+struct BundleQuote {
+    amount: u128,
+    context: [u8; 32],
+    global_execution: bool,
+}
+
+/// Quote the settlement of `rest`, the destination bundle with its first
+/// request left empty: the destination venue's quoted charge for the bundle's
+/// state growth (plus the claim's marker) with the automatic headroom.
+#[cfg(feature = "native-proof")]
+async fn quote_bundle(
     tc: &TokenCtx,
     destination: [u8; 32],
     rest: &quil_execution::message_envelope::CanonicalMessageBundle,
-    payment: Option<(RecipientAddress, u128)>,
-    wait: std::time::Duration,
-) -> anyhow::Result<(Vec<u8>, bool)> {
+) -> anyhow::Result<BundleQuote> {
     use quil_execution::token_intrinsic::settlement_claim::{
         bundle_context, marker_record, request_cost,
     };
@@ -4651,68 +5426,102 @@ pub(super) async fn pay_for_bundle(
     println!("This bundle needs {amount} base units for {cost} bytes of state growth on {} (snapshot frame {}).",
         hex::encode(destination), quote.observed_frame);
     check_automatic_fee("bundle settlement", amount, tc.max_fee)?;
-    let claimed_payment = match &payment {
-        Some((payee, value)) => Some((
-            quil_execution::token_intrinsic::settlement_record::payment_address(&payee.encode())?,
-            *value,
-        )),
-        None => None,
+    Ok(BundleQuote {
+        amount,
+        context,
+        global_execution: quote.global_execution,
+    })
+}
+
+/// The claim of the smallest unused pre-funded settlement of `destination`
+/// covering `quote`, for the bundle it quotes; `None` when there is none.
+/// Waits up to `wait` for the settlement's GLOBAL record to be certified.
+#[cfg(feature = "native-proof")]
+async fn claim_prefunded(
+    tc: &TokenCtx,
+    destination: [u8; 32],
+    quote: &BundleQuote,
+    wait: std::time::Duration,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(prefunded) = take_prefunded(tc, destination, quote.amount).await? else {
+        return Ok(None);
     };
+    let network =
+        quil_lattice_ct::confidential::transfer::network_identifier(tc.node_config.p2p.network);
+    let signer = tc
+        .key_manager
+        .get_signer_by_id(&prefunded.key_id)
+        .map_err(|e| anyhow::anyhow!("claimant key {}: {e}", prefunded.key_id))?;
+    let signature = signer
+        .sign_with_domain(
+            &quil_execution::token_intrinsic::settlement_claim::claimant_message(
+                &network,
+                &destination,
+                &prefunded.receipt,
+                &quote.context,
+            ),
+            &quil_lattice_ct::confidential::transfer::parameter_context(&network, &destination),
+        )
+        .map_err(|e| anyhow::anyhow!("claimant signature: {e}"))?;
+    let binding = ClaimBinding::Claimant {
+        key_type: signer.key_type() as u32,
+        public_key: signer.public_key().to_vec(),
+        signature,
+    };
+    println!(
+        "Claiming pre-funded settlement {} ({} base units).",
+        hex::encode(prefunded.receipt),
+        prefunded.amount
+    );
+    settlement_claim(
+        tc,
+        destination,
+        prefunded.receipt,
+        prefunded.amount,
+        &binding,
+        None,
+        wait,
+    )
+    .await
+    .map(Some)
+}
+
+/// Pay, from this wallet's QUIL, for a bundle of operations on another
+/// application and return the claim to place first in that bundle.
+///
+/// `rest` is the destination bundle with its first request left empty. The
+/// settlement covers [`quote_bundle`]'s amount and goes to the destination
+/// venue's provers. `payment`, when given, also pays `value` QUIL to the
+/// payee in the same transaction (a paid mint's price). Waits up to `wait` for
+/// the settlement's GLOBAL record to be certified.
+#[cfg(feature = "native-proof")]
+pub(super) async fn pay_for_bundle(
+    tc: &TokenCtx,
+    destination: [u8; 32],
+    rest: &quil_execution::message_envelope::CanonicalMessageBundle,
+    payment: Option<(RecipientAddress, u128)>,
+    wait: std::time::Duration,
+) -> anyhow::Result<(Vec<u8>, bool)> {
+    let quote = quote_bundle(tc, destination, rest).await?;
+    let claimed_payment = paid_bundle::claimed_payment(&payment)?;
     // A pre-funded settlement of this destination pays for the bundle without
     // a new transaction. One that also carries a payment coin is not reused:
     // the payment is part of the settlement, chosen when it was paid.
     if payment.is_none() {
-        if let Some(prefunded) = take_prefunded(tc, destination, amount).await? {
-            let signer = tc
-                .key_manager
-                .get_signer_by_id(&prefunded.key_id)
-                .map_err(|e| anyhow::anyhow!("claimant key {}: {e}", prefunded.key_id))?;
-            let signature = signer
-                .sign_with_domain(
-                    &quil_execution::token_intrinsic::settlement_claim::claimant_message(
-                        &network,
-                        &destination,
-                        &prefunded.receipt,
-                        &context,
-                    ),
-                    &quil_lattice_ct::confidential::transfer::parameter_context(
-                        &network,
-                        &destination,
-                    ),
-                )
-                .map_err(|e| anyhow::anyhow!("claimant signature: {e}"))?;
-            let binding = ClaimBinding::Claimant {
-                key_type: signer.key_type() as u32,
-                public_key: signer.public_key().to_vec(),
-                signature,
-            };
-            println!(
-                "Claiming pre-funded settlement {} ({} base units).",
-                hex::encode(prefunded.receipt),
-                prefunded.amount
-            );
-            let claim = settlement_claim(
-                tc,
-                destination,
-                prefunded.receipt,
-                prefunded.amount,
-                &binding,
-                None,
-                wait,
-            )
-            .await?;
+        if let Some(claim) = claim_prefunded(tc, destination, &quote, wait).await? {
             return Ok((claim, quote.global_execution));
         }
     }
     let receipt = run_pay(
         tc,
         destination,
-        amount,
-        SettlementBinding::Bundle(context),
+        quote.amount,
+        SettlementBinding::Bundle(quote.context),
         None,
         payment,
-        128,
-        1024,
+        PAY_SCAN_BUDGET.0,
+        PAY_SCAN_BUDGET.1,
+        None,
     )
     .await?;
     println!("Waiting for the settlement to be certified in global state...");
@@ -4720,8 +5529,8 @@ pub(super) async fn pay_for_bundle(
         tc,
         destination,
         receipt,
-        amount,
-        &ClaimBinding::Bundle(context),
+        quote.amount,
+        &ClaimBinding::Bundle(quote.context),
         claimed_payment,
         wait,
     )
@@ -4785,68 +5594,7 @@ async fn submit_refreshed_operation(
         }
         return Ok(submitted);
     }
-    submit_paid_operation(tc, wallet, bytes, None, SETTLEMENT_WAIT).await
-}
-
-/// Pay a QUIL settlement bound to `[claim, operation]` for the operation's
-/// application, wait for certification, and submit claim and operation
-/// together. `payment` adds a public payment coin (a paid mint's price).
-#[cfg(feature = "native-proof")]
-async fn submit_paid_operation(
-    tc: &TokenCtx,
-    wallet: &RecipientWallet,
-    bytes: Vec<u8>,
-    payment: Option<(RecipientAddress, u128)>,
-    wait: std::time::Duration,
-) -> anyhow::Result<Option<Submitted>> {
-    use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
-    let mut submitted = Submitted::of(&wallet.network, wallet.application, &bytes);
-    let (domain, request) = wallet.prepare_submission(bytes.clone())?;
-    let timestamp = crate::send::now_millis();
-    let rest = CanonicalMessageBundle {
-        requests: vec![
-            None,
-            Some(
-                CanonicalMessageRequest::wrap(bytes.clone())
-                    .map_err(|e| anyhow::anyhow!("wrap operation: {e}"))?,
-            ),
-        ],
-        timestamp,
-    };
-    let (claim, global_execution) =
-        pay_for_bundle(tc, wallet.application, &rest, payment, wait).await?;
-    let bundle = quil_types::proto::global::MessageBundle {
-        requests: vec![
-            quil_types::proto::global::MessageRequest {
-                request: Some(
-                    quil_types::proto::global::message_request::Request::TokenOperation(
-                        quil_types::proto::token::TokenOperation {
-                            canonical_bytes: claim,
-                        },
-                    ),
-                ),
-                timestamp: 0,
-            },
-            request,
-        ],
-        timestamp,
-    };
-    if let Some(submitted) = &mut submitted {
-        submitted.bundle = bundle_id(&bundle)?;
-        if global_execution {
-            submitted.route = inclusion::Route::Global;
-        }
-    }
-    crate::send::send_to_venue(
-        &mut crate::retry::connect(|| tc.connect_submit()).await?,
-        &tc.submit_key_manager,
-        domain,
-        global_execution,
-        bundle,
-    )
-    .await?;
-    println!("Submitted with its QUIL settlement claim.");
-    Ok(submitted)
+    paid_bundle::submit_paid(tc, wallet, bytes, None, SETTLEMENT_WAIT, false).await
 }
 
 /// Build a token's mint-entitlement tree from a file of
@@ -4905,6 +5653,58 @@ pub(super) fn run_payment_address(tc: &TokenCtx) -> anyhow::Result<()> {
         hex::encode(quil_execution::token_intrinsic::settlement_record::payment_address(&encoded)?)
     );
     Ok(())
+}
+
+/// A certified settlement record whose fields are not the requested claim's.
+#[cfg(feature = "native-proof")]
+#[derive(Debug)]
+struct RecordMismatch(String);
+
+#[cfg(feature = "native-proof")]
+impl std::fmt::Display for RecordMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "settlement record does not match the requested claim: {}",
+            self.0
+        )
+    }
+}
+
+#[cfg(feature = "native-proof")]
+impl std::error::Error for RecordMismatch {}
+
+/// `token settlement-claim`: the claim spending `receipt` in the bundle whose
+/// context is `context`. The witness carries only a proof, so a paid
+/// settlement's payment comes from the caller; a claim without it never
+/// matches the record, and the error says which options supply it.
+#[cfg(feature = "native-proof")]
+pub(super) async fn run_settlement_claim(
+    tc: &TokenCtx,
+    destination: [u8; 32],
+    receipt: [u8; 32],
+    amount: u128,
+    context: [u8; 32],
+    payment: Option<([u8; 32], u128)>,
+    wait: std::time::Duration,
+) -> anyhow::Result<Vec<u8>> {
+    settlement_claim(
+        tc,
+        destination,
+        receipt,
+        amount,
+        &ClaimBinding::Bundle(context),
+        payment,
+        wait,
+    )
+    .await
+    .map_err(|error| {
+        if payment.is_none() && error.is::<RecordMismatch>() {
+            anyhow::anyhow!("{error:#}; a paid settlement needs --payment-address and --payment")
+        } else {
+            error
+        }
+    })
 }
 
 /// Build the claim spending settlement `receipt` in `destination`'s bundle,
@@ -4983,9 +5783,7 @@ pub(super) async fn settlement_claim(
                         &global_root,
                         &claim.forest_proof,
                     )
-                    .map_err(|e| {
-                        anyhow::anyhow!("settlement record does not match the requested claim: {e}")
-                    })?;
+                    .map_err(|e| RecordMismatch(e.to_string()))?;
                     return Ok(claim.encode()?);
                 }
             }
@@ -4994,7 +5792,11 @@ pub(super) async fn settlement_claim(
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "settlement record not yet certified in a retained global root; retry later"
+            "settlement {} not yet certified in a retained global root after {} s; the node's \
+             GetMintAuthorizationStatus RPC for this receipt says what is missing, and its log \
+             line \"mint claim: no citable authorization yet\" names the frame it searched",
+            hex::encode(receipt),
+            wait.as_secs()
         );
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
@@ -5026,7 +5828,7 @@ pub(super) async fn run_split(
     let mut client = tc.connect().await?;
     let coins = wallet
         .clone()
-        .scan_spendable(&client, max_pages, max_coins)
+        .scan_spendable_named(&client, max_pages, max_coins, &[coin_address])
         .await?;
     let source = coins
         .into_iter()
@@ -5082,7 +5884,7 @@ pub(crate) async fn run_merge(
     let mut client = tc.connect().await?;
     let owned = wallet
         .clone()
-        .scan_spendable(&client, max_pages, max_coins)
+        .scan_spendable_named(&client, max_pages, max_coins, &requested)
         .await?;
     let (selected, total) = merge_selection(owned, &requested, limits.max_inputs)?;
     let merged = total
@@ -5194,13 +5996,18 @@ pub(crate) async fn run_pending_create(
     inclusion::follow(tc, &wallet, "escrow funding", submitted, follow).await
 }
 
-/// The reward, fee and net amount of a reward mint, in QUIL: `verb` is
-/// "Minting" when authorizing and "Claiming" when claiming.
-fn mint_amounts_line(verb: &str, reward: u128, fee: u128) -> String {
-    use super::balance::quil_amount;
+/// The net amount of a reward mint, in QUIL: `verb` is "Minting" when
+/// authorizing and "Claiming" when claiming. `verbose` adds the reward and
+/// fee it is the difference of, exactly.
+fn mint_amounts_line(verb: &str, reward: u128, fee: u128, verbose: bool) -> String {
+    use super::balance::{quil_amount, quil_brief};
+    let net = reward.saturating_sub(fee);
+    if !verbose {
+        return format!("{verb} {} QUIL", quil_brief(net));
+    }
     format!(
-        "{verb} {} QUIL (reward {} QUIL less fee {} QUIL).",
-        quil_amount(reward.saturating_sub(fee)),
+        "{verb} {} QUIL (reward {} QUIL less fee {} QUIL; {net} base units).",
+        quil_amount(net),
         quil_amount(reward),
         quil_amount(fee)
     )
@@ -5228,13 +6035,26 @@ pub(crate) enum MintEvent {
 impl MintEvent {
     /// The line `token mint` prints for the event, if any.
     pub(crate) fn cli_line(&self) -> Option<String> {
+        self.cli_line_with(crate::verbosity::on())
+    }
+
+    /// [`Self::cli_line`], with `verbose` adding exact amounts and frames.
+    fn cli_line_with(&self, verbose: bool) -> Option<String> {
         Some(match self {
-            Self::Amounts { reward, fee } => mint_amounts_line("Minting", *reward, *fee),
+            Self::Amounts { reward, fee } => mint_amounts_line("Minting", *reward, *fee, verbose),
             // `token mint` prints a claim's identifiers after its event.
             Self::Proving | Self::Claimed => return None,
             Self::Submitted { cited_frame, saved } => format!(
-                "Reward mint authorization submitted to GLOBAL and saved to {}. It cites the reward root of GLOBAL frame {cited_frame}, which is not its inclusion frame.",
-                saved.display()
+                "Reward mint authorization submitted to GLOBAL and saved to {}.{}",
+                saved.display(),
+                if verbose {
+                    format!(
+                        " It cites the reward root of GLOBAL frame {cited_frame}, which is \
+                         not its inclusion frame."
+                    )
+                } else {
+                    String::new()
+                }
             ),
         })
     }
@@ -5532,6 +6352,7 @@ pub(super) async fn run_mint(
             println!("{line}");
         }
     };
+    use super::output::slow_phase;
     let deadline = std::time::Instant::now() + follow.wait;
     if let Some(path) = claim {
         let network =
@@ -5545,15 +6366,23 @@ pub(super) async fn run_mint(
         // Before the witness: a claim the node would not build says why, and
         // what ends the wait, rather than only that it is not ready.
         inclusion::await_claimable(tc, &mint.statement, path, deadline).await?;
-        let (wallet, submitted) = submit_mint_claim(tc, path, print).await?;
+        let (wallet, submitted) = slow_phase(
+            "Building the mint claim",
+            submit_mint_claim(tc, path, print),
+        )
+        .await?;
         let follow = Follow {
             wait: deadline.saturating_duration_since(std::time::Instant::now()),
             ..follow
         };
         return inclusion::follow(tc, &wallet, "mint claim", submitted, follow).await;
     }
-    let plan = plan_mint(tc, fee).await?;
-    let (saved, statement) = submit_mint(tc, plan, recipient, print).await?;
+    let plan = slow_phase("Reading claimable rewards", plan_mint(tc, fee)).await?;
+    let (saved, statement) = slow_phase(
+        "Proving the mint authorization",
+        submit_mint(tc, plan, recipient, print),
+    )
+    .await?;
     let claim = format!("`token mint --claim {}`", saved.display());
     if follow.wait.is_zero() {
         println!(
@@ -5598,10 +6427,10 @@ pub(super) async fn run_shield(
     let payee = shield_recipient(&wallet, recipient)?;
     let owner = legacy_owner_signer(tc)?;
     let mut client = tc.connect().await?;
-    super::legacy::ensure_shields_active(&client, tc.node_config.p2p.network, false).await?;
-    let bytes = wallet
-        .clone()
-        .create_shield(
+    super::legacy::ensure_shields_active(tc, false).await?;
+    let bytes = super::output::slow_phase(
+        "Proving the shield",
+        wallet.clone().create_shield(
             source,
             amount,
             owner,
@@ -5609,8 +6438,9 @@ pub(super) async fn run_shield(
             fee,
             1,
             native_budget(),
-        )
-        .await?;
+        ),
+    )
+    .await?;
     // Which shard admits it: the one holding its source, as far as this
     // node's shard list says.
     let shard = super::legacy::live_shard_paths(&client, &application)
@@ -5621,8 +6451,19 @@ pub(super) async fn run_shield(
     if let (Some(submitted), Some(shard)) = (&mut submitted, shard) {
         submitted.route = inclusion::Route::Shard(shard);
     }
-    let what = format!("shield of {shielded} base units to {}", payee.label);
+    let what = shield_what(shielded, &payee.label, crate::verbosity::on());
     inclusion::follow(tc, &wallet, &what, submitted, follow).await
+}
+
+/// What a shield's submission lines call it: the recipient and, under
+/// `verbose`, the base units it shields.
+#[cfg(feature = "native-proof")]
+fn shield_what(shielded: u128, recipient: &str, verbose: bool) -> String {
+    if verbose {
+        format!("shield of {shielded} base units to {recipient}")
+    } else {
+        format!("shield to {recipient}")
+    }
 }
 
 /// Groups of at most `max` legacy coins, each group inside one shard of
@@ -5724,18 +6565,14 @@ fn record_shielded(
     tc: &TokenCtx,
     sources: &[quil_lattice_ct::confidential::shield::ShieldSource],
 ) -> anyhow::Result<()> {
-    use std::io::Write;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(tc.config_dir.join(super::legacy::SHIELD_JOURNAL))?;
-    for source in sources {
-        writeln!(file, "{now} {}", hex::encode(source.address))?;
-    }
-    Ok(())
+    super::legacy::record_shielded(
+        &tc.config_dir,
+        now,
+        sources.iter().map(|source| source.address),
+    )
 }
 
 /// What `token shield-all` reports as it goes. The CLI prints
@@ -5822,6 +6659,9 @@ pub(crate) struct ShieldAllPlan {
     pub duplicates: usize,
     /// Each batch's shard, short form (`shield_pacing::shard_label`).
     shards: Vec<String>,
+    /// Each batch's shard filter, when the plan found it among the live
+    /// shards: the run reads whether it still has an active prover.
+    filters: Vec<Option<Vec<u8>>>,
     /// Who the batches pay. Boxed: an address is over a kilobyte, and the
     /// plan lives in the node manager's futures.
     payee: Box<ShieldRecipient>,
@@ -5919,6 +6759,7 @@ pub(crate) async fn plan_shield_all(
         shielded,
         duplicates: 0,
         shards: Vec::new(),
+        filters: Vec::new(),
         payee,
         paths: Vec::new(),
         wallet,
@@ -5928,7 +6769,7 @@ pub(crate) async fn plan_shield_all(
     if coins.is_empty() {
         return Ok(plan);
     }
-    super::legacy::ensure_shields_active(&plan.client, tc.node_config.p2p.network, true).await?;
+    super::legacy::ensure_shields_active(tc, true).await?;
     let listed_shards = super::legacy::app_shards(&plan.client, &application).await?;
     let live = super::legacy::live_of(&listed_shards);
     let paths: Vec<Vec<bool>> = live.iter().map(|(_, path)| path.clone()).collect();
@@ -5947,17 +6788,23 @@ pub(crate) async fn plan_shield_all(
         );
     }
     plan.duplicates = candidates - batches.iter().map(Vec::len).sum::<usize>() - uncovered.len();
-    plan.shards = batches
+    plan.filters = batches
         .iter()
         .map(|batch| {
             batch
                 .first()
                 .and_then(|source| super::legacy::deepest_shard(&paths, &source.address))
                 .and_then(|path| live.iter().find(|(_, live_path)| live_path == path))
-                .map_or_else(
-                    || "unknown".to_owned(),
-                    |(filter, _)| super::shield_pacing::shard_label(filter),
-                )
+                .map(|(filter, _)| filter.clone())
+        })
+        .collect();
+    plan.shards = plan
+        .filters
+        .iter()
+        .map(|filter| {
+            filter
+                .as_deref()
+                .map_or_else(|| "unknown".to_owned(), super::shield_pacing::shard_label)
         })
         .collect();
     plan.batches = batches;
@@ -5992,6 +6839,8 @@ struct ShieldAllIo<'a> {
     batches: Vec<Vec<quil_lattice_ct::confidential::shield::ShieldSource>>,
     /// Each batch's shard, short form.
     shards: Vec<String>,
+    /// Each batch's shard filter, if known.
+    filters: Vec<Option<Vec<u8>>>,
     /// The live shards' bit paths: each batch's route.
     paths: Vec<Vec<bool>>,
     /// `Some(waits)`: print what identifies each submitted batch, and keep
@@ -5999,6 +6848,8 @@ struct ShieldAllIo<'a> {
     announce: Option<bool>,
     /// The batches announced so far.
     submissions: Vec<Submitted>,
+    /// Where the node's GLOBAL judgement is read, or why it is not.
+    health: Result<crate::commands::node::diagnostics::HealthSource, String>,
     /// The last proved batch's total and fee, for its submission record.
     proved: Option<(u128, u128)>,
     started: std::time::Instant,
@@ -6034,13 +6885,24 @@ impl super::shield_pacing::ShieldIo for ShieldAllIo<'_> {
         tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
     }
 
-    async fn head(&mut self) -> anyhow::Result<u64> {
-        Ok(self
+    async fn global(&mut self) -> anyhow::Result<super::shield_pacing::GlobalRead> {
+        let head = self
             .client
             .get_node_info(quil_types::proto::node::GetNodeInfoRequest::default())
             .await?
             .into_inner()
-            .last_global_head_frame)
+            .last_global_head_frame;
+        let source = self
+            .health
+            .as_ref()
+            .map_err(|why| anyhow::anyhow!("{why}"))?;
+        let health = source.read().await.map_err(|why| anyhow::anyhow!(why))?;
+        let health = health
+            .ok_or_else(|| anyhow::anyhow!("the node predates health conditions; update it"))?;
+        Ok(super::shield_pacing::GlobalRead {
+            head,
+            degraded: quil_rpc::health_conditions::global_progress_notice(&health),
+        })
     }
 
     fn coins(&self, index: usize) -> usize {
@@ -6150,6 +7012,22 @@ impl super::shield_pacing::ShieldIo for ShieldAllIo<'_> {
         }))
     }
 
+    async fn shard_live(&mut self, index: usize) -> anyhow::Result<bool> {
+        let filter = self.filters[index]
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("batch {}'s shard is not known", index + 1))?;
+        let shards =
+            super::legacy::app_shards(&self.client, &quil_execution::domains::QUIL_TOKEN).await?;
+        // An empty list is no evidence about this shard.
+        anyhow::ensure!(
+            !shards.is_empty(),
+            "the node's shard list has no shard of the application"
+        );
+        Ok(super::legacy::live_of(&shards)
+            .iter()
+            .any(|(live, _)| live.as_slice() == filter))
+    }
+
     fn event(&mut self, event: &super::shield_pacing::ShieldEvent) {
         (self.sink)(ShieldReport::Paced(event));
     }
@@ -6197,6 +7075,7 @@ async fn submit_shield_all(
     let ShieldAllPlan {
         batches,
         shards,
+        filters,
         payee,
         paths,
         wallet,
@@ -6212,9 +7091,14 @@ async fn submit_shield_all(
         client,
         batches,
         shards,
+        filters,
         paths,
         announce,
         submissions: Vec::new(),
+        health: crate::commands::node::diagnostics::HealthSource::for_node(
+            &tc.node_config,
+            &tc.key_manager,
+        ),
         proved: None,
         started: std::time::Instant::now(),
         record,
@@ -6386,9 +7270,112 @@ pub(crate) async fn run_claim(
     inclusion::follow(tc, &wallet, "escrow claim", submitted, follow).await
 }
 
-/// Custom-token issuance. The keystore authority must be the token's configured
-/// mint authority; `--permissionless` builds an unsigned statement for a free
-/// payment policy. Delivery is not finality; admission checks the deployed policy.
+/// Whether a custom mint's statement is signed, decided from the token's
+/// deployed mint policy before anything is paid; an unusable combination is
+/// refused here, since the node refuses it only after the settlement that
+/// funds it has been paid. A payment policy mints unsigned statements, and a
+/// paid one needs its price paid to the token's payment address; authority,
+/// signature and entitlement policies sign. `paid` is the settlement's
+/// payment address and value.
+#[cfg(feature = "native-proof")]
+pub(super) fn custom_mint_signs(
+    policy: &quil_execution::token_intrinsic::custom_mint::MintPolicy,
+    permissionless: bool,
+    amount: u128,
+    paid: Option<([u8; 32], u128)>,
+    entitlement: bool,
+) -> anyhow::Result<bool> {
+    use quil_execution::token_intrinsic::config_resolver::MintVariant;
+    anyhow::ensure!(
+        policy.behavior & quil_execution::token_intrinsic::constants::MINTABLE != 0,
+        "this token is not mintable"
+    );
+    let entry = &policy.entry;
+    let signs = match entry.variant {
+        MintVariant::Payment => {
+            anyhow::ensure!(!entitlement, "a payment-policy mint takes no --entitlement");
+            match &entry.payment_fee_baseline {
+                Some(baseline) => {
+                    let price = baseline * num_bigint::BigInt::from(amount);
+                    let Some((address, payment)) = paid else {
+                        anyhow::bail!(
+                            "this token's mints are paid: pass --payee (its payee) and \
+                             --price {price}"
+                        );
+                    };
+                    anyhow::ensure!(
+                        entry.payment_address.as_deref() == Some(&address[..]),
+                        "--payee does not pay this token's payment address {}",
+                        hex::encode(entry.payment_address.as_deref().unwrap_or_default())
+                    );
+                    anyhow::ensure!(
+                        payment > 0 && num_bigint::BigInt::from(payment) >= price,
+                        "--price {payment} is below this mint's price {price}"
+                    );
+                }
+                None => anyhow::ensure!(
+                    paid.is_none(),
+                    "this token mints free: drop --payee and --price"
+                ),
+            }
+            false
+        }
+        MintVariant::Authority | MintVariant::Signature => true,
+        MintVariant::MerkleEntitlementWithSignature => {
+            anyhow::ensure!(
+                entitlement,
+                "this token mints by entitlement: pass --entitlement"
+            );
+            true
+        }
+        _ => anyhow::bail!("this token's mint policy does not permit a custom mint"),
+    };
+    if signs {
+        anyhow::ensure!(
+            !permissionless,
+            "this token mints only under a signing key: drop --permissionless"
+        );
+        anyhow::ensure!(
+            paid.is_none(),
+            "this token does not mint by payment: drop --payee and --price"
+        );
+    }
+    Ok(signs)
+}
+
+/// The token's deployed mint policy, read from its metadata vertex.
+#[cfg(feature = "native-proof")]
+async fn fetch_mint_policy(
+    client: &quil_types::proto::node::node_service_client::NodeServiceClient<
+        tonic::transport::Channel,
+    >,
+    application: &[u8; 32],
+) -> anyhow::Result<quil_execution::token_intrinsic::custom_mint::MintPolicy> {
+    let mut address = application.to_vec();
+    address.extend_from_slice(&quil_execution::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS);
+    let response = client
+        .clone()
+        .max_decoding_message_size(64 << 20)
+        .get_vertex_data(quil_types::proto::node::GetVertexDataRequest {
+            address,
+            full_data: true,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("token configuration: {e}"))?
+        .into_inner();
+    anyhow::ensure!(
+        !response.raw_data.is_empty(),
+        "token {} has no deployed configuration",
+        hex::encode(application)
+    );
+    quil_execution::token_intrinsic::custom_mint::policy_from_metadata(&response.raw_data)
+        .map_err(|e| anyhow::anyhow!("token configuration: {e}"))
+}
+
+/// Custom-token issuance under the token's deployed policy, read first: an
+/// authority or signature policy signs with the keystore authority, an
+/// entitlement policy with the entitled key, and a payment policy mints an
+/// unsigned statement. Delivery is not finality.
 #[cfg(feature = "native-proof")]
 pub(super) async fn run_custom_mint(
     tc: &TokenCtx,
@@ -6419,16 +7406,55 @@ pub(super) async fn run_custom_mint(
         .map_err(|e| anyhow::anyhow!("recipient address: {e:?}"))?,
         None => wallet.address().clone(),
     };
-    let authority: Option<std::sync::Arc<dyn quil_types::crypto::Signer>> = if permissionless {
-        None
-    } else {
-        Some(std::sync::Arc::from(
+    // Paid mint: the claim's settlement pays the provers; its payment coin
+    // pays the price to the token's payee.
+    let paid = match paid {
+        Some((payee, price, wait)) => {
+            let quil_context = quil_lattice_ct::confidential::transfer::parameter_context(
+                &network,
+                &quil_execution::domains::QUIL_TOKEN,
+            );
+            let payee = RecipientAddress::decode(
+                &hex::decode(payee.strip_prefix("0x").unwrap_or(payee))?,
+                &quil_context,
+            )
+            .map_err(|e| anyhow::anyhow!("payee address: {e:?}"))?;
+            Some((payee, price, wait))
+        }
+        None => None,
+    };
+    let paid_to = match &paid {
+        Some((payee, price, _)) => Some((
+            quil_execution::token_intrinsic::settlement_record::payment_address(&payee.encode())?,
+            *price,
+        )),
+        None => None,
+    };
+    let client = tc.connect().await?;
+    let policy = fetch_mint_policy(&client, &application).await?;
+    let signs = custom_mint_signs(
+        &policy,
+        permissionless,
+        amount,
+        paid_to,
+        !entitlement.is_empty(),
+    )?;
+    let authority: Option<std::sync::Arc<dyn quil_types::crypto::Signer>> = if signs {
+        let signer: std::sync::Arc<dyn quil_types::crypto::Signer> = std::sync::Arc::from(
             tc.key_manager
                 .get_signer_by_id(authority_key)
                 .map_err(|e| anyhow::anyhow!("mint authority key {authority_key}: {e}"))?,
-        ))
+        );
+        if let Some(configured) = &policy.entry.authority_public_key {
+            anyhow::ensure!(
+                configured.as_slice() == signer.public_key(),
+                "key {authority_key} is not this token's mint authority"
+            );
+        }
+        Some(signer)
+    } else {
+        None
     };
-    let mut client = tc.connect().await?;
     let bytes = wallet
         .clone()
         .create_custom_mint(
@@ -6441,24 +7467,15 @@ pub(super) async fn run_custom_mint(
             },
         )
         .await?;
-    if let Some((payee, price, wait)) = paid {
-        // Paid mint: the claim's settlement pays the provers; its payment coin
-        // pays the price to the token's payee.
-        let quil_context = quil_lattice_ct::confidential::transfer::parameter_context(
-            &network,
-            &quil_execution::domains::QUIL_TOKEN,
-        );
-        let payee = RecipientAddress::decode(
-            &hex::decode(payee.strip_prefix("0x").unwrap_or(payee))?,
-            &quil_context,
-        )
-        .map_err(|e| anyhow::anyhow!("payee address: {e:?}"))?;
-        let submitted =
-            submit_paid_operation(tc, &wallet, bytes, Some((payee, price)), wait).await?;
-        return inclusion::follow(tc, &wallet, "paid custom-token mint", submitted, follow).await;
-    }
-    let submitted = submit_operation(tc, &wallet, &mut client, bytes).await?;
-    inclusion::follow(tc, &wallet, "custom-token mint", submitted, follow).await
+    // The settlement pays for this one bundle, so the bundle is saved before
+    // the settlement is sent: a wait that runs out is finished by `--resume`,
+    // never by paying again.
+    let (what, payment, wait) = match paid {
+        Some((payee, price, wait)) => ("paid custom-token mint", Some((payee, price)), wait),
+        None => ("custom-token mint", None, SETTLEMENT_WAIT),
+    };
+    let submitted = paid_bundle::submit_paid(tc, &wallet, bytes, payment, wait, true).await?;
+    inclusion::follow(tc, &wallet, what, submitted, follow).await
 }
 
 #[cfg(test)]
@@ -6637,18 +7654,180 @@ mod tests {
     }
 
     use super::*;
-    use quil_lattice_ct::confidential::{memo::create_output, relation::membership::MembershipKey};
+    use quil_lattice_ct::confidential::{
+        memo::{create_output, open_output},
+        relation::membership::MembershipKey,
+    };
 
+    /// `token confidential-address` labels its two lines on stderr: which
+    /// address is which, and what the escrow one is for.
     #[test]
-    fn mint_lines_show_the_net_amount_beside_reward_and_fee() {
+    fn confidential_address_labels_each_address() {
+        assert_eq!(address_label(false), "Receiving address (token transfer):");
+        assert_eq!(
+            address_label(true),
+            "Escrow address (token pending-transfer: the recipient accepts; after expiry the \
+             sender may reject to refund):"
+        );
+    }
+
+    /// The net amount by default; under `-v` (next test) the reward and fee
+    /// it is the difference of, exactly and in base units.
+    #[test]
+    fn mint_lines_show_the_net_amount_by_default() {
         // 12.5 QUIL less 0.25 QUIL (8e9 base units per QUIL).
         assert_eq!(
-            mint_amounts_line("Minting", 100_000_000_000, 2_000_000_000),
-            "Minting 12.250000000000 QUIL (reward 12.500000000000 QUIL less fee 0.250000000000 QUIL)."
+            mint_amounts_line("Minting", 100_000_000_000, 2_000_000_000, false),
+            "Minting 12.25 QUIL"
         );
         assert_eq!(
-            mint_amounts_line("Claiming", 8, 0),
-            "Claiming 0.000000001000 QUIL (reward 0.000000001000 QUIL less fee 0.000000000000 QUIL)."
+            mint_amounts_line("Claiming", 8, 0, false),
+            "Claiming 0.000000001 QUIL"
+        );
+    }
+
+    #[test]
+    fn mint_lines_keep_reward_and_fee_under_verbose() {
+        assert_eq!(
+            mint_amounts_line("Minting", 100_000_000_000, 2_000_000_000, true),
+            "Minting 12.250000000000 QUIL (reward 12.500000000000 QUIL less fee 0.250000000000 QUIL; 98000000000 base units)."
+        );
+    }
+
+    /// The fee in QUIL by default; under `-v` its base units and the quote
+    /// it came from.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn fee_line_is_the_fee_alone_by_default() {
+        assert_eq!(
+            fee_line(17_659, 16_053, 16_053, 991_548, false),
+            "Estimated fee: 0.000002 QUIL"
+        );
+    }
+
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn fee_line_keeps_the_quote_under_verbose() {
+        assert_eq!(
+            fee_line(17_659, 16_053, 16_053, 991_548, true),
+            "Estimated fee: 0.000002207375 QUIL (17659 base units for 16053 bytes of state growth; \
+             snapshot frame 991548; 16053 at the snapshot plus 10% for fee-vote movement before \
+             inclusion)"
+        );
+    }
+
+    /// `token coins`: the header counts and totals the coins; the coin
+    /// lines below it are unchanged for scripts. `-v` adds base units and
+    /// where the count comes from.
+    #[test]
+    fn coins_header_counts_and_totals_and_keeps_its_source_under_verbose() {
+        let coins = [100_000_000_000, 2_000_000_000];
+        assert_eq!(
+            coins_header(&coins, true, false).unwrap(),
+            "2 unspent coins, 12.75 QUIL:"
+        );
+        assert_eq!(
+            coins_header(&coins[..1], false, false).unwrap(),
+            "1 unspent coin, 100000000000 base units:"
+        );
+        assert_eq!(
+            coins_header(&[], true, false).unwrap(),
+            "0 unspent coins, 0 QUIL"
+        );
+        assert_eq!(
+            coins_header(&coins, true, true).unwrap(),
+            "2 unspent coins, 12.750000000000 QUIL (102000000000 base units), reported unspent \
+             by the configured node:"
+        );
+    }
+
+    /// A/B reproducer: a payment-policy token mints unsigned statements. A
+    /// wallet that signed them by default paid the settlement, then saw the
+    /// mint refused ("permissionless mint carries no authority"). The form
+    /// comes from the deployed policy, and an unusable combination is refused
+    /// before anything is paid.
+    #[cfg(feature = "native-proof")]
+    #[test]
+    fn custom_mint_form_follows_the_deployed_policy_before_paying() {
+        use super::custom_mint_signs as signs;
+        use quil_execution::token_intrinsic::{
+            config_resolver::{MintVariant, StaticTokenEntry},
+            custom_mint::MintPolicy,
+        };
+        const MSG: &str = "mint form ignores the deployed policy";
+        let policy = |variant, baseline: Option<i64>| MintPolicy {
+            behavior: 1,
+            entry: StaticTokenEntry {
+                variant,
+                authority_key_type: None,
+                authority_public_key: None,
+                entitlement_root: None,
+                payment_fee_baseline: baseline.map(num_bigint::BigInt::from),
+                payment_address: Some(vec![9; 32]),
+            },
+        };
+        let paid = policy(MintVariant::Payment, Some(7));
+        let free = policy(MintVariant::Payment, None);
+        // Payment policies mint unsigned without --permissionless; on mainnet
+        // both the paid and the free form were refused after the fee.
+        assert_eq!(
+            signs(&paid, false, 3, Some(([9; 32], 21)), false).ok(),
+            Some(false),
+            "{MSG}: a paid mint was signed"
+        );
+        assert_eq!(
+            signs(&free, false, 3, None, false).ok(),
+            Some(false),
+            "{MSG}: a free payment mint was signed"
+        );
+        // A paid mint without its price, below it, or to another payee.
+        assert!(signs(&paid, true, 3, None, false).is_err(), "{MSG}: unpaid");
+        assert!(
+            signs(&paid, true, 3, Some(([9; 32], 20)), false).is_err(),
+            "{MSG}: underpaid"
+        );
+        assert!(
+            signs(&paid, true, 3, Some(([8; 32], 21)), false).is_err(),
+            "{MSG}: another payee"
+        );
+        // A price paid under a free or an authority policy buys nothing.
+        assert!(
+            signs(&free, true, 3, Some(([9; 32], 21)), false).is_err(),
+            "{MSG}: a free mint paid a price"
+        );
+        let authority = policy(MintVariant::Authority, None);
+        assert_eq!(
+            signs(&authority, false, 3, None, false).ok(),
+            Some(true),
+            "{MSG}: an authority mint was unsigned"
+        );
+        assert!(
+            signs(&authority, true, 3, None, false).is_err(),
+            "{MSG}: an authority mint built unsigned"
+        );
+        assert!(
+            signs(&authority, false, 3, Some(([9; 32], 21)), false).is_err(),
+            "{MSG}: an authority mint paid a price"
+        );
+        let entitled = policy(MintVariant::MerkleEntitlementWithSignature, None);
+        assert_eq!(
+            signs(&entitled, false, 3, None, true).ok(),
+            Some(true),
+            "{MSG}: an entitlement mint was unsigned"
+        );
+        assert!(
+            signs(&entitled, false, 3, None, false).is_err(),
+            "{MSG}: an entitlement mint without its proof"
+        );
+        assert!(
+            signs(&policy(MintVariant::NoMint, None), false, 3, None, false).is_err(),
+            "{MSG}: a non-minting policy"
+        );
+        let mut unmintable = policy(MintVariant::Authority, None);
+        unmintable.behavior = 0;
+        assert!(
+            signs(&unmintable, false, 3, None, false).is_err(),
+            "{MSG}: an unmintable token"
         );
     }
 
@@ -6848,6 +8027,7 @@ mod tests {
                         .collect(),
                 )
                 .unwrap()
+                .0
         };
         let (selected, total) = merge_selection(coins(&[5, 0, 9, 7, 1, 2]), &[], 4).unwrap();
         assert_eq!(
@@ -6894,6 +8074,7 @@ mod tests {
                         .collect(),
                 )
                 .unwrap()
+                .0
         };
         let (selected, change) = select_coins(coins(&[1, 20, 3]), 11, 2, 1).unwrap();
         assert_eq!(selected.len(), 1);
@@ -6914,7 +8095,8 @@ mod tests {
             .output;
         let duplicate = wallet
             .recover_page(vec![([1; 32], output.clone()), ([2; 32], output)])
-            .unwrap();
+            .unwrap()
+            .0;
         assert!(select_coins(duplicate, 10, 0, 2).is_err());
     }
     #[test]
@@ -7572,6 +8754,91 @@ mod tests {
         );
     }
 
+    /// A wallet and a page of its coins (0, 1, 7 and the largest amount)
+    /// between coins of another wallet, as a scan reads them.
+    fn mixed_page() -> (RecipientWallet, Vec<([u8; 32], Output)>) {
+        let wallet = shield_test_wallet([1; 32]);
+        let other = shield_test_wallet([1; 32]);
+        let page = [
+            (true, 0),
+            (false, 5),
+            (true, 1),
+            (false, 9),
+            (true, 7),
+            (true, u128::MAX),
+            (false, 3),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (ours, amount))| {
+            let payee = if ours { &wallet } else { &other };
+            let output = create_output(&wallet.context, payee.address(), amount)
+                .unwrap()
+                .output;
+            ([i as u8; 32], output)
+        })
+        .collect();
+        (wallet, page)
+    }
+
+    /// A scan derives the keys that open a coin once, not once per coin:
+    /// they depend on the wallet alone.
+    #[test]
+    fn a_scan_derives_the_wallet_keys_once() {
+        let (wallet, page) = mixed_page();
+        KEY_DERIVATIONS.with(|n| n.set(0));
+        for _ in 0..2 {
+            assert_eq!(wallet.recover_page(page.clone()).unwrap().0.len(), 4);
+        }
+        let derivations = KEY_DERIVATIONS.with(|n| n.get());
+        assert_eq!(
+            derivations, 1,
+            "the scan derived the wallet keys {derivations} times"
+        );
+    }
+
+    /// The keys a scan derives once open exactly the coins `open_output`
+    /// opens with keys of its own, to the same amounts and spend images.
+    #[test]
+    fn a_scan_opens_the_coins_open_output_opens() {
+        let (wallet, page) = mixed_page();
+        let membership = MembershipKey::derive(&wallet.context);
+        let expected: Vec<_> = page
+            .iter()
+            .filter_map(|(address, output)| {
+                let opened = open_output(
+                    &wallet.context,
+                    &wallet.kem_secret,
+                    &wallet.recipient,
+                    output,
+                )
+                .ok()?;
+                let image = membership
+                    .key_image(&opened.secrets.owner)
+                    .identity_bytes()
+                    .unwrap();
+                Some((*address, opened.amount, image))
+            })
+            .collect();
+        let scanned: Vec<_> = wallet
+            .recover_page(page)
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|coin| (coin.address, *coin.amount, coin.image))
+            .collect();
+        assert_eq!(
+            scanned, expected,
+            "the scan opened other coins than open_output"
+        );
+        let amounts: Vec<_> = expected.iter().map(|(_, amount, _)| *amount).collect();
+        assert_eq!(
+            amounts,
+            [0, 1, 7, u128::MAX],
+            "open_output opened other coins than the wallet's"
+        );
+    }
+
     #[test]
     fn wallet_prepares_owned_transfer_and_rejects_invalid_selection() {
         use quil_lattice_ct::confidential::{
@@ -7623,7 +8890,8 @@ mod tests {
             .map(|(record, output)| (record.address, output.clone()))
             .collect();
         page.push(([3; 32], foreign));
-        let recovered = wallet.recover_page(page).unwrap();
+        let (recovered, mismatched) = wallet.recover_page(page).unwrap();
+        assert!(mismatched.is_empty());
         assert_eq!(recovered.len(), 2);
         for (index, coin) in recovered.iter().enumerate() {
             assert_eq!(coin.address, records[index].address);
@@ -8304,9 +9572,10 @@ mod tests {
 mod shield_all_cli_tests {
     use super::*;
 
-    /// The lines `token mint` prints for its events. An authorization says
-    /// the frame it names is the cited reward root, not its inclusion; a
-    /// claim prints its identifiers afterwards, not a line of its own.
+    /// The lines `token mint` prints for its events by default. An
+    /// authorization names the file it was saved to; a claim prints its
+    /// identifiers afterwards, not a line of its own. `-v` adds the cited
+    /// reward root's frame, which is not the inclusion frame.
     #[test]
     fn mint_prints_its_event_lines() {
         let lines: Vec<Option<String>> = [
@@ -8322,21 +9591,34 @@ mod shield_all_cli_tests {
             MintEvent::Claimed,
         ]
         .iter()
-        .map(MintEvent::cli_line)
+        .map(|event| event.cli_line_with(false))
         .collect();
         assert_eq!(
             lines,
             [
-                Some(mint_amounts_line("Minting", 100_000_000_000, 2_000_000_000)),
+                Some("Minting 12.25 QUIL".into()),
                 None,
                 Some(
                     "Reward mint authorization submitted to GLOBAL and saved to \
-                     /cfg/mint-42.bin. It cites the reward root of GLOBAL frame 42, which is \
-                     not its inclusion frame."
+                     /cfg/mint-42.bin."
                         .into()
                 ),
                 None,
             ]
+        );
+    }
+
+    /// A shield's submission lines name its recipient; `-v` adds the base
+    /// units it shields.
+    #[test]
+    fn a_shield_names_its_amount_only_under_verbose() {
+        assert_eq!(
+            shield_what(7, "this wallet", false),
+            "shield to this wallet"
+        );
+        assert_eq!(
+            shield_what(7, "this wallet", true),
+            "shield of 7 base units to this wallet"
         );
     }
 
@@ -8365,6 +9647,19 @@ mod shield_all_cli_tests {
         assert_eq!(
             paced_cli_line(&waiting, "recipient 0123456789ab"),
             waiting.line()
+        );
+    }
+
+    #[test]
+    fn mint_keeps_the_cited_frame_under_verbose() {
+        let submitted = MintEvent::Submitted {
+            cited_frame: 42,
+            saved: "/cfg/mint-42.bin".into(),
+        };
+        assert_eq!(
+            submitted.cli_line_with(true).unwrap(),
+            "Reward mint authorization submitted to GLOBAL and saved to /cfg/mint-42.bin. \
+             It cites the reward root of GLOBAL frame 42, which is not its inclusion frame."
         );
     }
 

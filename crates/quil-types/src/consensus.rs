@@ -4,6 +4,9 @@ use crate::store;
 use num_bigint::BigInt;
 use std::collections::HashMap;
 
+mod persistent_storage;
+pub use persistent_storage::*;
+
 // ---------------------------------------------------------------------------
 // Engine state
 // ---------------------------------------------------------------------------
@@ -173,7 +176,7 @@ pub struct ProverAllocationInfo {
     /// The last GLOBAL frame that included an app frame this allocation
     /// signed. Unlike `last_active_frame_number`, confirms do not advance it.
     /// `0` when never recorded, including every frame before
-    /// [`SIGNED_FRAME_ACTIVATION_FRAME`].
+    /// [`signed_frame_activation_frame`].
     pub last_signed_frame_number: u64,
     /// The storage epoch this allocation was last confirmed for. A data-shard
     /// (non-empty filter) Active allocation whose `epoch` is older than the
@@ -530,6 +533,73 @@ pub fn set_prover_op_replay_guard_epoch_for_thread(epoch: Option<u64>) {
     PROVER_OP_REPLAY_GUARD_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which a `ShardSplit` or `ShardMerge` signs what GLOBAL
+/// executes: its signature covers the frame, the parent and every child in
+/// order, under a new domain, so a signature over only the frame and parent
+/// no longer verifies; the op must be signed at most ten frames before, and
+/// in the epoch of, the GLOBAL frame that includes it; its children must be
+/// the two bit-path children of one branch (a merge's: of its parent); and a
+/// due merge whose children are not live in the grid, or whose parent's
+/// range holds another live shard, is consumed without changing the grid.
+/// Consensus-affecting: every archive and GLOBAL prover must run a build with
+/// it before then, or they disagree on which splits and merges execute; a
+/// prover on an older build signs ops that are refused, with a warning.
+/// Mainnet epoch 1477 (frame 1,063,440), which GLOBAL cannot reach before
+/// 2026-11-11 14:00 UTC even at ten seconds a frame: only archives execute
+/// these ops and adopt a release within hours, and it is the one flag day
+/// this release's other GLOBAL gates share.
+/// `QUIL_SHARD_OP_BINDING_EPOCH` elsewhere, never by default.
+pub const MAINNET_SHARD_OP_BINDING_EPOCH: Option<u64> = Some(1477);
+
+static SHARD_OP_BINDING_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SHARD_OP_BINDING_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn shard_op_binding_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SHARD_OP_BINDING_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's shard op binding epoch from its network, and return
+/// it. Called at startup before any frame is processed; the first call
+/// decides.
+pub fn init_shard_op_binding_epoch(network: u8) -> u64 {
+    *SHARD_OP_BINDING_EPOCH.get_or_init(|| {
+        shard_op_binding_epoch_for(
+            network,
+            std::env::var("QUIL_SHARD_OP_BINDING_EPOCH").ok().as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_shard_op_binding_epoch`]; the mainnet epoch in
+/// a process that never called it, so the setting cannot reach mainnet.
+/// `u64::MAX` when the network has none.
+pub fn shard_op_binding_epoch() -> u64 {
+    if let Some(epoch) = SHARD_OP_BINDING_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *SHARD_OP_BINDING_EPOCH.get_or_init(|| shard_op_binding_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` applies the shard op binding
+/// ([`MAINNET_SHARD_OP_BINDING_EPOCH`]).
+pub fn shard_op_binding_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= shard_op_binding_epoch()
+}
+
+/// Set the shard op binding epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_shard_op_binding_epoch_for_thread(epoch: Option<u64>) {
+    SHARD_OP_BINDING_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// The epoch from which a `ProverSeniorityMerge` follows the seniority
 /// succession rules: an Ed448 node key whose spent markers name another,
 /// idle prover can move that prover's seniority to the prover submitting
@@ -848,6 +918,68 @@ pub fn set_strict_peer_info_epoch_for_thread(epoch: Option<u64>) {
     STRICT_PEER_INFO_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from which nodes enforce strict shard gossip: the mesh
+/// penalises a peer that forwards, on a shard's dispatch or submission topic,
+/// a message no leader can propose (one that is not a well-formed message
+/// bundle), and a shard CW topic's message ids cover their author. Before it
+/// such messages are dropped without penalty, because releases before this
+/// rule forward them, and every topic keeps the content id, because they
+/// compute it. Not consensus-affecting, but it splits gossip from nodes on
+/// older releases: from mainnet epoch 1483 (frame 1,067,760) a node that
+/// has not upgraded and the upgraded nodes in its shard CW meshes break each
+/// other's gossip promises and graylist each other.
+/// `QUIL_STRICT_SHARD_GOSSIP_EPOCH` elsewhere, never by default.
+pub const MAINNET_STRICT_SHARD_GOSSIP_EPOCH: Option<u64> = Some(1483);
+
+static STRICT_SHARD_GOSSIP_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static STRICT_SHARD_GOSSIP_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn strict_shard_gossip_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_STRICT_SHARD_GOSSIP_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's strict shard gossip epoch from its network, and return
+/// it. Called at startup; the first call decides.
+pub fn init_strict_shard_gossip_epoch(network: u8) -> u64 {
+    *STRICT_SHARD_GOSSIP_EPOCH.get_or_init(|| {
+        strict_shard_gossip_epoch_for(
+            network,
+            std::env::var("QUIL_STRICT_SHARD_GOSSIP_EPOCH")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The epoch fixed by [`init_strict_shard_gossip_epoch`]; the mainnet epoch
+/// in a process that never called it. `u64::MAX` when the network has none.
+pub fn strict_shard_gossip_epoch() -> u64 {
+    if let Some(epoch) = STRICT_SHARD_GOSSIP_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *STRICT_SHARD_GOSSIP_EPOCH.get_or_init(|| strict_shard_gossip_epoch_for(0, None))
+}
+
+/// Whether GLOBAL frame `frame` falls in or after the strict shard gossip
+/// epoch.
+pub fn strict_shard_gossip_active(frame: u64) -> bool {
+    epoch_for_frame(frame) >= strict_shard_gossip_epoch()
+}
+
+/// Set the strict shard gossip epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_strict_shard_gossip_epoch_for_thread(epoch: Option<u64>) {
+    STRICT_SHARD_GOSSIP_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
 /// PoRep block polynomial size (KZG evaluation-domain size per replica block).
 /// Measured most efficient at 64 in testing; a power-of-two ≤ the ceremony
 /// domain cap (`quil_crypto::sdr::BLOCK_POLY_SIZE = 256`). Consensus parameter —
@@ -1134,13 +1266,79 @@ pub fn unsealed_issuance_epoch() -> u64 {
 /// without a sealed registration at once
 /// ([`MAINNET_UNSEALED_ISSUANCE_EPOCH`]).
 pub fn unsealed_issuance_active(frame: u64) -> bool {
-    epoch_for_frame(frame) >= unsealed_issuance_epoch()
+    epoch_for_frame(frame) >= unsealed_issuance_epoch() && !sealed_storage_required_at(frame)
 }
 
 /// Set the unsealed issuance epoch for the calling thread only (tests).
 /// `Some(u64::MAX)` disables it; `None` restores the process setting.
 pub fn set_unsealed_issuance_epoch_for_thread(epoch: Option<u64>) {
     UNSEALED_ISSUANCE_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+/// Mainnet epoch 1467 (GLOBAL frame 1,056,240): application committees and
+/// rewarded participants must have a sealed registration for their epoch.
+/// No empty-committee fallback may admit an unsealed member. Archives serving
+/// GLOBAL use its separate membership protocol and have no shard storage seat.
+/// Replica keys switch to persistent member/leaf keys at
+/// [`MAINNET_STABLE_REPLICA_KEY_EPOCH`]; epoch freshness remains bound into
+/// the registration, beacon challenges and STARK.
+/// Equal to [`MAINNET_PERSISTENT_STORAGE_EPOCH`], whose capacity warmup
+/// ([`PERSISTENT_STORAGE_WARMUP_EPOCHS`], 32) starts at epoch 1435 (frame
+/// 1,033,200, [`persistent_storage_warmup_epoch`]): from then nodes publish
+/// capacity precommits and GLOBAL applies them, and a GLOBAL executor
+/// without the release skips them. Every GLOBAL executor (every archive, in
+/// any order) must run the release before epoch 1435, or GLOBAL splits.
+/// Provers should run it before epoch 1435 for the full capacity warmup, and
+/// before epoch 1459 for the full eight-epoch label warmup of the first
+/// sealed epoch (`storage_labels::ahead_epoch`).
+pub const MAINNET_SEALED_STORAGE_EPOCH: Option<u64> = Some(1467);
+static SEALED_STORAGE_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+thread_local! {
+    static SEALED_STORAGE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+fn sealed_storage_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SEALED_STORAGE_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting.and_then(|s| s.parse().ok()).unwrap_or(u64::MAX)
+}
+pub fn init_sealed_storage_epoch(network: u8) -> u64 {
+    *SEALED_STORAGE_EPOCH.get_or_init(|| {
+        sealed_storage_epoch_for(
+            network,
+            std::env::var("QUIL_SEALED_STORAGE_EPOCH").ok().as_deref(),
+        )
+    })
+}
+pub fn sealed_storage_epoch() -> u64 {
+    if let Some(epoch) = SEALED_STORAGE_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *SEALED_STORAGE_EPOCH.get_or_init(|| sealed_storage_epoch_for(0, None))
+}
+pub fn sealed_storage_required(epoch: u64) -> bool {
+    let first = sealed_storage_epoch();
+    persistent_storage_at(epoch) || (first != u64::MAX && epoch >= first)
+}
+pub fn sealed_storage_required_at(frame: u64) -> bool {
+    sealed_storage_required(epoch_for_frame(frame))
+}
+/// Shared by committed scheduling, cached runtime membership and header admission.
+pub fn storage_seat_eligible(filter: &[u8], frame: u64, slot: Option<&StorageSeatSlot>) -> bool {
+    if filter.is_empty() || !sealed_storage_required_at(frame) {
+        return true;
+    }
+    let epoch = epoch_for_frame(frame);
+    slot.is_some_and(|slot| {
+        slot.epoch == epoch
+            && !slot.leaves.is_empty()
+            && slot
+                .sealed_at
+                .is_some_and(|at| at < epoch_start_frame(epoch))
+    })
+}
+pub fn set_sealed_storage_epoch_for_thread(epoch: Option<u64>) {
+    SEALED_STORAGE_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
 /// The epoch from which a storage seat that closes an epoch with committed
@@ -1223,10 +1421,13 @@ pub fn set_storage_kick_suspension_epoch_for_thread(epoch: Option<u64>) {
 /// all hash the epoch and a beacon fixed after the registration. Labels for
 /// this epoch are made ahead two epochs before it and sealed in the epoch
 /// before it. Consensus-affecting (seal verification in every GLOBAL
-/// execution): every node must run a build carrying the epoch before the
-/// epoch two before it begins. Mainnet: not set until decided;
+/// execution): every node and archive must run a build carrying the epoch
+/// before the epoch two before it begins, and every archive before the
+/// epoch before it at the latest. Mainnet epoch 1429 (frame 1,028,880):
+/// labelling from 1427 leaves the release carrying it about a day to
+/// adopt, the slowest recent release's time to 95% of peers.
 /// `QUIL_STABLE_REPLICA_KEY_EPOCH` elsewhere, never by default.
-pub const MAINNET_STABLE_REPLICA_KEY_EPOCH: Option<u64> = None;
+pub const MAINNET_STABLE_REPLICA_KEY_EPOCH: Option<u64> = Some(1429);
 
 static STABLE_REPLICA_KEY_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -1323,9 +1524,11 @@ pub fn stable_replica_key_epoch_thread_override() -> Option<u64> {
 /// before its first kick less what its vertex held when it rejoined, so
 /// seniority earned since the rejoin is kept, once. Consensus-affecting
 /// (prover state): every node that executes GLOBAL frames must run a build
-/// carrying the frame before it. Mainnet: not set until decided;
-/// `QUIL_KICKED_SENIORITY_RESTORATION_FRAME` elsewhere, never by default.
-pub const MAINNET_KICKED_SENIORITY_RESTORATION_FRAME: Option<u64> = None;
+/// carrying the frame before it. Mainnet: 1,024,560, the first frame of epoch
+/// 1423, which GLOBAL cannot reach before 2026-11-07 00:00 UTC even at ten
+/// seconds a frame; `QUIL_KICKED_SENIORITY_RESTORATION_FRAME` elsewhere, never
+/// by default.
+pub const MAINNET_KICKED_SENIORITY_RESTORATION_FRAME: Option<u64> = Some(1_024_560);
 
 /// A prover whose seniority [`MAINNET_KICKED_SENIORITY_RESTORATION_FRAME`]
 /// restores.
@@ -1655,6 +1858,88 @@ pub fn set_exact_state_size_epoch_for_thread(epoch: Option<u64>) {
     EXACT_STATE_SIZE_OVERRIDE.with(|cell| cell.set(epoch));
 }
 
+/// The epoch from whose seals a registration may pad its leaf's data only
+/// with zero nodes: the seal's binding opens the first node past the
+/// leaf's data and shows it and every node after it zero, and opens record
+/// 0 and shows the values start at its offset 0, adding offsets checked.
+/// Before it neither the padding nor a gap before the first value was ever
+/// opened, so a member could fill either with the negated last labels,
+/// making its replica zero there, and answer the frames' openings of those
+/// nodes without keeping them. Keyed by the seal's epoch, in its
+/// decoding too, so every build parses and checks a seal of an earlier
+/// epoch alike. Consensus-affecting: every GLOBAL prover and archive must
+/// run a build with it before its seals begin, the epoch before.
+/// `QUIL_STORAGE_PADDING_BOUND_EPOCH` elsewhere, never by default.
+pub const MAINNET_STORAGE_PADDING_BOUND_EPOCH: Option<u64> = None;
+
+static STORAGE_PADDING_BOUND_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static STORAGE_PADDING_BOUND_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn storage_padding_bound_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_STORAGE_PADDING_BOUND_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's storage padding bound epoch from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_storage_padding_bound_epoch(network: u8) -> u64 {
+    *STORAGE_PADDING_BOUND_EPOCH.get_or_init(|| {
+        let setting = std::env::var("QUIL_STORAGE_PADDING_BOUND_EPOCH").ok();
+        storage_padding_bound_epoch_for(network, setting.as_deref())
+    })
+}
+
+/// The epoch fixed by [`init_storage_padding_bound_epoch`]; the mainnet
+/// epoch in a process that never called it, so the setting cannot reach
+/// mainnet. `u64::MAX`: never.
+pub fn storage_padding_bound_epoch() -> u64 {
+    if let Some(epoch) = STORAGE_PADDING_BOUND_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *STORAGE_PADDING_BOUND_EPOCH.get_or_init(|| storage_padding_bound_epoch_for(0, None))
+}
+
+/// Whether a seal for `epoch` must show its registration's padding zero.
+pub fn storage_padding_bound_at(epoch: u64) -> bool {
+    epoch >= storage_padding_bound_epoch()
+}
+
+/// Set the storage padding bound epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_storage_padding_bound_epoch_for_thread(epoch: Option<u64>) {
+    STORAGE_PADDING_BOUND_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+#[cfg(test)]
+mod storage_padding_bound_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_storage_padding_bound_setting() {
+        assert_eq!(super::MAINNET_STORAGE_PADDING_BOUND_EPOCH, None);
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(super::storage_padding_bound_epoch_for(0, setting), u64::MAX);
+        }
+        assert_eq!(super::storage_padding_bound_epoch_for(1, Some("4")), 4);
+        assert_eq!(
+            super::storage_padding_bound_epoch_for(1, Some("x")),
+            u64::MAX
+        );
+        assert_eq!(super::storage_padding_bound_epoch_for(1, None), u64::MAX);
+        super::set_storage_padding_bound_epoch_for_thread(Some(7));
+        assert!(!super::storage_padding_bound_at(6));
+        assert!(super::storage_padding_bound_at(7));
+        super::set_storage_padding_bound_epoch_for_thread(None);
+        assert!(!super::storage_padding_bound_at(u64::MAX - 1));
+    }
+}
+
 #[cfg(test)]
 mod exact_state_size_epoch_tests {
     #[test]
@@ -1667,17 +1952,20 @@ mod exact_state_size_epoch_tests {
         assert_eq!(super::exact_state_size_epoch_for(1, None), u64::MAX);
     }
 
-    /// Mainnet restores at no frame until one is set, whatever the settings
-    /// say, and always from its own table; other networks take both
-    /// settings, and nothing without them.
+    /// Mainnet restores at its own frame, the first of an epoch, whatever
+    /// the settings say, and always from its own table; other networks
+    /// take both settings, and nothing without them.
     #[test]
     fn only_a_test_network_reads_the_kicked_seniority_restoration_settings() {
         let address = "09b404433671157db1a6f606b4d27378c970021a9d806a48b52396bb7e1a0ecf";
         let table = format!("{address}:2420:0, {}:5:7", "ab".repeat(32));
-        assert_eq!(super::MAINNET_KICKED_SENIORITY_RESTORATION_FRAME, None);
+        assert_eq!(
+            super::MAINNET_KICKED_SENIORITY_RESTORATION_FRAME,
+            Some(1423 * super::EPOCH_LENGTH_FRAMES)
+        );
         let (frame, mainnet) =
             super::kicked_seniority_restoration_for(0, Some("700"), Some(&table));
-        assert_eq!(frame, u64::MAX);
+        assert_eq!(frame, 1_024_560);
         assert_eq!(mainnet, super::MAINNET_KICKED_SENIORITY_RESTORATIONS);
         let (frame, devnet) = super::kicked_seniority_restoration_for(1, Some("700"), Some(&table));
         assert_eq!(frame, 700);
@@ -1708,7 +1996,11 @@ mod exact_state_size_epoch_tests {
         }
         super::set_kicked_seniority_restoration_frame_for_thread(None);
         super::set_kicked_seniority_restorations_for_thread(None);
-        assert_eq!(super::kicked_seniority_restoration_frame(), u64::MAX);
+        assert_eq!(
+            super::kicked_seniority_restoration_frame(),
+            1_024_560,
+            "without init, the mainnet frame"
+        );
         assert_eq!(
             super::kicked_seniority_restorations(),
             super::MAINNET_KICKED_SENIORITY_RESTORATIONS
@@ -1766,14 +2058,15 @@ mod exact_state_size_epoch_tests {
         assert!(super::storage_kicks_suspended(966_240));
     }
 
-    /// Mainnet has no stable replica key epoch, whatever the setting says:
-    /// every epoch keeps the epoch-bound key. Other networks take the
-    /// setting, and none without it.
+    /// Mainnet's stable replica key epoch is 1429 (GLOBAL frame 1,028,880),
+    /// whatever the setting says. Other networks take the setting, and none
+    /// without it.
     #[test]
-    fn stable_replica_keys_are_inert_on_mainnet() {
-        assert_eq!(super::MAINNET_STABLE_REPLICA_KEY_EPOCH, None);
-        assert_eq!(super::stable_replica_key_epoch_for(0, Some("5")), u64::MAX);
-        assert_eq!(super::stable_replica_key_epoch_for(0, None), u64::MAX);
+    fn mainnet_replica_keys_are_stable_from_epoch_1429() {
+        assert_eq!(super::MAINNET_STABLE_REPLICA_KEY_EPOCH, Some(1429));
+        assert_eq!(1429 * super::EPOCH_LENGTH_FRAMES, 1_028_880);
+        assert_eq!(super::stable_replica_key_epoch_for(0, Some("5")), 1429);
+        assert_eq!(super::stable_replica_key_epoch_for(0, None), 1429);
         assert_eq!(super::stable_replica_key_epoch_for(1, Some("5")), 5);
         assert_eq!(
             super::stable_replica_key_epoch_for(1, Some("bad")),
@@ -1781,7 +2074,12 @@ mod exact_state_size_epoch_tests {
         );
         assert_eq!(super::stable_replica_key_epoch_for(1, None), u64::MAX);
         super::set_stable_replica_key_epoch_for_thread(None);
-        assert_eq!(super::stable_replica_key_epoch(), u64::MAX);
+        assert_eq!(super::stable_replica_key_epoch(), 1429);
+        assert!(!super::stable_replica_keys_at(0));
+        assert!(!super::stable_replica_keys_at(1428));
+        assert!(super::stable_replica_keys_at(1429));
+        assert!(super::stable_replica_keys_at(u64::MAX));
+        super::set_stable_replica_key_epoch_for_thread(Some(u64::MAX));
         assert!(!super::stable_replica_keys_at(0));
         assert!(!super::stable_replica_keys_at(u64::MAX - 1));
         assert!(!super::stable_replica_keys_at(u64::MAX));
@@ -1790,26 +2088,27 @@ mod exact_state_size_epoch_tests {
         assert!(super::stable_replica_keys_at(9));
         assert_eq!(super::stable_replica_key_epoch_thread_override(), Some(9));
         super::set_stable_replica_key_epoch_for_thread(None);
-        // Never before the hash storage proof epoch; mainnet's must not be.
+        // Never before the hash storage proof epoch; mainnet's is not.
         assert_eq!(super::stable_replica_key_epoch_from(1, Some("5"), 3), 5);
         assert_eq!(super::stable_replica_key_epoch_from(1, Some("5"), 8), 8);
         assert_eq!(super::stable_replica_key_epoch_from(1, None, 8), u64::MAX);
-        if let (Some(stable), Some(hash)) = (
-            super::MAINNET_STABLE_REPLICA_KEY_EPOCH,
-            super::MAINNET_HASH_STORAGE_PROOF_EPOCH,
-        ) {
-            assert!(stable >= hash);
-        }
+        let stable = super::MAINNET_STABLE_REPLICA_KEY_EPOCH.unwrap();
+        let hash = super::MAINNET_HASH_STORAGE_PROOF_EPOCH.unwrap();
+        assert!(stable >= hash);
+        assert_eq!(
+            super::stable_replica_key_epoch_from(0, Some("5"), hash),
+            stable
+        );
     }
 
-    /// A read before initialization does not fix the epoch: the
-    /// initialization after it still decides.
+    /// A read before initialization is the mainnet epoch and does not fix
+    /// it: the initialization after it still decides.
     #[test]
     fn a_stable_replica_key_epoch_read_before_init_does_not_fix_it() {
         if super::STABLE_REPLICA_KEY_EPOCH.get().is_some() {
             return; // another test in this process initialized it
         }
-        assert_eq!(super::stable_replica_key_epoch(), u64::MAX);
+        assert_eq!(super::stable_replica_key_epoch(), 1429);
         assert!(
             super::STABLE_REPLICA_KEY_EPOCH.get().is_none(),
             "a read fixed it"
@@ -1828,6 +2127,109 @@ mod exact_state_size_epoch_tests {
         super::set_exact_state_size_epoch_for_thread(Some(u64::MAX));
         assert!(!super::exact_state_size_active(u64::MAX));
         super::set_exact_state_size_epoch_for_thread(None);
+    }
+}
+
+/// How many GLOBAL frames a cited global frame may trail the finalized
+/// global anchor of the frame that executes the citation, from
+/// [`MAINNET_GLOBAL_CITATION_WINDOW_EPOCH`]: eight epochs, about 16 hours at
+/// the roughly 350 GLOBAL frames per hour (about 10.3 s per frame) mainnet
+/// produced in November 2026.
+/// It covers reward mints, mint and settlement claims and coin deliveries.
+/// Honest witnesses cite the newest root their node retains, at most 1,440
+/// frames before the anchor or the latest frame they see (the reward witness
+/// lookback); the remaining 4,320 frames, about 12 hours at that rate, cover
+/// inclusion delay. A claim that waits longer is refused and is rebuilt with
+/// a fresh witness; the record it cites is not consumed.
+pub const GLOBAL_CITATION_WINDOW_FRAMES: u64 = 5_760;
+
+/// The epoch from which a citation of a global frame more than
+/// [`GLOBAL_CITATION_WINDOW_FRAMES`] before the executing frame's anchor is
+/// refused deterministically. Before it a node resolved a citation of any
+/// earlier frame from its clock store, and a node without that frame (one
+/// that started from a later snapshot) held the executing frame for retry
+/// while the others applied it. Consensus-affecting: nodes on either side
+/// disagree on an old citation they both hold, so every archive and prover
+/// must run a build with it before then. Mainnet epoch 1488 (frame
+/// 1,071,360), which GLOBAL cannot reach before 2026-11-12 13:00 UTC even at
+/// ten seconds a frame: more than two days after a release published by
+/// 2026-11-10 12:00 UTC. `QUIL_GLOBAL_CITATION_WINDOW_EPOCH` elsewhere, never
+/// by default.
+pub const MAINNET_GLOBAL_CITATION_WINDOW_EPOCH: Option<u64> = Some(1488);
+
+static GLOBAL_CITATION_WINDOW_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static GLOBAL_CITATION_WINDOW_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn global_citation_window_epoch_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_GLOBAL_CITATION_WINDOW_EPOCH.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's global citation window epoch from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_global_citation_window_epoch(network: u8) -> u64 {
+    *GLOBAL_CITATION_WINDOW_EPOCH.get_or_init(|| {
+        let setting = std::env::var("QUIL_GLOBAL_CITATION_WINDOW_EPOCH").ok();
+        global_citation_window_epoch_for(network, setting.as_deref())
+    })
+}
+
+/// The epoch fixed by [`init_global_citation_window_epoch`]; the mainnet
+/// epoch in a process that never called it, so the setting cannot reach
+/// mainnet. `u64::MAX`: never.
+pub fn global_citation_window_epoch() -> u64 {
+    if let Some(epoch) = GLOBAL_CITATION_WINDOW_OVERRIDE.with(|cell| cell.get()) {
+        return epoch;
+    }
+    *GLOBAL_CITATION_WINDOW_EPOCH.get_or_init(|| global_citation_window_epoch_for(0, None))
+}
+
+/// Whether a citation executing under finalized global anchor `anchor` must
+/// lie within [`GLOBAL_CITATION_WINDOW_FRAMES`] of it.
+pub fn global_citation_window_active(anchor: u64) -> bool {
+    epoch_for_frame(anchor) >= global_citation_window_epoch()
+}
+
+/// Set the global citation window epoch for the calling thread only (tests).
+/// `Some(u64::MAX)` disables it; `None` restores the process setting.
+pub fn set_global_citation_window_epoch_for_thread(epoch: Option<u64>) {
+    GLOBAL_CITATION_WINDOW_OVERRIDE.with(|cell| cell.set(epoch));
+}
+
+#[cfg(test)]
+mod global_citation_window_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_global_citation_window_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(super::global_citation_window_epoch_for(0, setting), 1488);
+        }
+        assert_eq!(super::global_citation_window_epoch_for(1, Some("4")), 4);
+        assert_eq!(
+            super::global_citation_window_epoch_for(1, Some("x")),
+            u64::MAX
+        );
+        assert_eq!(super::global_citation_window_epoch_for(1, None), u64::MAX);
+    }
+
+    /// Mainnet epoch 1488; a thread override moves or disables it.
+    #[test]
+    fn the_global_citation_window_starts_at_the_first_frame_of_its_epoch() {
+        assert_eq!(super::MAINNET_GLOBAL_CITATION_WINDOW_EPOCH, Some(1488));
+        super::set_global_citation_window_epoch_for_thread(Some(3));
+        let first = 3 * super::epoch_length_frames();
+        assert!(!super::global_citation_window_active(first - 1));
+        assert!(super::global_citation_window_active(first));
+        super::set_global_citation_window_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::global_citation_window_active(u64::MAX));
+        super::set_global_citation_window_epoch_for_thread(None);
     }
 }
 
@@ -2285,9 +2687,96 @@ pub fn set_global_sync_authentication_frame_for_thread(frame: Option<u64>) {
 /// counts an allocation as fresh by that field instead of
 /// `LastActiveFrameNumber`, which confirms also advance. Recording the field
 /// changes committed allocation trees, so every archive must start at the same
-/// frame. `u64::MAX` disables both: no frame records the field and the census
-/// keeps reading `LastActiveFrameNumber`.
-pub const SIGNED_FRAME_ACTIVATION_FRAME: u64 = u64::MAX;
+/// frame. From it GLOBAL also records the frame of each committee session's tip
+/// advance (`session_tip_frame` in the execution crate's handoff records); the
+/// silent-prover fence reads both records. Without one (`u64::MAX`) no frame
+/// records the field and the census keeps reading `LastActiveFrameNumber`.
+/// Mainnet: 1,024,560, the first frame of epoch 1423, which GLOBAL cannot reach
+/// before 2026-11-07 00:00 UTC even at ten seconds a frame, with the presence
+/// report frame; `QUIL_SIGNED_FRAME_ACTIVATION_FRAME` elsewhere, never by
+/// default.
+pub const MAINNET_SIGNED_FRAME_ACTIVATION_FRAME: Option<u64> = Some(1_024_560);
+
+static SIGNED_FRAME_ACTIVATION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+thread_local! {
+    static SIGNED_FRAME_ACTIVATION_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn signed_frame_activation_frame_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_SIGNED_FRAME_ACTIVATION_FRAME.unwrap_or(u64::MAX);
+    }
+    setting
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(u64::MAX)
+}
+
+/// Fix this process's signed frame activation frame from its network, and
+/// return it. Called at startup before any frame is processed; the first
+/// call decides.
+pub fn init_signed_frame_activation_frame(network: u8) -> u64 {
+    *SIGNED_FRAME_ACTIVATION.get_or_init(|| {
+        signed_frame_activation_frame_for(
+            network,
+            std::env::var("QUIL_SIGNED_FRAME_ACTIVATION_FRAME")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The frame fixed by [`init_signed_frame_activation_frame`]; the mainnet
+/// frame in a process that never called it (the explorer, tools), so the
+/// setting cannot reach mainnet. `u64::MAX`: never.
+pub fn signed_frame_activation_frame() -> u64 {
+    if let Some(frame) = SIGNED_FRAME_ACTIVATION_OVERRIDE.with(|cell| cell.get()) {
+        return frame;
+    }
+    SIGNED_FRAME_ACTIVATION
+        .get()
+        .copied()
+        .unwrap_or_else(|| signed_frame_activation_frame_for(0, None))
+}
+
+/// Set the signed frame activation frame for the calling thread only
+/// (tests). `Some(u64::MAX)` disables it; `None` restores the process
+/// setting.
+pub fn set_signed_frame_activation_frame_for_thread(frame: Option<u64>) {
+    SIGNED_FRAME_ACTIVATION_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+#[cfg(test)]
+mod signed_frame_activation_tests {
+    /// Mainnet records signed frames from its own frame, the first of an
+    /// epoch, whatever the setting says; other networks only when set.
+    #[test]
+    fn only_a_test_network_reads_the_signed_frame_activation_setting() {
+        let mainnet = 1423 * super::EPOCH_LENGTH_FRAMES;
+        assert_eq!(super::MAINNET_SIGNED_FRAME_ACTIVATION_FRAME, Some(mainnet));
+        for setting in [None, Some("7"), Some("bad")] {
+            assert_eq!(
+                super::signed_frame_activation_frame_for(0, setting),
+                mainnet
+            );
+        }
+        assert_eq!(super::signed_frame_activation_frame_for(1, Some("7")), 7);
+        assert_eq!(
+            super::signed_frame_activation_frame_for(1, Some("bad")),
+            u64::MAX
+        );
+        assert_eq!(super::signed_frame_activation_frame_for(1, None), u64::MAX);
+        super::set_signed_frame_activation_frame_for_thread(None);
+        assert_eq!(
+            super::signed_frame_activation_frame(),
+            mainnet,
+            "without init, the mainnet frame"
+        );
+        super::set_signed_frame_activation_frame_for_thread(Some(9));
+        assert_eq!(super::signed_frame_activation_frame(), 9);
+        super::set_signed_frame_activation_frame_for_thread(None);
+    }
+}
 
 /// Minimum number of effectively-active provers a shard needs to run its
 /// app-shard consensus (form a committee and reach quorum). A shard with
@@ -3932,5 +4421,122 @@ mod strict_peer_info_epoch_tests {
         assert!(!super::strict_peer_info_active(first - 1));
         assert!(super::strict_peer_info_active(first));
         super::set_strict_peer_info_epoch_for_thread(None);
+    }
+}
+
+#[cfg(test)]
+mod sealed_storage_activation_tests {
+    use super::*;
+    #[test]
+    fn sealed_storage_cutover_is_the_mainnet_constant_and_mainnet_ignores_overrides() {
+        let first = MAINNET_SEALED_STORAGE_EPOCH.expect("mainnet seals");
+        for setting in [None, Some("0"), Some("9999"), Some("bad")] {
+            assert_eq!(
+                sealed_storage_epoch_for(0, setting),
+                first,
+                "mainnet seals from epoch {first} whatever the setting"
+            );
+        }
+        assert_eq!(sealed_storage_epoch_for(1, None), u64::MAX);
+        assert_eq!(sealed_storage_epoch_for(1, Some("7")), 7);
+        set_sealed_storage_epoch_for_thread(Some(1393));
+        set_unsealed_issuance_epoch_for_thread(Some(1321));
+        let boundary = epoch_start_frame(1393);
+        assert!(unsealed_issuance_active(boundary - 1));
+        assert!(!unsealed_issuance_active(boundary));
+        assert!(storage_seat_eligible(&[1], boundary - 1, None));
+        assert!(!storage_seat_eligible(&[1], boundary, None));
+        assert!(
+            storage_seat_eligible(&[], boundary, None),
+            "GLOBAL archives have separate membership"
+        );
+        let mut slot = StorageSeatSlot {
+            epoch: 1393,
+            leaves: vec![vec![]],
+            registered_at: boundary - 10,
+            sealed_at: Some(boundary - 1),
+            frames: 0,
+            accumulator: [0; 32],
+            chained: vec![],
+            open: true,
+        };
+        assert!(storage_seat_eligible(&[1], boundary, Some(&slot)));
+        slot.sealed_at = Some(boundary);
+        assert!(!storage_seat_eligible(&[1], boundary, Some(&slot)));
+        slot.sealed_at = Some(boundary - 1);
+        slot.epoch = 1392;
+        assert!(!storage_seat_eligible(&[1], boundary, Some(&slot)));
+        slot.epoch = 1393;
+        slot.leaves.clear();
+        assert!(!storage_seat_eligible(&[1], boundary, Some(&slot)));
+        set_unsealed_issuance_epoch_for_thread(None);
+        set_sealed_storage_epoch_for_thread(None);
+    }
+
+    /// The mainnet defaults, with no setting or thread override: a frame
+    /// before the first frame of [`MAINNET_SEALED_STORAGE_EPOCH`], the
+    /// warmup included, neither requires a sealed seat nor stops the unsealed
+    /// issuance share; that frame does both.
+    #[test]
+    fn mainnet_requires_sealing_from_the_first_frame_of_the_sealed_epoch() {
+        set_sealed_storage_epoch_for_thread(None);
+        set_persistent_storage_epoch_for_thread(None);
+        set_unsealed_issuance_epoch_for_thread(None);
+        let first = MAINNET_SEALED_STORAGE_EPOCH.expect("mainnet seals");
+        let boundary = epoch_start_frame(first);
+        let warmup = epoch_start_frame(first - PERSISTENT_STORAGE_WARMUP_EPOCHS);
+        for frame in [1_002_960, warmup, boundary - 1] {
+            assert!(
+                !sealed_storage_required_at(frame),
+                "frame {frame}: sealing is required only from epoch {first}"
+            );
+            assert!(
+                storage_seat_eligible(&[1], frame, None),
+                "frame {frame}: an unsealed member counts until epoch {first}"
+            );
+            assert!(
+                unsealed_issuance_active(frame),
+                "frame {frame}: unsealed issuance is paid until epoch {first}"
+            );
+        }
+        assert!(
+            sealed_storage_required_at(boundary),
+            "sealing is required from epoch {first}"
+        );
+        assert!(
+            !storage_seat_eligible(&[1], boundary, None),
+            "an unsealed member stops counting at epoch {first}"
+        );
+        assert!(
+            !unsealed_issuance_active(boundary),
+            "unsealed issuance stops at epoch {first}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod strict_shard_gossip_epoch_tests {
+    #[test]
+    fn only_a_test_network_reads_the_strict_shard_gossip_setting() {
+        for setting in [None, Some("4"), Some("0"), Some("bad")] {
+            assert_eq!(
+                super::strict_shard_gossip_epoch_for(0, setting),
+                super::MAINNET_STRICT_SHARD_GOSSIP_EPOCH.unwrap_or(u64::MAX)
+            );
+        }
+        assert_eq!(super::strict_shard_gossip_epoch_for(1, Some("4")), 4);
+        assert_eq!(super::strict_shard_gossip_epoch_for(1, None), u64::MAX);
+        assert_eq!(super::MAINNET_STRICT_SHARD_GOSSIP_EPOCH, Some(1483));
+    }
+
+    #[test]
+    fn strict_shard_gossip_is_active_from_the_first_frame_of_its_epoch() {
+        super::set_strict_shard_gossip_epoch_for_thread(Some(u64::MAX));
+        assert!(!super::strict_shard_gossip_active(u64::MAX - 1));
+        super::set_strict_shard_gossip_epoch_for_thread(Some(3));
+        let first = 3 * super::epoch_length_frames();
+        assert!(!super::strict_shard_gossip_active(first - 1));
+        assert!(super::strict_shard_gossip_active(first));
+        super::set_strict_shard_gossip_epoch_for_thread(None);
     }
 }

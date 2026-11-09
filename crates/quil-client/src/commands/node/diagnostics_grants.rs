@@ -24,9 +24,12 @@ const MAX_GRANT_SECS: u64 = 365 * 86_400;
 /// What a peer on the list gets, from `HealthReport`.
 const SHARED: &str =
     "It gets, per request: this node's release and build fingerprint, GLOBAL head \
-frame, worker count, store write state and store and disk read times; and per worker its core \
-ID, public shard filter, allocation, phase, blocker, frames, committee generation, recovery \
-state and failure counts, and when these last changed.\n\
+frame, worker count, store write state and store and disk read times; its health conditions \
+(kind, severity, scope, start, counts, the shard filters, frames and worker cores affected, \
+the GLOBAL frames an expected wait ends at, and for GLOBAL's progress its head, its recent \
+frame rate and how many GLOBAL provers this node hears); and per worker its core ID, public \
+shard filter, allocation, phase, blocker, frames, committee generation, recovery state and \
+failure counts, and when these last changed.\n\
 It gets no log text, addresses or keys.\n";
 
 const APPLY: &str = "The node reads this at start: restart it to apply. This command restarts \
@@ -390,7 +393,9 @@ mod tests {
     /// this compiling, so that it is judged and named there.
     #[test]
     fn the_shared_text_is_reviewed_against_the_report() {
-        use quil_types::proto::diagnostics::{HealthReport, WorkerHealth};
+        use quil_types::proto::diagnostics::{
+            ExpectedWait, GlobalProgress, HealthCondition, HealthReport, WorkerHealth,
+        };
         let report = HealthReport::default();
         let HealthReport {
             schema: _,
@@ -405,6 +410,7 @@ mod tests {
             master_store_write_failed: _,
             worker_capacity: _,
             store_io: _,
+            health: _,
         } = report;
         let WorkerHealth {
             core_id: _,
@@ -433,6 +439,34 @@ mod tests {
             awaited_frame: _,
             draining: _,
         } = WorkerHealth::default();
+        let HealthCondition {
+            kind: _,
+            severity: _,
+            scope: _,
+            action: _,
+            since_unix_ms: _,
+            affected: _,
+            tracked: _,
+            threshold: _,
+            shards: _,
+            omitted_shards: _,
+            global: _,
+            wait: _,
+        } = HealthCondition::default();
+        let GlobalProgress {
+            head: _,
+            advanced_frames: _,
+            span_secs: _,
+            provers: _,
+            reachable: _,
+            quorum: _,
+        } = GlobalProgress::default();
+        let ExpectedWait {
+            head_frame: _,
+            until_frame: _,
+            batch_from_frame: _,
+            expected_secs: _,
+        } = ExpectedWait::default();
         assert!(SHARED.contains("no log text, addresses or keys"));
     }
 }

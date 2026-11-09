@@ -211,23 +211,10 @@ mod private {
         Ok(file)
     }
 
-    /// Replace `path` with `body` through a new 0600 file renamed over it.
+    /// Replace `path` with `body` through [`quil_config::atomic_write`]:
+    /// a new 0600 file renamed over it, with its owner kept.
     pub(super) fn replace(path: &Path, body: &[u8]) -> anyhow::Result<()> {
-        use std::io::Write;
-        let temp = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
-        let written = file
-            .write_all(body)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| std::fs::rename(&temp, path));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&temp);
-        }
-        Ok(written?)
+        Ok(quil_config::atomic_write(path, body, 0o600)?)
     }
 }
 
@@ -331,6 +318,11 @@ pub(crate) fn error_class(error: &str) -> (&'static str, &'static str) {
         ("identity", "the signing config is not the node's")
     } else if has("shields") && has("open") {
         ("not_open", "shields are not admitted yet")
+    } else if has("no active provers") {
+        (
+            "shard_no_provers",
+            "a batch's shard had no active provers; a rerun re-plans it",
+        )
     } else if has("prov") || has("budget") {
         ("proving", "a proof failed")
     } else if has("transport") || has("status:") || has("connect") || has("deadline") {

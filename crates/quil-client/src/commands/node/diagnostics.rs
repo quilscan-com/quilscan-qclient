@@ -17,11 +17,12 @@ use std::str::FromStr;
 
 use clap::{Args, Subcommand};
 
+use quil_forest::store_io::{health_cause, SlowCause};
 use quil_p2p::PeerId;
 use quil_rpc::diagnostics_service as diag;
 use quil_types::proto::diagnostics::{
-    Blocker, GetHealthReportRequest, HealthReport, Phase, RecoveryFailure, RecoveryPhase,
-    StoreIoHealth, StoreIoVerdict, WorkerHealth,
+    Blocker, ConditionSeverity, GetHealthReportRequest, HealthConditions, HealthReport, Phase,
+    RecoveryFailure, RecoveryPhase, StoreIoHealth, StoreIoVerdict, WorkerHealth,
 };
 use quil_types::proto::node::PeerInfo;
 
@@ -267,6 +268,83 @@ async fn health(global: GlobalArgs, args: &HealthArgs) -> anyhow::Result<()> {
                 render_refusal(&label, &status, &own.to_base58(), requester.whose)
             );
             anyhow::bail!("no health report from {label}")
+        }
+    }
+}
+
+/// How long one connect or read of this node's health report may take.
+const HEALTH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+type HealthClient =
+    quil_types::proto::diagnostics::diagnostics_service_client::DiagnosticsServiceClient<
+        tonic::transport::Channel,
+    >;
+
+/// How this node's own health conditions are read (the node manager each
+/// refresh, a prover op before it signs, a shield before it proves and a
+/// paced shield before each step): on the node's peer listener, as the node
+/// itself, as `node diagnostics health --self` asks; the channel is kept
+/// between reads.
+#[derive(Clone)]
+pub(crate) struct HealthSource {
+    addr: String,
+    key: std::sync::Arc<Vec<u8>>,
+    peer: PeerId,
+    client: std::sync::Arc<tokio::sync::Mutex<Option<HealthClient>>>,
+}
+
+impl HealthSource {
+    /// This node's source, or why there is none.
+    pub(crate) fn for_node(
+        config: &quil_config::Config,
+        km: &quil_keys::FileKeyManager,
+    ) -> Result<Self, String> {
+        let key = km
+            .get_secret_key_bytes_by_id("q-prover-key")
+            .map_err(|e| format!("no network key to ask this node with: {e}"))?;
+        let peer = super::diagnostics_logs::falcon_peer(&key).map_err(|e| format!("{e:#}"))?;
+        let addr = rpc::local_stream_addr(config).map_err(|e| format!("{e:#}"))?;
+        Ok(Self {
+            addr,
+            key: std::sync::Arc::new(key),
+            peer,
+            client: std::sync::Arc::default(),
+        })
+    }
+
+    /// The node's health conditions; `None` from a node that predates them
+    /// (no conditions in its report, or no diagnostics service); an error
+    /// naming why none could be read.
+    pub(crate) async fn read(&self) -> Result<Option<HealthConditions>, String> {
+        let mut slot = self.client.lock().await;
+        if slot.is_none() {
+            let connect = diag::connect_peer(&self.addr, &self.key, self.peer);
+            match tokio::time::timeout(HEALTH_READ_TIMEOUT, connect).await {
+                Ok(Ok(client)) => *slot = Some(client),
+                Ok(Err(e)) => {
+                    return Err(format!(
+                        "connect to this node's peer listener: {}",
+                        error_chain(&*e)
+                    ))
+                }
+                Err(_) => return Err("connect to this node's peer listener: timed out".into()),
+            }
+        }
+        let Some(client) = slot.as_mut() else {
+            return Err("not connected".into());
+        };
+        let read = client.get_health_report(GetHealthReportRequest {});
+        match tokio::time::timeout(HEALTH_READ_TIMEOUT, read).await {
+            Ok(Ok(report)) => Ok(report.into_inner().health),
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => Ok(None),
+            Ok(Err(status)) => {
+                *slot = None;
+                Err(format!("health report: {}", status.message()))
+            }
+            Err(_) => {
+                *slot = None;
+                Err("health report: timed out".into())
+            }
         }
     }
 }
@@ -711,6 +789,16 @@ pub(crate) fn store_io_figures(io: &StoreIoHealth) -> String {
     parts.join(", ")
 }
 
+/// The label of the store-slow notice: the cause the figures support
+/// (the same rule as the node's warning line).
+pub(crate) fn store_io_scope(io: &StoreIoHealth) -> &'static str {
+    match health_cause(io) {
+        SlowCause::Disk => "this node's disk",
+        SlowCause::Load => "disk normal, this node's load",
+        SlowCause::Unknown => "disk not ruled out",
+    }
+}
+
 /// The health report's store I/O line; `None` from nodes that predate it.
 fn store_io_line(io: Option<&StoreIoHealth>) -> Option<String> {
     let io = io?;
@@ -722,10 +810,21 @@ fn store_io_line(io: Option<&StoreIoHealth>) -> Option<String> {
                 secs @ 120..=7199 => format!("{}m", secs / 60),
                 secs => format!("{}h", secs / 3600),
             };
-            format!(
-                "Store I/O: slow for {slow} ({figures}); this node's disk is the \
-                 cause: check TRIM, the disk's health and other I/O load."
-            )
+            let what = match health_cause(io) {
+                SlowCause::Disk => {
+                    "this node's disk is the cause: check TRIM, the disk's health \
+                     and other I/O load."
+                }
+                SlowCause::Load => {
+                    "the disk responds normally: check this node's load (CPU, \
+                     memory pressure, compaction)."
+                }
+                SlowCause::Unknown => {
+                    "the disk is not ruled out: check TRIM, the disk's health, then \
+                     this node's load (CPU, memory pressure, compaction)."
+                }
+            };
+            format!("Store I/O: slow for {slow} ({figures}); {what}")
         }
         StoreIoVerdict::Ok => format!("Store I/O: ok ({figures})."),
         _ => "Store I/O: not measured.".to_string(),
@@ -734,6 +833,53 @@ fn store_io_line(io: Option<&StoreIoHealth>) -> Option<String> {
 
 /// The report of `target` as plain text: a summary line, then one line per
 /// worker.
+/// The node's health conditions, one `[HH:MM:SS UTC] <LEVEL> <text>` line
+/// each with its scope and next check under it, and the kinds it judged
+/// without fresh observations; a node that predates them says so.
+fn health_lines(health: Option<&HealthConditions>) -> String {
+    use quil_rpc::health_conditions as hc;
+    let Some(health) = health else {
+        return "Health conditions: not reported by this node version.\n".into();
+    };
+    let mut out = String::new();
+    for c in &health.conditions {
+        let level = match ConditionSeverity::try_from(c.severity) {
+            Ok(ConditionSeverity::Error) => "ERROR",
+            Ok(ConditionSeverity::Info) => "INFO",
+            _ => "WARN",
+        };
+        let seconds = c.since_unix_ms / 1000;
+        let _ = writeln!(
+            out,
+            "[{:02}:{:02}:{:02} UTC] {level} {}",
+            seconds / 3600 % 24,
+            seconds / 60 % 60,
+            seconds % 60,
+            hc::notice_text(c)
+        );
+        let _ = writeln!(
+            out,
+            "  Scope: {}; next: {}.",
+            hc::scope_label(c.scope),
+            hc::action_text(c.action)
+        );
+    }
+    let unobserved: Vec<&str> = health
+        .sources
+        .iter()
+        .filter(|s| s.observed_unix_ms == 0)
+        .map(|s| hc::kind_label(s.kind))
+        .collect();
+    if !unobserved.is_empty() {
+        let _ = writeln!(
+            out,
+            "Not judged, no fresh observations: {}.",
+            unobserved.join(", ")
+        );
+    }
+    out
+}
+
 pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
     let mut out = String::new();
     let build = report
@@ -766,6 +912,7 @@ pub(crate) fn render_report(target: &str, report: &HealthReport) -> String {
     if let Some(line) = store_io_line(report.store_io.as_ref()) {
         let _ = writeln!(out, "{line}");
     }
+    out += &health_lines(report.health.as_ref());
     if report.workers.is_empty() {
         let _ = writeln!(out, "No data workers reported.");
         return out;
@@ -841,7 +988,7 @@ pub(crate) fn render_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quil_types::proto::diagnostics::FailureCount;
+    use quil_types::proto::diagnostics::{FailureCount, StoreIoReason};
     use quil_types::proto::node::Reachability;
 
     #[test]
@@ -983,6 +1130,7 @@ mod tests {
             workers,
             omitted_workers,
             master_store_write_failed: false,
+            health: Some(HealthConditions::default()),
             worker_capacity: 0,
             store_io: None,
         }
@@ -1150,6 +1298,61 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         );
     }
 
+    /// The node's conditions print as notice lines with their scope and
+    /// next check, kinds without fresh observations are named, and a node
+    /// that predates conditions says so.
+    #[test]
+    fn the_node_conditions_print_as_notice_lines() {
+        use quil_types::proto::diagnostics::{
+            ConditionAction, ConditionKind, ConditionScope, ConditionSource, HealthCondition,
+        };
+        let mut with = report(Vec::new(), 0);
+        with.health = Some(HealthConditions {
+            conditions: vec![HealthCondition {
+                kind: ConditionKind::GlobalAppFramesUnchanged as i32,
+                severity: ConditionSeverity::Warning as i32,
+                scope: ConditionScope::Network as i32,
+                action: ConditionAction::CheckGlobalInclusion as i32,
+                since_unix_ms: 3_723_000,
+                affected: 2,
+                tracked: 9,
+                threshold: 60,
+                ..Default::default()
+            }],
+            sources: vec![
+                ConditionSource {
+                    kind: ConditionKind::GlobalAppFramesUnchanged as i32,
+                    observed_unix_ms: 3_723_000,
+                    tracked: 9,
+                },
+                ConditionSource {
+                    kind: ConditionKind::PeerAppFramesUnchanged as i32,
+                    observed_unix_ms: 0,
+                    tracked: 0,
+                },
+            ],
+        });
+        let text = render_report("this node", &with);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[1], "[01:02:03 UTC] WARN Global app frames unchanged >60s: 2/9 tracked shards.",
+            "{text}"
+        );
+        assert!(
+            lines[2].starts_with("  Scope: the network; next: check GLOBAL's inclusion"),
+            "{text}"
+        );
+        assert_eq!(
+            lines[3], "Not judged, no fresh observations: peer_app_frames_unchanged.",
+            "{text}"
+        );
+        with.health = None;
+        assert_eq!(
+            render_report("this node", &with).lines().nth(1),
+            Some("Health conditions: not reported by this node version.")
+        );
+    }
+
     #[test]
     fn a_master_store_refusing_writes_is_named() {
         let mut latched = report(Vec::new(), 0);
@@ -1176,6 +1379,8 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
             interval_secs: 60,
             canary_reads: 58,
             canary_p99_us: 412_000,
+            disk_reads: Some(40),
+            disk_writes: Some(10),
             disk_read_await_us: Some(25_400),
             disk_write_await_us: Some(3_100),
             ..Default::default()
@@ -1196,6 +1401,8 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         let stalled = StoreIoHealth {
             canary_reads: 0,
             canary_pending_us: 95_000_000,
+            disk_reads: None,
+            disk_writes: None,
             disk_read_await_us: None,
             disk_write_await_us: None,
             slow_secs: 30,
@@ -1203,9 +1410,31 @@ CORE  ALLOC  PHASE    REASON             LOCAL  COMMITTEE  GEN  ADVANCE  SEAL   
         };
         assert_eq!(
             store_io_line(Some(&stalled)).unwrap(),
-            "Store I/O: slow for 30s (a read pending 95s); this node's disk is the cause: \
-             check TRIM, the disk's health and other I/O load."
+            "Store I/O: slow for 30s (a read pending 95s); the disk is not ruled out: \
+             check TRIM, the disk's health, then this node's load (CPU, memory pressure, \
+             compaction)."
         );
+        // Canary threshold with the disk's awaits known and under theirs.
+        let load = StoreIoHealth {
+            disk_read_await_us: Some(1_500),
+            ..slow
+        };
+        assert_eq!(
+            store_io_line(Some(&load)).unwrap(),
+            "Store I/O: slow for 12m (canary p99 412ms of 58 reads in 60s, disk read \
+             1.5ms/op, write 3.1ms/op); the disk responds normally: check this node's \
+             load (CPU, memory pressure, compaction)."
+        );
+        assert_eq!(store_io_scope(&load), "disk normal, this node's load");
+        assert_eq!(store_io_scope(&slow), "this node's disk");
+        assert_eq!(store_io_scope(&stalled), "disk not ruled out");
+        // A disk threshold names the disk whatever the other figures say.
+        let mut by_disk = StoreIoHealth {
+            disk_read_await_us: Some(1_500),
+            ..slow
+        };
+        by_disk.set_slow_reason(StoreIoReason::DiskWriteAwait);
+        assert_eq!(store_io_scope(&by_disk), "this node's disk");
         let mut ok = StoreIoHealth {
             interval_secs: 60,
             canary_reads: 60,

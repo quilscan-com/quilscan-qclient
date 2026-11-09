@@ -44,7 +44,8 @@ const SUGGESTED_WAIT_SECS: u64 = 600;
 pub(crate) struct Follow {
     /// `--wait`: zero prints the identifiers and returns.
     pub(crate) wait: std::time::Duration,
-    /// Page budget of a coin scan for the operation's coins.
+    /// Page cap of a coin scan for the operation's coins: `--max-pages`, else
+    /// none.
     pub(crate) max_pages: usize,
 }
 
@@ -108,7 +109,7 @@ fn hex32(bytes: &[u8]) -> String {
 }
 
 /// An argument as a POSIX shell reads it back unchanged.
-fn shell_word(word: &str) -> String {
+pub(super) fn shell_word(word: &str) -> String {
     if !word.is_empty()
         && word
             .bytes()
@@ -145,7 +146,7 @@ pub(super) fn check_command(
 }
 
 /// The program name this process was started as, for commands it prints.
-fn program() -> String {
+pub(super) fn program() -> String {
     std::env::args()
         .next()
         .filter(|name| !name.is_empty())
@@ -324,6 +325,9 @@ impl RecipientWallet {
                     }
                 }
                 pages += 1;
+                if let Some(line) = scan.progress("coins") {
+                    say_err!("{line}");
+                }
             }
             say_err!(
                 "coin scan: {pages} pages in {:.1} s{}",
@@ -343,8 +347,8 @@ impl RecipientWallet {
 
     /// Whether this wallet can open `output`: the coin is its own.
     pub(super) fn owns(&self, output: &Output) -> bool {
-        quil_lattice_ct::confidential::memo::open_output(
-            &self.context,
+        quil_lattice_ct::confidential::memo::open_output_with_keys(
+            self.opening_keys(),
             &self.kem_secret,
             &self.recipient,
             output,

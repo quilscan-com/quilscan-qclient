@@ -20,6 +20,7 @@ pub(crate) mod action_log;
 pub(crate) mod balance;
 #[cfg(feature = "confidential-tokens")]
 mod claimable_rewards;
+mod info;
 pub(crate) mod legacy;
 pub(crate) mod output;
 #[cfg(feature = "native-proof")]
@@ -29,10 +30,27 @@ mod wallet;
 #[cfg(feature = "native-proof")]
 pub(crate) use wallet::inclusion::Follow;
 #[cfg(feature = "confidential-tokens")]
-pub(crate) use wallet::{check_recipient, confidential_balance, list_escrows, saved_mints};
+pub(crate) use wallet::{
+    check_recipient, confidential_balance, list_escrows, saved_mints, ScanStopped,
+};
+#[cfg(all(test, feature = "native-proof"))]
+pub(crate) use wallet::{
+    scans_begin_ago, serve_left_out, serve_left_out_expiring, serve_left_out_with,
+};
 
-/// Default scan bounds of `qclient token` (`--max-pages`, `--max-coins`).
-pub(crate) const SCAN_MAX_PAGES: usize = 2048;
+/// A scan's page count when `--max-pages` sets none: no cap. A scan reads
+/// every coin or escrow of the application, nearly all of them other
+/// users', so a page cap counts what anyone can add for fees. The cursor's
+/// strict advance under one snapshot ends a scan, the owned-coin and escrow
+/// limits bound its memory, and each page's call deadline bounds a stall.
+///
+/// One bound still counts other users' records: the node releases a scan's
+/// snapshot an hour after the scan starts (`SCAN_MAX_AGE`), however often
+/// it is paged. At the ~90 coins/s a regular node served, a scan of more
+/// than about 320,000 coins cannot finish and fails each time it runs;
+/// through an archive or on a slow host the bound is lower.
+pub(crate) const SCAN_PAGES_UNCAPPED: usize = usize::MAX;
+/// Default limit of `qclient token` on the coins a scan keeps (`--max-coins`).
 pub(crate) const SCAN_MAX_COINS: usize = 1024;
 #[cfg(feature = "native-proof")]
 pub(crate) use wallet::{
@@ -423,11 +441,11 @@ pub struct TokenArgs {
     /// Application identifier in hexadecimal (default: QUIL).
     #[arg(long, global = true)]
     pub application: Option<String>,
-    /// Maximum discovery pages (up to 64 confidential coins or escrows each,
-    /// 8 from older nodes); exhaustion fails rather than returning a partial
-    /// balance.
-    #[arg(long, global = true, default_value_t = SCAN_MAX_PAGES)]
-    pub max_pages: usize,
+    /// Stop a scan after this many discovery pages (up to 64 confidential
+    /// coins or escrows each, 8 from older nodes) instead of returning a
+    /// partial balance. None by default: a scan reads every page.
+    #[arg(long, global = true)]
+    pub max_pages: Option<usize>,
     /// Maximum recovered unspent coins retained during discovery.
     #[arg(long, global = true, default_value_t = SCAN_MAX_COINS)]
     pub max_coins: usize,
@@ -435,10 +453,23 @@ pub struct TokenArgs {
     pub command: TokenCommand,
 }
 
+impl TokenArgs {
+    /// The page cap `--max-pages` sets, else none.
+    pub(crate) fn page_cap(&self) -> usize {
+        self.max_pages.unwrap_or(SCAN_PAGES_UNCAPPED)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TokenCommand {
     /// Shows the account address of the managing account.
     Account,
+    /// Print a token's name, symbol and configuration, read from its
+    /// metadata vertex: `info <TokenDomain>`.
+    Info {
+        /// Token domain (32-byte hex), as `deploy token` printed it.
+        domain: String,
+    },
     /// Lists the total balance of tokens in the managing account.
     Balance,
     /// Reads QUIL rewards, unshielded legacy coins and confidential balance independently.
@@ -472,7 +503,15 @@ pub enum TokenCommand {
         #[arg(long, value_name = "SECS", default_value_t = 0)]
         wait: u64,
     },
-    /// Print this wallet's confidential (lattice) receiving address.
+    /// Print this wallet's two confidential addresses: receiving, then escrow.
+    ///
+    /// Line 1: the receiving address, for `token transfer`.
+    ///
+    /// Line 2: the escrow address (the receiving address and this node's
+    /// Falcon claim key), for `token pending-transfer`: the recipient
+    /// accepts it; after expiry the sender may reject it to refund.
+    ///
+    /// Each line is labelled on stderr; stdout carries the bare addresses.
     ConfidentialAddress,
     /// Report the global commit's decision on a submitted confidential
     /// operation: `inclusion <Operation>`, the id its submission printed.
@@ -529,15 +568,21 @@ pub enum TokenCommand {
     /// naming the check if that takes longer than `--inclusion-timeout`
     /// (time GLOBAL is paused does not count; the default, an hour, outlasts
     /// the shard stalls of up to 30 minutes seen after frames carrying
-    /// batches: a batch commits with its shard's next frame). A submitted
-    /// batch's coins stay out of new runs for two hours. Submissions are at
-    /// least `--min-interval` seconds apart (default 300, at most 12 per
-    /// hour).
-    /// The run pauses while GLOBAL is degraded (head not advancing for 60 s,
-    /// or under 330 frames per hour as the head advanced across the sampled
-    /// window, judged once 10 minutes are sampled) and resumes after 10
-    /// minutes of healthy advance. Each pause, resume, submission and
-    /// inclusion is printed with the projected end.
+    /// batches: a batch commits with its shard's next frame). A shard
+    /// without an active prover makes no frame: the run reads the batch's
+    /// shard in the node's shard list before its proof and every 2 minutes
+    /// while it waits, and leaves the batch when the shard has none (while
+    /// waiting, two reads in a row). It goes on with the next batches and
+    /// ends naming those left; a rerun plans their coins onto the live shard
+    /// covering them. A submitted batch's coins stay out of new runs for two
+    /// hours. Submissions are at least `--min-interval` seconds apart
+    /// (default 300, at most 12 per hour).
+    /// The run pauses while the node reports GLOBAL degraded (its head
+    /// unchanged for 120 s, or under 330 frames in the last hour, judged
+    /// once 10 minutes are observed) or its report is unreadable for 60 s,
+    /// and resumes once the node has reported GLOBAL healthy for 10
+    /// minutes. Each pause, resume, submission and inclusion is printed
+    /// with the projected end.
     #[cfg(feature = "native-proof")]
     ShieldAll {
         /// Legacy coins per batch (1 to 96).
@@ -562,15 +607,24 @@ pub enum TokenCommand {
         wait: u64,
     },
     /// Mint a custom token under its deployed policy.
+    ///
+    /// The mint's QUIL settlement pays for one exact bundle, so the bundle is
+    /// saved before the settlement is sent, as `custom-mint-<receipt>.txt` in
+    /// the config directory (the path is printed). When the settlement is not
+    /// certified within --pay-wait, `custom-mint --resume <file>` finishes
+    /// the mint; running custom-mint again pays a second settlement.
     #[cfg(feature = "native-proof")]
     CustomMint {
         /// Positive amount in base units.
-        amount: u128,
+        #[arg(required_unless_present = "resume")]
+        amount: Option<u128>,
         #[arg(long)]
         recipient: Option<String>,
         #[arg(long = "authority-key", default_value = "q-prover-key")]
         authority_key: String,
-        /// Use a free permissionless mint policy.
+        /// Require an unsigned mint. Optional: the token's deployed policy
+        /// decides whether the mint is signed; this only refuses a policy
+        /// that needs a signature.
         #[arg(long)]
         permissionless: bool,
         /// Paid mint policy: the token's payee QUIL address (hex, from
@@ -581,9 +635,19 @@ pub enum TokenCommand {
         /// basis times the amount). The node rejects an underpayment.
         #[arg(long)]
         price: Option<u128>,
-        /// Seconds to wait for the payment settlement to be certified.
+        /// Seconds to wait for the payment settlement to be certified (with
+        /// --resume, for the saved mint's settlement).
         #[arg(long, default_value_t = 900)]
         pay_wait: u64,
+        /// Finish the mint saved at FILE without paying again: wait up to
+        /// --pay-wait for its settlement to be certified, then submit the
+        /// saved bundle.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["amount", "recipient", "permissionless", "payee", "price", "entitlement"]
+        )]
+        resume: Option<PathBuf>,
         /// Proof-basis policy: this mint's entitlement proof (hex), from
         /// `token entitlements`. The authority key must be the entitled key
         /// and the amount the entitled amount.
@@ -718,6 +782,9 @@ pub enum TokenCommand {
     Prefunded,
     /// Print the claim (hex) that spends a certified settlement in its destination
     /// bundle: `settlement-claim <Destination> <Receipt> <Amount> <Context>`.
+    ///
+    /// A paid settlement (a paid mint's) also recorded its payment, which the
+    /// claim must repeat: pass --payment-address and --payment together.
     #[cfg(feature = "native-proof")]
     SettlementClaim {
         destination: String,
@@ -727,6 +794,14 @@ pub enum TokenCommand {
         /// Seconds to wait for the settlement's GLOBAL record to be certified.
         #[arg(long, default_value_t = 0)]
         wait: u64,
+        /// Paid settlement: the payment address it paid (32 bytes of hex), the
+        /// payee's `Payment address` as `token payment-address` prints it.
+        #[arg(long, value_name = "HEX32", requires = "payment")]
+        payment_address: Option<String>,
+        /// Paid settlement: the payment it made in QUIL base units, the price
+        /// paid (a paid mint's --price).
+        #[arg(long, value_name = "AMOUNT", requires = "payment_address")]
+        payment: Option<String>,
     },
     /// Claim this prover's reward balance as new coins: `mint [<RecipientAddress>]`.
     /// The reward mint is two-stage: authorize, then `--claim <file>` once finalized.
@@ -756,6 +831,7 @@ impl TokenCommand {
     fn submits(&self) -> bool {
         match self {
             TokenCommand::Account
+            | TokenCommand::Info { .. }
             | TokenCommand::Balance
             | TokenCommand::Coins
             | TokenCommand::Legacy(_)
@@ -1070,7 +1146,10 @@ pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
         return legacy::run(global, &args.common, &application(args)?, listing).await;
     }
     let tc = TokenCtx::load(global, &args.common)?;
-    if !matches!(args.command, TokenCommand::Account) {
+    if !matches!(
+        args.command,
+        TokenCommand::Account | TokenCommand::Info { .. }
+    ) {
         tc.require_keys()?;
     }
     run_with_context(&tc, args).await
@@ -1102,20 +1181,20 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
     #[cfg(feature = "confidential-tokens")]
     match &args.command {
         TokenCommand::ClaimableRewards => {
-            return claimable_rewards::run(tc, args.max_pages, args.max_coins).await;
+            return claimable_rewards::run(tc, args.page_cap(), args.max_coins).await;
         }
         TokenCommand::Balance => {
-            return wallet::run_balance(&tc, &application, args.max_pages, args.max_coins).await
+            return wallet::run_balance(tc, &application, args.page_cap(), args.max_coins).await
         }
         TokenCommand::Coins => {
-            return wallet::run_coins(&tc, &application, args.max_pages, args.max_coins).await
+            return wallet::run_coins(tc, &application, args.page_cap(), args.max_coins).await
         }
         TokenCommand::ConfidentialAddress => {
             wallet::run(&tc, &application, false)?;
             return wallet::run(&tc, &application, true);
         }
         TokenCommand::Escrows { max_escrows } => {
-            return wallet::run_escrows(&tc, &application, args.max_pages, *max_escrows).await
+            return wallet::run_escrows(tc, &application, args.page_cap(), *max_escrows).await
         }
         _ => {}
     }
@@ -1135,7 +1214,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
         let secs = std::time::Duration::from_secs;
         let follow = |wait: u64| wallet::inclusion::Follow {
             wait: secs(wait),
-            max_pages: args.max_pages,
+            max_pages: args.page_cap(),
         };
         match &args.command {
             TokenCommand::Transfer {
@@ -1153,7 +1232,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                         recipient,
                         parse_amount(amount)?,
                         *fee,
-                        args.max_pages,
+                        args.page_cap(),
                         args.max_coins,
                         secs(*wait),
                     )
@@ -1170,7 +1249,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                         &application,
                         coins,
                         merge_fee(&tc, &application, *fee).await?,
-                        args.max_pages,
+                        args.page_cap(),
                         args.max_coins,
                         secs(*wait),
                     )
@@ -1218,7 +1297,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                         },
                     )
                     .await?,
-                    args.max_pages,
+                    args.page_cap(),
                     args.max_coins,
                     secs(*wait),
                 )
@@ -1240,7 +1319,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                         parse_amount(amount)?,
                         pending_fee(&tc, &application, *fee).await?,
                         *expiration,
-                        args.max_pages,
+                        args.page_cap(),
                         args.max_coins,
                         secs(*wait),
                     )
@@ -1369,8 +1448,9 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     wallet::SettlementBinding::Bundle(parse_id(context)?),
                     *fee,
                     None,
-                    args.max_pages,
+                    args.page_cap(),
                     args.max_coins,
+                    None,
                 )
                 .await?;
                 return Ok(());
@@ -1387,7 +1467,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                     parse_amount(amount)?,
                     *fee,
                     claimant_key,
-                    args.max_pages,
+                    args.page_cap(),
                     args.max_coins,
                 )
                 .await
@@ -1399,14 +1479,23 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 amount,
                 context,
                 wait,
+                payment_address,
+                payment,
             } => {
-                let claim = wallet::settlement_claim(
-                    &tc,
+                // Clap takes both or neither.
+                let payment = match (payment_address, payment) {
+                    (Some(address), Some(value)) => {
+                        Some((parse_id(address)?, parse_amount(value)?))
+                    }
+                    _ => None,
+                };
+                let claim = wallet::run_settlement_claim(
+                    tc,
                     parse_id(destination)?,
                     parse_id(receipt)?,
                     parse_amount(amount)?,
-                    &wallet::ClaimBinding::Bundle(parse_id(context)?),
-                    None,
+                    parse_id(context)?,
+                    payment,
                     std::time::Duration::from_secs(*wait),
                 )
                 .await?;
@@ -1423,8 +1512,26 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 price,
                 pay_wait,
                 entitlement,
+                resume,
                 wait,
             } => {
+                if let Some(saved) = resume {
+                    // The saved bundle names its application; one given must match.
+                    let application: Option<[u8; 32]> = args
+                        .application
+                        .as_ref()
+                        .map(|_| decoded.as_slice().try_into().expect("checked above"));
+                    return wallet::run_custom_mint_resume(
+                        tc,
+                        application,
+                        saved,
+                        secs(*pay_wait),
+                        follow(*wait),
+                    )
+                    .await;
+                }
+                let amount =
+                    amount.ok_or_else(|| anyhow::anyhow!("custom-mint needs an amount"))?;
                 let paid = match (payee, price) {
                     (Some(payee), Some(price)) => Some((
                         payee.as_str(),
@@ -1441,7 +1548,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
                 return wallet::run_custom_mint(
                     &tc,
                     &application,
-                    *amount,
+                    amount,
                     recipient.as_deref(),
                     authority_key,
                     *permissionless,
@@ -1457,6 +1564,7 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
     }
     match &args.command {
         TokenCommand::Account => account::run(&tc),
+        TokenCommand::Info { domain } => info::run(tc, domain).await,
         TokenCommand::Legacy(listing) => {
             let application: [u8; 32] = decoded.as_slice().try_into().expect("checked above");
             legacy::run_loaded(tc, &application, listing).await
@@ -1479,6 +1587,18 @@ mod tests {
     }
 
     #[test]
+    fn token_info_takes_a_domain() {
+        let domain = hex::encode([7; 32]);
+        let parsed = TokenCli::try_parse_from(["token", "info", &domain]).unwrap();
+        assert!(matches!(
+            parsed.token.command,
+            TokenCommand::Info { domain: ref d } if *d == domain
+        ));
+        assert!(!parsed.token.command.submits());
+        assert!(TokenCli::try_parse_from(["token", "info"]).is_err());
+    }
+
+    #[test]
     fn token_cli_uses_one_command_family_for_all_applications() {
         let app = hex::encode([7; 32]);
         let parsed = TokenCli::try_parse_from([
@@ -1497,7 +1617,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(parsed.token.application.as_deref(), Some(app.as_str()));
-        assert_eq!((parsed.token.max_pages, parsed.token.max_coins), (4, 8));
+        assert_eq!((parsed.token.page_cap(), parsed.token.max_coins), (4, 8));
         assert!(matches!(
             parsed.token.command,
             TokenCommand::Transfer { fee: Some(0), .. }
@@ -1528,6 +1648,27 @@ mod tests {
                 TokenCli::try_parse_from(["token", "custom-mint", "9", "--application", &app])
                     .is_ok()
             );
+            // Finishing a saved mint takes its file, no amount or mint form.
+            assert!(matches!(
+                TokenCli::try_parse_from(["token", "custom-mint", "--resume", "saved.txt"])
+                    .unwrap()
+                    .token
+                    .command,
+                TokenCommand::CustomMint {
+                    amount: None,
+                    resume: Some(_),
+                    ..
+                }
+            ));
+            assert!(TokenCli::try_parse_from(["token", "custom-mint"]).is_err());
+            assert!(TokenCli::try_parse_from([
+                "token",
+                "custom-mint",
+                "9",
+                "--resume",
+                "saved.txt"
+            ])
+            .is_err());
             // Paid and proof-basis mints, and the entitlement tree builder.
             assert!(TokenCli::try_parse_from([
                 "token",

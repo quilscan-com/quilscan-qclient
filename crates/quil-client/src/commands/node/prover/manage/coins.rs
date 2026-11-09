@@ -17,8 +17,8 @@ use crate::commands::token::legacy::Snapshot;
 use super::model::{Model, NoticeSeverity, Tab};
 use super::update::Cmd;
 
-/// How often an open Coins tab reads legacy coins again (6–9 s per read on
-/// a regular node).
+/// How often an open Coins tab reads legacy coins again (5–9 s per read of
+/// 3,000 coins on a regular node, about 250 s of 180,000).
 pub const LEGACY_REFRESH: Duration = Duration::from_secs(600);
 
 /// Rows of the Balances panel, top to bottom: claimable, legacy,
@@ -357,6 +357,8 @@ pub type LegacyAnswer = Result<Option<Snapshot>, String>;
 pub struct Legacy {
     /// A read is in flight, started at this time.
     pub reading: Option<Instant>,
+    /// The read in flight's pages read and coins listed so far.
+    pub progress: Option<(usize, usize)>,
     /// When the last read started; the next one is due [`LEGACY_REFRESH`]
     /// later.
     pub last_start: Option<Instant>,
@@ -404,6 +406,7 @@ fn start_legacy(m: &mut Model, now: Instant) -> Vec<Cmd> {
         return vec![];
     }
     m.coins.legacy.reading = Some(now);
+    m.coins.legacy.progress = None;
     m.coins.legacy.last_start = Some(now);
     m.coins.legacy.refresh_at = None;
     vec![Cmd::FetchLegacy]
@@ -429,10 +432,19 @@ pub fn open(m: &mut Model) -> Vec<Cmd> {
     due(m, Instant::now())
 }
 
+/// A legacy read's progress, while it is in flight.
+pub fn apply_legacy_progress(m: &mut Model, pages: usize, coins: usize) {
+    let legacy = &mut m.coins.legacy;
+    if legacy.reading.is_some() {
+        legacy.progress = Some((pages, coins));
+    }
+}
+
 /// A finished legacy read.
 pub fn apply_legacy(m: &mut Model, answer: LegacyAnswer, took: Duration) {
     let legacy = &mut m.coins.legacy;
     legacy.reading = None;
+    legacy.progress = None;
     match answer {
         Ok(snapshot) => {
             legacy.answer = Some((snapshot, SystemTime::now(), took));
@@ -615,12 +627,34 @@ fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// Shields of legacy coins open at this GLOBAL frame, and the frames
-/// left, while the received head is before it.
-pub fn shields_open_at(snapshot: &Snapshot) -> Option<(u64, u64)> {
-    let rule = snapshot.rule?;
-    let head = *snapshot.head.as_ref().ok()?;
-    (head < rule.shield_all_from).then(|| (rule.shield_all_from, rule.shield_all_from - head))
+/// Shields of legacy coins (`shield-all`'s batches) open at this GLOBAL
+/// frame, and the frames left, while this node's health conditions say
+/// admission refuses them.
+pub fn shields_open_at(m: &Model) -> Option<(u64, u64)> {
+    let (from, head) = crate::commands::token::legacy::shields_closed(m.health_conditions(), true)?;
+    Some((from, from - head))
+}
+
+/// This node's health conditions at GLOBAL `head` with shields admitted
+/// from frame 900 and batches from 1000, as its registry judges them.
+#[cfg(test)]
+pub(crate) fn node_reports_shields_at(m: &mut Model, head: u64) {
+    let mut registry = quil_rpc::health_conditions::HealthRegistry::default();
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    registry.refresh_waits(
+        quil_rpc::health_conditions::GlobalObservation {
+            head_frame: head,
+            epoch_length: 720,
+            shields_from: Some((900, 1000)),
+            sync_installing: None,
+        },
+        now_ms,
+    );
+    m.health = super::model::HealthAnswer::Reported(registry.snapshot());
+    m.health_received = Some(Instant::now());
 }
 
 /// Every current Coins condition, in display order.
@@ -657,6 +691,36 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
         _ => {}
     }
     let legacy = &m.coins.legacy;
+    // A long listing's progress: its count is the read's own, not a row's.
+    if let (Some(since), Some((pages, coins))) = (legacy.reading, legacy.progress) {
+        out.push(Notice {
+            key: "coins-legacy-reading",
+            severity: NoticeSeverity::Info,
+            attention: false,
+            progress: true,
+            success: false,
+            text: format!(
+                "Legacy coins: reading, {} listed in {} so far {}.",
+                plural(coins, "coin", "coins"),
+                plural(pages, "page", "pages"),
+                if since.elapsed() < Duration::from_secs(60) {
+                    "<60s"
+                } else {
+                    ">60s"
+                }
+            ),
+        });
+    }
+    let mut push = |key, severity, attention, text: String| {
+        out.push(Notice {
+            key,
+            severity,
+            attention,
+            progress: false,
+            success: false,
+            text,
+        })
+    };
     // The legacy row's `As of` marks how old its figures are.
     if let (Some(error), Some(since)) = (&legacy.error, legacy.failing_since) {
         push(
@@ -664,7 +728,8 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
             NoticeSeverity::Warning,
             false,
             format!(
-                "Legacy coins: read failed {} since {} ({error}).",
+                "Legacy coins: read failed {} since {} ({error}); \
+                 qclient token legacy --summary lists them.",
                 plural(legacy.failures as usize, "time", "times"),
                 utc_hm(since)
             ),
@@ -679,7 +744,7 @@ pub fn notices(m: &Model, fmt_amount: impl Fn(u128) -> String) -> Vec<Notice> {
     }
     // Counts are the legacy row's, the batches and the frame shields open
     // at the Shield plan's: these notices name the condition and the key.
-    match (shields_open_at(snapshot), snapshot.plan) {
+    match (shields_open_at(m), snapshot.plan) {
         (Some(_), _) => push(
             "coins-shield-gate",
             NoticeSeverity::Info,
@@ -1067,6 +1132,8 @@ mod coins_tests {
             &mut m,
             Ok(Read {
                 coins: Some((2, 90)),
+                skipped: Default::default(),
+                escrows_failed: None,
                 escrows: vec![escrow(false, 0), escrow(true, 400), escrow(true, 900)],
             }),
         );
@@ -1229,7 +1296,9 @@ mod coins_tests {
             .all(|n| n.attention && n.severity == NoticeSeverity::Info));
         m.notice_minimum = NoticeSeverity::Info;
         assert_eq!(shown_notices(&m, fmt).len(), 3);
-        // Before the gate: an expected wait, no attention item.
+        // Before the gate, as the node reports it: an expected wait, no
+        // attention item.
+        node_reports_shields_at(&mut m, 990);
         apply_legacy(
             &mut m,
             Ok(Some(snapshot(4, 990, 0, false))),
@@ -1257,5 +1326,59 @@ mod coins_tests {
         assert_eq!(failed.severity, NoticeSeverity::Warning);
         assert!(failed.text.contains("read failed 2 times since "));
         assert!(!failed.text.contains("figures as of"), "{}", failed.text);
+    }
+
+    /// A long legacy read shows how far it got, from either tab, until it
+    /// ends; a failed one names how far it got and the command that lists
+    /// the coins instead, and ‹S› still prepares a shield, which reads the
+    /// coins itself.
+    #[test]
+    fn a_long_legacy_read_shows_its_progress_and_a_failure_its_remedy() {
+        let mut m = Model::new();
+        let fmt = |units: u128| units.to_string();
+        let reading = |m: &Model| {
+            notices(m, fmt)
+                .into_iter()
+                .find(|n| n.key == "coins-legacy-reading")
+        };
+        assert!(matches!(
+            due(&mut m, Instant::now()).as_slice(),
+            [Cmd::FetchLegacy]
+        ));
+        assert!(reading(&m).is_none(), "no page yet, nothing to count");
+        apply_legacy_progress(&mut m, 166, 84_992);
+        let shown = reading(&m).unwrap();
+        assert!(shown.progress, "{shown:?}");
+        assert_eq!(
+            shown.text,
+            "Legacy coins: reading, 84992 coins listed in 166 pages so far <60s."
+        );
+        assert!(shown.rank() >= m.notice_minimum, "shows by default");
+        // ‹S› on the legacy row prepares a shield before any answer.
+        m.tab = Tab::Coins;
+        m.coins.cursor = 1;
+        assert_eq!(key_refusal(&m, "S"), None);
+        apply_legacy(
+            &mut m,
+            Err("no answer for 120s after 166 pages (84992 coins)".into()),
+            Duration::from_secs(300),
+        );
+        assert!(reading(&m).is_none(), "the read ended");
+        let failed = notices(&m, fmt)
+            .into_iter()
+            .find(|n| n.key == "coins-legacy-failed")
+            .unwrap();
+        assert!(
+            failed.text.contains("after 166 pages (84992 coins)")
+                && failed
+                    .text
+                    .ends_with("; qclient token legacy --summary lists them."),
+            "{}",
+            failed.text
+        );
+        assert_eq!(key_refusal(&m, "S"), None, "a failed read keeps ‹S›");
+        // Progress of a read no longer in flight is stale.
+        apply_legacy_progress(&mut m, 1, 512);
+        assert!(reading(&m).is_none());
     }
 }

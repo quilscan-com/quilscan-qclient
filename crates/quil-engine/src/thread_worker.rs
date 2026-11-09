@@ -810,7 +810,7 @@ impl ThreadWorkerManager {
                 }
 
                 // Create per-thread tokio runtime
-                let rt = crate::worker_stall::worker_runtime()
+                let rt = crate::worker_stall::worker_runtime(core_id)
                     .expect("failed to create worker tokio runtime");
 
                 // A watchdog on another thread names what blocks this one
@@ -1222,10 +1222,11 @@ impl ThreadWorkerManager {
                                                                             Err(quil_types::error::QuilError::NotFound(_)) => Ok(None),
                                                                             Err(error) => Err(error),
                                                                         };
-                                                                        // Without a frame of the shard the recovery
-                                                                        // installs it, which a departing seat skips.
-                                                                        let given_up = || recovery_withheld(
-                                                                            &gate, &withheld, core_id, &filter, matches!(lineage(), Ok(None)),
+                                                                        // A recovery that installs the shard (no frame
+                                                                        // of it here, or a lineage no replay brings to
+                                                                        // its state) is skipped by a departing seat.
+                                                                        let given_up = |installs| recovery_withheld(
+                                                                            &gate, &withheld, core_id, &filter, installs,
                                                                         );
                                                                         let _ = crate::prover_tree_syncer::recover_in_turns(
                                                                             &crate::recovery_turns::SHARD_RECOVERY_TURNS, syncer.as_ref(), &filter,

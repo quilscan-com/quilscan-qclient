@@ -1,4 +1,5 @@
 pub mod admission_verify;
+pub mod app_body_delivery;
 pub mod app_engine;
 pub mod app_glue;
 pub mod app_handoff;
@@ -9,7 +10,7 @@ mod app_stall;
 pub mod app_types;
 pub mod archive_ingest;
 pub mod archive_preverify;
-mod bounded_warn;
+pub mod bounded_warn;
 mod closing_certificate;
 pub mod committee;
 pub mod consensus_metrics;
@@ -63,7 +64,9 @@ pub mod provers;
 mod recovery_turns;
 mod relay_reoffer;
 pub mod remote_worker;
+mod replay_split;
 pub mod resolver_traffic;
+pub mod restart_readiness;
 pub mod rewards;
 mod seal_follow;
 pub mod shard_info;
@@ -73,6 +76,8 @@ pub mod storage_epoch_batch;
 pub mod storage_history;
 pub mod storage_jobs;
 pub mod storage_labels;
+pub mod storage_ledger;
+pub mod storage_readiness;
 pub mod storage_snapshot;
 pub mod thread_worker;
 pub mod time_reel;
@@ -95,6 +100,10 @@ pub mod test_support;
 /// Per-thread heap accounting for this crate's unit tests.
 #[cfg(test)]
 mod test_alloc;
+
+/// Reproducers of a private advisory (SCA).
+#[cfg(test)]
+mod sca_repro_tests;
 
 pub use app_engine::AppConsensusEngine;
 pub use app_shard_cache::AppShardCache;

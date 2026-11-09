@@ -553,13 +553,13 @@ impl Tally {
 
 /// Every legacy coin of `owner`, ascending by address, as
 /// `(address, amount, shielded)`. `progress` gets the running count after
-/// each page that more pages follow.
+/// each page, and whether more pages follow.
 async fn list_owner(
     client: &Client,
     application: &[u8; 32],
     owner: &[u8; 32],
     pages: &mut usize,
-    mut progress: impl FnMut(usize),
+    mut progress: impl FnMut(usize, bool),
 ) -> anyhow::Result<Vec<([u8; 32], u128, bool)>> {
     let mut coins = Vec::new();
     let mut after: Vec<u8> = Vec::new();
@@ -597,21 +597,23 @@ async fn list_owner(
             after = coin.address.clone();
         }
         if !page.has_more {
+            progress(coins.len(), false);
             break;
         }
         anyhow::ensure!(
             !page.coins.is_empty(),
             "legacy coin listing did not advance"
         );
-        progress(coins.len());
+        progress(coins.len(), true);
     }
     Ok(coins)
 }
 
-/// Every coin of `owners`. A long listing shows its progress on one line
-/// of a terminal's stderr, rewritten after each page and cleared once the
-/// listing ends; piped or redirected output gets none, nor does a `quiet`
-/// listing (the node manager, whose screen that line would overwrite).
+/// Every coin of `owners`. A listing past `output::SLOW_PHASE` (any, under
+/// `-v`) shows its progress on one line of a terminal's stderr, rewritten
+/// after each page and cleared once the listing ends; piped or redirected
+/// output gets none, nor does a `quiet` listing (the node manager, whose
+/// screen that line would overwrite).
 async fn list_owners(
     client: &Client,
     application: &[u8; 32],
@@ -620,13 +622,40 @@ async fn list_owners(
     pages: &mut usize,
     quiet: bool,
 ) -> anyhow::Result<Vec<Coin>> {
+    list_owners_observed(
+        client,
+        application,
+        owners,
+        label,
+        pages,
+        quiet,
+        &mut |_, _| {},
+    )
+    .await
+}
+
+/// [`list_owners`], telling `on_page` the pages read and the coins listed
+/// so far, across `owners`, after each page.
+async fn list_owners_observed(
+    client: &Client,
+    application: &[u8; 32],
+    owners: &[(OwnerForm, [u8; 32])],
+    label: &str,
+    pages: &mut usize,
+    quiet: bool,
+    on_page: &mut (dyn FnMut(usize, usize) + Send),
+) -> anyhow::Result<Vec<Coin>> {
     use std::io::{IsTerminal, Write};
     let terminal = !quiet && !super::output::captured() && std::io::stderr().is_terminal();
+    let (started, verbose) = (std::time::Instant::now(), crate::verbosity::on());
     let mut coins = Vec::new();
     for (form, owner) in owners {
         let mut shown = false;
-        let listed = list_owner(client, application, owner, pages, |count| {
-            if terminal {
+        let (before, mut read) = (coins.len(), *pages);
+        let listed = list_owner(client, application, owner, pages, |count, more| {
+            read += 1;
+            on_page(read, before + count);
+            if terminal && more && (verbose || started.elapsed() > super::output::SLOW_PHASE) {
                 eprint!(
                     "\r{label}: {count} legacy coins listed under the {} owner, more follow",
                     form.text()
@@ -721,6 +750,33 @@ pub(crate) fn recently_shielded(dir: &Path) -> BTreeSet<[u8; 32]> {
         .collect()
 }
 
+/// Add the coins `addresses` of a batch submitted at `now` (Unix seconds)
+/// to shield-all's journal in the config directory `dir`, replaced through
+/// [`quil_config::atomic_write`]: readable by its owner only (it lists the
+/// wallet's coins), its owner kept, and whole after a failure.
+#[cfg(feature = "native-proof")]
+pub(crate) fn record_shielded(
+    dir: &Path,
+    now: u64,
+    addresses: impl IntoIterator<Item = [u8; 32]>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let path = dir.join(SHIELD_JOURNAL);
+    let mut journal = match std::fs::read_to_string(&path) {
+        Ok(journal) => journal,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    if !journal.is_empty() && !journal.ends_with('\n') {
+        journal.push('\n');
+    }
+    for address in addresses {
+        let _ = writeln!(journal, "{now} {}", hex::encode(address));
+    }
+    quil_config::atomic_write(&path, journal.as_bytes(), 0o600)
+        .with_context(|| format!("write {}", path.display()))
+}
+
 /// One batch of a shield plan: its shard and its coins.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlanBatch {
@@ -757,23 +813,29 @@ pub(crate) struct Snapshot {
 
 /// The [`Snapshot`] of the identity with Ed448 public key `public` on
 /// `network`, read from `client`; `config_dir` holds shield-all's journal.
+/// `progress` gets the pages read and the coins listed after each page,
+/// and again after the shard list, so a caller can tell a long read from a
+/// stalled one.
 pub(crate) async fn snapshot(
     client: &Client,
     application: &[u8; 32],
     public: &[u8; 57],
     network: u8,
     config_dir: Option<&Path>,
+    progress: &mut (dyn FnMut(usize, usize) + Send),
 ) -> anyhow::Result<Snapshot> {
     let mut pages = 0;
-    let listed = list_owners(
+    let listed = list_owners_observed(
         client,
         application,
         &key_owners(public)?,
         "",
         &mut pages,
         true,
+        progress,
     )
     .await?;
+    let listed_count = listed.len();
     let tally = Tally::of(&listed)?;
     let recent = config_dir.map(recently_shielded).unwrap_or_default();
     let shielded = listed
@@ -791,7 +853,9 @@ pub(crate) async fn snapshot(
         .filter(|coin| !pending.contains(&coin.address))
         .collect();
     let shards = if tally.unshielded > pending.len() && BATCH_SHIELDS.is_some() {
-        live_shards(client, application).await.ok()
+        let shards = live_shards(client, application).await.ok();
+        progress(pages, listed_count);
+        shards
     } else {
         None
     };
@@ -986,36 +1050,49 @@ async fn global_head(client: &Client) -> Result<u64, String> {
     }
 }
 
-/// Refuse to prove shields that admission would refuse at the node's GLOBAL
-/// head: the proving is wasted, and a refused batch also keeps its coins out
-/// of the next run for two hours. Without a known rule or head, go ahead.
-#[cfg(feature = "native-proof")]
-pub(crate) async fn ensure_shields_active(
-    client: &Client,
-    network: u8,
+/// The frame admission takes shields of legacy coins from (`batch`: those
+/// of `token shield-all`), and the GLOBAL head, while this node's health
+/// conditions say admission refuses them.
+pub(crate) fn shields_closed(
+    conditions: &[quil_types::proto::diagnostics::HealthCondition],
     batch: bool,
-) -> anyhow::Result<()> {
-    let Some(rule) = shield_rule(network) else {
-        return Ok(());
-    };
-    let Ok(head) = global_head(client).await else {
-        return Ok(());
-    };
+) -> Option<(u64, u64)> {
+    let kind = quil_types::proto::diagnostics::ConditionKind::ShieldsNotAdmitted as i32;
+    let wait = conditions.iter().find(|c| c.kind == kind)?.wait?;
     let from = if batch {
-        rule.shield_all_from
+        wait.batch_from_frame
     } else {
-        rule.shield_from
+        wait.until_frame
     };
-    anyhow::ensure!(
-        head >= from,
+    (wait.head_frame < from).then_some((from, wait.head_frame))
+}
+
+/// Refuse to prove shields that admission would refuse at this node's
+/// GLOBAL head, as its health conditions say: the proving is wasted, and a
+/// refused batch also keeps its coins out of the next run for two hours.
+/// When the node cannot say, go ahead: admission still refuses them.
+#[cfg(feature = "native-proof")]
+pub(crate) async fn ensure_shields_active(tc: &TokenCtx, batch: bool) -> anyhow::Result<()> {
+    let Ok(source) = crate::commands::node::diagnostics::HealthSource::for_node(
+        &tc.node_config,
+        &tc.key_manager,
+    ) else {
+        return Ok(());
+    };
+    let Ok(Some(health)) = source.read().await else {
+        return Ok(());
+    };
+    let Some((from, head)) = shields_closed(&health.conditions, batch) else {
+        return Ok(());
+    };
+    anyhow::bail!(
         "shields of legacy coins are admitted from GLOBAL frame {}, and the node's GLOBAL head \
          is {} ({} frames before it): admission would refuse them (\"source owner mismatch\"); \
          run this again once the head reaches that frame (`qclient token legacy` shows it)",
         grouped(from),
         grouped(head),
         grouped(from - head)
-    );
-    Ok(())
+    )
 }
 
 /// The filters, bit paths and active prover counts of `application`'s

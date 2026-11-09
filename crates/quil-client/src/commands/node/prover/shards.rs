@@ -32,9 +32,6 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
     let mut unknown = 0;
     let mut adjusted = [BigInt::from(0), BigInt::from(0)];
     let mut adjusted_known = [0usize; 2];
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
     for shard in &resp.shards {
         let filter_hex = hex::encode(&shard.filter);
         let worker_str = workers
@@ -61,8 +58,8 @@ pub async fn run(pc: &ProverCtx) -> anyhow::Result<()> {
                             &reward,
                             c,
                             *day,
-                            now,
                             super::committee_size(shard),
+                            shard.certificate_share.as_ref(),
                         )
                     })
                 };

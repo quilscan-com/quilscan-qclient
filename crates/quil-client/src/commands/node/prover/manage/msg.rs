@@ -17,18 +17,26 @@ pub enum Msg {
         /// The saved mint authorizations, read with it.
         mints: Vec<super::mint::Saved>,
     },
+    /// A legacy read under way: the pages read and the coins listed so far.
+    LegacyProgress {
+        pages: usize,
+        coins: usize,
+    },
     /// The mint confirmation's reads and quote, or why there is none.
     MintPreview(Result<super::mint::Preview, String>),
     /// A running mint's or claim's report.
     Mint(super::mint::Progress),
     /// The shielded coins and pending transfers read, or why the read
     /// failed.
-    Shielded(Result<super::transfer::Read, String>),
+    Shielded(Result<super::transfer::Read, super::transfer::ReadFailure>),
     /// A transfer action's confirmation, or why there is none.
     TransferPreview(Result<super::transfer::Preview, String>),
     /// A running transfer action's report.
     Transfer(super::transfer::Progress),
     RewardRefresh(Result<Option<(u128, u64)>, String>),
+    /// The node's health report: its conditions, none from a node that
+    /// predates them, or why it is unavailable.
+    HealthRefresh(super::model::HealthAnswer),
     ShardLoading,
     ShardRefresh(Result<GetShardInfoResponse, String>),
     /// `dataRefreshMsg` — result of a full RPC data fetch.

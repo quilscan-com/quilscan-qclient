@@ -6,9 +6,11 @@
 //! cache publication still require the execution owner's higher-level locks.
 
 use std::collections::BTreeMap;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use crate::storage_health::{StoreRole, StoreState};
 use quil_types::store::{BackingStoreIdentity, CapturePoint, ScanPoint};
@@ -35,7 +37,8 @@ pub enum DatabaseCommitError {
 }
 
 pub(crate) struct DatabaseInner {
-    db: DB,
+    /// Closed when dropped, unless the process is exiting ([`ExitHold`]).
+    db: ManuallyDrop<DB>,
     writes: Mutex<WriteLedger>,
     /// The failed-write latch and the store's role in the operator log.
     state: Arc<StoreState>,
@@ -48,6 +51,133 @@ pub(crate) struct DatabaseInner {
 }
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+impl Drop for DatabaseInner {
+    fn drop(&mut self) {
+        // Once the process is exiting the store is left open: a close could
+        // run into RocksDB's static teardown. Its write-ahead log is
+        // replayed at the next open, as after the node's own exit.
+        if let Some(_closing) = ExitHold::unless_exiting() {
+            // SAFETY: dropped once, here; `db` is not used after.
+            unsafe { ManuallyDrop::drop(&mut self.db) };
+        }
+    }
+}
+
+/// RocksDB work a process ending through `exit` (a test binary; any normal
+/// return from `main`) waits for, up to a minute, before RocksDB's
+/// static teardown: a store closed or used under it aborts the process
+/// ("pthread lock: Invalid argument"). Every store's close holds one; hold
+/// one around RocksDB work on a thread of its own. Then every store still
+/// open stops its background work, and a store dropped once the process is
+/// exiting is not closed.
+pub struct ExitHold(());
+
+/// Whether the process is exiting, and the [`ExitHold`]s held.
+struct ExitState {
+    exiting: bool,
+    held: usize,
+}
+
+static EXIT: (Mutex<ExitState>, Condvar) = (
+    Mutex::new(ExitState {
+        exiting: false,
+        held: 0,
+    }),
+    Condvar::new(),
+);
+
+/// Every store opened, so an exiting process can stop their background work.
+static OPEN_STORES: Mutex<Vec<Weak<DatabaseInner>>> = Mutex::new(Vec::new());
+
+/// How long an exiting process waits for the [`ExitHold`]s held.
+const EXIT_WAIT: Duration = Duration::from_secs(60);
+
+impl ExitHold {
+    /// Hold off RocksDB's teardown at exit until this is dropped.
+    pub fn start() -> Self {
+        wait_at_exit();
+        exit_state().held += 1;
+        Self(())
+    }
+
+    /// A hold, unless the process is exiting.
+    fn unless_exiting() -> Option<Self> {
+        let mut state = exit_state();
+        if state.exiting {
+            return None;
+        }
+        state.held += 1;
+        Some(Self(()))
+    }
+}
+
+impl Drop for ExitHold {
+    fn drop(&mut self) {
+        exit_state().held -= 1;
+        EXIT.1.notify_all();
+    }
+}
+
+fn exit_state() -> MutexGuard<'static, ExitState> {
+    EXIT.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Make the process wait for the [`ExitHold`]s held when it exits, then stop
+/// the background work of every store still open. Called once a store is
+/// open: RocksDB's static mutexes were built before (before `main`, or as
+/// the first store opened), so this runs before their teardown.
+fn wait_at_exit() {
+    static REGISTERED: Once = Once::new();
+    REGISTERED.call_once(|| {
+        extern "C" fn exiting() {
+            wait_for_exit_holds();
+            // RocksDB's own threads keep working for a store left open: its
+            // timer's stats dump (first run as the store opens), flushes and
+            // compactions. Under its static teardown they read the statics
+            // it frees (SIGSEGV). Stop them first, waiting for a job already
+            // running.
+            let open: Vec<Arc<DatabaseInner>> = OPEN_STORES
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect();
+            for store in &open {
+                store.db.cancel_all_background_work(true);
+            }
+        }
+        // SAFETY: registers a plain function with no captured state.
+        unsafe { libc::atexit(exiting) };
+    });
+}
+
+/// Mark the process exiting and wait up to [`EXIT_WAIT`] for the
+/// [`ExitHold`]s held.
+fn wait_for_exit_holds() {
+    let deadline = Instant::now() + EXIT_WAIT;
+    let mut state = exit_state();
+    state.exiting = true;
+    while state.held > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            // Not a log line: a log writer may have stopped as `main`
+            // returned.
+            eprintln!(
+                "exiting with {} store closes or RocksDB jobs still running after {} s: \
+                 RocksDB's teardown may abort the process",
+                state.held,
+                EXIT_WAIT.as_secs()
+            );
+            return;
+        }
+        state = EXIT
+            .1
+            .wait_timeout(state, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+}
 
 /// How long writes took, since last read. A slow disk shows in `max_write`
 /// with no `max_barrier_wait` of its own; a writer holding the barrier shows
@@ -99,6 +229,18 @@ impl WriteTimes {
         self.write_us.fetch_add(us, Ordering::Relaxed);
         self.max_write_us.fetch_max(us, Ordering::Relaxed);
     }
+}
+
+thread_local! {
+    /// How long this thread's store writes took.
+    static THREAD_WRITE_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How long this thread's writes to any store took since it started: the
+/// difference across a step gives that step's writes, whichever store they
+/// went to.
+pub fn thread_store_write_time() -> std::time::Duration {
+    std::time::Duration::from_micros(THREAD_WRITE_US.with(std::cell::Cell::get))
 }
 
 /// Every store's write times in this process: a node's workers write their
@@ -331,10 +473,11 @@ impl CoordinatedDb {
     }
 
     fn open(db: DB, watched: Option<Vec<Vec<u8>>>) -> Self {
+        wait_at_exit();
         let general = db.latest_sequence_number();
         let state = Arc::new(StoreState::new(db.path().to_path_buf()));
-        Self(Arc::new(DatabaseInner {
-            db,
+        let inner = Arc::new(DatabaseInner {
+            db: ManuallyDrop::new(db),
             writes: Mutex::new(WriteLedger {
                 general,
                 disjoint: BTreeMap::new(),
@@ -346,7 +489,12 @@ impl CoordinatedDb {
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             watched,
             times: WriteTimes::default(),
-        }))
+        });
+        let mut open = OPEN_STORES.lock().unwrap_or_else(PoisonError::into_inner);
+        open.retain(|store| store.strong_count() > 0);
+        open.push(Arc::downgrade(&inner));
+        drop(open);
+        Self(inner)
     }
 
     pub fn instance(&self) -> u64 {
@@ -416,6 +564,12 @@ impl CoordinatedDb {
     /// Returns false when it already has a role, which it keeps.
     pub fn register_store(&self, role: StoreRole) -> bool {
         crate::storage_health::register(&self.0.state, Arc::downgrade(&self.0), role)
+    }
+
+    /// The role this database was named with ([`Self::register_store`]),
+    /// or `None` for one never named.
+    pub fn store_role(&self) -> Option<StoreRole> {
+        self.0.state.role()
     }
 
     /// Whether a write failed, so the database refuses every later write
@@ -686,6 +840,7 @@ impl DatabaseWriteGuard<'_> {
             None => self.database.0.db.write_opt(batch, options),
         };
         let took = started.elapsed();
+        THREAD_WRITE_US.with(|us| us.set(us.get().saturating_add(took.as_micros() as u64)));
         self.database.0.times.wrote(took);
         ALL_STORES.wrote(took);
         if !matches!(watched, WatchedWrite::None) {
@@ -1218,5 +1373,28 @@ mod write_times_tests {
         assert!(held.max_barrier_hold_ms >= 150, "{held:?}");
         assert!(held.max_barrier_wait_ms >= 100, "{held:?}");
         assert!(take_all_stores_write_times().writes >= 1);
+    }
+
+    /// A thread's write time grows with its own writes, not another's.
+    #[test]
+    fn a_threads_store_write_time_counts_only_its_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        let db = CoordinatedDb::new(DB::open(&options, dir.path()).unwrap());
+        let before = thread_store_write_time();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let theirs = thread_store_write_time();
+                    db.put(b"a", b"1").unwrap();
+                    assert!(thread_store_write_time() > theirs);
+                })
+                .join()
+                .unwrap();
+        });
+        assert_eq!(thread_store_write_time(), before);
+        db.put(b"b", b"2").unwrap();
+        assert!(thread_store_write_time() > before);
     }
 }

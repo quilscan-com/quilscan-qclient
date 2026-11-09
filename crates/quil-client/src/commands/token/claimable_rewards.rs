@@ -44,7 +44,7 @@ pub(super) async fn run(tc: &TokenCtx, max_pages: usize, max_coins: usize) -> an
         }
     };
     stream(
-        balance::claimable_rewards(tc),
+        read_reward_line(tc),
         legacy,
         confidential,
         LEGACY_TIMEOUT,
@@ -85,15 +85,13 @@ async fn stream(
                         "legacy coin query timed out after {legacy_timeout:?}"
                     ))
                 });
-            emit(&single_line(&balance::format_legacy_coins(result)))
+            emit(&single_line(&legacy_line(result)))
         },
         async {
             // Match native balance discovery: retain official per-RPC and
             // page/coin limits, without imposing a total scan deadline here.
             let result = confidential.await;
-            emit(&single_line(&balance::format_confidential_coins(
-                result, true,
-            )))
+            emit(&single_line(&confidential_line(result)))
         }
     );
     rewards?;
@@ -101,11 +99,84 @@ async fn stream(
     confidential
 }
 
+// Keep this existing machine-readable interface precise and stable while
+// native balance owns its new terse/verbose presentation. All queries and
+// base-unit conversion still use the current official implementations.
+async fn read_reward_line(tc: &TokenCtx) -> (String, bool) {
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let public = tc.key_manager.get_public_key_bytes_by_id("q-prover-key")?;
+        let client = tc.connect_submit().await?;
+        balance::read_claimable_rewards(client, &public).await
+    })
+    .await
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("reward query timed out")));
+    let read = result.is_ok();
+    (reward_line(result), read)
+}
+
+fn reward_line(result: anyhow::Result<Option<(u128, u64)>>) -> String {
+    match result {
+        Ok(Some((value, frame))) => format!(
+            "Claimable prover rewards: {} QUIL (witness cites global frame {frame}; requires minting)",
+            balance::quil_amount(value)
+        ),
+        Ok(None) => "Claimable prover rewards: unavailable (no claimable reward witness returned)".into(),
+        Err(error) => format!("Claimable prover rewards: unavailable ({error})"),
+    }
+}
+
+fn legacy_line(result: LegacyResult) -> String {
+    match result {
+        Ok(Some((_, 0, 0))) => "Unshielded legacy coins: none (the listing has no coin under this identity's key or peer-id owner)".into(),
+        Ok(Some((_, 0, shielded))) => format!("Unshielded legacy coins: none left ({shielded} already shielded)"),
+        Ok(Some((total, unshielded, shielded))) => format!(
+            "Unshielded legacy coins: {} QUIL ({total} base units) across {unshielded} coins ({shielded} already shielded)",
+            balance::quil_amount(total)
+        ),
+        Ok(None) => "Unshielded legacy coins: none (this node has no Ed448 identity)".into(),
+        Err(error) => format!("Unshielded legacy coins: unavailable ({})", balance::reason(&error)),
+    }
+}
+
+fn confidential_line(result: ConfidentialResult) -> String {
+    match result {
+        Ok(Some((total, coins))) => format!(
+            "Confidential QUIL coins: {} QUIL ({total} base units) across {coins} coins reported unspent by the configured node (not a finalized balance)",
+            balance::quil_amount(total)
+        ),
+        Ok(None) => "Confidential QUIL coins: none exist on the network yet (no QUIL root published)".into(),
+        Err(error) => format!("Confidential coins: unavailable ({})", balance::reason(&error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
     const REWARD: &str = "Claimable prover rewards: 1.000000000000 QUIL (witness cites global frame 42; requires minting)";
+
+    #[test]
+    fn native_read_results_keep_the_existing_machine_lines() {
+        assert_eq!(reward_line(Ok(Some((8_000_000_000, 42)))), REWARD);
+        assert_eq!(legacy_line(Ok(Some((24_000_000_000, 2, 1)))), "Unshielded legacy coins: 3.000000000000 QUIL (24000000000 base units) across 2 coins (1 already shielded)");
+        assert_eq!(confidential_line(Ok(Some((40_000_000_000, 3)))), "Confidential QUIL coins: 5.000000000000 QUIL (40000000000 base units) across 3 coins reported unspent by the configured node (not a finalized balance)");
+    }
+
+    #[test]
+    fn machine_lines_keep_missing_and_error_distinct_from_zero() {
+        assert!(reward_line(Ok(None)).contains("unavailable"));
+        assert!(reward_line(Ok(Some((0, 42)))).contains("0.000000000000 QUIL"));
+        assert!(legacy_line(Ok(None)).contains("no Ed448 identity"));
+        assert!(legacy_line(Ok(Some((0, 0, 2)))).contains("2 already shielded"));
+        assert!(confidential_line(Ok(None)).contains("no QUIL root published"));
+        for line in [
+            reward_line(Err(anyhow::anyhow!("read failed"))),
+            legacy_line(Err(anyhow::anyhow!("read failed"))),
+            confidential_line(Err(anyhow::anyhow!("read failed"))),
+        ] {
+            assert!(line.ends_with("unavailable (read failed)"));
+        }
+    }
 
     async fn fixture(failed: Option<usize>) -> Vec<String> {
         let output = Mutex::new(Vec::new());

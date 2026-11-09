@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use quil_cw_consensus::adapters::ProposalContext;
 use quil_cw_consensus::handoff::automaton::{
-    AuthorizedParent, ClosingAbsence, ClosingProbe, ParentReader,
+    AuthorizedParent, BehindProbe, ClosingAbsence, ClosingProbe, ParentReader,
 };
 use quil_cw_consensus::handoff::{Checkpoint, Seal, Session};
 use quil_execution::global_intrinsic::handoff::{
@@ -178,31 +178,51 @@ pub fn worker_retention(
     filter: &[u8],
     member: &[u8],
 ) -> Option<bool> {
-    let check = || -> Result<bool> {
-        let view = CommittedView::capture(global)?;
-        let Some(session) = handoff::head(&view, filter)? else {
+    worker_retention_in(&CommittedView::capture(global), filter, member)
+}
+
+/// [`worker_retention`] in a view captured once for many workers
+/// (`CommittedView::capture`): a reconcile pass asks for each of its
+/// workers and reads them all from one snapshot.
+pub fn worker_retention_in(
+    view: &Result<CommittedView>,
+    filter: &[u8],
+    member: &[u8],
+) -> Option<bool> {
+    let check = |view: &CommittedView| -> Result<bool> {
+        let Some(session) = handoff::head(view, filter)? else {
             return Ok(false);
         };
         if !session.members.iter().any(|key| key == member) {
             return Ok(false);
         }
-        Ok(match handoff::status(&view, &session.id()?)? {
+        Ok(match handoff::status(view, &session.id()?)? {
             Status::Active => true,
-            Status::Sealing(_) => !schedule::seal_submitted(&view, &session)?,
+            Status::Sealing(_) => !schedule::seal_submitted(view, &session)?,
             Status::Closed(_) => false,
         })
     };
-    match check() {
-        Ok(retain) => Some(retain),
-        Err(error) if handoff::global_sync_in_progress(&error) => None,
+    match view {
+        Ok(view) => match check(view) {
+            Ok(retain) => Some(retain),
+            Err(error) => retention_unknown(&error, filter),
+        },
+        Err(error) => retention_unknown(error, filter),
+    }
+}
+
+/// What [`worker_retention`] answers when the committed view cannot be read.
+fn retention_unknown(error: &QuilError, filter: &[u8]) -> Option<bool> {
+    match error {
+        error if handoff::global_sync_in_progress(error) => None,
         // No authenticated GLOBAL state yet: this node cannot be running a
         // session host (startup needs the same snapshot), so nothing is closing.
-        Err(QuilError::ExecutionUnavailable(_)) => Some(false),
+        QuilError::ExecutionUnavailable(_) => Some(false),
         // A store or decoding failure says nothing about the session: do not
         // release a possibly closing member on it.
         // Once a minute at most: the reconcile asks every frame, and the
         // recovery gate on each recovery request.
-        Err(error) => {
+        error => {
             static LAST_WARN_SECS: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let now = std::time::SystemTime::now()
@@ -317,6 +337,18 @@ impl ParentSource {
 
     pub fn reader(self: &Arc<Self>) -> ParentReader {
         self.reader_of(true)
+    }
+
+    /// Behind for longer than a leader's parent waits: the committed GLOBAL
+    /// view is withheld while a state sync installs its chunks, so no parent
+    /// reads until the sync records its cursor
+    /// (`HandoffProposer::with_behind_probe`).
+    pub fn behind_probe(self: &Arc<Self>) -> BehindProbe {
+        let source = self.clone();
+        Arc::new(move || match CommittedView::capture(&source.global) {
+            Err(error) if handoff::global_sync_in_progress(&error) => Some(error.to_string()),
+            _ => None,
+        })
     }
 
     /// The authorized checkpoint at the local materialized tip, whatever the
@@ -2970,7 +3002,8 @@ mod successor_tests {
     /// committed view is withheld, and a member of the head session keeps
     /// its worker: the wait says nothing about the session, unlike a node
     /// with no GLOBAL state yet. Once the sync is in, the view shows the
-    /// archive's state (here without the session).
+    /// archive's state (here without the session). Meanwhile its leaders
+    /// are behind: they give their turns up at once.
     #[test]
     fn a_global_sync_between_chunks_withholds_the_view_but_keeps_the_worker() {
         use quil_execution::global_intrinsic::handoff::global_sync_in_progress;
@@ -2979,6 +3012,17 @@ mod successor_tests {
         let (source, _, _) = closing_session(&global, &state, &filter);
         let member = source.members[0].clone();
         assert!(retains_worker(&global, &filter, &member));
+        let behind = ParentSource::new(
+            source.clone(),
+            global.clone(),
+            crdt(),
+            Arc::new(quil_store::testing::InMemoryClockStore::new()) as Arc<dyn ClockStore>,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap()
+        .behind_probe();
+        assert_eq!(behind(), None);
 
         let address = [0xff; 32];
         let archive = Arc::new(HypergraphCrdt::new(
@@ -3024,6 +3068,7 @@ mod successor_tests {
             .err()
             .expect("no committed view between a sync's chunks");
         assert!(global_sync_in_progress(&error), "{error}");
+        assert_eq!(behind(), Some(error.to_string()));
         assert!(
             retains_worker(&global, &filter, &member),
             "the member keeps its worker while the sync installs"
@@ -3038,6 +3083,7 @@ mod successor_tests {
         global.apply_sync_chunk(&mut plan, &rest).unwrap();
         assert_eq!(global.finish_phase_sync(&plan).unwrap(), root);
         let view = CommittedView::capture(&global).unwrap();
+        assert_eq!(behind(), None);
         assert!(handoff::head(&view, &filter).unwrap().is_none());
         assert!(!retains_worker(&global, &filter, &member));
         assert_eq!(worker_retention(&global, &filter, &member), Some(false));

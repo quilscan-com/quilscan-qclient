@@ -1509,6 +1509,22 @@ impl TokenPolicy {
         .is_some()
     }
 
+    /// Whether one confidential operation's proof is cached as rejected: the
+    /// worker verified it and found it invalid. Operations carrying no
+    /// worker proof never are.
+    pub fn verdict_rejected(&self, address: &[u8], bytes: &[u8], tp: u32) -> bool {
+        let Some((application, limits)) = self.worker_request_shape(address, tp) else {
+            return false;
+        };
+        cached_verdict(&verdict_key(
+            &self.network,
+            &application,
+            bytes,
+            limits,
+            self.native_budget,
+        )) == Some(false)
+    }
+
     /// Verify one confidential operation ahead of materialization so the
     /// verdict is cached. The outcome only reports what happened: busy
     /// workers, invalid proofs and unknown types are all re-handled by
@@ -1779,6 +1795,9 @@ impl TokenPolicy {
                 "operation does not commit through the global frame",
             ));
         }
+        if super::global_commit::canonical_owners_active(context.finalized_global_frame) {
+            super::spend_entries::check_owners(&self.network, &application, tp, bytes)?;
+        }
         if tp == TYPE_LATTICE_MINT {
             custom_mint::verify_custom_mint_with_worker(
                 state,
@@ -1808,7 +1827,11 @@ impl TokenPolicy {
 
     /// Global venue of an operation that commits through the global frame: the
     /// global materializer is both executor and committer, so it verifies,
-    /// commits, and places the outputs in one pass.
+    /// commits, and places the outputs in one pass. What the commit refuses
+    /// from GLOBAL state alone (a root GLOBAL does not hold, a consumed
+    /// marker, a claimed escrow, ...) it refuses before the proof, with the
+    /// commit's own error: either refusal fails the operation, so only the
+    /// proof work changes.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_commit_inline(
         &self,
@@ -1821,8 +1844,19 @@ impl TokenPolicy {
         worker: Option<&WorkerVerifier>,
         paid: Option<custom_mint::PaidMintAllowance>,
     ) -> Result<()> {
-        self.dispatch_for_commit(state, context, clock, address, bytes, tp, worker, paid)?;
+        self.preflight(address, bytes, tp)?;
         let application = self.application(address)?;
+        if let Some(refused) = super::commit_apply::refused_before_proof(
+            state,
+            context.frame_number,
+            &self.network,
+            &application,
+            tp,
+            bytes,
+        ) {
+            return Err(refused);
+        }
+        self.dispatch_for_commit(state, context, clock, address, bytes, tp, worker, paid)?;
         super::commit_apply::commit_and_place(
             state,
             context.frame_number,
@@ -1881,6 +1915,14 @@ impl TokenPolicy {
         let finalized = frame
             .checked_sub(1)
             .ok_or_else(|| invalid("mint requires a prior global frame"))?;
+        if super::global_commit::canonical_owners_active(Some(finalized)) {
+            super::spend_entries::check_owners(
+                &self.network,
+                &domains::QUIL_TOKEN,
+                TYPE_LATTICE_MINT,
+                bytes,
+            )?;
+        }
         super::mint::verify_mint_from_clock_with_worker(
             state,
             clock,

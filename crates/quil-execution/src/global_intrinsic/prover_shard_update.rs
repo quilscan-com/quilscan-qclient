@@ -174,13 +174,23 @@ pub fn verify_app_frame_output(frame_header: &FrameHeader, anchor_output: &[u8])
         &frame_header.spends,
     );
     if expected != frame_header.output {
-        return Err(QuilError::Crypto(
-            "frame header attestation: app-shard frame output does not match the \
-             deterministic digest of its header fields"
-                .into(),
-        ));
+        return Err(QuilError::Crypto(format!(
+            "{OUTPUT_NOT_REPRODUCED}the deterministic digest of its header fields"
+        )));
     }
     Ok(())
+}
+
+/// The start of the refusal of a header whose fields do not reproduce its
+/// output ([`output_not_reproduced`]).
+const OUTPUT_NOT_REPRODUCED: &str =
+    "frame header attestation: app-shard frame output does not match ";
+
+/// Whether `error` refused a shard frame header because its fields do not
+/// reproduce its output: a field was rewritten after the frame was certified,
+/// or the frame was never certified at all.
+pub fn output_not_reproduced(error: &QuilError) -> bool {
+    matches!(error, QuilError::Crypto(message) if message.starts_with(OUTPUT_NOT_REPRODUCED))
 }
 
 fn verify_genesis_app_frame_output(frame_header: &FrameHeader) -> Result<()> {
@@ -343,6 +353,24 @@ pub fn verify_frame_header_session(
                 }
                 members.push(info);
             }
+            let epoch = quil_types::consensus::epoch_for_frame(frame_header.global_frame_number);
+            super::storage_seat::require_sealed_participant(
+                state,
+                &frame_header.prover,
+                &frame_header.address,
+                global_frame,
+                epoch,
+            )?;
+            for key in &verified.certificate.signers {
+                let address = prover_address_from_pubkey(key)?;
+                super::storage_seat::require_sealed_participant(
+                    state,
+                    &address,
+                    &frame_header.address,
+                    global_frame,
+                    epoch,
+                )?;
+            }
             let mut bitmask = Vec::new();
             for key in &verified.certificate.signers {
                 let index = verified.session.members.binary_search(key).map_err(|_| {
@@ -361,6 +389,25 @@ pub fn verify_frame_header_session(
     }
     let active = registry.get_active_provers(&frame_header.address, legacy_committee_frame)?;
     let bitmask = verify_frame_header_attestation(frame_header, frame_prover, bls, &active)?;
+    let epoch = quil_types::consensus::epoch_for_frame(frame_header.global_frame_number);
+    super::storage_seat::require_sealed_participant(
+        state,
+        &frame_header.prover,
+        &frame_header.address,
+        global_frame,
+        epoch,
+    )?;
+    for (index, member) in active.iter().enumerate() {
+        if quil_consensus::bitmask::bit_is_set(&bitmask, index) {
+            super::storage_seat::require_sealed_participant(
+                state,
+                &member.address,
+                &frame_header.address,
+                global_frame,
+                epoch,
+            )?;
+        }
+    }
     Ok((active, bitmask, None))
 }
 
@@ -983,6 +1030,36 @@ pub fn materialize_prover_shard_update_with_fees(
     storage: Option<&mut StorageFrame>,
     issuance: HeaderIssuance,
 ) -> Result<()> {
+    let storage_epoch = quil_types::consensus::epoch_for_frame(frame_header.global_frame_number);
+    if !frame_header.address.is_empty()
+        && quil_types::consensus::sealed_storage_required_at(current_frame_number)
+        && storage
+            .as_ref()
+            .is_none_or(|storage| storage.epoch != storage_epoch)
+    {
+        return Err(QuilError::InvalidArgument(
+            "sealed storage issuance requires its epoch accounting".into(),
+        ));
+    }
+    super::storage_seat::require_sealed_participant(
+        state,
+        &frame_header.prover,
+        &frame_header.address,
+        current_frame_number,
+        storage_epoch,
+    )?;
+    for &index in participant_bitmask {
+        let member = active_provers
+            .get(index)
+            .ok_or_else(|| QuilError::InvalidArgument("participant outside committee".into()))?;
+        super::storage_seat::require_sealed_participant(
+            state,
+            &member.address,
+            &frame_header.address,
+            current_frame_number,
+            storage_epoch,
+        )?;
+    }
     let session_rings = match &session {
         Some(session) => Some(session_member_rings(
             state,
@@ -1101,7 +1178,13 @@ pub fn materialize_prover_shard_update_with_fees(
     // Hash-proof epochs: issuance shares are held per seat, fees paid below.
     // From the unsealed issuance epoch a participant without a sealed
     // registration is paid its share at once, as before the hash epoch.
-    let pay_unsealed = quil_types::consensus::unsealed_issuance_active(current_frame_number);
+    // That ends with the sealed storage epoch, by the header's anchor epoch
+    // as the participation gate judges it: a header anchored before it pays
+    // as it did there, wherever GLOBAL executes it.
+    let pay_unsealed = quil_types::consensus::unsealed_issuance_active(current_frame_number)
+        || (quil_types::consensus::epoch_for_frame(current_frame_number)
+            >= quil_types::consensus::unsealed_issuance_epoch()
+            && !quil_types::consensus::sealed_storage_required(storage_epoch));
     let held = match storage {
         Some(storage) => Some(hold_storage_shares(
             frame_header,
@@ -1525,7 +1608,7 @@ fn encode_rewarded_shards(
 }
 
 /// Update an allocation's `LastActiveFrameNumber`, and from
-/// `SIGNED_FRAME_ACTIVATION_FRAME` its `LastSignedFrameNumber`: the caller
+/// `signed_frame_activation_frame()` its `LastSignedFrameNumber`: the caller
 /// passes the signers of an app frame this GLOBAL frame includes.
 ///
 /// Go equivalent: `updateAllocationActivity` at
@@ -1541,7 +1624,7 @@ fn update_allocation_activity(
         frame_number,
         prover,
         filter,
-        quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME,
+        quil_types::consensus::signed_frame_activation_frame(),
     )
 }
 
@@ -2563,7 +2646,7 @@ mod tests {
         let last_active_only = |tree: &mut quil_tries::VectorCommitmentTree| {
             materialize_frame_header_activity(tree, 77).unwrap();
         };
-        for activation in [78, quil_types::consensus::SIGNED_FRAME_ACTIVATION_FRAME] {
+        for activation in [78, quil_types::consensus::signed_frame_activation_frame()] {
             let (written, expected) = activity_blobs(77, activation, last_active_only);
             assert_eq!(written, expected, "activation {activation}");
             let tree = rebuild_vertex_tree_from_blob(&written);
@@ -2574,7 +2657,7 @@ mod tests {
             );
             assert_eq!(last_signed, None);
         }
-        // The production path uses the disabled default.
+        // The production path uses the mainnet frame, far above this one.
         let state = make_state();
         let filter = vec![0xAAu8; 32];
         let p = fake_prover(1, 1, 0, &filter);
@@ -2586,6 +2669,35 @@ mod tests {
             .get(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc)
             .unwrap();
         assert_eq!(blob.unwrap(), activity_blobs(77, 78, last_active_only).1);
+    }
+
+    /// The production path records `LastSignedFrameNumber` from the
+    /// scheduled signed-frame activation frame, and not below it.
+    #[test]
+    fn update_allocation_activity_records_last_signed_from_the_scheduled_frame() {
+        let filter = vec![0xABu8; 32];
+        let last_signed = |frame: u64| {
+            let state = make_state();
+            let p = fake_prover(1, 1, 0, &filter);
+            seed_alloc_blob(&state, &p, &filter);
+            update_allocation_activity(&state, frame, &p, &filter).unwrap();
+            let alloc_addr = allocation_address(&p.public_key, &filter).unwrap();
+            let va_disc = vertex_adds_discriminator().unwrap();
+            let blob = state
+                .get(&GLOBAL_INTRINSIC_ADDRESS[..], &alloc_addr, &va_disc)
+                .unwrap()
+                .unwrap();
+            read_field(
+                &rebuild_vertex_tree_from_blob(&blob),
+                "allocation:ProverAllocation",
+                "LastSignedFrameNumber",
+            )
+        };
+        quil_types::consensus::set_signed_frame_activation_frame_for_thread(Some(80));
+        assert_eq!(last_signed(79), None, "below the scheduled frame");
+        assert_eq!(last_signed(80), Some(80u64.to_be_bytes().to_vec()));
+        quil_types::consensus::set_signed_frame_activation_frame_for_thread(None);
+        assert_eq!(last_signed(80), None, "below the mainnet frame by default");
     }
 
     #[test]
@@ -4739,5 +4851,263 @@ mod tests {
                  (receipt {receipt}): claimable credit without a committed spend"
             );
         }
+    }
+    #[test]
+    fn sealed_storage_1393_refuses_unsealed_participants_before_any_payment() {
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1393));
+        let boundary = quil_types::consensus::epoch_start_frame(1393);
+        let state = make_state();
+        let filter = vec![0xB9; 32];
+        let provers: Vec<_> = (1..=2).map(|id| fake_prover(id, 1, 0, &filter)).collect();
+        for prover in &provers {
+            seed_alloc_blob(&state, prover, &filter);
+        }
+        give_seat(&state, &provers[0], &filter, 1393, true);
+        give_seat(&state, &provers[1], &filter, 1393, false);
+        let mut header = fake_header(filter.clone(), 10);
+        header.global_frame_number = boundary;
+        header.prover = provers[0].address.clone();
+        header.fee_total = super::super::frame_header::fee_total_to_bytes(300);
+        let reward: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8000)));
+        let mut storage = StorageFrame {
+            epoch: 1393,
+            ..Default::default()
+        };
+        let run = |participants: &[usize], storage: &mut StorageFrame| {
+            materialize_prover_shard_update_with_fees(
+                &header,
+                boundary,
+                &state,
+                &noop_registry(),
+                &noop_frame_prover(),
+                &reward,
+                4096,
+                provers.clone(),
+                participants,
+                ShardMetadata {
+                    state_size: 1024,
+                    shard_count: 1,
+                },
+                0,
+                None,
+                Some(storage),
+                HeaderIssuance::claimed(&header),
+            )
+        };
+        assert!(run(&[0, 1], &mut storage)
+            .unwrap_err()
+            .to_string()
+            .contains("unsealed storage participant"));
+        assert_eq!(reward_balance(&state, &provers[0]), BigInt::from(0));
+        assert_eq!(reward_balance(&state, &provers[1]), BigInt::from(0));
+        assert_eq!(
+            held_share(&state, &provers[0], &filter, 1393),
+            Some(BigInt::from(0))
+        );
+        give_seat(&state, &provers[1], &filter, 1393, true);
+        run(&[0, 1], &mut storage).unwrap();
+        assert!(held_share(&state, &provers[0], &filter, 1393).unwrap() > BigInt::from(0));
+        assert!(held_share(&state, &provers[1], &filter, 1393).unwrap() > BigInt::from(0));
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+    }
+    /// Materialize `header`, anchored in `epoch`, at GLOBAL frame `frame`
+    /// with every prover of `provers` participating.
+    fn materialize_anchored(
+        state: &HypergraphState,
+        provers: &[ProverInfo],
+        header: &FrameHeader,
+        frame: u64,
+        epoch: u64,
+    ) -> Result<()> {
+        let reward: Arc<dyn RewardIssuance> = Arc::new(StubReward(BigInt::from(8000)));
+        let participants: Vec<usize> = (0..provers.len()).collect();
+        let mut storage = StorageFrame {
+            epoch,
+            ..Default::default()
+        };
+        materialize_prover_shard_update_with_fees(
+            header,
+            frame,
+            state,
+            &noop_registry(),
+            &noop_frame_prover(),
+            &reward,
+            4096,
+            provers.to_vec(),
+            &participants,
+            ShardMetadata {
+                state_size: 1024,
+                shard_count: 1,
+            },
+            0,
+            None,
+            Some(&mut storage),
+            HeaderIssuance::claimed(header),
+        )
+    }
+
+    /// A header anchored in the epoch before the sealed storage epoch was
+    /// signed under that epoch's rules. GLOBAL executing it in the sealed
+    /// epoch's first frame (a late header, a closing seal's drain) judges it
+    /// by its anchor epoch: an unsealed signer neither refuses it nor goes
+    /// unpaid. Judged by the executing frame, every such header and the seal
+    /// draining it were refused, and the shard halted (a release-candidate
+    /// devnet, 2026-11-08).
+    #[test]
+    fn sealed_storage_judges_a_header_anchored_before_it_by_its_anchor_epoch() {
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1393));
+        pay_unsealed_issuance(true);
+        let boundary = quil_types::consensus::epoch_start_frame(1393);
+        let state = make_state();
+        let filter = vec![0xBD; 32];
+        let provers: Vec<_> = (1..=2).map(|id| fake_prover(id, 1, 0, &filter)).collect();
+        for prover in &provers {
+            seed_alloc_blob(&state, prover, &filter);
+        }
+        give_seat(&state, &provers[0], &filter, 1392, true);
+        give_seat(&state, &provers[1], &filter, 1392, false);
+        let mut header = fake_header(filter.clone(), 10);
+        header.global_frame_number = boundary - 1;
+        header.prover = provers[0].address.clone();
+
+        materialize_anchored(&state, &provers, &header, boundary, 1392)
+            .expect("old_anchor_refused");
+        assert!(
+            held_share(&state, &provers[0], &filter, 1392).unwrap() > BigInt::from(0),
+            "the sealed member's share is held in its seat"
+        );
+        assert!(
+            reward_balance(&state, &provers[1]) > BigInt::from(0),
+            "unsealed_not_paid: a header anchored before the sealed storage epoch \
+             pays an unsealed participant at once, as it did in its epoch"
+        );
+        pay_unsealed_issuance(false);
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+    }
+
+    /// A header anchored in the sealed storage epoch is judged by that epoch's
+    /// seat, wherever GLOBAL executes it: a signer sealed only for the epoch
+    /// before is refused, and nothing is paid.
+    #[test]
+    fn sealed_storage_refuses_an_unsealed_signer_of_a_header_anchored_in_it() {
+        use super::super::storage_seat::{self, Seat};
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1393));
+        pay_unsealed_issuance(true);
+        let boundary = quil_types::consensus::epoch_start_frame(1393);
+        let state = make_state();
+        let filter = vec![0xBE; 32];
+        let provers: Vec<_> = (1..=2).map(|id| fake_prover(id, 1, 0, &filter)).collect();
+        for prover in &provers {
+            seed_alloc_blob(&state, prover, &filter);
+        }
+        give_seat(&state, &provers[0], &filter, 1393, true);
+        // Sealed for the epoch before, registered but unsealed for this one.
+        let member = <[u8; 32]>::try_from(provers[1].address.as_slice()).unwrap();
+        let mut seat = Seat::new(member, filter.clone());
+        seat.register(1392, &[vec![]], 10);
+        assert!(seat.seal(1392, 11));
+        seat.register(1393, &[vec![]], 12);
+        storage_seat::write(&state, 12, &seat).unwrap();
+        let mut header = fake_header(filter.clone(), 10);
+        header.global_frame_number = boundary;
+        header.prover = provers[0].address.clone();
+
+        for frame in [boundary, boundary + 1] {
+            let error = materialize_anchored(&state, &provers, &header, frame, 1393)
+                .expect_err("anchor_epoch_admitted");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsealed storage participant for epoch 1393"),
+                "anchor_epoch_admitted: {error}"
+            );
+        }
+        assert_eq!(reward_balance(&state, &provers[1]), BigInt::from(0));
+        pay_unsealed_issuance(false);
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+    }
+    #[test]
+    fn sealed_storage_committed_scan_reads_the_canonical_seats() {
+        use super::super::{materialize, storage_seat};
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1393));
+        let frame = quil_types::consensus::epoch_start_frame(1393);
+        let directory = tempfile::tempdir().unwrap();
+        let db = Arc::new(quil_store::RocksDb::open(directory.path()).unwrap());
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = Arc::new(HypergraphCrdt::new(store, Arc::new(StubProver)));
+        let state = HypergraphState::new(crdt);
+        let filter = vec![0xBC; 32];
+        let mut expected = None;
+        for id in 1..=3 {
+            let mut output =
+                materialize::materialize_prover_join(&vec![id; 585], &[filter.clone()], 1, 0)
+                    .unwrap();
+            crate::global_schema::write_field(
+                &mut output.prover_tree,
+                "prover:Prover",
+                "Status",
+                &[materialize::STATUS_ACTIVE],
+            )
+            .unwrap();
+            state
+                .set(
+                    &GLOBAL_INTRINSIC_ADDRESS,
+                    &output.prover_address,
+                    &vertex_adds_discriminator().unwrap(),
+                    frame - 1,
+                    vertex_tree_to_blob(&output.prover_tree),
+                )
+                .unwrap();
+            for (address, mut tree) in output.allocations {
+                crate::global_schema::write_field(
+                    &mut tree,
+                    "allocation:ProverAllocation",
+                    "Status",
+                    &[materialize::STATUS_ACTIVE],
+                )
+                .unwrap();
+                crate::global_schema::write_field(
+                    &mut tree,
+                    "allocation:ProverAllocation",
+                    "Epoch",
+                    &1393u64.to_be_bytes(),
+                )
+                .unwrap();
+                state
+                    .set(
+                        &GLOBAL_INTRINSIC_ADDRESS,
+                        &address,
+                        &vertex_adds_discriminator().unwrap(),
+                        frame - 1,
+                        vertex_tree_to_blob(&tree),
+                    )
+                    .unwrap();
+            }
+            if id < 3 {
+                let mut seat = storage_seat::Seat::new(output.prover_address, filter.clone());
+                seat.register(1393, &[vec![]], frame - 10);
+                if id == 1 {
+                    seat.seal(1393, frame - 1);
+                    expected = Some(output.prover_address.to_vec());
+                }
+                storage_seat::write(&state, frame - 1, &seat).unwrap();
+            }
+        }
+        state.commit().unwrap();
+        state.crdt().commit(frame - 1).unwrap();
+        let scan = crate::prover_registry::CommittedProverScan::try_scan(state.crdt()).unwrap();
+        assert_eq!(
+            scan.all_on_filter(&filter).len(),
+            3,
+            "the test persisted all allocations"
+        );
+        assert_eq!(
+            scan.active_on_filter(&filter, frame)
+                .into_iter()
+                .map(|(_, address)| address)
+                .collect::<Vec<_>>(),
+            vec![expected.unwrap()]
+        );
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
     }
 }

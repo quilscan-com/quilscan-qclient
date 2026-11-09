@@ -22,11 +22,27 @@
 //! Each check catches a leaf whose records or coverage are wrong in a share ε
 //! of its entries with probability ε, by entry rather than by byte (sizes are
 //! not authenticated), every epoch it is sealed.
+//!
+//! A registration may pad the data with zero nodes (decided 2026-10-26). From
+//! the storage padding bound epoch
+//! ([`quil_types::consensus::storage_padding_bound_at`]) the binding opens the
+//! first padding node and shows every node from it on zero
+//! ([`verify_zero_padding`]): the seal checks only that the replica is data
+//! plus labels, so padding left unchecked could be the negated last labels,
+//! a replica of zeros there that answers the frames' openings unkept. From
+//! the same epoch it opens record 0 and requires its value to start at
+//! offset 0, and adds offsets checked: shifting every offset would leave a
+//! gap before the first value, inside the data, that no check opens.
 
 use quil_crypto::storage_hash::{self, DATA_BYTES_PER_NODE};
-use quil_crypto::storage_proof::{padded_nodes_allowed, verify_path, Node, Tree, MIN_NODES};
+use quil_crypto::storage_proof::{
+    padded_nodes_allowed, verify_path, verify_zero_padding, Node, Tree, MIN_NODES,
+};
 use quil_forest::subtree_proof::{same_root, subtree_root, CompactProof};
 use sha3::{Digest as _, Sha3_256};
+
+mod sparse;
+pub use sparse::{prove_sparse, BindingSource, SparseData};
 
 /// The leaf-data encoding of hash-proof epochs.
 pub const LEAF_DATA_VERSION: u8 = 0x03;
@@ -154,6 +170,13 @@ pub struct LeafClaim<'a> {
 }
 
 impl LeafClaim<'_> {
+    fn allows_nodes(&self, exact: u64) -> bool {
+        if quil_types::consensus::persistent_storage_at(self.epoch) {
+            quil_crypto::persistent_storage::padded_nodes_allowed(exact, self.n)
+        } else {
+            padded_nodes_allowed(exact, self.n)
+        }
+    }
     fn challenge(&self, kind: u8, index: u64) -> [u8; 32] {
         let mut h = Sha3_256::new();
         h.update(DST_BINDING);
@@ -285,8 +308,15 @@ pub struct LeafBinding {
     pub header: Vec<Opening>,
     /// The last record's nodes, which fix where the values end.
     pub last: Vec<Opening>,
+    /// From the storage padding bound epoch, when the leaf has more than one
+    /// entry: record 0's nodes, which fix where the values start (with one
+    /// entry, record 0 is `last`).
+    pub first: Vec<Opening>,
     pub records: Vec<RecordCheck>,
     pub coverage: Vec<CoverageCheck>,
+    /// From the storage padding bound epoch, when the registration pads the
+    /// data: the first node past it, which shows every padding node zero.
+    pub padding: Option<Opening>,
 }
 
 /// Why a binding does not hold.
@@ -336,11 +366,22 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
         Ok(record)
     };
     let values_start = header_count + RECORD_NODES * entries;
+    let bound = quil_types::consensus::storage_padding_bound_at(claim.epoch);
+    // From the bound an offset sum that does not fit refuses the binding;
+    // before it, offsets add as every earlier build adds them.
+    let add = |offset: u64, bytes: u64| -> Result<u64, String> {
+        if bound {
+            offset
+                .checked_add(bytes)
+                .ok_or_else(|| "storage binding: an offset past the values' end".to_string())
+        } else {
+            Ok(offset + bytes)
+        }
+    };
+    let exact;
     if entries == 0 {
-        if !binding.last.is_empty()
-            || !binding.records.is_empty()
-            || !padded_nodes_allowed(node_count(header_count, 0, 0), claim.n)
-        {
+        exact = node_count(header_count, 0, 0);
+        if !binding.last.is_empty() || !binding.records.is_empty() || !claim.allows_nodes(exact) {
             return fail("an empty leaf's size");
         }
     } else {
@@ -348,9 +389,27 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
             return fail("the last record");
         }
         let last = open_record(&binding.last, entries - 1)?;
-        let exact = node_count(header_count, entries, last.offset + last.len as u64);
-        if !padded_nodes_allowed(exact, claim.n) {
+        exact = node_count(header_count, entries, add(last.offset, last.len as u64)?);
+        if !claim.allows_nodes(exact) {
             return fail("the node count is not the index's");
+        }
+        if bound {
+            // The values start at record 0's offset 0, so no node between
+            // the index and the first value goes unopened.
+            let first = if entries == 1 {
+                Some(last)
+            } else if binding.first.is_empty() {
+                None
+            } else {
+                Some(open_record(&binding.first, 0)?)
+            };
+            match first {
+                None => return fail("the first record"),
+                Some(first) if first.offset != 0 => {
+                    return fail("values that do not start at the first record")
+                }
+                Some(_) => {}
+            }
         }
         if binding.records.len() != BINDING_SAMPLES {
             return fail("record checks");
@@ -368,7 +427,9 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
             let record = open_record(&check.records[..RECORD_NODES as usize], j)?;
             if j + 1 < entries {
                 let next = open_record(&check.records[RECORD_NODES as usize..], j + 1)?;
-                if next.key() <= record.key() || next.offset != record.offset + record.len as u64 {
+                if next.key() <= record.key()
+                    || next.offset != add(record.offset, record.len as u64)?
+                {
                     return fail("records out of order or not contiguous");
                 }
             }
@@ -392,16 +453,17 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
             match (&check.value_node, record.len) {
                 (None, 0) => {}
                 (Some(opening), len) if len > 0 => {
-                    let byte = record.offset + claim.value_byte(sample, len);
+                    let byte = add(record.offset, claim.value_byte(sample, len))?;
                     let node = values_start + byte / DATA_BYTES_PER_NODE as u64;
                     let bytes = claim
                         .open(opening, node)
                         .ok_or("storage binding: a value node does not open")?;
                     let node_start = (node - values_start) * DATA_BYTES_PER_NODE as u64;
+                    let end = add(record.offset, len as u64)?;
                     for (k, &b) in bytes.iter().enumerate() {
                         let at = node_start + k as u64;
                         if at >= record.offset
-                            && at < record.offset + len as u64
+                            && at < end
                             && b != check.value[(at - record.offset) as usize]
                         {
                             return fail("a value the data does not hold");
@@ -411,6 +473,18 @@ pub fn verify(claim: &LeafClaim, binding: &LeafBinding) -> Result<(), String> {
                 _ => return fail("a value node"),
             }
         }
+    }
+    match &binding.padding {
+        None if !bound || exact == claim.n => {}
+        Some(opening) if bound && exact < claim.n => {
+            if !verify_zero_padding(claim.n, &claim.comm_d, exact, &opening.node, &opening.path) {
+                return fail("padding that is not zero nodes");
+            }
+        }
+        _ => return fail("the padding opening"),
+    }
+    if !binding.first.is_empty() && (!bound || entries < 2) {
+        return fail("the first record");
     }
     if binding.coverage.len() != BINDING_SAMPLES {
         return fail("coverage checks");
@@ -455,24 +529,52 @@ pub fn prove(
     entries: &[Entry],
     proof_of: &dyn Fn(u8, &[u8; 32]) -> Result<CompactProof, String>,
 ) -> Result<LeafBinding, String> {
+    prove_with_cap(claim, entries, proof_of, None)
+}
+
+/// Reuse the snapshot's data-tree cap when preparing its binding. Every
+/// opened subtree must still match the cap and the registered commitment.
+pub fn prove_with_cap(
+    claim: &LeafClaim,
+    entries: &[Entry],
+    proof_of: &dyn Fn(u8, &[u8; 32]) -> Result<CompactProof, String>,
+    cap: Option<&quil_crypto::storage_proof::MerkleCap>,
+) -> Result<LeafBinding, String> {
     use quil_crypto::storage_proof::{data_nodes, MerkleTree, NODE_BYTES};
     let data = leaf_data(claim.filter, claim.prefix, entries);
     let mut nodes = data_nodes(&data);
     // A registration may pad the data with zero nodes (decided 2026-10-26).
     let exact = (nodes.len() / NODE_BYTES) as u64;
-    if !padded_nodes_allowed(exact, claim.n) {
+    if !claim.allows_nodes(exact) {
         return fail("the registration is not this snapshot's data");
     }
     nodes.resize(claim.n as usize * NODE_BYTES, 0);
-    let tree = MerkleTree::from_nodes(&nodes).ok_or("storage binding: no data tree")?;
-    if tree.commitment(Tree::Data) != claim.comm_d || tree.n() != claim.n {
+    let tree = if cap.is_none() {
+        Some(MerkleTree::from_nodes(&nodes).ok_or("storage binding: no data tree")?)
+    } else {
+        None
+    };
+    let (commitment, n) = match (cap, tree.as_ref()) {
+        (Some(cap), _) => (cap.commitment(Tree::Data), cap.n),
+        (_, Some(tree)) => (tree.commitment(Tree::Data), tree.n()),
+        _ => return fail("no data commitment"),
+    };
+    if commitment != claim.comm_d || n != claim.n {
         return fail("the registration is not this snapshot's data");
     }
+    let invalid = std::cell::Cell::new(false);
     let open = |index: u64| Opening {
         node: nodes[index as usize * NODE_BYTES..][..NODE_BYTES]
             .try_into()
             .expect("a node"),
-        path: tree.path(index),
+        path: if let Some(cap) = cap {
+            cap.path(&nodes, index).unwrap_or_else(|| {
+                invalid.set(true);
+                Vec::new()
+            })
+        } else {
+            tree.as_ref().unwrap().path(index)
+        },
     };
     let header = header_nodes(claim.filter, claim.prefix);
     let count = entries.len() as u64;
@@ -495,6 +597,13 @@ pub fn prove(
         } else {
             Vec::new()
         },
+        first: if quil_types::consensus::storage_padding_bound_at(claim.epoch) && count > 1 {
+            record_nodes(0)
+        } else {
+            Vec::new()
+        },
+        padding: (quil_types::consensus::storage_padding_bound_at(claim.epoch) && exact < claim.n)
+            .then(|| open(exact)),
         ..Default::default()
     };
     if count > 0 {
@@ -537,6 +646,9 @@ pub fn prove(
             None => None,
         };
         proved.coverage.push(CoverageCheck { proof, record });
+    }
+    if invalid.get() {
+        return fail("a binding subtree differs from the cached data cap");
     }
     Ok(proved)
 }
@@ -638,10 +750,18 @@ impl LeafBinding {
                 None => out.push(0),
             }
         }
+        if !self.first.is_empty() || self.padding.is_some() {
+            put_openings(&mut out, &self.first);
+            put_openings(&mut out, self.padding.as_slice());
+        }
         out
     }
 
-    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+    /// Strict inverse of [`Self::to_bytes`] for a seal of `epoch`, which
+    /// carries record 0 and a padding opening only from the storage padding
+    /// bound epoch, after the coverage checks and only when either is there:
+    /// a seal of an earlier epoch parses as it does in a build without it.
+    pub fn from_bytes(data: &[u8], epoch: u64) -> Option<Self> {
         let mut r = Reader { data, at: 0 };
         let header = r.openings()?;
         let last = r.openings()?;
@@ -679,11 +799,24 @@ impl LeafBinding {
             };
             coverage.push(CoverageCheck { proof, record });
         }
+        let (first, padding) =
+            if r.at < data.len() && quil_types::consensus::storage_padding_bound_at(epoch) {
+                let first = r.openings()?;
+                let mut padding = r.openings()?;
+                if padding.len() > 1 || (first.is_empty() && padding.is_empty()) {
+                    return None;
+                }
+                (first, padding.pop())
+            } else {
+                (Vec::new(), None)
+            };
         (r.at == data.len()).then_some(Self {
             header,
             last,
+            first,
             records,
             coverage,
+            padding,
         })
     }
 }

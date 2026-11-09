@@ -20,7 +20,7 @@
 //! `quil_cw_consensus::adapters` — they are generic over the 32-byte `Sha256`
 //! digest, so the `Global*` naming is incidental.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use quil_cw_consensus::adapters::{
@@ -112,6 +112,9 @@ pub struct SessionHost {
     /// of the committed GLOBAL view is on its way
     /// (`HandoffProposer::with_closing_probe`).
     pub closing_probe: Option<quil_cw_consensus::handoff::automaton::ClosingProbe>,
+    /// Says why this member is behind for longer than a leader's parent
+    /// waits (`HandoffProposer::with_behind_probe`).
+    pub behind: Option<quil_cw_consensus::handoff::automaton::BehindProbe>,
 }
 
 /// Build the full `AppShardFrame` from a produced consensus state + the leader's
@@ -344,6 +347,10 @@ pub struct FinalizedRecords {
     directory: std::path::PathBuf,
 }
 
+/// One record [`FinalizedRecords`] loads: `(frame_number, frame bytes, cert,
+/// locally_verified)`, with no cert for an implied ancestor.
+type FinalizedRecord = (u64, Vec<u8>, Option<Vec<u8>>, bool);
+
 impl FinalizedRecords {
     pub fn open(directory: std::path::PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(&directory)?;
@@ -356,6 +363,47 @@ impl FinalizedRecords {
 
     fn implied_path(&self, frame_number: u64) -> std::path::PathBuf {
         self.directory.join(format!("{frame_number:020}.implied"))
+    }
+
+    /// Where a record of `frame` goes: `slot`, its frame number's file,
+    /// unless that holds another frame's record and this one is not
+    /// verified: then a file of its own beside it, named by the frame's
+    /// hash. A body under a certified digest this node did not verify can
+    /// claim any frame number; replacing the record let it put the honest
+    /// frame of that number, not yet materialized, out of the replay after a
+    /// restart. Both replay, and the engine checks the unverified ones.
+    fn slot_for(
+        slot: std::path::PathBuf,
+        verified: bool,
+        frame: &[u8],
+        held_frame: fn(&[u8]) -> Option<&[u8]>,
+    ) -> std::path::PathBuf {
+        if verified {
+            return slot;
+        }
+        let Ok(present) = std::fs::read(&slot) else {
+            return slot;
+        };
+        if held_frame(&present).is_none_or(|held| held == frame) {
+            return slot;
+        }
+        use sha2::Digest as _;
+        let hash = sha2::Sha256::digest(frame);
+        let mut name = slot.into_os_string();
+        name.push(format!(".{}", hex::encode(&hash[..8])));
+        name.into()
+    }
+
+    /// The frame bytes of a record [`Self::persist`] wrote.
+    fn certified_frame(record: &[u8]) -> Option<&[u8]> {
+        let (cert_len, rest) = record.split_first_chunk::<4>()?;
+        let cert_len = u32::from_be_bytes(*cert_len) as usize;
+        rest.get(cert_len..)?.get(1..)
+    }
+
+    /// The frame bytes of a record [`Self::persist_implied`] wrote.
+    fn implied_frame(record: &[u8]) -> Option<&[u8]> {
+        record.get(1..)
     }
 
     fn write_synced(
@@ -388,12 +436,19 @@ impl FinalizedRecords {
         let staged = self
             .directory
             .join(format!("{frame_number:020}.implied-staged"));
-        self.write_synced(&self.implied_path(frame_number), &staged, &record)
+        let path = Self::slot_for(
+            self.implied_path(frame_number),
+            verified,
+            bytes,
+            Self::implied_frame,
+        );
+        self.write_synced(&path, &staged, &record)
     }
 
     /// `cert_len (4, BE) ‖ cert ‖ locally_verified (1) ‖ frame bytes`;
-    /// write-then-rename, synced. The latest delivery of a frame number wins;
-    /// an identical record is not rewritten (backpressured deliveries retry).
+    /// write-then-rename, synced. The latest delivery of a frame wins, and
+    /// of a frame number when verified ([`Self::slot_for`]); an identical
+    /// record is not rewritten (backpressured deliveries retry).
     fn persist(
         &self,
         frame_number: u64,
@@ -401,7 +456,12 @@ impl FinalizedRecords {
         verified: bool,
         bytes: &[u8],
     ) -> std::io::Result<()> {
-        let path = self.path(frame_number);
+        let path = Self::slot_for(
+            self.path(frame_number),
+            verified,
+            bytes,
+            Self::certified_frame,
+        );
         let cert_len = u32::try_from(cert.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "certificate too large")
         })?;
@@ -418,6 +478,18 @@ impl FinalizedRecords {
     /// implied ancestor. `None` for anything else, including staged writes.
     fn record_name(path: &std::path::Path) -> Option<(u64, bool)> {
         let name = path.file_name()?.to_str()?;
+        // A record beside its frame number's file ([`Self::slot_for`]).
+        let name = match name.rsplit_once('.') {
+            Some((name, hash))
+                if hash.len() == 16
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+            {
+                name
+            }
+            _ => name,
+        };
         match name.strip_suffix(".implied") {
             Some(number) => Some((number.parse().ok()?, true)),
             None => Some((name.parse().ok()?, false)),
@@ -432,6 +504,18 @@ impl FinalizedRecords {
         &self,
         after: u64,
     ) -> std::io::Result<Vec<(u64, Vec<u8>, Option<Vec<u8>>, bool)>> {
+        Ok(self
+            .load_files_above(after)?
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect())
+    }
+
+    /// [`Self::load_above`], each record with its file.
+    fn load_files_above(
+        &self,
+        after: u64,
+    ) -> std::io::Result<Vec<(std::path::PathBuf, FinalizedRecord)>> {
         let mut records = Vec::new();
         for entry in std::fs::read_dir(&self.directory)? {
             let path = entry?.path();
@@ -452,7 +536,7 @@ impl FinalizedRecords {
             match (named, parsed) {
                 (Some((named, _)), Some(record)) if named == record.0 => {
                     if record.0 > after {
-                        records.push(record);
+                        records.push((path, record));
                     }
                 }
                 _ => {
@@ -460,7 +544,9 @@ impl FinalizedRecords {
                 }
             }
         }
-        records.sort_by_key(|record| (record.0, record.2.is_some()));
+        records.sort_by(|(a_path, a), (b_path, b)| {
+            (a.0, a.2.is_some(), a_path).cmp(&(b.0, b.2.is_some(), b_path))
+        });
         Ok(records)
     }
 
@@ -483,23 +569,16 @@ impl FinalizedRecords {
     /// committee-handoff flag day discarded that history, and every session
     /// frame anchors at or after it. Returns how many were dropped.
     pub(crate) fn discard_anchored_before(&self, activation: u64) -> usize {
-        let Ok(records) = self.load_above(0) else {
+        let Ok(records) = self.load_files_above(0) else {
             return 0;
         };
         let mut dropped = 0;
-        for (number, bytes, cert, _) in records {
+        for (path, (_, bytes, _, _)) in records {
             let anchored = decode_app_frame(&bytes)
                 .and_then(|frame| frame.header)
                 .map_or(0, |h| h.global_frame_number);
-            if anchored < activation {
-                let path = if cert.is_some() {
-                    self.path(number)
-                } else {
-                    self.implied_path(number)
-                };
-                if std::fs::remove_file(path).is_ok() {
-                    dropped += 1;
-                }
+            if anchored < activation && std::fs::remove_file(path).is_ok() {
+                dropped += 1;
             }
         }
         dropped
@@ -574,6 +653,22 @@ impl<P: GlobalProposer> GlobalProposer for PersistingSeals<P> {
         let copy = bytes.clone();
         self.inner.verify_with_context(context, digest, bytes)
             && copy.is_none_or(|bytes| self.keep(&digest, &bytes))
+    }
+    // The inner proposer's own waits (a vote whose parent a GLOBAL state
+    // sync withholds) and its end of patience pass through.
+    fn verify_or_defer(
+        &self,
+        context: ProposalContext,
+        digest: Digest,
+        bytes: Option<Vec<u8>>,
+    ) -> std::result::Result<bool, std::time::Duration> {
+        let copy = bytes.clone();
+        self.inner
+            .verify_or_defer(context, digest, bytes)
+            .map(|verified| verified && copy.is_none_or(|bytes| self.keep(&digest, &bytes)))
+    }
+    fn verify_patience_ran_out(&self, context: ProposalContext, waited: std::time::Duration) {
+        self.inner.verify_patience_ran_out(context, waited)
     }
 }
 
@@ -706,14 +801,19 @@ impl AppSeamProposer {
     /// Build peer ingress without capturing the validated parent-height index.
     /// Peer bytes are candidates until consensus verifies them; the digest does
     /// not authenticate a claimed height. Only validated or recovered frames
-    /// may populate `block_meta`.
-    fn peer_ingress(self: &Arc<Self>, store: BlockStore) -> Arc<dyn Fn(Vec<u8>) + Send + Sync> {
-        Arc::new(move |bytes: Vec<u8>| {
+    /// may populate `block_meta`. A block from a named committee member is
+    /// held as that member's ([`BlockStore::put_from`]).
+    fn peer_ingress(self: &Arc<Self>, store: BlockStore) -> AppBlockIngress {
+        Arc::new(move |bytes: Vec<u8>, sender: Option<&[u8]>| {
+            let hold = |digest: Digest, bytes: Vec<u8>| match sender {
+                Some(sender) => store.put_from(digest, bytes, sender),
+                None => store.put(digest, bytes),
+            };
             if Seal::is_encoding(&bytes) {
-                // A peer's terminal-seal proposal: a replaceable candidate until
-                // this member's own automaton verifies it against its parent.
+                // A peer's terminal-seal proposal: a candidate until this
+                // member's own automaton verifies it against its parent.
                 if let Ok(seal) = Seal::decode(&bytes) {
-                    store.put(digest_from_identity(seal.digest()), bytes);
+                    hold(digest_from_identity(seal.digest()), bytes);
                 }
                 return;
             }
@@ -728,7 +828,7 @@ impl AppSeamProposer {
                 return;
             };
             let frame_number = header.frame_number;
-            store.put(digest, bytes);
+            hold(digest, bytes);
             tracing::debug!(
                 frame = frame_number,
                 "cw app block ingress: stored peer frame"
@@ -1200,6 +1300,30 @@ impl AppSeamProposer {
             );
             return false;
         }
+        if let Some(latest) = self.validator.fee_vote_out_of_bounds_now(&frame) {
+            tracing::warn!(
+                view,
+                frame = header.frame_number,
+                fee_vote = header.fee_multiplier_vote,
+                anchor = header.global_frame_number,
+                latest_global = latest,
+                filter = %hex::encode(&self.filter),
+                leader = %leader.map(hex::encode).unwrap_or_default(),
+                action = "no action needed for a one-off refusal; if the same leader repeats it, report this \
+                          line with its shard and frame to the maintainer",
+                "refused to vote for a shard proposal: its fee vote is outside the bounds every leader computes"
+            );
+            self.note(
+                Step::Verify,
+                view,
+                "fee vote out of range",
+                format!(
+                    "frame {}, vote {}, latest GLOBAL frame {latest}",
+                    header.frame_number, header.fee_multiplier_vote
+                ),
+            );
+            return false;
+        }
         if app_frame_digest(&frame) != Some(digest) {
             tracing::warn!(
                 view,
@@ -1389,6 +1513,8 @@ fn validation_reason(error: &str) -> &'static str {
         "output does not match the header"
     } else if error.contains("timestamp") {
         "timestamp out of range"
+    } else if error.contains("fee multiplier vote") {
+        "fee vote out of range"
     } else {
         "frame validation failed"
     }
@@ -1451,10 +1577,17 @@ impl FrameSink for AppSeamSink {
 // Finalizer (FrameFinalizer seam) — materialize on finalize.
 // ---------------------------------------------------------------------------
 
+/// Frames an [`AppSeamFinalizer`] remembers handing to the engine without
+/// having verified their bodies ([`AppSeamFinalizer::handed`]).
+const HANDED_UNVERIFIED: usize = 256;
+
 /// How long the head of the pending finalizations may stay undeliverable
-/// before the operator is warned, and how often the warning repeats.
-const HEAD_STALL_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
-const HEAD_STALL_REPEAT: std::time::Duration = std::time::Duration::from_secs(600);
+/// before the wait is logged.
+const HEAD_STALL_NOTE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long before the operator is warned: a miss clears by itself well
+/// within this on a healthy node. The warning repeats at this interval too.
+const HEAD_STALL_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+const HEAD_STALL_REPEAT: std::time::Duration = HEAD_STALL_WARN_AFTER;
 
 /// Why a pending finalization was not delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1482,10 +1615,20 @@ impl Held {
 
     fn action(self) -> &'static str {
         match self {
-            Held::BodyMissing => "expected to clear once archive replay materializes the frame; until then this worker follows the shard by archive replay and sends no reward proofs, full frames or closing certificate; report this line if it persists",
+            Held::BodyMissing => "expected to clear once archive replay materializes the frame; until then this worker follows the shard by archive replay and its seat signs little; if it recurs, check this node's link ('app shard body delivery summary' lines); report this line if it persists",
             Held::BodyMismatch => "a peer served other bytes under this digest; report this line if it persists",
             Held::SealNotPersisted => "check free space and permissions of this node's store",
             Held::SinkRefused => "the engine is busy or stalled; check this worker's materialized height",
+        }
+    }
+
+    /// What a head held for this reason waits for, and what ends the wait.
+    fn wait(self) -> &'static str {
+        match self {
+            Held::BodyMissing => "the frame's body has not arrived by gossip; it ends when the body arrives, or once archive replay has passed the frame and a later finalization with a verified body shows it",
+            Held::BodyMismatch => "the stored bytes are not the certified frame; it ends when the certified body arrives",
+            Held::SealNotPersisted => "it ends when the closing certificate is stored",
+            Held::SinkRefused => "it ends when the engine takes the frame",
         }
     }
 }
@@ -1505,6 +1648,8 @@ struct HeadStall {
     digest: Digest,
     view: u64,
     since: std::time::Instant,
+    /// The wait was logged, so its end is too.
+    noted: bool,
     warned: Option<std::time::Instant>,
 }
 
@@ -1515,14 +1660,17 @@ struct DropReport {
     dropped: usize,
     /// The lowest and highest dropped view.
     views: Option<(u64, u64)>,
+    /// Dropped since the head was last looked at, to say how a stall ended.
+    since_head: HashSet<Digest>,
 }
 
 /// What [`AppSeamFinalizer::retry_pending_at`] told the operator.
 #[derive(Debug, PartialEq, Eq)]
 enum HeadSignal {
+    Noted,
     Stalled,
     StillStalled,
-    Cleared,
+    Cleared(&'static str),
 }
 
 /// Materializes finalized app frames + writes candidates on notarize, via
@@ -1547,9 +1695,17 @@ pub struct AppSeamFinalizer {
     /// below it are no longer needed. `None` prunes through each delivered
     /// frame, as before records existed.
     materialized: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// The highest frame number handed to the engine, so a later walk does not
-    /// hand over again an ancestor already queued there.
+    /// The highest frame number handed to the engine with a body this node
+    /// verified, so a later walk does not hand over again an ancestor already
+    /// queued there.
     delivered: std::sync::atomic::AtomicU64,
+    /// The digests of the latest frames handed to the engine with bodies
+    /// this node did not verify, oldest first, at most
+    /// [`HANDED_UNVERIFIED`]. Such a body's frame number is its own claim:
+    /// another member's body under the certified digest can carry the
+    /// leader's output with any number, and the engine refuses it only
+    /// after this. A walk stops at them instead.
+    handed: Mutex<std::collections::VecDeque<Digest>>,
     // Only consensus-validated finalization certificates enter this queue.
     // Repeated reports for the same digest coalesce; bytes stay in BlockStore.
     // The flag marks a finalization this instance reported, or its own
@@ -1566,6 +1722,12 @@ pub struct AppSeamFinalizer {
     scanned: Mutex<Option<(u64, usize)>>,
     /// Entries dropped as already materialized, for the operator.
     drop_report: Mutex<DropReport>,
+    /// This worker's body delivery counts, kept across its consensus hosts.
+    delivery: Arc<crate::app_body_delivery::BodyDelivery>,
+    /// `(generation, members)`, to name the leader of a view in `delivery`.
+    committee: Option<(u64, usize)>,
+    /// Pending finalizations seen without a body, counted once each.
+    missing_bodies: Mutex<HashSet<Digest>>,
 }
 
 impl AppSeamFinalizer {
@@ -1587,12 +1749,50 @@ impl AppSeamFinalizer {
             finalized_records: None,
             materialized: None,
             delivered: std::sync::atomic::AtomicU64::new(0),
+            handed: Default::default(),
             pending: Mutex::new(HashMap::new()),
             reported: Default::default(),
             head_stall: Default::default(),
             scanned: Default::default(),
             drop_report: Default::default(),
+            delivery: Default::default(),
+            committee: None,
+            missing_bodies: Default::default(),
         }
+    }
+
+    /// Count body delivery into `delivery`, naming leaders of the host's
+    /// committee of `members` in generation `epoch`.
+    fn with_body_delivery(
+        mut self,
+        delivery: Arc<crate::app_body_delivery::BodyDelivery>,
+        epoch: u64,
+        members: usize,
+    ) -> Self {
+        self.delivery = delivery;
+        self.committee = Some((epoch, members));
+        self
+    }
+
+    /// Count a finalization's body as missing once. Only a finalization this
+    /// instance reported has a view in its own numbering, naming its leader.
+    fn note_missing_body(&self, digest: Digest, view: u64) {
+        if !self.missing_bodies.lock().unwrap().insert(digest) {
+            return;
+        }
+        let reported = self
+            .pending
+            .lock()
+            .unwrap()
+            .get(&digest)
+            .is_some_and(|(_, _, reported)| *reported);
+        let leader = self
+            .committee
+            .filter(|_| reported)
+            .and_then(|(epoch, members)| {
+                quil_cw_consensus::engine_host::round_robin_leader(epoch, view, members)
+            });
+        self.delivery.body_missing(leader);
     }
 
     /// The lowest view whose finalized body this finalizer still has to
@@ -1674,6 +1874,12 @@ impl AppSeamFinalizer {
         Ok(replayed)
     }
 
+    /// Whether `digest`'s frame was handed to the engine with a body this
+    /// node did not verify ([`Self::handed`]).
+    fn was_handed(&self, digest: &Digest) -> bool {
+        self.handed.lock().unwrap().contains(digest)
+    }
+
     fn prune_delivered(&self, delivered: u64) {
         let through = match self.materialized.as_ref() {
             Some(cursor) => cursor.load(std::sync::atomic::Ordering::SeqCst),
@@ -1718,6 +1924,29 @@ impl AppSeamFinalizer {
         self
     }
 
+    /// The body to deliver for `digest`, with whether this node verified it:
+    /// the sealed one, else the first held body that is this shard's frame,
+    /// or a seal, under `digest`, else the first held body (whose mismatch
+    /// the caller reports). Peer ingress keeps a different later body beside
+    /// the first instead of replacing it ([`BlockStore::put`]), so the
+    /// matching body may be an alternate.
+    fn deliverable_body(&self, digest: &Digest) -> Option<(Vec<u8>, bool)> {
+        let (first, verified) = self.store.get_with_verification(digest)?;
+        if verified {
+            return Some((first, true));
+        }
+        let matching = self.store.candidates(digest).into_iter().find(|bytes| {
+            if Seal::is_encoding(bytes) {
+                return Seal::decode(bytes).is_ok_and(|seal| seal.digest() == digest.0);
+            }
+            decode_app_frame(bytes).is_some_and(|frame| {
+                frame.header.as_ref().map(|h| h.address.as_slice()) == Some(self.filter.as_slice())
+                    && app_frame_digest(&frame) == Some(*digest)
+            })
+        });
+        Some((matching.unwrap_or(first), false))
+    }
+
     /// The ancestors `frame`'s finalization makes final that the engine has
     /// not been handed: every frame from just above the engine's cursor (or
     /// the last delivered frame) up to `frame`'s parent, lowest first, each
@@ -1748,7 +1977,10 @@ impl AppSeamFinalizer {
                 return Vec::new();
             };
             let digest = digest_from_identity(identity);
-            let Some((bytes, verified)) = self.store.get_with_verification(&digest) else {
+            if self.was_handed(&digest) {
+                break;
+            }
+            let Some((bytes, verified)) = self.deliverable_body(&digest) else {
                 return Vec::new();
             };
             if Seal::is_encoding(&bytes) {
@@ -1791,7 +2023,10 @@ impl AppSeamFinalizer {
             return Vec::new();
         }
         let digest = digest_from_identity(seal.checkpoint.digest);
-        let Some((bytes, verified)) = self.store.get_with_verification(&digest) else {
+        if self.was_handed(&digest) {
+            return Vec::new();
+        }
+        let Some((bytes, verified)) = self.deliverable_body(&digest) else {
             return Vec::new();
         };
         if Seal::is_encoding(&bytes) {
@@ -1847,7 +2082,7 @@ impl AppSeamFinalizer {
             return Ok(());
         };
         let view = *view;
-        let Some((bytes, locally_verified)) = self.store.get_with_verification(&digest) else {
+        let Some((bytes, locally_verified)) = self.deliverable_body(&digest) else {
             return Err((Held::BodyMissing, None));
         };
         if Seal::is_encoding(&bytes) {
@@ -1938,11 +2173,22 @@ impl AppSeamFinalizer {
             .collect();
         if (self.on_finalized)(frame, cert.clone(), locally_verified, implied) {
             pending.remove(&digest);
-            if let Some(number) = delivered {
-                self.delivered
-                    .fetch_max(number, std::sync::atomic::Ordering::SeqCst);
-                self.prune_delivered(number);
+            // Only a verified body's frame number counts as delivered; the
+            // engine checks any other before it materializes, and the
+            // materialized cursor then moves.
+            if locally_verified {
+                if let Some(number) = delivered {
+                    self.delivered
+                        .fetch_max(number, std::sync::atomic::Ordering::SeqCst);
+                }
+            } else {
+                let mut handed = self.handed.lock().unwrap();
+                if handed.len() >= HANDED_UNVERIFIED {
+                    handed.pop_front();
+                }
+                handed.push_back(digest);
             }
+            self.prune_delivered(self.delivered.load(std::sync::atomic::Ordering::SeqCst));
             return Ok(());
         }
         Err((Held::SinkRefused, delivered))
@@ -1976,6 +2222,9 @@ impl AppSeamFinalizer {
             // Do not knowingly deliver newer finalizations ahead of a missing
             // earlier body or a backpressured notification.
             if let Err((held, frame)) = self.try_deliver(digest) {
+                if held == Held::BodyMissing {
+                    self.note_missing_body(digest, view);
+                }
                 return Some(Head {
                     view,
                     digest,
@@ -1983,6 +2232,9 @@ impl AppSeamFinalizer {
                     frame,
                     behind: count - index - 1,
                 });
+            }
+            if self.missing_bodies.lock().unwrap().remove(&digest) {
+                self.delivery.body_late();
             }
         }
         None
@@ -2040,11 +2292,14 @@ impl AppSeamFinalizer {
                 report.views = Some(report.views.map_or((*view, *view), |(low, high)| {
                     (low.min(*view), high.max(*view))
                 }));
+                report.since_head.insert(*digest);
+                self.missing_bodies.lock().unwrap().remove(digest);
             }
             !dropped
         });
         let dropped = before - pending.len();
         drop(pending);
+        self.delivery.body_never(dropped as u64);
         report.dropped += dropped;
         if dropped > 0
             && report
@@ -2068,24 +2323,32 @@ impl AppSeamFinalizer {
         report.last = Some(now);
     }
 
-    /// Warn once the same head has been undeliverable for
-    /// [`HEAD_STALL_WARN_AFTER`], again every [`HEAD_STALL_REPEAT`], and say
-    /// when it clears. A missing body with nothing behind it holds nothing
-    /// back: it is the engine's own gap, which the engine reports.
+    /// Log the wait once the same head has been undeliverable for
+    /// [`HEAD_STALL_NOTE_AFTER`], warn at [`HEAD_STALL_WARN_AFTER`] and again
+    /// every [`HEAD_STALL_REPEAT`], and say when and how it clears. A missing
+    /// body with nothing behind it holds nothing back: it is the engine's own
+    /// gap, which the engine reports.
     fn note_head(&self, head: Option<Head>, now: std::time::Instant) -> Option<HeadSignal> {
         let mut stall = self.head_stall.lock().unwrap();
         let mut signal = None;
+        let dropped = std::mem::take(&mut self.drop_report.lock().unwrap().since_head);
         let moved = stall
             .as_ref()
             .is_some_and(|stall| head.as_ref().is_none_or(|head| head.digest != stall.digest));
         if let Some(previous) = stall.take_if(|_| moved) {
-            if previous.warned.is_some() {
+            if previous.noted {
+                let how = if dropped.contains(&previous.digest) {
+                    "dropped"
+                } else {
+                    "delivered"
+                };
+                self.delivery.stall_ended(now);
                 tracing::info!(filter = %hex::encode(&self.filter), view = previous.view,
                     digest = %hex::encode(&previous.digest.0[..4]),
                     stalled_secs = now.saturating_duration_since(previous.since).as_secs(),
-                    materialized = self.materialized_floor(),
-                    "finalized app frame delivery resumed: the pending finalization that held back later ones was delivered or dropped");
-                signal = Some(HeadSignal::Cleared);
+                    materialized = self.materialized_floor(), how,
+                    "finalized app frame delivery resumed: the pending finalization that held back later ones cleared");
+                signal = Some(HeadSignal::Cleared(how));
             }
         }
         let Some(head) = head else {
@@ -2096,11 +2359,25 @@ impl AppSeamFinalizer {
             digest: head.digest,
             view: head.view,
             since: now,
+            noted: false,
             warned: None,
         });
         let stuck = now.saturating_duration_since(stall.since);
+        if stuck < HEAD_STALL_NOTE_AFTER || (head.held == Held::BodyMissing && head.behind == 0) {
+            return signal;
+        }
+        if !stall.noted {
+            stall.noted = true;
+            self.delivery.stall_noted(stall.since);
+            tracing::info!(filter = %hex::encode(&self.filter), view = head.view,
+                digest = %hex::encode(&head.digest.0[..4]),
+                frame = %head.frame.map_or_else(|| "unknown".to_string(), |frame| frame.to_string()),
+                reason = head.held.reason(), materialized = self.materialized_floor(),
+                stalled_secs = stuck.as_secs(), held_back = head.behind, wait = head.held.wait(),
+                "waiting for a pending finalization that holds back later ones: this clears by itself and takes no action");
+            signal = Some(HeadSignal::Noted);
+        }
         if stuck < HEAD_STALL_WARN_AFTER
-            || (head.held == Held::BodyMissing && head.behind == 0)
             || stall
                 .warned
                 .is_some_and(|warned| now.saturating_duration_since(warned) < HEAD_STALL_REPEAT)
@@ -2144,11 +2421,14 @@ impl FrameFinalizer for AppSeamFinalizer {
         // itself never upgrades an unverified candidate into verified data.
         self.reported
             .store(true, std::sync::atomic::Ordering::Release);
-        self.pending
-            .lock()
-            .unwrap()
+        let mut pending = self.pending.lock().unwrap();
+        if !pending.contains_key(&digest) {
+            self.delivery.finalized();
+        }
+        pending
             .entry(digest)
             .or_insert_with(|| (view, cert.unwrap_or_default(), true));
+        drop(pending);
         self.retry_pending();
     }
 }
@@ -2272,10 +2552,19 @@ pub fn restart_finalization(
     Ok(Some(verified))
 }
 
+/// Stores a delivered app block's bytes, naming the committee member that sent
+/// it when known.
+type AppBlockIngress = Arc<dyn Fn(Vec<u8>, Option<&[u8]>) + Send + Sync>;
+
+/// Stores a peer-delivered app block's bytes, naming the committee member
+/// that sent it.
+pub type PeerAppBlockIngress = Arc<dyn Fn(Vec<u8>, &[u8]) + Send + Sync>;
+
 /// The engine's handle to a running simplex-backed app-shard consensus. On each
 /// inbound CW‑tagged shard‑consensus message the node demuxes the channel id:
 /// - channels 0/1/2 (vote/cert/resolver) → `inbound[channel].send(...)`;
-/// - channel 3 (block) → `ingest_block(bytes)` (feeds the shared `BlockStore`).
+/// - channel 3 (block) → `ingest_block(bytes, sender)` (feeds the shared
+///   `BlockStore`).
 pub struct AppConsensusCwHandle {
     /// Declared first so it drops first: the shutdown flag is set before the
     /// inbound senders close, and the host reports a requested stop.
@@ -2285,8 +2574,9 @@ pub struct AppConsensusCwHandle {
     >; 3],
     /// Feed a peer-delivered app frame's bytes into the engine's `BlockStore`
     /// so `verify` finds the block behind a proposed digest. Peer ingress never
-    /// records an unverified height. Drops malformed bytes.
-    pub ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    /// records an unverified height. Drops malformed bytes. The second
+    /// argument is the committee key of the member that sent the block.
+    pub ingest_block: PeerAppBlockIngress,
     /// Cooperative shutdown flag for the simplex host thread. Set it to stop this
     /// instance (the engine drops + the runtime thread returns) — used to REBUILD
     /// the committee when the shard's active-prover set changes.
@@ -2320,7 +2610,7 @@ impl AppConsensusCwHandle {
         AppConsensusCwHandle {
             _stop_on_drop: StopOnDrop(shutdown.clone()),
             inbound: std::array::from_fn(|_| tokio::sync::mpsc::unbounded_channel().0),
-            ingest_block: Arc::new(|_| {}),
+            ingest_block: Arc::new(|_: Vec<u8>, _: &[u8]| {}),
             shutdown,
             adopted_genesis: None,
             finalized: Default::default(),
@@ -2393,6 +2683,7 @@ pub fn activate_app_consensus_cw(
     // across sessions) and the engine's contiguous materialized cursor they
     // are kept until (see [`FinalizedRecords`]).
     finalized_records: Option<(std::path::PathBuf, Arc<std::sync::atomic::AtomicU64>)>,
+    reporting: crate::app_body_delivery::HostReporting,
 ) -> quil_types::error::Result<AppConsensusCwHandle> {
     // An instance that restarts from its certified local head: every legacy
     // instance, and generation zero, which continues one.
@@ -2499,7 +2790,8 @@ pub fn activate_app_consensus_cw(
     if let Some((records, cursor)) = finalized_records {
         finalizer = finalizer.with_finalized_records(records, cursor);
     }
-    let finalizer = Arc::new(finalizer);
+    reporting.delivery.host_started(std::time::Instant::now());
+    let finalizer = Arc::new(finalizer.with_body_delivery(reporting.delivery, epoch, peers.len()));
     // Finalized bodies wait in the store until the engine takes them, in
     // order: keep the window open below the oldest one still waiting.
     store.hold_from({
@@ -2531,6 +2823,7 @@ pub fn activate_app_consensus_cw(
     let mut params = GlobalEngineParams::new(partition, epoch, genesis_digest)
         .with_leader_timeout_secs(leader_timeout_secs);
     params.liveness = session.as_ref().map(|host| host.liveness.clone());
+    params.thread_tag = reporting.thread_tag;
     // A leader skips nullified notarized parents too deep to execute privately.
     params.parent_fallback = private_parents
         .map(|parents| parents as Arc<dyn quil_cw_consensus::engine_host::ParentFallback>);
@@ -2631,6 +2924,7 @@ pub fn activate_app_consensus_cw(
                 .with_seal_parents(store.clone(), host.read_tip)
                 .with_checkpoint_votes(host.checkpoint_votes)
                 .with_closing_probe(host.closing_probe)
+                .with_behind_probe(host.behind)
                 .with_liveness(Some(host.liveness)),
                 bodies: sealed_bodies.clone(),
             }),
@@ -2675,8 +2969,8 @@ pub fn activate_app_consensus_cw(
 
     // Peer ingress can store candidates, but cannot change trusted heights.
     let ingress = proposer.peer_ingress(store.clone());
-    let ingest_block: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |bytes| {
-        ingress(bytes);
+    let ingest_block: PeerAppBlockIngress = Arc::new(move |bytes: Vec<u8>, sender: &[u8]| {
+        ingress(bytes, Some(sender));
         finalizer.retry_pending();
     });
 
@@ -2719,7 +3013,7 @@ mod tests {
         let handle = AppConsensusCwHandle {
             _stop_on_drop: StopOnDrop(shutdown.clone()),
             inbound: std::array::from_fn(|_| tokio::sync::mpsc::unbounded_channel().0),
-            ingest_block: Arc::new(|_| {}),
+            ingest_block: Arc::new(|_: Vec<u8>, _: &[u8]| {}),
             shutdown,
             adopted_genesis: None,
             finalized: Default::default(),
@@ -2766,7 +3060,7 @@ mod tests {
                 tokio::sync::mpsc::unbounded_channel().0,
                 tokio::sync::mpsc::unbounded_channel().0,
             ],
-            ingest_block: Arc::new(|_| {}),
+            ingest_block: Arc::new(|_: Vec<u8>, _: &[u8]| {}),
             shutdown: shutdown.clone(),
             adopted_genesis: None,
             finalized: Default::default(),
@@ -2909,7 +3203,7 @@ mod tests {
         let handle = AppConsensusCwHandle {
             _stop_on_drop: StopOnDrop(shutdown.clone()),
             inbound: std::array::from_fn(|_| tokio::sync::mpsc::unbounded_channel().0),
-            ingest_block: Arc::new(|_| {}),
+            ingest_block: Arc::new(|_: Vec<u8>, _: &[u8]| {}),
             shutdown,
             adopted_genesis: None,
             finalized: Default::default(),
@@ -3617,6 +3911,51 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    /// A body a member delivered under a certified digest this node did not
+    /// verify can claim any frame number. Its record must not replace the
+    /// honest record of that number the engine has not materialized yet, or
+    /// that frame is lost to the replay after a restart; both are kept and
+    /// replayed, and a verified record still replaces its number's.
+    #[test]
+    fn a_forged_frame_number_does_not_replace_an_honest_record() {
+        let directory = test_directory("forged-frame-number");
+        let records = FinalizedRecords::open(directory.clone()).unwrap();
+        let honest = encode_app_frame(&finalized_test_frame(6));
+        let mut forged = finalized_test_frame(6);
+        forged.header.as_mut().unwrap().output = vec![0xf0; 32];
+        let forged = encode_app_frame(&forged);
+        let implied = encode_app_frame(&finalized_test_frame(4));
+        let mut forged_implied = finalized_test_frame(4);
+        forged_implied.header.as_mut().unwrap().output = vec![0xf0; 32];
+        let forged_implied = encode_app_frame(&forged_implied);
+        records.persist(6, &[6; 3], false, &honest).unwrap();
+        records.persist(6, &[9; 3], false, &forged).unwrap();
+        records.persist_implied(4, false, &implied).unwrap();
+        records.persist_implied(4, false, &forged_implied).unwrap();
+        let loaded = FinalizedRecords::open(directory.clone())
+            .unwrap()
+            .load_above(0)
+            .unwrap();
+        assert!(
+            loaded.contains(&(6, honest.clone(), Some(vec![6; 3]), false)),
+            "VULNERABLE: a forged body claiming frame 6 replaced its honest record"
+        );
+        assert!(
+            loaded.contains(&(4, implied.clone(), None, false)),
+            "VULNERABLE: a forged body claiming implied frame 4 replaced its honest record"
+        );
+        assert!(loaded.contains(&(6, forged.clone(), Some(vec![9; 3]), false)));
+        assert_eq!(loaded.len(), 4);
+        records.persist(6, &[6; 3], true, &forged).unwrap();
+        let loaded = records.load_above(0).unwrap();
+        assert!(loaded.contains(&(6, forged.clone(), Some(vec![6; 3]), true)));
+        assert!(!loaded.contains(&(6, honest.clone(), Some(vec![6; 3]), false)));
+        records.prune_through(6);
+        assert!(records.load_above(0).unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     /// A sole-member shard's frame 2: delivery is queued, the process restarts
     /// before the engine materializes it, the next instance finalizes frame 3,
     /// and without replay GLOBAL waits on frame 2 forever.
@@ -3873,6 +4212,89 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    /// A head dropped as materialized says so; one under the 30 s mark never
+    /// logged a wait, so its end stays silent too.
+    #[test]
+    fn a_head_dropped_as_materialized_reports_how_it_ended() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        let directory = test_directory("head-dropped");
+        let frames = linked_frames(5, 9);
+        let digest = |index: usize| app_frame_digest(&frames[index]).unwrap();
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let cursor = Arc::new(std::sync::atomic::AtomicU64::new(5));
+        let (store, finalizer) =
+            gap_host(&directory.join("noted"), cursor.clone(), Default::default());
+        finalizer.on_finalized(16, digest(1), None, Some(vec![6]), true);
+        store.seal(digest(2), encode_app_frame(&frames[2]));
+        finalizer.on_finalized(17, digest(2), None, Some(vec![7]), true);
+        assert_eq!(finalizer.retry_pending_at(at(0)), None);
+        assert_eq!(finalizer.retry_pending_at(at(31)), Some(HeadSignal::Noted));
+        // Archive replay passes frame 6; frame 7's verified body shows it.
+        cursor.store(6, Ordering::SeqCst);
+        assert_eq!(
+            finalizer.retry_pending_at(at(40)),
+            Some(HeadSignal::Cleared("dropped"))
+        );
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+
+        let cursor = Arc::new(std::sync::atomic::AtomicU64::new(5));
+        let (store, finalizer) = gap_host(
+            &directory.join("silent"),
+            cursor.clone(),
+            Default::default(),
+        );
+        finalizer.on_finalized(16, digest(1), None, Some(vec![6]), true);
+        store.seal(digest(2), encode_app_frame(&frames[2]));
+        finalizer.on_finalized(17, digest(2), None, Some(vec![7]), true);
+        assert_eq!(finalizer.retry_pending_at(at(0)), None);
+        cursor.store(6, Ordering::SeqCst);
+        assert_eq!(finalizer.retry_pending_at(at(10)), None);
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// What the summary line counts here: each finalization once, a body that
+    /// came late, one that never came and the leader of the missing ones.
+    #[test]
+    fn body_delivery_counts_late_and_never_delivered_bodies_and_their_leader() {
+        use std::sync::atomic::Ordering;
+        let directory = test_directory("delivery-counts");
+        let frames = linked_frames(5, 9);
+        let digest = |index: usize| app_frame_digest(&frames[index]).unwrap();
+        let delivery = Arc::new(crate::app_body_delivery::BodyDelivery::default());
+        let cursor = Arc::new(std::sync::atomic::AtomicU64::new(5));
+        let (store, finalizer) = gap_host(&directory, cursor.clone(), Default::default());
+        // Generation 2 of 5 members: view 16 is member 3's, view 17 member 4's.
+        let finalizer = Arc::new(finalizer.with_body_delivery(delivery.clone(), 2, 5));
+        let start = std::time::Instant::now();
+        delivery.take_summary(start);
+
+        finalizer.on_finalized(16, digest(1), None, Some(vec![6]), true);
+        finalizer.on_finalized(16, digest(1), None, Some(vec![6]), true);
+        finalizer.retry_pending();
+        store.put(digest(1), encode_app_frame(&frames[1]));
+        finalizer.retry_pending();
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+
+        finalizer.on_finalized(17, digest(2), None, Some(vec![7]), true);
+        store.seal(digest(3), encode_app_frame(&frames[3]));
+        cursor.store(7, Ordering::SeqCst);
+        finalizer.on_finalized(18, digest(3), None, Some(vec![8]), true);
+        assert!(finalizer.pending.lock().unwrap().is_empty());
+        assert!(finalizer.missing_bodies.lock().unwrap().is_empty());
+
+        let summary = delivery
+            .take_summary(start + std::time::Duration::from_secs(300))
+            .unwrap();
+        assert_eq!(summary.finalized, 3, "a repeated report counts once");
+        assert_eq!(summary.body_late, 1);
+        assert_eq!(summary.body_never, 1);
+        assert_eq!(summary.top_leader, Some((3, 1)), "lowest of a tie");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     /// A lost body above the materialized cursor still holds back later
     /// frames: delivering frame 7 first would skip frame 6. Once the body
     /// arrives, both go in order, each recorded before it is handed over.
@@ -4093,6 +4515,157 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    /// A body under a finalized digest that this node never verified names
+    /// its own frame number. Another member's, with the leader's output and
+    /// a far higher number, goes to the engine (which refuses it), but must
+    /// not stop the notarized ancestors of later finalizations from being
+    /// delivered.
+    #[test]
+    fn an_unverified_frame_number_does_not_move_the_delivered_floor() {
+        let directory = test_directory("forged-number");
+        let frames = linked_frames(1, 4);
+        let delivered: Delivered = Default::default();
+        let cursor = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let (store, finalizer) = gap_host(&directory, cursor.clone(), delivered.clone());
+        let digest = app_frame_digest(&frames[1]).unwrap();
+        let mut forged = frames[1].clone();
+        forged.header.as_mut().unwrap().frame_number = 1_000_000;
+        assert_eq!(app_frame_digest(&forged), Some(digest), "rig check");
+        store.put(digest, encode_app_frame(&forged));
+        finalizer.on_finalized(12, digest, None, Some(vec![2]), false);
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            vec![(1_000_000, vec![2], vec![])],
+            "rig check"
+        );
+        // The engine refused it, and the shard sync materialized frame 2.
+        cursor.store(2, std::sync::atomic::Ordering::SeqCst);
+        for frame in &frames[2..] {
+            store.seal(app_frame_digest(frame).unwrap(), encode_app_frame(frame));
+        }
+        finalizer.on_finalized(
+            14,
+            app_frame_digest(&frames[3]).unwrap(),
+            None,
+            Some(vec![4]),
+            true,
+        );
+        assert_eq!(
+            delivered.lock().unwrap().last(),
+            Some(&(4, vec![4], vec![3])),
+            "a forged frame number moved the delivered floor: frame 4's finalization \
+             did not deliver the notarized frame 3 it makes final"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A frame handed to the engine with a body this node did not verify is
+    /// not handed again as the implied parent of a later finalization: its
+    /// own delivery carried it, and the engine has not materialized it yet.
+    #[test]
+    fn a_frame_handed_unverified_is_not_handed_again_as_a_parent() {
+        let directory = test_directory("handed-parent");
+        let frames = linked_frames(1, 3);
+        let delivered: Delivered = Default::default();
+        let (store, finalizer) = implied_host(&directory, 1, delivered.clone());
+        let parent = app_frame_digest(&frames[1]).unwrap();
+        store.put(parent, encode_app_frame(&frames[1]));
+        finalizer.on_finalized(12, parent, None, Some(vec![2]), false);
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            vec![(2, vec![2], vec![])],
+            "rig check"
+        );
+        let child = app_frame_digest(&frames[2]).unwrap();
+        store.seal(child, encode_app_frame(&frames[2]));
+        finalizer.on_finalized(13, child, None, Some(vec![3]), true);
+        assert_eq!(
+            delivered.lock().unwrap().last(),
+            Some(&(3, vec![3], vec![])),
+            "the engine was handed frame 2 twice: again as the parent frame 3 makes final"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A checkpoint frame handed to the engine with a body this node did not
+    /// verify is not handed again with the seal whose finalization makes it
+    /// final.
+    #[test]
+    fn a_checkpoint_handed_unverified_is_not_handed_again_with_its_seal() {
+        use quil_types::crypto::Signer;
+        let signer = quil_crypto::FalconSigner::generate();
+        let session = Session {
+            chain_id: [1; 32],
+            filter: vec![1; 32],
+            generation: 1,
+            genesis: [2; 32],
+            base_frame: 0,
+            authorization: [3; 32],
+            members: vec![signer.public_key().to_vec()],
+        };
+        let frames = linked_frames(1, 3);
+        let checkpoint = &frames[2];
+        let checkpoint_digest = app_frame_digest(checkpoint).unwrap();
+        let seal = Seal {
+            request: [4; 32],
+            session: session.id().unwrap(),
+            view: 20,
+            checkpoint: quil_cw_consensus::handoff::Checkpoint {
+                frame: 3,
+                view: checkpoint.header.as_ref().unwrap().rank,
+                digest: checkpoint_digest.0,
+                state_roots: [[5; 32]; 4],
+                history_root: [6; 32],
+            },
+        };
+        let certificate = crate::test_support::certify_seal(&session, &[signer], &seal);
+        let directory = test_directory("handed-checkpoint");
+        std::fs::create_dir_all(&directory).unwrap();
+        let delivered: Delivered = Default::default();
+        let sealed: Arc<Mutex<Vec<Vec<u64>>>> = Default::default();
+        let (store, finalizer) = gap_host(
+            &directory.join("records"),
+            Arc::new(std::sync::atomic::AtomicU64::new(2)),
+            delivered.clone(),
+        );
+        let on_sealed = sealed.clone();
+        let finalizer = finalizer
+            .with_closing_certificate(Arc::new(
+                crate::closing_certificate::ClosingCertificate::new(
+                    directory.join("certificate"),
+                    session.clone(),
+                ),
+            ))
+            .with_sealed_sink(Arc::new(
+                move |_, _, implied: Vec<(AppShardFrame, bool)>| {
+                    on_sealed.lock().unwrap().push(
+                        implied
+                            .into_iter()
+                            .map(|(frame, _)| frame.header.unwrap().frame_number)
+                            .collect(),
+                    );
+                    true
+                },
+            ));
+        store.put(checkpoint_digest, encode_app_frame(checkpoint));
+        finalizer.on_finalized(13, checkpoint_digest, None, Some(vec![3]), false);
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            vec![(3, vec![3], vec![])],
+            "rig check"
+        );
+        let digest = digest_from_identity(seal.digest());
+        store.seal(digest, seal.encode());
+        finalizer.on_finalized(seal.view, digest, None, Some(certificate), true);
+        assert!(finalizer.pending.lock().unwrap().is_empty(), "rig check");
+        assert_eq!(
+            *sealed.lock().unwrap(),
+            vec![Vec::<u64>::new()],
+            "the engine was handed checkpoint frame 3 twice: again with its seal"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     /// A legacy host drops a finalized seal it can never deliver instead of
     /// holding every later finalization behind it.
     #[test]
@@ -4138,12 +4711,15 @@ mod tests {
         assert!(finalizer.pending.lock().unwrap().is_empty());
     }
 
-    /// The operator hears of a stuck head after 30 s, again every 10 min,
-    /// and when it clears; a missing body with nothing behind it is the
-    /// engine's own gap and stays silent here.
+    /// A stuck head is logged after 30 s, warned of after 10 min and every
+    /// 10 min from then on, and its end says how; a missing body with nothing
+    /// behind it is the engine's own gap and stays silent here.
     #[test]
-    fn a_stuck_head_warns_after_thirty_seconds_repeats_every_ten_minutes_and_reports_its_end() {
+    fn a_stuck_head_logs_at_thirty_seconds_warns_at_ten_minutes_and_reports_how_it_ended() {
+        use crate::outage::test_logs::CapturedLogs;
         use std::time::Duration;
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
         let directory = test_directory("head-stall");
         let frames = linked_frames(5, 7);
         let (_, alone) = implied_host(&directory.join("alone"), 5, Default::default());
@@ -4183,25 +4759,47 @@ mod tests {
         let start = std::time::Instant::now();
         let at = |secs| start + Duration::from_secs(secs);
         assert_eq!(finalizer.retry_pending_at(at(20)), None);
+        assert!(logs
+            .lines_with("waiting for a pending finalization")
+            .is_empty());
+        assert_eq!(finalizer.retry_pending_at(at(31)), Some(HeadSignal::Noted));
+        let noted = logs.lines_with("waiting for a pending finalization");
+        assert_eq!(noted.len(), 1, "{noted:?}");
+        for field in ["INFO", "has not arrived by gossip", "held_back=1"] {
+            assert!(noted[0].contains(field), "{field}: {}", noted[0]);
+        }
+        assert_eq!(finalizer.retry_pending_at(at(590)), None);
+        assert!(logs
+            .lines_with("not reaching this worker's engine")
+            .is_empty());
         assert_eq!(
-            finalizer.retry_pending_at(at(31)),
+            finalizer.retry_pending_at(at(601)),
             Some(HeadSignal::Stalled)
         );
-        assert_eq!(finalizer.retry_pending_at(at(300)), None);
+        let warned = logs.lines_with("not reaching this worker's engine");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("WARN"), "{}", warned[0]);
+        assert!(warned[0].contains("its seat signs little"), "{}", warned[0]);
+        assert!(!warned[0].contains("reward proofs"), "{}", warned[0]);
+        assert_eq!(finalizer.retry_pending_at(at(1200)), None);
         assert_eq!(
-            finalizer.retry_pending_at(at(631)),
+            finalizer.retry_pending_at(at(1201)),
             Some(HeadSignal::StillStalled)
         );
-        assert_eq!(finalizer.retry_pending_at(at(700)), None);
         store.put(
             app_frame_digest(&frames[1]).unwrap(),
             encode_app_frame(&frames[1]),
         );
         assert_eq!(
-            finalizer.retry_pending_at(at(701)),
-            Some(HeadSignal::Cleared)
+            finalizer.retry_pending_at(at(1202)),
+            Some(HeadSignal::Cleared("delivered"))
         );
-        assert_eq!(finalizer.retry_pending_at(at(702)), None);
+        let resumed = logs.lines_with("delivery resumed");
+        assert_eq!(resumed.len(), 1, "{resumed:?}");
+        for field in ["how=\"delivered\"", "stalled_secs=120"] {
+            assert!(resumed[0].contains(field), "{field}: {}", resumed[0]);
+        }
+        assert_eq!(finalizer.retry_pending_at(at(1203)), None);
         assert_eq!(
             delivered
                 .lock()
@@ -4296,7 +4894,7 @@ mod tests {
         let digest = app_frame_digest(&frame).unwrap();
         let honest = encode_app_frame(&frame);
         proposer.note_frame(digest, 7);
-        ingress(honest.clone());
+        ingress(honest.clone(), None);
         assert_eq!(store.get(&digest), Some(honest.clone()));
         // A frame below those already held, such as an unfinalized parent a
         // leader re-sends, is kept under its own digest, still unvalidated.
@@ -4310,7 +4908,7 @@ mod tests {
             ..Default::default()
         };
         let older_digest = app_frame_digest(&older).unwrap();
-        ingress(encode_app_frame(&older));
+        ingress(encode_app_frame(&older), None);
         assert_eq!(
             store.get_with_verification(&older_digest),
             Some((encode_app_frame(&older), false))
@@ -4323,16 +4921,21 @@ mod tests {
         frame.header.as_mut().unwrap().frame_number = u64::MAX / 2;
         assert_eq!(app_frame_digest(&frame), Some(digest));
         let forged = encode_app_frame(&frame);
-        ingress(forged.clone());
-        assert_eq!(store.get(&digest), Some(forged.clone()));
+        ingress(forged.clone(), None);
+        // The first body stays; the different later one waits beside it.
+        assert_eq!(store.get(&digest), Some(honest.clone()));
+        assert_eq!(
+            store.candidates(&digest),
+            vec![honest.clone(), forged.clone()]
+        );
         assert_eq!(proposer.block_meta.lock().unwrap().get(&digest), Some(&7));
         store.seal(digest, honest.clone());
-        ingress(forged);
-        assert_eq!(store.get(&digest), Some(honest));
-        ingress(vec![0xff]);
+        ingress(forged, None);
+        assert_eq!(store.candidates(&digest), vec![honest]);
+        ingress(vec![0xff], None);
         frame.header.as_mut().unwrap().output = vec![4; 32];
         let unknown = app_frame_digest(&frame).unwrap();
-        ingress(encode_app_frame(&frame));
+        ingress(encode_app_frame(&frame), None);
         assert!(!proposer.block_meta.lock().unwrap().contains_key(&unknown));
         let seal = Seal {
             request: [1; 32],
@@ -4347,7 +4950,7 @@ mod tests {
             },
         };
         let bytes = seal.encode();
-        ingress(bytes.clone());
+        ingress(bytes.clone(), None);
         assert_eq!(store.get(&digest_from_identity(seal.digest())), Some(bytes));
         assert_eq!(proposer.block_meta.lock().unwrap().len(), 1);
         assert_eq!(proposer.block_meta.lock().unwrap().get(&digest), Some(&7));
@@ -4450,6 +5053,138 @@ mod tests {
             liveness.decisions().refused.get("block not delivered"),
             Some(&1)
         );
+    }
+
+    /// A frame prices its application writes at the fee vote its leader
+    /// chose. From the fee vote bound frame a member refuses a frame whose
+    /// vote lies outside the bounds every leader computes, zero included,
+    /// and sync refuses it too; inside the bounds, and before the frame, they
+    /// accept it as before. A voter judges by its own latest GLOBAL frame as
+    /// well, so an anchor older than the bound frame does not evade it.
+    #[test]
+    fn a_frame_with_a_fee_vote_out_of_range_is_refused() {
+        use quil_types::store::ClockStore as _;
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let put_global = |number: u64| {
+            let frame = quil_types::proto::global::GlobalFrame {
+                header: Some(quil_types::proto::global::GlobalFrameHeader {
+                    frame_number: number,
+                    output: vec![number as u8; 516],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let txn = clock.new_transaction(false).unwrap();
+            clock.put_global_clock_frame(&frame, txn.as_ref()).unwrap();
+            txn.commit().unwrap();
+        };
+        put_global(5);
+        let filter = vec![1; 32];
+        let validator = Arc::new(
+            BlsAppFrameValidator::new(
+                Arc::new(crate::test_support::TestProverRegistry::default()),
+                Arc::new(quil_crypto::FalconKeyConstructor),
+                Arc::new(quil_crypto::WesolowskiFrameProver::new(2048)),
+            )
+            .with_clock_store(clock.clone()),
+        );
+        let proposer = AppSeamProposer::new(
+            Arc::new(NoProposal),
+            validator.clone(),
+            Arc::new(|_| unreachable!()),
+            filter.clone(),
+            Some(Arc::new(|_| Ok(()))),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let liveness = Arc::new(Liveness::default());
+        let proposer = proposer.with_liveness(Some(liveness.clone()));
+        // A frame anchored at GLOBAL frame 5, valid but for its vote.
+        let frame = |vote: u64| {
+            let mut header = quil_types::proto::global::FrameHeader {
+                address: filter.clone(),
+                frame_number: 7,
+                rank: 43,
+                parent_selector: vec![7; 32],
+                state_roots: vec![vec![0; 32]; 4],
+                global_frame_number: 5,
+                timestamp: 1_000,
+                fee_multiplier_vote: vote,
+                ..Default::default()
+            };
+            header.output = quil_crypto::porep::deterministic_app_frame_output(
+                &header.parent_selector,
+                &header.requests_root,
+                &header.state_roots,
+                &quil_crypto::porep::derive_storage_beacon(5, &[5; 516]),
+                header.frame_number,
+                header.rank,
+                &header.prover,
+                header.difficulty,
+                header.fee_multiplier_vote,
+                header.timestamp,
+                &header.storage_attestation_root,
+                0,
+                &header.settlements,
+                &header.accumulator,
+                &header.spends,
+            );
+            AppShardFrame {
+                header: Some(header),
+                ..Default::default()
+            }
+        };
+        let votes_for = |frame: &AppShardFrame| {
+            proposer.verify(
+                43,
+                digest_from_identity([7; 32]),
+                app_frame_digest(frame).unwrap(),
+                Some(encode_app_frame(frame)),
+            )
+        };
+
+        crate::fees::set_fee_vote_bound_frame_for_thread(Some(6));
+        assert!(votes_for(&frame(0)), "before the bound frame");
+        assert!(validator
+            .validate_linked_without_storage(&frame(0))
+            .unwrap());
+
+        crate::fees::set_fee_vote_bound_frame_for_thread(Some(5));
+        for vote in [0, 1, 89, 111, u64::MAX] {
+            assert!(!votes_for(&frame(vote)), "vote {vote}");
+            liveness.settle(Step::Verify, 43, false);
+            let error = validator
+                .validate_linked_without_storage(&frame(vote))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("fee multiplier vote"), "{error}");
+        }
+        assert_eq!(
+            liveness.decisions().refused.get("fee vote out of range"),
+            Some(&5)
+        );
+        for vote in [90, 100, 110] {
+            assert!(votes_for(&frame(vote)), "vote {vote}");
+            assert!(validator
+                .validate_linked_without_storage(&frame(vote))
+                .unwrap());
+        }
+
+        // Anchored before the bound frame, judged by this voter's head.
+        crate::fees::set_fee_vote_bound_frame_for_thread(Some(6));
+        put_global(6);
+        assert!(
+            !votes_for(&frame(0)),
+            "an older anchor does not evade the bounds"
+        );
+        assert!(votes_for(&frame(100)));
+        assert!(
+            validator
+                .validate_linked_without_storage(&frame(0))
+                .unwrap(),
+            "sync judges by the anchor"
+        );
+        crate::fees::set_fee_vote_bound_frame_for_thread(None);
     }
 
     /// A voter whose latest GLOBAL frame is in the required-anchor epoch
@@ -4715,5 +5450,58 @@ mod tests {
             &app_a,
         )
         .is_none());
+    }
+
+    /// A vote the handoff proposer defers (its parent read withheld while a
+    /// GLOBAL state sync installs) stays deferred through the seal wrapper,
+    /// and the end of its patience reaches the proposer. The wrapper used to
+    /// check such a vote at once, refusing it.
+    #[test]
+    fn the_seal_wrapper_passes_a_deferred_vote_and_its_end_through() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Deferring(AtomicUsize);
+        impl GlobalProposer for Deferring {
+            fn propose(&self, _: u64, _: Digest) -> Option<(Digest, Vec<u8>)> {
+                None
+            }
+            fn verify(&self, _: u64, _: Digest, _: Digest, _: Option<Vec<u8>>) -> bool {
+                false
+            }
+            fn verify_or_defer(
+                &self,
+                _: ProposalContext,
+                _: Digest,
+                _: Option<Vec<u8>>,
+            ) -> std::result::Result<bool, std::time::Duration> {
+                Err(std::time::Duration::from_millis(250))
+            }
+            fn verify_patience_ran_out(&self, _: ProposalContext, _: std::time::Duration) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let wrapper = PersistingSeals {
+            inner: Deferring(AtomicUsize::new(0)),
+            bodies: None,
+        };
+        let context = ProposalContext {
+            epoch: 1,
+            view: 2,
+            parent_view: 1,
+            parent: digest_from_identity([0; 32]),
+            leader: None,
+        };
+        let digest = digest_from_identity([1; 32]);
+        assert!(
+            wrapper
+                .verify_or_defer(context, digest, Some(b"DATA".to_vec()))
+                .is_err(),
+            "a deferral of the wrapped proposer was refused at once"
+        );
+        wrapper.verify_patience_ran_out(context, quil_cw_consensus::adapters::VERIFY_PATIENCE);
+        assert_eq!(
+            wrapper.inner.0.load(Ordering::SeqCst),
+            1,
+            "the end of a vote's patience did not reach the wrapped proposer"
+        );
     }
 }

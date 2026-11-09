@@ -19,7 +19,8 @@ path = "src/bin/blossom_chat.rs"
 
 [features]
 # The replacement (QCT3) token suite is the default node path. Disabling the
-# feature builds a node that rejects every confidential token operation.
+# feature builds a node that cannot verify a confidential token operation and
+# stops at the first frame that carries one.
 default = ["native-proof"]
 confidential-tokens = ["quil-execution/confidential-tokens", "quil-lattice-ct/confidential-tokens"]
 # Fault-injection hooks for scripts/devnet-smoke.sh; never part of a release.
@@ -62,6 +63,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 chrono = "0.4"
 serde_json = "1"
+reqwest = "0.13"
+sysinfo = "0.37.2"
 file-rotate = "0.7"
 anyhow = "1"
 sha2 = "0.10"

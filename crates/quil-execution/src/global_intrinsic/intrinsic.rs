@@ -92,6 +92,55 @@ struct SealDrain {
     complete: bool,
 }
 
+/// What [`GlobalIntrinsic::seal_drain`] requires of drain headers from their
+/// shard and frame numbers alone, checked before any certificate or header
+/// is verified: each from the session's shard `filter`, consecutive, the
+/// first not yet executed numbered `next`, none past the sealed `checkpoint`.
+/// Whether they end at it (complete); else, from the seal recovery frame, a
+/// partial drain of exactly `MAX_DRAIN_HEADERS` headers, one or more not yet
+/// executed.
+fn drain_shape(
+    frame_number: u64,
+    checkpoint: u64,
+    filter: &[u8],
+    mut next: u64,
+    headers: &[super::frame_header::FrameHeader],
+) -> Result<bool> {
+    use super::handoff;
+    let invalid = |message: &str| QuilError::InvalidArgument(format!("seal drain: {message}"));
+    let mut last: Option<u64> = None;
+    let mut drained = 0usize;
+    for op in headers {
+        if op.address != filter {
+            return Err(invalid("header from another shard"));
+        }
+        if last.is_some_and(|previous| op.frame_number != previous.saturating_add(1)) {
+            return Err(invalid("headers are not consecutive"));
+        }
+        last = Some(op.frame_number);
+        if op.frame_number < next {
+            continue;
+        }
+        if op.frame_number > next {
+            return Err(invalid("headers leave a gap after the executed tip"));
+        }
+        next = next.saturating_add(1);
+        drained += 1;
+    }
+    match last {
+        Some(last) if last == checkpoint => Ok(true),
+        Some(last) if last > checkpoint => Err(invalid("headers run past the sealed checkpoint")),
+        _ if frame_number < handoff::seal_recovery_frame() => {
+            Err(invalid("headers do not end at the sealed checkpoint"))
+        }
+        _ if headers.len() != handoff::MAX_DRAIN_HEADERS => Err(invalid(
+            "a partial drain carries exactly the most headers a submission may",
+        )),
+        _ if drained == 0 => Err(invalid(handoff::superseded::PARTIAL_DRAIN_EXECUTED)),
+        _ => Ok(false),
+    }
+}
+
 /// Where a committee session pass spent its time, logged when it is slow.
 struct SessionPassTiming {
     frame: u64,
@@ -463,7 +512,8 @@ impl GlobalIntrinsic {
     /// the frame's epoch at most 10 frames before it
     /// (`verify::validate_prover_op_frame`). ProverConfirm must be signed in
     /// the frame's epoch (`validate_confirm_epoch`). ShardSplit/Merge have
-    /// no per-op replay window. ProverConfirm/Reject's epoch window is a
+    /// the same window from the shard op binding epoch
+    /// (`verify::verify_shard_split`), none before it. ProverConfirm/Reject's epoch window is a
     /// timing constraint relative to JoinFrameNumber, not a freshness gate
     /// (enforced by `validate_confirm_timing`).
     ///
@@ -821,7 +871,12 @@ impl GlobalIntrinsic {
                         "ShardSplit: prover tree unavailable — cannot verify signature".into(),
                     )
                 })?;
-                let sig_ok = match verify::verify_shard_split(&op, pt, self.key_manager.as_ref()) {
+                let sig_ok = match verify::verify_shard_split(
+                    &op,
+                    pt,
+                    self.key_manager.as_ref(),
+                    frame_number,
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(frame = frame_number, error = %e, "validate_message: ShardSplit verify ERRORED → rejected");
@@ -859,7 +914,8 @@ impl GlobalIntrinsic {
                         "ShardMerge: prover tree unavailable — cannot verify signature".into(),
                     )
                 })?;
-                let sig_ok = verify::verify_shard_merge(&op, pt, self.key_manager.as_ref())?;
+                let sig_ok =
+                    verify::verify_shard_merge(&op, pt, self.key_manager.as_ref(), frame_number)?;
                 if !sig_ok {
                     return Ok(false);
                 }
@@ -1021,11 +1077,11 @@ impl GlobalIntrinsic {
                         "FrameHeader: bls_constructor not installed — cannot verify".into(),
                     )
                 })?;
-                Self::require_global_anchor(frame_number, &op)?;
-                // Header fields a certificate does not sign directly (fee
-                // total, settlement relay, ...) must reproduce the certified
-                // output, and a relay must be canonical for its window.
-                self.verify_shard_frame_output(&op)?;
+                // Header fields a certificate does not sign directly (frame
+                // number, fee total, settlement relay, ...) must reproduce
+                // the certified output, and a relay must be canonical for its
+                // window.
+                Self::check_anchor_and_output(self.clock_store.as_deref(), frame_number, &op)?;
                 super::prover_shard_update::verify_settlement_relay(&op)?;
                 // CW path: a simplex-finalized shard frame's sig field
                 // holds the magic-prefixed finalization certificate, not a BLS
@@ -1665,6 +1721,10 @@ impl GlobalIntrinsic {
             super::storage_epoch_proof::TYPE_STORAGE_EPOCH_PROOF => {
                 let proof =
                     super::storage_epoch_proof::StorageEpochProof::from_canonical_bytes(input)?;
+                if super::persistent_storage::capacity_message(&proof) {
+                    let records = self.verify_capacity_certificate(frame_number, &proof, state)?;
+                    return super::persistent_storage::apply(state, frame_number, &records);
+                }
                 let Some(settlements) =
                     self.verify_storage_epoch_proof(frame_number, &proof, state)?
                 else {
@@ -1672,6 +1732,11 @@ impl GlobalIntrinsic {
                 };
                 let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
                 for (part, settlement) in proof.seats.iter().zip(&settlements) {
+                    super::persistent_storage::apply(
+                        state,
+                        frame_number,
+                        &settlement.persistent_records,
+                    )?;
                     for (address, tree) in &settlement.sealed {
                         let blob = crate::prover_registry::vertex_tree_to_blob(tree);
                         state.set(
@@ -2744,10 +2809,18 @@ impl GlobalIntrinsic {
     /// Recompute a shard frame header's deterministic output against the
     /// anchored global frame from this node's clock store.
     fn verify_shard_frame_output(&self, op: &super::frame_header::FrameHeader) -> Result<()> {
+        Self::verify_anchored_output(self.clock_store.as_deref(), op)
+    }
+
+    /// [`Self::verify_shard_frame_output`] against `clock_store`.
+    fn verify_anchored_output(
+        clock_store: Option<&dyn quil_types::store::ClockStore>,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
         if op.global_frame_number == 0 {
             return super::prover_shard_update::verify_app_frame_output(op, &[]);
         }
-        let clock_store = self.clock_store.as_ref().ok_or_else(|| {
+        let clock_store = clock_store.ok_or_else(|| {
             QuilError::Internal(
                 "FrameHeader: clock_store not installed — cannot recompute output".into(),
             )
@@ -2763,6 +2836,24 @@ impl GlobalIntrinsic {
                 ))
             })?;
         super::prover_shard_update::verify_app_frame_output(op, &anchor_output)
+    }
+
+    /// What GLOBAL frame `frame_number` checks of a shard frame header before
+    /// its certificate: it names an anchor, the anchor lies in the frame's
+    /// window, and the header's fields reproduce its output. The certificate
+    /// signs only the view and the output's digest, so until this passes a
+    /// header's other fields, its frame number among them, are claims.
+    /// An error of the unavailable class is a local gap: an anchor in the
+    /// window this node lacks. Any other error refuses the header on every
+    /// node, whatever its certificate.
+    pub fn check_anchor_and_output(
+        clock_store: Option<&dyn quil_types::store::ClockStore>,
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
+        Self::require_global_anchor(frame_number, op)?;
+        Self::refuse_anchor_outside_window(frame_number, op)?;
+        Self::verify_anchored_output(clock_store, op)
     }
 
     /// From the required-anchor epoch GLOBAL frame `frame_number` refuses a
@@ -2785,6 +2876,42 @@ impl GlobalIntrinsic {
             )));
         }
         Ok(())
+    }
+
+    /// GLOBAL frame `frame_number` refuses a shard frame header anchored
+    /// outside its lockstep window ([`super::frame_header::anchor_in_window`])
+    /// before anything reads the anchor. No node may hold such an anchor (a
+    /// future frame, a frame below its history, any number a leader writes),
+    /// and a read that failed would fail the frame on every node, for ever;
+    /// one held is refused by the storage audit anyway. Every node so refuses
+    /// it the same way, and the frame carrying it finishes. An anchor inside
+    /// the window that this node lacks stays unavailable: a local gap.
+    fn refuse_anchor_outside_window(
+        frame_number: u64,
+        op: &super::frame_header::FrameHeader,
+    ) -> Result<()> {
+        use super::frame_header::{
+            anchor_in_window, anchor_window, ANCHOR_AHEAD_OF_WINDOW, ANCHOR_OUTSIDE_WINDOW,
+        };
+        if op.global_frame_number == 0 || anchor_in_window(op.global_frame_number, frame_number) {
+            return Ok(());
+        }
+        let (oldest, newest) = anchor_window(frame_number);
+        let refusal = if op.global_frame_number > newest {
+            ANCHOR_AHEAD_OF_WINDOW
+        } else {
+            ANCHOR_OUTSIDE_WINDOW
+        };
+        Err(QuilError::InvalidArgument(format!(
+            "{refusal}shard {} frame {} anchors to GLOBAL frame {}, but GLOBAL frame {} \
+             requires an anchor in [{}, {}]",
+            hex::encode(&op.address),
+            op.frame_number,
+            op.global_frame_number,
+            frame_number,
+            oldest,
+            newest
+        )))
     }
 
     /// The difficulty of the GLOBAL frame a shard frame header anchors to,
@@ -2847,14 +2974,18 @@ impl GlobalIntrinsic {
         // to `latest − K` (a frame every committee member already holds), which
         // then lags the packing frame by K + transit. The window absorbs that.
         // Still rejects FUTURE anchors (> frame-1) and STALE ones (older than the
-        // window). Hard-reject: an out-of-window op invalidates the whole global
-        // frame (Err → invoke_frame_header → materialize), so a correct leader
-        // includes ONLY shard proofs whose beacon anchors within the window.
+        // window). An out-of-window header is refused (its step rolls back and
+        // the frame skips it); validation and `invoke_frame_header` refuse it
+        // first, by the same predicate, before reading the anchor. A correct
+        // leader includes ONLY shard proofs whose beacon anchors within the
+        // window.
         // `W = STORAGE_ANCHOR_LOCKSTEP_WINDOW` bounds ρ_N staleness (freshness).
-        let expected_anchor = frame_number.saturating_sub(1);
-        let oldest_anchor = expected_anchor
-            .saturating_sub(crate::global_intrinsic::frame_header::STORAGE_ANCHOR_LOCKSTEP_WINDOW);
-        if op.global_frame_number > expected_anchor || op.global_frame_number < oldest_anchor {
+        let (oldest_anchor, expected_anchor) =
+            crate::global_intrinsic::frame_header::anchor_window(frame_number);
+        if !crate::global_intrinsic::frame_header::anchor_in_window(
+            op.global_frame_number,
+            frame_number,
+        ) {
             return Err(QuilError::InvalidArgument(format!(
                 "storage attestation out of lockstep: anchor global_frame_number={} \
                  but global frame {} requires anchor in [{}, {}]",
@@ -3177,28 +3308,23 @@ impl GlobalIntrinsic {
             .iter()
             .map(|bytes| super::frame_header::FrameHeader::from_canonical_bytes(bytes))
             .collect::<Result<Vec<_>>>()?;
-        let by_seal = self.drain_certified_by_seal(frame_number, sealed, state, &headers)?;
         let mut executed = recorded;
         let mut next = executed
             .as_ref()
             .map_or(session.base_frame, |tip| tip.frame)
             .saturating_add(1);
+        let checkpoint = sealed.submission.seal.checkpoint.frame;
+        // Before any certificate: a copy numbered wrong costs no signature.
+        let complete = drain_shape(frame_number, checkpoint, &session.filter, next, &headers)?;
+        let by_seal = self.drain_certified_by_seal(frame_number, sealed, state, &headers)?;
         let mut last: Option<u64> = None;
         let mut drained = 0usize;
         for (op, by_seal) in headers.into_iter().zip(by_seal) {
-            if op.address != session.filter {
-                return Err(invalid("header from another shard"));
-            }
-            if last.is_some_and(|previous| op.frame_number != previous.saturating_add(1)) {
-                return Err(invalid("headers are not consecutive"));
-            }
             last = Some(op.frame_number);
             if op.frame_number < next {
                 continue;
             }
-            if op.frame_number > next {
-                return Err(invalid("headers leave a gap after the executed tip"));
-            }
+            refuse_drain_anchor(frame_number, &op)?;
             if by_seal {
                 self.check_seal_certified_header(frame_number, &op)?;
             } else {
@@ -3254,23 +3380,6 @@ impl GlobalIntrinsic {
             next = next.saturating_add(1);
             drained += 1;
         }
-        let checkpoint = sealed.submission.seal.checkpoint.frame;
-        let complete = match last {
-            Some(last) if last == checkpoint => true,
-            Some(last) if last > checkpoint => {
-                return Err(invalid("headers run past the sealed checkpoint"))
-            }
-            _ if frame_number < handoff::seal_recovery_frame() => {
-                return Err(invalid("headers do not end at the sealed checkpoint"));
-            }
-            _ if sealed.drain.len() != handoff::MAX_DRAIN_HEADERS => {
-                return Err(invalid(
-                    "a partial drain carries exactly the most headers a submission may",
-                ));
-            }
-            _ if drained == 0 => return Err(invalid(handoff::superseded::PARTIAL_DRAIN_EXECUTED)),
-            _ => false,
-        };
         if execute && drained > 0 {
             tracing::info!(
                 frame = frame_number,
@@ -3385,6 +3494,10 @@ impl GlobalIntrinsic {
         proof: &super::storage_epoch_proof::StorageEpochProof,
         state: &HypergraphState,
     ) -> Result<Option<Vec<super::storage_epoch_proof::Settlement>>> {
+        if super::persistent_storage::capacity_message(proof) {
+            self.verify_capacity_certificate(frame_number, proof, state)?;
+            return Ok(Some(Vec::new()));
+        }
         let clock_store = self.clock_store.as_ref().ok_or_else(|| {
             QuilError::Internal("storage epoch proof: clock_store not installed".into())
         })?;
@@ -3418,6 +3531,31 @@ impl GlobalIntrinsic {
             |frame| header(frame).map(|header| header.output),
             |frame| header(frame).map(|header| header.timestamp),
             &context,
+        )
+    }
+
+    fn verify_capacity_certificate(
+        &self,
+        frame: u64,
+        proof: &super::storage_epoch_proof::StorageEpochProof,
+        state: &HypergraphState,
+    ) -> Result<Vec<super::persistent_storage::StateRecord>> {
+        let clock = self.clock_store.as_ref().ok_or_else(|| {
+            QuilError::ExecutionUnavailable("capacity certificate needs GLOBAL headers".into())
+        })?;
+        super::persistent_storage::check_capacity(
+            frame,
+            proof,
+            state,
+            self.key_manager.as_ref(),
+            &|at| {
+                clock
+                    .get_global_clock_frame_header(at)
+                    .map(|header| header.output)
+                    .map_err(|_| {
+                        QuilError::ExecutionUnavailable("capacity beacon header unavailable".into())
+                    })
+            },
         )
     }
 
@@ -3506,6 +3644,7 @@ impl GlobalIntrinsic {
         // mutations but only AFTER the attestation has verified.
         let mut timing = HeaderTiming::start();
         Self::require_global_anchor(frame_number, op)?;
+        Self::refuse_anchor_outside_window(frame_number, op)?;
         let fp = self.frame_prover.as_ref().ok_or_else(|| {
             QuilError::Internal(
                 "invoke_frame_header: frame_prover not installed — cannot verify attestation"
@@ -4051,7 +4190,7 @@ impl GlobalIntrinsic {
             ));
         }
         let prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
-        if !verify::verify_shard_split(op, &prover_tree, self.key_manager.as_ref())? {
+        if !verify::verify_shard_split(op, &prover_tree, self.key_manager.as_ref(), frame_number)? {
             return Err(QuilError::InvalidArgument(
                 "invoke_shard_split: signature verification failed".into(),
             ));
@@ -4155,7 +4294,7 @@ impl GlobalIntrinsic {
             ));
         }
         let prover_tree = crate::prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
-        if !verify::verify_shard_merge(op, &prover_tree, self.key_manager.as_ref())? {
+        if !verify::verify_shard_merge(op, &prover_tree, self.key_manager.as_ref(), frame_number)? {
             return Err(QuilError::InvalidArgument(
                 "invoke_shard_merge: signature verification failed".into(),
             ));
@@ -4787,7 +4926,8 @@ impl GlobalIntrinsic {
             quil_forest::shard_bit_path_from_prefix(prefix)
                 .unwrap_or_else(|| quil_forest::prefix_to_bits(prefix, 6))
         };
-        let mut live: std::collections::HashSet<(Vec<u8>, Vec<bool>)> = store
+        type Grid = std::collections::HashSet<(Vec<u8>, Vec<bool>)>;
+        let mut live: Grid = store
             .range_app_shards()?
             .into_iter()
             .map(|r| (r.shard_key, canon_bits(&r.prefix)))
@@ -4797,7 +4937,7 @@ impl GlobalIntrinsic {
         // the gate would hold it forever) nor reassign anything (the parent's
         // retired slots would be moved onto the live children, overwriting
         // their allocations); the grid step below only consumes its record.
-        let stale_split = |change: &PendingShardChange| -> Result<bool> {
+        let stale_split = |change: &PendingShardChange, live: &Grid| -> Result<bool> {
             if change.kind != ShardChangeKind::Split {
                 return Ok(false);
             }
@@ -4812,56 +4952,219 @@ impl GlobalIntrinsic {
             Ok(removed
                 .is_some_and(|(l2, path)| !live.contains(&(grid_key(&l2), canon_bits(&path)))))
         };
+        // From the shard op binding epoch a due merge must collapse exactly the
+        // live children of its parent: each child in the grid, and no other live
+        // shard inside or above the parent's range. A merge whose children were
+        // split or merged away since, or that a forged or replayed op named,
+        // would otherwise delete live shards and add a parent overlapping the
+        // rest, leaving the grid with overlaps or gaps. Like a stale split it is
+        // consumed without changing the grid. Before the epoch nothing changes.
+        let binding = quil_types::consensus::shard_op_binding_active(frame_number);
+        let stale_merge = |change: &PendingShardChange, live: &Grid| -> bool {
+            if change.kind != ShardChangeKind::Merge || !binding {
+                return false;
+            }
+            let bit_path_mode =
+                change.proposed_frame >= super::materialize::unified_tree_cutover_frame();
+            let Ok(output) = materialize::materialize_shard_merge(
+                &change.children,
+                &change.parent,
+                bit_path_mode,
+            ) else {
+                return true;
+            };
+            let Some((app, parent_path)) = output.added_parent else {
+                return true;
+            };
+            let key = grid_key(&app);
+            let parent_bits = canon_bits(&parent_path);
+            let mut children = Vec::with_capacity(output.removed_shards.len());
+            for (l2, path) in &output.removed_shards {
+                let child = (grid_key(l2), canon_bits(path));
+                if !live.contains(&child) {
+                    return true;
+                }
+                children.push(child);
+            }
+            live.iter().any(|entry| {
+                entry.0 == key
+                    && !children.contains(entry)
+                    && (entry.1.starts_with(&parent_bits) || parent_bits.starts_with(&entry.1))
+            })
+        };
+        // From the same epoch a due split must name the two bit-path siblings
+        // of one branch below its parent, as validate requires of a split
+        // included from the epoch on. A split included before the epoch was
+        // validated without that rule, so a re-wrapped one could name any
+        // filters extending its parent (overlapping, gapped, more than two, a
+        // descent past the limit). Like a stale split it is consumed without
+        // changing the grid; honest proposers emit only such siblings, so their
+        // in-flight splits apply. Its signature never covered the children, so
+        // a re-wrap onto other siblings within the limit still applies.
+        let unbound_split = |change: &PendingShardChange| -> bool {
+            change.kind == ShardChangeKind::Split
+                && binding
+                && verify::require_sibling_children(
+                    "due shard split",
+                    &change.parent,
+                    &change.children,
+                    false,
+                )
+                .is_err()
+        };
+        // Each due change's fate is decided once, in order, before the handoff
+        // gate, and the reassignment and the grid step below keep it, so a
+        // change is gated and reassigned exactly when it applies. From the
+        // binding epoch a change is judged against the grid as the changes
+        // admitted before it this frame leave it, so a duplicate of one of
+        // them is consumed. A change that needs a shard one of them adds waits
+        // a frame: the gate and the reassignment read the committed grid and
+        // allocations, which do not hold that shard yet. Before the epoch the
+        // gate and the reassignment judge splits against the grid the frame
+        // started with, and the grid step against the updated one, as before.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Verdict {
+            Apply,
+            StaleSplit,
+            UnboundSplit,
+            StaleMerge,
+            Defer,
+        }
+        let judge = |change: &PendingShardChange, view: &Grid| -> Result<Verdict> {
+            if !binding {
+                return Ok(if stale_split(change, &live)? {
+                    Verdict::StaleSplit
+                } else {
+                    Verdict::Apply
+                });
+            }
+            Ok(if unbound_split(change) {
+                Verdict::UnboundSplit
+            } else if stale_split(change, view)? {
+                Verdict::StaleSplit
+            } else if stale_merge(change, view) {
+                Verdict::StaleMerge
+            } else if stale_split(change, &live)? || stale_merge(change, &live) {
+                Verdict::Defer
+            } else {
+                Verdict::Apply
+            })
+        };
+        // The grid step's effect of an admitted change on the view.
+        let admit = |change: &PendingShardChange, view: &mut Grid| -> Result<()> {
+            let bit_path_mode =
+                change.proposed_frame >= super::materialize::unified_tree_cutover_frame();
+            let (removed, added) = match change.kind {
+                ShardChangeKind::Split => {
+                    let output = materialize::materialize_shard_split(
+                        &change.parent,
+                        &change.children,
+                        bit_path_mode,
+                    )?;
+                    (
+                        output.removed_parent.into_iter().collect::<Vec<_>>(),
+                        output.new_shards,
+                    )
+                }
+                ShardChangeKind::Merge => {
+                    let output = materialize::materialize_shard_merge(
+                        &change.children,
+                        &change.parent,
+                        bit_path_mode,
+                    )?;
+                    (
+                        output.removed_shards,
+                        output.added_parent.into_iter().collect(),
+                    )
+                }
+            };
+            for (l2, path) in &removed {
+                view.remove(&(grid_key(l2), canon_bits(path)));
+            }
+            for (l2, path) in &added {
+                view.insert((grid_key(l2), canon_bits(path)));
+            }
+            Ok(())
+        };
         // Sources governed by an authorized committee session must seal their
         // final checkpoint first; such a change stays pending until its
         // successors are authorized (see `handoff::schedule`).
+        let policy = quil_types::consensus::committee_handoff_policy();
+        let even = frame_number >= super::materialize::unified_tree_cutover_frame();
+        let mut view = live.clone();
         let mut dropped: Vec<PendingShardChange> = Vec::new();
-        let due: Vec<PendingShardChange> = match quil_types::consensus::committee_handoff_policy() {
-            Some(policy) => {
-                let even = frame_number >= super::materialize::unified_tree_cutover_frame();
-                let mut ready = Vec::with_capacity(due.len());
-                for change in due {
-                    if stale_split(&change)? {
-                        ready.push(change);
+        let mut ready: Vec<(PendingShardChange, Verdict)> = Vec::with_capacity(due.len());
+        for change in due {
+            // Before the epoch a network without a handoff policy judged
+            // nothing here.
+            let verdict = if binding || policy.is_some() {
+                judge(&change, &view)?
+            } else {
+                Verdict::Apply
+            };
+            match verdict {
+                Verdict::Apply => {}
+                Verdict::Defer => {
+                    tracing::warn!(
+                        parent = hex::encode(&change.parent),
+                        children = %change.children.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                        kind = ?change.kind,
+                        effective_epoch = change.effective_epoch,
+                        proposed_frame = change.proposed_frame,
+                        frame = frame_number,
+                        "apply_due: DEFERRING change that needs a shard another change due this frame adds; it stays pending and is judged again next frame"
+                    );
+                    continue;
+                }
+                _ => {
+                    ready.push((change, verdict));
+                    continue;
+                }
+            }
+            if let Some(policy) = &policy {
+                // A change the scheduler cannot express must not take the
+                // chain down with it: a failed frame here stops the
+                // materializer, and the same change is due again on every
+                // later frame. Undo the attempt, keep the change pending.
+                let checkpoint = state.changeset_len();
+                let size = |filter: &[u8]| self.split_child_size(filter);
+                match super::handoff::schedule::gate_topology_change_sized(
+                    state,
+                    frame_number,
+                    policy,
+                    &change,
+                    scan.as_ref().map(|f| f as _),
+                    even,
+                    &size,
+                ) {
+                    Ok(super::handoff::schedule::TopologyGate::Apply) => {}
+                    Ok(super::handoff::schedule::TopologyGate::Wait) => continue,
+                    Ok(super::handoff::schedule::TopologyGate::Drop) => {
+                        dropped.push(change);
                         continue;
                     }
-                    // A change the scheduler cannot express must not take the
-                    // chain down with it: a failed frame here stops the
-                    // materializer, and the same change is due again on every
-                    // later frame. Undo the attempt, keep the change pending.
-                    let checkpoint = state.changeset_len();
-                    let size = |filter: &[u8]| self.split_child_size(filter);
-                    match super::handoff::schedule::gate_topology_change_sized(
-                        state,
-                        frame_number,
-                        &policy,
-                        &change,
-                        scan.as_ref().map(|f| f as _),
-                        even,
-                        &size,
-                    ) {
-                        Ok(super::handoff::schedule::TopologyGate::Apply) => ready.push(change),
-                        Ok(super::handoff::schedule::TopologyGate::Wait) => {}
-                        Ok(super::handoff::schedule::TopologyGate::Drop) => dropped.push(change),
-                        // Only a DETERMINISTIC refusal is skipped: every
-                        // materializing node computes it identically. A local
-                        // store fault still fails the frame, or one archive would
-                        // skip what the others scheduled.
-                        Err(error) if !matches!(error, QuilError::InvalidArgument(_)) => {
-                            return Err(error)
-                        }
-                        Err(error) => {
-                            state.rollback_to(checkpoint);
-                            tracing::error!(frame = frame_number, parent = hex::encode(&change.parent),
-                                kind = ?change.kind, %error,
-                                "committee handoff: due topology change could not be scheduled; it stays pending");
-                        }
+                    // Only a DETERMINISTIC refusal is skipped: every
+                    // materializing node computes it identically. A local
+                    // store fault still fails the frame, or one archive would
+                    // skip what the others scheduled.
+                    Err(error) if !matches!(error, QuilError::InvalidArgument(_)) => {
+                        return Err(error)
+                    }
+                    Err(error) => {
+                        state.rollback_to(checkpoint);
+                        tracing::error!(frame = frame_number, parent = hex::encode(&change.parent),
+                            kind = ?change.kind, %error,
+                            "committee handoff: due topology change could not be scheduled; it stays pending");
+                        continue;
                     }
                 }
-                ready
             }
-            None => due,
-        };
+            if binding {
+                admit(&change, &mut view)?;
+            }
+            ready.push((change, Verdict::Apply));
+        }
+        let due = ready;
         if !dropped.is_empty() {
             for change in &dropped {
                 store.delete_pending_shard_change(txn, &change.parent, change.effective_epoch)?;
@@ -4875,8 +5178,13 @@ impl GlobalIntrinsic {
             return Ok(Vec::new());
         }
         let mut flipped: Vec<([u8; 32], Vec<bool>)> = Vec::new();
-        for change in &due {
-            if stale_split(change)? {
+        for (change, verdict) in &due {
+            let skip = if binding {
+                *verdict != Verdict::Apply
+            } else {
+                stale_split(change, &live)?
+            };
+            if skip {
                 continue;
             }
             let reassigned = scan
@@ -4899,9 +5207,25 @@ impl GlobalIntrinsic {
             }
         }
 
-        for change in &due {
+        for (change, verdict) in &due {
             match change.kind {
                 ShardChangeKind::Split => {
+                    if *verdict == Verdict::UnboundSplit {
+                        tracing::warn!(
+                            parent = hex::encode(&change.parent),
+                            children = %change.children.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                            effective_epoch = change.effective_epoch,
+                            proposed_frame = change.proposed_frame,
+                            frame = frame_number,
+                            "apply_due: SKIPPING split whose children are not the bit-path siblings of one branch below its parent; consuming the pending record without changing the grid"
+                        );
+                        store.delete_pending_shard_change(
+                            txn,
+                            &change.parent,
+                            change.effective_epoch,
+                        )?;
+                        continue;
+                    }
                     // Decode in the format the children were PROPOSED in (a split
                     // that straddles the cutover keeps its original encoding).
                     let bit_path_mode =
@@ -4916,10 +5240,13 @@ impl GlobalIntrinsic {
                     // DIFFERENT partition on top of the real children (overlapping
                     // shards → provers on "both sides"). Still consume the pending
                     // record below so it stops re-firing.
-                    let parent_in_grid =
-                        output.removed_parent.as_ref().map_or(true, |(l2, path)| {
+                    let parent_in_grid = if binding {
+                        *verdict != Verdict::StaleSplit
+                    } else {
+                        output.removed_parent.as_ref().is_none_or(|(l2, path)| {
                             live.contains(&(grid_key(l2), canon_bits(path)))
-                        });
+                        })
+                    };
                     if !parent_in_grid {
                         tracing::warn!(
                             parent = hex::encode(&change.parent),
@@ -5012,6 +5339,22 @@ impl GlobalIntrinsic {
                     }
                 }
                 ShardChangeKind::Merge => {
+                    if *verdict == Verdict::StaleMerge {
+                        tracing::warn!(
+                            parent = hex::encode(&change.parent),
+                            children = %change.children.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                            effective_epoch = change.effective_epoch,
+                            proposed_frame = change.proposed_frame,
+                            frame = frame_number,
+                            "apply_due: SKIPPING stale merge — its children are not exactly the live shards of its parent; consuming the pending record without changing the grid"
+                        );
+                        store.delete_pending_shard_change(
+                            txn,
+                            &change.parent,
+                            change.effective_epoch,
+                        )?;
+                        continue;
+                    }
                     // Decode in the format the children were PROPOSED in (mirrors
                     // the Split branch's straddle-safe gate).
                     let bit_path_mode =
@@ -5210,6 +5553,47 @@ impl GlobalIntrinsic {
                 timing.lap("early fences");
             }
         }
+        // From the silent fence's first frame, a session whose tip stood
+        // still for K frames because members went silent on every shard is
+        // fenced early without them (`handoff::silence`). The prover scan is
+        // built only when some session is due for that judgement.
+        if super::handoff::silence::evaluates(frame_number) {
+            let stalled = super::handoff::silence::stalled(state, frame_number, &filters)?;
+            timing.lap("silent stalls");
+            if !stalled.is_empty() {
+                if scanned.is_none() {
+                    scanned = Some(timed_prover_scan(hg, &timing.scan_ms)?);
+                }
+                let scan = scanned.as_ref().expect("scanned above");
+                let mut desired = |filter: &[u8]| -> Result<Vec<Vec<u8>>> {
+                    let desired =
+                        super::handoff::schedule::desired_members(scan, filter, frame_number);
+                    let desired =
+                        super::handoff::exclusion::seated(state, frame_number, filter, desired)?;
+                    super::handoff::silence::seated(state, frame_number, filter, desired, scan)
+                };
+                let checkpoint = state.changeset_len();
+                match super::handoff::silence::evaluate(
+                    state,
+                    frame_number,
+                    &stalled,
+                    scan,
+                    &mut desired,
+                ) {
+                    Ok(decisions) => {
+                        if !decisions.is_empty() {
+                            super::handoff::silence::fence(state, frame_number, &decisions)?;
+                        }
+                    }
+                    Err(error) if matches!(error, QuilError::InvalidArgument(_)) => {
+                        state.rollback_to(checkpoint);
+                        tracing::error!(frame = frame_number, %error, "committee silence: silent-prover pass failed; nothing fenced");
+                    }
+                    Err(error) => return Err(error),
+                }
+                timing.lap("silent-prover fences");
+            }
+        }
         // Closing sessions that never sealed are fenced first, so a successor
         // they authorize is visible to the reconciliation below. A fenced
         // membership successor takes the eligibility that reconciliation
@@ -5219,10 +5603,12 @@ impl GlobalIntrinsic {
             if scanned.is_none() {
                 scanned = Some(timed_prover_scan(hg, &eligible_scan_ms)?);
             }
-            let desired = scanned.as_ref().map_or_else(Vec::new, |scan| {
-                super::handoff::schedule::desired_members(scan, filter, frame_number)
-            });
-            super::handoff::exclusion::seated(state, frame_number, filter, desired)
+            let Some(scan) = scanned.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let desired = super::handoff::schedule::desired_members(scan, filter, frame_number);
+            let desired = super::handoff::exclusion::seated(state, frame_number, filter, desired)?;
+            super::handoff::silence::seated(state, frame_number, filter, desired, scan)
         };
         // From the seal successor eligibility frame a sealed membership
         // source's successor waits for this pass, and takes the same
@@ -6699,12 +7085,173 @@ fn storage_reward_withheld(global_frame_number: u64, state_size: u64, attested: 
         && !quil_types::consensus::storage_attestation_paused(epoch)
 }
 
+/// A seal's drain header missed its window, so no window bounds the GLOBAL
+/// frame it names as its anchor, and its output check reads that frame. The
+/// certificate signs the output, which commits to the anchor only through
+/// that frame's output, so nothing else binds the number. Refuse, before
+/// any read, an anchor no node can hold for GLOBAL frame `frame_number`:
+/// that frame or a later one, or one below the network's history
+/// (`handoff::drain_anchor_floor`), or, from the raise's frame, older than
+/// any committee session (`handoff::drain_anchor_floor_at`), which takes in
+/// the holes of the history. Anchor 0 names no frame and reads none; from the
+/// raise's frame it is refused too (`handoff::drain_anchor_required_at`). A
+/// frame between them that this node lacks stays unavailable: a local gap.
+fn refuse_drain_anchor(frame_number: u64, op: &super::frame_header::FrameHeader) -> Result<()> {
+    let anchor = op.global_frame_number;
+    let floor = super::handoff::drain_anchor_floor_at(frame_number);
+    let unanchored = anchor == 0 && !super::handoff::drain_anchor_required_at(frame_number);
+    if unanchored || (floor..frame_number).contains(&anchor) {
+        return Ok(());
+    }
+    note_drain_anchor_refusal(frame_number, op, floor);
+    let why = if anchor == 0 {
+        "which names no frame"
+    } else if (super::handoff::drain_anchor_floor()..frame_number).contains(&anchor) {
+        "older than any committee session"
+    } else {
+        "a frame no node holds"
+    };
+    Err(QuilError::InvalidArgument(format!(
+        "seal drain: shard {} frame {} names GLOBAL anchor {anchor}, {why}: GLOBAL frame \
+         {frame_number} admits anchors {floor} to {}",
+        hex::encode(&op.address),
+        op.frame_number,
+        frame_number.saturating_sub(1),
+    )))
+}
+
+/// At most one line per interval for refused drain anchors, of each kind.
+const DRAIN_ANCHOR_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+static DRAIN_ANCHOR_WARNED: std::sync::Mutex<Option<(std::time::Instant, u64)>> =
+    std::sync::Mutex::new(None);
+
+static DRAIN_ANCHOR_PACKED_WARNED: std::sync::Mutex<Option<(std::time::Instant, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// Whether a refusal at `now` warns, with the refusals quieted since the
+/// last warning; inside the interval it only counts.
+fn drain_anchor_warn_due(
+    last: &mut Option<(std::time::Instant, u64)>,
+    now: std::time::Instant,
+) -> Option<u64> {
+    if let Some((at, quieted)) = last.as_mut() {
+        if now.saturating_duration_since(*at) < DRAIN_ANCHOR_WARN_EVERY {
+            *quieted += 1;
+            return None;
+        }
+    }
+    let quieted = last.as_ref().map_or(0, |(_, quieted)| *quieted);
+    *last = Some((now, 0));
+    Some(quieted)
+}
+
+fn note_drain_anchor_refusal(frame_number: u64, op: &super::frame_header::FrameHeader, floor: u64) {
+    let due = drain_anchor_warn_due(
+        &mut DRAIN_ANCHOR_WARNED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        std::time::Instant::now(),
+    );
+    if let Some(quieted) = due {
+        tracing::info!(
+            frame = frame_number,
+            shard = %hex::encode(&op.address),
+            shard_frame = op.frame_number,
+            anchor = op.global_frame_number,
+            floor,
+            quieted,
+            "seal drain: refused a drain header anchored outside the GLOBAL frames a drain may \
+             name; any peer can send a copy, so this alone names no one; a GLOBAL frame carrying \
+             one warns",
+        );
+    }
+}
+
+/// Whether `error` is [`refuse_drain_anchor`]'s refusal.
+fn is_drain_anchor_refusal(error: &QuilError) -> bool {
+    matches!(
+        error,
+        QuilError::InvalidArgument(reason)
+            if reason.starts_with("seal drain: shard ") && reason.contains(" names GLOBAL anchor ")
+    )
+}
+
+/// `error` came from executing a GLOBAL frame `leader` proposed: when it is a
+/// refused drain anchor, that leader validated what this node refuses, so it
+/// runs a build without the rule or other code. Warn, at most once per
+/// interval and apart from gossiped copies, which cannot quiet it.
+pub fn note_packed_drain_anchor_refusal(frame_number: u64, leader: &[u8], error: &QuilError) {
+    if !is_drain_anchor_refusal(error) {
+        return;
+    }
+    let due = drain_anchor_warn_due(
+        &mut DRAIN_ANCHOR_PACKED_WARNED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        std::time::Instant::now(),
+    );
+    if let Some(quieted) = due {
+        tracing::warn!(
+            frame = frame_number,
+            leader = %hex::encode(leader),
+            quieted,
+            %error,
+            "seal drain: a GLOBAL frame carries a drain header anchored outside the GLOBAL frames \
+             a drain may name, skipped here; its leader runs a build without this rule or other \
+             code: an archive on an older release now holds different state, so upgrade it; \
+             otherwise report this line",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::global_intrinsic::addressed_signature::AddressedSignature;
     use crate::global_schema::{write_field, write_type};
     use quil_types::crypto::KeyType;
+
+    /// Only the drain anchor refusal itself counts as a packed one.
+    #[test]
+    fn a_packed_drain_anchor_refusal_is_told_from_other_refusals() {
+        let refused = |anchor| {
+            refuse_drain_anchor(
+                10,
+                &super::super::frame_header::FrameHeader {
+                    frame_number: 2,
+                    global_frame_number: anchor,
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(refused(0).is_ok(), "no raise here: anchor 0 is admitted");
+        assert!(is_drain_anchor_refusal(&refused(1_000_000).unwrap_err()));
+        for other in [
+            QuilError::InvalidArgument("seal drain: shard 00 frame 2 has no output".into()),
+            QuilError::InvalidArgument("other names GLOBAL anchor 7".into()),
+            QuilError::ExecutionUnavailable(
+                "seal drain: shard 00 frame 2 names GLOBAL anchor 7".into(),
+            ),
+        ] {
+            assert!(!is_drain_anchor_refusal(&other), "{other}");
+        }
+    }
+
+    /// A refused drain anchor warns at once, then once per interval, the
+    /// next warning counting the refusals quieted in between.
+    #[test]
+    fn drain_anchor_refusal_warning_is_bounded_and_counts_the_quieted() {
+        let start = std::time::Instant::now();
+        let mut last = None;
+        assert_eq!(drain_anchor_warn_due(&mut last, start), Some(0));
+        let inside = start + DRAIN_ANCHOR_WARN_EVERY - std::time::Duration::from_secs(1);
+        assert_eq!(drain_anchor_warn_due(&mut last, inside), None);
+        assert_eq!(drain_anchor_warn_due(&mut last, inside), None);
+        let after = start + DRAIN_ANCHOR_WARN_EVERY;
+        assert_eq!(drain_anchor_warn_due(&mut last, after), Some(2));
+        assert_eq!(drain_anchor_warn_due(&mut last, after), None);
+    }
 
     /// The expected epoch-boundary scan (3.7 s for 25,600 allocations) logs
     /// at info; a slow remainder, a slow scan-free pass or a scan past its
@@ -9143,6 +9690,7 @@ mod tests {
                 seats: vec![epoch_proof::SeatClaim {
                     seal_epoch: epoch,
                     seals: vec![epoch_proof::SealedLeaf {
+                        persistent: None,
                         leaf_id: leaf_id.clone(),
                         n: encoded.n,
                         registered,

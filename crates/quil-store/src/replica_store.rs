@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use quil_crypto::storage_proof::{MerkleCap, NODE_BYTES};
 use quil_types::error::{QuilError, Result};
@@ -59,12 +60,30 @@ const HASH_LEAF: u8 = 0x05;
 /// length-prefixed leaf id and chunk index, so opening a node reads one chunk
 /// instead of the whole replica.
 const HASH_NODES: u8 = 0x06;
+/// Optional snapshot-data cap for sparse seal preparation.
+const DATA_CAP: u8 = 0x07;
+/// Latest immutable snapshot fingerprint and its epoch, by logical leaf.
+const SNAPSHOT_REUSE: u8 = 0x08;
 
 /// Nodes per stored chunk: one subtree below the cap, all a member reads of a
 /// replica to open one node of it (`MerkleCap::subtree`).
 pub const CHUNK_NODES: u64 = 1 << quil_crypto::storage_proof::CAP_HEIGHT;
 /// Chunks written per batch: bounds what writing a replica copies at once.
+/// The most a batch holds: fewer on a disk slower than [`WalPace`] allows.
 const CHUNKS_PER_BATCH: usize = 512;
+/// The fewest chunks a batch is cut to ([`WalPace::batch_chunks`]), 1 MiB:
+/// below it a sync's own cost outweighs its bytes. A disk slower than this
+/// a [`REPLICA_SYNC_TARGET`] (20 MB/s) is paced by time instead.
+const MIN_CHUNKS_PER_BATCH: usize = 32;
+/// How long a batch of replica nodes may take the disk to sync
+/// ([`WalPace`]): the store's synced commits sync its write-ahead log, and
+/// every write made before them with it, and a frame's votes wait on about
+/// 8 of them in turn within its 10 s. 50 ms keeps a replica's share to
+/// half of the 100 ms a store fsync is warned at.
+const REPLICA_SYNC_TARGET: Duration = Duration::from_millis(50);
+/// Batch syncs a disk's speed is taken from: their median ignores up to
+/// three slow ones, as behind a compaction.
+const PACE_WINDOW: usize = 8;
 /// Chunks read per range scan when a whole replica is loaded.
 const CHUNKS_PER_SCAN: u64 = 256;
 /// A table file at least this large under replica keys holds a whole
@@ -170,6 +189,8 @@ pub struct HashLeaf {
     pub cap: MerkleCap,
     pub registration_root: Vec<u8>,
     chunk_nodes: u64,
+    /// Immutable chunks retained for an epoch alias; aliases always point directly to the base.
+    source_epoch: Option<u64>,
 }
 
 impl HashLeaf {
@@ -188,7 +209,16 @@ impl HashLeaf {
     fn decode(value: &[u8]) -> Result<Self> {
         let corrupt = || QuilError::Store("a stored replica's leaf record does not decode".into());
         let (&version, rest) = value.split_first().ok_or_else(corrupt)?;
-        if version != HASH_LEAF_VERSION || rest.len() < 12 {
+        if ![HASH_LEAF_VERSION, 2].contains(&version) || rest.len() < 12 {
+            return Err(corrupt());
+        }
+        let (source_epoch, rest) = if version == 2 {
+            let epoch = u64::from_be_bytes(rest.get(..8).ok_or_else(corrupt)?.try_into().unwrap());
+            (Some(epoch), &rest[8..])
+        } else {
+            (None, rest)
+        };
+        if rest.len() < 12 {
             return Err(corrupt());
         }
         let n = u64::from_be_bytes(rest[..8].try_into().expect("8 bytes"));
@@ -206,6 +236,7 @@ impl HashLeaf {
             cap,
             registration_root: registration_root.to_vec(),
             chunk_nodes,
+            source_epoch,
         })
     }
 
@@ -329,24 +360,17 @@ fn compact_evicted(db: &Arc<dyn KvDb>, lo: &[u8], hi: &[u8], keep_from: u64, sto
 static BACKGROUND: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
 
 /// One thread of this module's, counted from before it is spawned until it
-/// ends, so a wait started meanwhile sees it.
-struct Background;
+/// ends, so a wait started meanwhile sees it. A process ending through
+/// `exit` waits for it too.
+struct Background {
+    _exit: quil_forest::ExitHold,
+}
 
 impl Background {
     fn start() -> Self {
-        // A process ending through `exit` (a test binary; any normal return
-        // from `main`) first waits for these threads: RocksDB's statics were
-        // registered for teardown before this, so they are torn down after.
-        static AT_EXIT: std::sync::Once = std::sync::Once::new();
-        AT_EXIT.call_once(|| {
-            extern "C" fn wait_at_exit() {
-                wait_for_background_work(std::time::Duration::from_secs(60));
-            }
-            // SAFETY: registers a plain function with no captured state.
-            unsafe { libc::atexit(wait_at_exit) };
-        });
+        let exit = quil_forest::ExitHold::start();
         *BACKGROUND.0.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-        Self
+        Self { _exit: exit }
     }
 }
 
@@ -430,6 +454,71 @@ fn chunk_key(epoch: u64, leaf_id: &[u8], chunk: u32) -> Vec<u8> {
 fn hash_writes() -> &'static Mutex<()> {
     static WRITES: Mutex<()> = Mutex::new(());
     &WRITES
+}
+
+/// How a replica's nodes go into the store, which the consensus commits
+/// share: each batch is synced on its own before the next is written, so
+/// a synced commit of the store's waits behind at most one batch, not
+/// behind every node written since the last (an epoch's replicas are
+/// 1-1.7 GB a seat, written at once). Each sync is timed and the next
+/// batch cut to what the disk synced in [`REPLICA_SYNC_TARGET`] at the
+/// median of the latest; a sync past it is followed by as long a wait,
+/// leaving the disk to the store's commits. A fast disk keeps
+/// [`CHUNKS_PER_BATCH`] and never waits.
+struct WalPace {
+    /// Seconds a byte of the latest [`PACE_WINDOW`] syncs, the oldest
+    /// replaced first.
+    recent: [f64; PACE_WINDOW],
+    /// Syncs timed in all.
+    timed: usize,
+}
+
+impl WalPace {
+    const fn new() -> Self {
+        Self {
+            recent: [0.0; PACE_WINDOW],
+            timed: 0,
+        }
+    }
+
+    /// Chunks of the next batch: what the disk synced in
+    /// [`REPLICA_SYNC_TARGET`] at the median of the latest syncs, from
+    /// [`MIN_CHUNKS_PER_BATCH`] to [`CHUNKS_PER_BATCH`], the most until a
+    /// sync is timed.
+    fn batch_chunks(&self) -> usize {
+        let timed = self.timed.min(PACE_WINDOW);
+        let mut recent = self.recent;
+        let recent = &mut recent[..timed];
+        recent.sort_unstable_by(f64::total_cmp);
+        let Some(&per_byte) = recent.get(timed / 2) else {
+            return CHUNKS_PER_BATCH;
+        };
+        let chunk_bytes = (CHUNK_NODES as usize * NODE_BYTES) as f64;
+        let chunks = REPLICA_SYNC_TARGET.as_secs_f64() / per_byte / chunk_bytes;
+        if chunks >= CHUNKS_PER_BATCH as f64 {
+            return CHUNKS_PER_BATCH;
+        }
+        (chunks as usize).clamp(MIN_CHUNKS_PER_BATCH, CHUNKS_PER_BATCH)
+    }
+
+    /// Time a sync of a batch of `bytes` that `took` (a batch of at least
+    /// [`MIN_CHUNKS_PER_BATCH`]: a replica's smaller end costs more than
+    /// its bytes): returns how long to wait before the next batch, what it
+    /// took past [`REPLICA_SYNC_TARGET`].
+    fn synced(&mut self, bytes: u64, took: Duration) -> Duration {
+        let batch = (MIN_CHUNKS_PER_BATCH * CHUNK_NODES as usize * NODE_BYTES) as u64;
+        if bytes >= batch {
+            self.recent[self.timed % PACE_WINDOW] = took.as_secs_f64() / bytes as f64;
+            self.timed += 1;
+        }
+        took.saturating_sub(REPLICA_SYNC_TARGET)
+    }
+}
+
+/// This process's [`WalPace`]: replica writes take turns ([`hash_writes`]).
+fn wal_pace() -> std::sync::MutexGuard<'static, WalPace> {
+    static PACE: Mutex<WalPace> = Mutex::new(WalPace::new());
+    PACE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 type LeafCacheKey = (usize, u64, Vec<u8>);
@@ -603,31 +692,177 @@ impl ReplicaStore {
         cap: &[u8],
         registration_root: &[u8],
     ) -> Result<()> {
+        if self
+            .referenced_sources(0)?
+            .contains(&(epoch, leaf_id.to_vec()))
+        {
+            return Err(QuilError::Store(
+                "cannot replace a referenced immutable replica".into(),
+            ));
+        }
         if replica.len() % NODE_BYTES != 0 {
             return Err(QuilError::InvalidArgument(
                 "a replica is a whole number of nodes".into(),
             ));
         }
         forget_leaves(|e, id| e == epoch && id == leaf_id);
+        self.db.delete(&meta_key(DATA_CAP, epoch, leaf_id))?;
         self.db.delete(&leaf_key(epoch, leaf_id))?;
         self.db.delete_range(
             &chunk_key(epoch, leaf_id, 0),
             &chunk_key(epoch, leaf_id, u32::MAX),
         )?;
         let chunk_bytes = CHUNK_NODES as usize * NODE_BYTES;
-        for (batch, nodes) in replica.chunks(chunk_bytes * CHUNKS_PER_BATCH).enumerate() {
+        let (mut rest, mut index) = (replica, 0u32);
+        let (mut batches, mut syncing, mut waited) = (0u64, Duration::ZERO, Duration::ZERO);
+        while !rest.is_empty() {
+            let chunks = wal_pace().batch_chunks();
+            let (nodes, after) = rest.split_at(rest.len().min(chunks * chunk_bytes));
             let txn = self.db.new_batch(false)?;
-            for (i, chunk) in nodes.chunks(chunk_bytes).enumerate() {
-                let index = (batch * CHUNKS_PER_BATCH + i) as u32;
+            for chunk in nodes.chunks(chunk_bytes) {
                 txn.set(&chunk_key(epoch, leaf_id, index), chunk)?;
+                index += 1;
             }
             txn.commit()?;
+            // Synced on its own, so the store's next synced commit does not
+            // take it; past the target, the disk is left to them a while.
+            let started = Instant::now();
+            self.db.sync_wal()?;
+            let took = started.elapsed();
+            let wait = wal_pace().synced(nodes.len() as u64, took);
+            std::thread::sleep(wait);
+            (batches, syncing, waited) = (batches + 1, syncing + took, waited + wait);
+            rest = after;
+        }
+        if !waited.is_zero() {
+            tracing::info!(epoch, leaf = %hex::encode(leaf_id), bytes = replica.len(), batches,
+                sync_seconds = syncing.as_secs_f64(), wait_seconds = waited.as_secs_f64(),
+                target_ms = REPLICA_SYNC_TARGET.as_millis() as u64, scope = "this node",
+                "storage replica written to the store in synced batches slower than \
+                 `target_ms` each, waiting as long after each, so the store's synced commits \
+                 do not wait behind it; check this node's disk write speed if this recurs");
         }
         let n = (replica.len() / NODE_BYTES) as u64;
         self.db.set(
             &leaf_key(epoch, leaf_id),
             &HashLeaf::encode(n, cap, registration_root),
         )
+    }
+
+    /// Reuse the same immutable nodes in a later epoch. The source's data cap
+    /// and complete registration are retained; no chunk is copied. Eviction
+    /// pins exactly the base ranges still referenced by a live epoch.
+    pub fn alias_hash(&self, epoch: u64, leaf_id: &[u8], from: u64) -> Result<bool> {
+        if from >= epoch {
+            return Ok(false);
+        }
+        let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(value) = self.db.get(&leaf_key(from, leaf_id))? else {
+            return Ok(false);
+        };
+        let leaf = HashLeaf::decode(&value)?;
+        let Some(cap) = self.db.get(&meta_key(DATA_CAP, from, leaf_id))? else {
+            return Ok(false);
+        };
+        let data = MerkleCap::from_bytes(&cap)
+            .ok_or_else(|| QuilError::Store("invalid source data cap".into()))?;
+        let registered =
+            quil_crypto::storage_proof::parse_registration_root(&leaf.registration_root)
+                .ok_or_else(|| QuilError::Store("invalid source registration".into()))?;
+        if data.n != leaf.n
+            || data.commitment(quil_crypto::storage_proof::Tree::Data) != registered.comm_d
+        {
+            return Err(QuilError::Store(
+                "source data cap differs from registration".into(),
+            ));
+        }
+        if leaf.source_epoch.is_some_and(|base| base >= from) {
+            return Err(QuilError::Store("forward snapshot reference".into()));
+        }
+        let base = leaf.source_epoch.unwrap_or(from);
+        let mut alias = vec![2];
+        alias.extend_from_slice(&base.to_be_bytes());
+        alias.extend_from_slice(&value[if value[0] == 2 { 9 } else { 1 }..]);
+        let txn = self.db.new_batch(false)?;
+        txn.set(&leaf_key(epoch, leaf_id), &alias)?;
+        txn.set(&meta_key(DATA_CAP, epoch, leaf_id), &cap)?;
+        txn.commit()?;
+        forget_leaves(|e, id| e == epoch && id == leaf_id);
+        Ok(true)
+    }
+
+    fn referenced_sources(&self, from: u64) -> Result<std::collections::BTreeSet<(u64, Vec<u8>)>> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut iter = self.db.new_iter(
+            &meta_key(HASH_LEAF, from, &[]),
+            &meta_key(HASH_LEAF + 1, 0, &[]),
+        )?;
+        let mut ok = iter.first();
+        while ok {
+            let key = iter.key();
+            if key.len() < 11 {
+                return Err(QuilError::Store("invalid leaf key".into()));
+            }
+            let epoch = u64::from_be_bytes(key[3..11].try_into().unwrap());
+            // Legacy metadata may contain an evictable incomplete cache; it
+            // cannot pin chunks. Only v2 records carry references.
+            if iter.value().first() != Some(&2) {
+                ok = iter.next();
+                continue;
+            }
+            let leaf = HashLeaf::decode(iter.value())?;
+            if let Some(base) = leaf.source_epoch {
+                if base >= epoch {
+                    return Err(QuilError::Store("invalid replica reference".into()));
+                }
+                out.insert((base, key[11..].to_vec()));
+            }
+            ok = iter.next();
+        }
+        iter.close()?;
+        Ok(out)
+    }
+
+    pub fn snapshot_match(&self, leaf_id: &[u8], fingerprint: &[u8; 32]) -> Result<Option<u64>> {
+        Ok(self
+            .db
+            .get(&meta_key(SNAPSHOT_REUSE, 0, leaf_id))?
+            .filter(|bytes| bytes.len() == 40 && bytes[..32] == fingerprint[..])
+            .map(|bytes| u64::from_be_bytes(bytes[32..].try_into().unwrap())))
+    }
+
+    pub fn note_snapshot(&self, epoch: u64, leaf_id: &[u8], fingerprint: &[u8; 32]) -> Result<()> {
+        let mut bytes = fingerprint.to_vec();
+        bytes.extend_from_slice(&epoch.to_be_bytes());
+        self.db.set(&meta_key(SNAPSHOT_REUSE, 0, leaf_id), &bytes)
+    }
+
+    /// Cache metadata only after the replica was committed; always bind it
+    /// back to that registration when reading it.
+    pub fn put_data_cap(&self, epoch: u64, leaf_id: &[u8], cap: &MerkleCap) -> Result<()> {
+        use quil_crypto::storage_proof::{parse_registration_root, Tree};
+        let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
+        let leaf = self
+            .db
+            .get(&leaf_key(epoch, leaf_id))?
+            .and_then(|bytes| HashLeaf::decode(&bytes).ok())
+            .ok_or_else(|| QuilError::Store("no chunked replica for data cap".into()))?;
+        let registered = parse_registration_root(&leaf.registration_root)
+            .ok_or_else(|| QuilError::Store("invalid replica registration".into()))?;
+        if cap.n != leaf.n || cap.commitment(Tree::Data) != registered.comm_d {
+            return Err(QuilError::Store(
+                "data cap differs from replica registration".into(),
+            ));
+        }
+        self.db
+            .set(&meta_key(DATA_CAP, epoch, leaf_id), &cap.to_bytes())
+    }
+
+    pub fn get_data_cap(&self, epoch: u64, leaf_id: &[u8]) -> Result<Option<MerkleCap>> {
+        let Some(bytes) = self.db.get(&meta_key(DATA_CAP, epoch, leaf_id))? else {
+            return Ok(None);
+        };
+        Ok(MerkleCap::from_bytes(&bytes))
     }
 
     /// A hash-proof epoch's leaf as [`Self::put_hash`] stored it, nodes and
@@ -849,6 +1084,10 @@ impl ReplicaStore {
         leaf: &HashLeaf,
         nodes: std::ops::Range<u64>,
     ) -> Result<Vec<u8>> {
+        if leaf.source_epoch.is_some_and(|base| base >= epoch) {
+            return Err(QuilError::Store("forward replica alias".into()));
+        }
+        let epoch = leaf.source_epoch.unwrap_or(epoch);
         let missing = || {
             QuilError::Store(format!(
                 "nodes {}..{} of a stored replica of {} nodes are missing",
@@ -957,6 +1196,24 @@ impl ReplicaStore {
         self.db.get(&meta_key(SNAPSHOT_SOURCES, epoch, filter))
     }
 
+    /// The shards [`Self::put_snapshot_sources`] recorded sources of for
+    /// `epoch`: those whose registrations for it were encoded here.
+    pub fn snapshot_source_filters(&self, epoch: u64) -> Result<Vec<Vec<u8>>> {
+        let lower = meta_key(SNAPSHOT_SOURCES, epoch, &[]);
+        let upper = meta_key(SNAPSHOT_SOURCES, epoch.saturating_add(1), &[]);
+        let mut iter = self.db.new_iter(&lower, &upper)?;
+        let mut filters = Vec::new();
+        let mut ok = iter.first();
+        while ok {
+            if let Some(filter) = iter.key().get(lower.len()..) {
+                filters.push(filter.to_vec());
+            }
+            ok = iter.next();
+        }
+        iter.close()?;
+        Ok(filters)
+    }
+
     /// Record the node count of each leaf of shard `filter`'s partition for
     /// `epoch`, in the partition's order.
     pub fn put_leaf_nodes(&self, epoch: u64, filter: &[u8], nodes: &[u64]) -> Result<()> {
@@ -983,11 +1240,17 @@ impl ReplicaStore {
     pub fn delete(&self, epoch: u64, leaf_id: &[u8]) -> Result<()> {
         let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
         forget_leaves(|e, id| e == epoch && id == leaf_id);
+        self.db.delete(&meta_key(DATA_CAP, epoch, leaf_id))?;
         self.db.delete(&leaf_key(epoch, leaf_id))?;
-        self.db.delete_range(
-            &chunk_key(epoch, leaf_id, 0),
-            &chunk_key(epoch, leaf_id, u32::MAX),
-        )?;
+        if !self
+            .referenced_sources(0)?
+            .contains(&(epoch, leaf_id.to_vec()))
+        {
+            self.db.delete_range(
+                &chunk_key(epoch, leaf_id, 0),
+                &chunk_key(epoch, leaf_id, u32::MAX),
+            )?;
+        }
         self.db.delete(&replica_key(epoch, leaf_id))
     }
 
@@ -1022,6 +1285,8 @@ impl ReplicaStore {
     }
 
     fn evict(&self, keep_from: u64, store: &str) -> Result<()> {
+        let _writing = hash_writes().lock().unwrap_or_else(PoisonError::into_inner);
+        let pinned = self.referenced_sources(keep_from)?;
         let mut lo = Vec::with_capacity(9);
         lo.push(STORAGE_REPLICA);
         lo.extend_from_slice(&0u64.to_be_bytes());
@@ -1032,15 +1297,26 @@ impl ReplicaStore {
         self.db.delete_range(&lo, &hi)?;
         self.reclaim_in_background(lo, hi, "evicted");
         forget_leaves(|epoch, _| epoch < keep_from);
-        for kind in [
-            PARTITION,
-            SNAPSHOT_SOURCES,
-            LEAF_NODES,
-            HASH_LEAF,
-            HASH_NODES,
-        ] {
+        for kind in [PARTITION, SNAPSHOT_SOURCES, LEAF_NODES, HASH_LEAF, DATA_CAP] {
             self.db
                 .delete_range(&meta_key(kind, 0, &[]), &meta_key(kind, keep_from, &[]))?;
+        }
+        let mut at = meta_key(HASH_NODES, 0, &[]);
+        let until = meta_key(HASH_NODES, keep_from, &[]);
+        let mut protected: Vec<_> = pinned
+            .into_iter()
+            .filter(|(epoch, _)| *epoch < keep_from)
+            .map(|(epoch, id)| (chunk_key(epoch, &id, 0), chunk_key(epoch, &id, u32::MAX)))
+            .collect();
+        protected.sort();
+        for (lo, hi) in protected {
+            if at < lo {
+                self.db.delete_range(&at, &lo)?;
+            }
+            at = at.max(hi);
+        }
+        if at < until {
+            self.db.delete_range(&at, &until)?;
         }
         self.compact_evicted_in_background(keep_from, store);
         Ok(())
@@ -1111,6 +1387,76 @@ mod tests {
     fn store() -> ReplicaStore {
         let rocks = crate::RocksDb::open_in_memory().unwrap();
         ReplicaStore::new(Arc::new(rocks))
+    }
+
+    #[test]
+    fn aliases_survive_base_eviction_restart_and_flattened_chains() {
+        let s = store();
+        let (nodes, cap) = hash_leaf(3 * CHUNK_NODES as usize + 7, 19);
+        let data_cap = MerkleCap::from_bytes(&cap).unwrap();
+        let root = quil_crypto::storage_proof::registration_root(
+            &data_cap.commitment(quil_crypto::storage_proof::Tree::Data),
+            &[0; 32],
+            &data_cap.commitment(quil_crypto::storage_proof::Tree::Replica),
+        );
+        s.put_hash(3, b"leaf", &nodes, &cap, &root).unwrap();
+        s.put_data_cap(3, b"leaf", &data_cap).unwrap();
+        assert!(s.alias_hash(4, b"leaf", 3).unwrap());
+        assert!(s.alias_hash(5, b"leaf", 4).unwrap());
+        assert!(!s.alias_hash(5, b"leaf", 5).unwrap());
+        assert!(!s.alias_hash(5, b"absent", 3).unwrap());
+        assert!(s.db.get(&chunk_key(5, b"leaf", 0)).unwrap().is_none());
+        assert!(
+            s.put_hash(3, b"leaf", &nodes, &cap, &[0; 96]).is_err(),
+            "live alias protects base from overwrite"
+        );
+        s.evict_below_epoch(5).unwrap();
+        assert!(s.get_hash_leaf(3, b"leaf").unwrap().is_none());
+        let reopened = ReplicaStore::new(s.db.clone());
+        assert_eq!(
+            reopened.get_hash(5, b"leaf").unwrap().unwrap().replica[..],
+            nodes[..]
+        );
+        assert_eq!(reopened.get_data_cap(5, b"leaf").unwrap(), Some(data_cap));
+        assert!(reopened.alias_hash(6, b"leaf", 5).unwrap());
+        reopened.delete(5, b"leaf").unwrap();
+        assert_eq!(
+            reopened.get_hash(6, b"leaf").unwrap().unwrap().replica[..],
+            nodes[..]
+        );
+        reopened.evict_below_epoch(7).unwrap();
+        assert!(
+            reopened
+                .db
+                .get(&chunk_key(3, b"leaf", 0))
+                .unwrap()
+                .is_none(),
+            "last reference gone reclaims base"
+        );
+    }
+
+    #[test]
+    fn deleting_base_metadata_keeps_live_alias_chunks() {
+        let s = store();
+        let (nodes, cap) = hash_leaf(33, 6);
+        let data_cap = MerkleCap::from_bytes(&cap).unwrap();
+        let root = quil_crypto::storage_proof::registration_root(
+            &data_cap.commitment(quil_crypto::storage_proof::Tree::Data),
+            &[0; 32],
+            &data_cap.commitment(quil_crypto::storage_proof::Tree::Replica),
+        );
+        s.put_hash(3, b"leaf", &nodes, &cap, &root).unwrap();
+        s.put_data_cap(3, b"leaf", &MerkleCap::from_bytes(&cap).unwrap())
+            .unwrap();
+        s.note_snapshot(3, b"leaf", &[8; 32]).unwrap();
+        assert_eq!(s.snapshot_match(b"leaf", &[8; 32]).unwrap(), Some(3));
+        assert_eq!(s.snapshot_match(b"leaf", &[9; 32]).unwrap(), None);
+        assert!(s.alias_hash(4, b"leaf", 3).unwrap());
+        s.delete(3, b"leaf").unwrap();
+        assert_eq!(
+            s.get_hash(4, b"leaf").unwrap().unwrap().replica[..],
+            nodes[..]
+        );
     }
 
     #[test]
@@ -1458,9 +1804,21 @@ mod tests {
             "beside, not over, the replica"
         );
         assert_eq!(s.get_partition(6, b"filter").unwrap(), None);
+        s.put_snapshot_sources(5, b"child", b"sources").unwrap();
+        s.put_snapshot_sources(6, b"later", b"sources").unwrap();
+        assert_eq!(
+            s.snapshot_source_filters(5).unwrap(),
+            vec![b"child".to_vec(), b"filter".to_vec()],
+            "the epoch's shards, not another epoch's"
+        );
         s.evict_below_epoch(6).unwrap();
         assert_eq!(s.get_partition(5, b"filter").unwrap(), None);
         assert_eq!(s.get_snapshot_sources(5, b"filter").unwrap(), None);
+        assert!(s.snapshot_source_filters(5).unwrap().is_empty());
+        assert_eq!(
+            s.snapshot_source_filters(6).unwrap(),
+            vec![b"later".to_vec()]
+        );
         assert_eq!(s.get_leaf_nodes(5, b"filter").unwrap(), None);
     }
 
@@ -1502,5 +1860,250 @@ mod tests {
                 (b"leaf-2".to_vec(), b"r2".to_vec()),
             ]
         );
+    }
+
+    /// What a store's write-ahead log holds not yet synced, on a disk
+    /// syncing it at a rate ([`SlowWal`]).
+    #[derive(Default)]
+    struct WalState {
+        /// Replica bytes committed since the last sync.
+        unsynced: u64,
+        /// Batches committed.
+        commits: u64,
+        /// The most bytes not yet synced as a batch after the first was
+        /// committed: what a synced commit of the store's would have
+        /// waited behind.
+        tail: u64,
+        /// When the first sync ended, and how long until the next batch.
+        first_synced: Option<Instant>,
+        idle: Option<Duration>,
+    }
+
+    /// A store whose log a disk writing `rate` bytes a second syncs: a
+    /// sync takes as long as its unsynced bytes take that disk.
+    struct SlowWal {
+        inner: Arc<crate::RocksDb>,
+        rate: f64,
+        state: Arc<Mutex<WalState>>,
+    }
+
+    struct SlowWalBatch {
+        inner: Box<dyn quil_types::store::Transaction>,
+        bytes: AtomicU64,
+        state: Arc<Mutex<WalState>>,
+    }
+
+    impl quil_types::store::Transaction for SlowWalBatch {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            self.bytes.fetch_add(value.len() as u64, Ordering::SeqCst);
+            self.inner.set(key, value)
+        }
+        fn commit(self: Box<Self>) -> Result<()> {
+            let bytes = self.bytes.load(Ordering::SeqCst);
+            self.inner.commit()?;
+            let mut wal = self.state.lock().unwrap();
+            wal.unsynced += bytes;
+            wal.commits += 1;
+            if wal.commits > 1 {
+                wal.tail = wal.tail.max(wal.unsynced);
+            }
+            if let (Some(synced), None) = (wal.first_synced, wal.idle) {
+                wal.idle = Some(synced.elapsed());
+            }
+            Ok(())
+        }
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            self.inner.delete(key)
+        }
+        fn abort(self: Box<Self>) -> Result<()> {
+            self.inner.abort()
+        }
+        fn new_iter(
+            &self,
+            lower: &[u8],
+            upper: &[u8],
+        ) -> Result<Box<dyn quil_types::store::Iterator>> {
+            self.inner.new_iter(lower, upper)
+        }
+        fn delete_range(&self, lower: &[u8], upper: &[u8]) -> Result<()> {
+            self.inner.delete_range(lower, upper)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl KvDb for SlowWal {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            self.inner.set(key, value)
+        }
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            self.inner.delete(key)
+        }
+        fn new_batch(&self, indexed: bool) -> Result<Box<dyn quil_types::store::Transaction>> {
+            Ok(Box::new(SlowWalBatch {
+                inner: self.inner.new_batch(indexed)?,
+                bytes: AtomicU64::new(0),
+                state: self.state.clone(),
+            }))
+        }
+        fn new_iter(
+            &self,
+            lower: &[u8],
+            upper: &[u8],
+        ) -> Result<Box<dyn quil_types::store::Iterator>> {
+            self.inner.new_iter(lower, upper)
+        }
+        fn compact(&self, start: &[u8], end: &[u8], parallelize: bool) -> Result<()> {
+            self.inner.compact(start, end, parallelize)
+        }
+        fn compact_all(&self) -> Result<()> {
+            self.inner.compact_all()
+        }
+        fn sync_wal(&self) -> Result<()> {
+            let unsynced = std::mem::take(&mut self.state.lock().unwrap().unsynced);
+            std::thread::sleep(Duration::from_secs_f64(unsynced as f64 / self.rate));
+            let mut wal = self.state.lock().unwrap();
+            if wal.first_synced.is_none() {
+                wal.first_synced = Some(Instant::now());
+            }
+            Ok(())
+        }
+        fn close(&self) -> Result<()> {
+            self.inner.close()
+        }
+        fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+            self.inner.delete_range(start, end)
+        }
+    }
+
+    /// An epoch's replicas, 1-1.7 GB a seat, go into the store the
+    /// consensus commits share: written in batches never synced, each
+    /// synced commit of the store's took every byte written since the
+    /// last with it. Each batch is now synced on its own, cut to what the
+    /// disk synced in [`REPLICA_SYNC_TARGET`] once one is timed, and one
+    /// synced past it leaves the disk idle as long (2026-11-07).
+    #[test]
+    fn a_replica_is_synced_a_batch_at_a_time_so_a_store_commit_waits_behind_one() {
+        // 32 MiB/s: the first, whole batch of 16 MiB takes it 500 ms.
+        let rate = (32u64 << 20) as f64;
+        let state = Arc::new(Mutex::new(WalState::default()));
+        let wal = SlowWal {
+            inner: Arc::new(crate::RocksDb::open_in_memory().unwrap()),
+            rate,
+            state: state.clone(),
+        };
+        let s = ReplicaStore::new(Arc::new(wal));
+        let chunk_bytes = CHUNK_NODES as usize * NODE_BYTES;
+        let chunks = CHUNKS_PER_BATCH + 256;
+        let mut replica = vec![0u8; chunks * chunk_bytes];
+        for (i, chunk) in replica.chunks_mut(chunk_bytes).enumerate() {
+            chunk[..4].copy_from_slice(&(i as u32).to_be_bytes());
+        }
+        // Not a cap that decodes: the leaf record is compared as bytes.
+        let cap = [1u8; 64];
+        s.put_hash(6, b"slow", &replica, &cap, &[7u8; 96]).unwrap();
+        let wal = state.lock().unwrap();
+        let behind = Duration::from_secs_f64(wal.tail as f64 / rate);
+        assert!(
+            behind <= REPLICA_SYNC_TARGET,
+            "PACE-REPLICA-TAIL: after a replica's first batch, a synced commit of the store \
+             would have waited {behind:?} behind {} replica bytes not yet synced, past \
+             {REPLICA_SYNC_TARGET:?}",
+            wal.tail
+        );
+        let idle = wal.idle.unwrap_or_default();
+        assert!(
+            idle >= Duration::from_millis(450),
+            "PACE-REPLICA-IDLE: a batch synced in 500 ms, 450 ms past the target, left the \
+             disk to the store's commits for {idle:?}"
+        );
+        drop(wal);
+        // Batches of every size keep each chunk at its index.
+        for (i, chunk) in replica.chunks(chunk_bytes).enumerate() {
+            let stored = s.db.get(&chunk_key(6, b"slow", i as u32)).unwrap();
+            assert_eq!(stored.as_deref(), Some(chunk), "chunk {i}");
+        }
+        assert_eq!(
+            s.db.get(&chunk_key(6, b"slow", chunks as u32)).unwrap(),
+            None
+        );
+        let n = (replica.len() / NODE_BYTES) as u64;
+        assert_eq!(
+            s.db.get(&leaf_key(6, b"slow")).unwrap(),
+            Some(HashLeaf::encode(n, &cap, &[7u8; 96]))
+        );
+    }
+
+    /// A slow disk gets replica batches it syncs within
+    /// [`REPLICA_SYNC_TARGET`]: a whole batch of 16 MiB took one writing
+    /// 40 MB/s 419 ms.
+    #[test]
+    fn replica_batches_are_cut_to_what_a_slow_disk_syncs_within_the_target() {
+        let chunk = (CHUNK_NODES as usize * NODE_BYTES) as f64;
+        for mb_s in [40.0, 80.0, 400.0] {
+            let rate = mb_s * 1e6;
+            let mut pace = WalPace::new();
+            let mut chunks = pace.batch_chunks();
+            assert_eq!(chunks, CHUNKS_PER_BATCH, "the most until a sync is timed");
+            for _ in 0..2 * PACE_WINDOW {
+                let bytes = chunks as f64 * chunk;
+                pace.synced(bytes as u64, Duration::from_secs_f64(bytes / rate));
+                chunks = pace.batch_chunks();
+            }
+            let took = Duration::from_secs_f64(chunks as f64 * chunk / rate);
+            assert!(
+                took <= REPLICA_SYNC_TARGET && took >= REPLICA_SYNC_TARGET / 2,
+                "PACE-REPLICA-CUT: at {mb_s} MB/s a batch of {chunks} chunks takes {took:?} \
+                 to sync, against {REPLICA_SYNC_TARGET:?}"
+            );
+        }
+    }
+
+    /// A disk too slow even for the smallest batch in
+    /// [`REPLICA_SYNC_TARGET`] waits as long as a sync overran it before
+    /// the next: the store's commits get about half of it.
+    #[test]
+    fn a_replica_batch_synced_past_the_target_is_followed_by_as_long_a_wait() {
+        let mut pace = WalPace::new();
+        let batch = (MIN_CHUNKS_PER_BATCH * CHUNK_NODES as usize * NODE_BYTES) as u64;
+        let over = Duration::from_millis(100);
+        let wait = pace.synced(batch, REPLICA_SYNC_TARGET + over);
+        let chunks = pace.batch_chunks();
+        assert!(
+            wait == over && chunks == MIN_CHUNKS_PER_BATCH,
+            "PACE-REPLICA-OVERRUN: a batch of {batch} bytes synced {over:?} past \
+             {REPLICA_SYNC_TARGET:?}: a wait of {wait:?}, then {chunks} chunks"
+        );
+    }
+
+    /// A disk syncing a whole batch well within [`REPLICA_SYNC_TARGET`]
+    /// keeps whole batches and never waits; a replica's small end, which
+    /// costs more than its bytes, does not count as the disk's speed.
+    #[test]
+    fn a_fast_disk_keeps_whole_replica_batches_and_no_waits() {
+        let chunk = CHUNK_NODES as usize * NODE_BYTES;
+        let mut pace = WalPace::new();
+        for _ in 0..2 * PACE_WINDOW {
+            // 1.7 GB/s.
+            let wait = pace.synced((CHUNKS_PER_BATCH * chunk) as u64, Duration::from_millis(10));
+            assert!(
+                wait.is_zero() && pace.batch_chunks() == CHUNKS_PER_BATCH,
+                "PACE-REPLICA-FAST: a fast disk's batches are cut or waited for"
+            );
+        }
+        for _ in 0..PACE_WINDOW {
+            let wait = pace.synced((4 * chunk) as u64, Duration::from_millis(5));
+            assert!(
+                wait.is_zero() && pace.batch_chunks() == CHUNKS_PER_BATCH,
+                "PACE-REPLICA-FAST: a replica's small ends cut the batches"
+            );
+        }
     }
 }

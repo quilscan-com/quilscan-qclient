@@ -468,6 +468,8 @@ fn seal_drain_frame_for(network: u8, setting: Option<&str>) -> u64 {
 /// Fix this process's seal drain frame from its network, and return it.
 /// Called at startup before any frame is processed; the first call decides.
 pub fn init_seal_drain_frame(network: u8) -> u64 {
+    init_drain_anchor_floor(network);
+    init_drain_anchor_raise(network);
     *SEAL_DRAIN_FRAME.get_or_init(|| {
         seal_drain_frame_for(
             network,
@@ -491,6 +493,192 @@ pub fn seal_drain_frame() -> u64 {
 /// Set the seal drain frame for the calling thread only (tests).
 pub fn set_seal_drain_frame_for_thread(frame: Option<u64>) {
     SEAL_DRAIN_OVERRIDE.with(|cell| cell.set(frame));
+}
+
+/// The oldest GLOBAL frame a mainnet seal's drain header may name as its
+/// anchor (`seal_drain`): the 2.1 genesis
+/// (`token_intrinsic::constants::FRAME_2_1_CUTOVER`), below which no node
+/// holds a GLOBAL frame. A drain header missed its window, so no window
+/// bounds its anchor, and its output check reads that frame: one below
+/// every node's history is unavailable everywhere, for ever.
+pub const MAINNET_DRAIN_ANCHOR_FLOOR: u64 = 244_200;
+
+static DRAIN_ANCHOR_FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Other networks hold their GLOBAL history from frame 1, or from
+/// `QUIL_SEAL_DRAIN_ANCHOR_FLOOR`, the same on every node of the network.
+fn drain_anchor_floor_for(network: u8, setting: Option<&str>) -> u64 {
+    if network == 0 {
+        return MAINNET_DRAIN_ANCHOR_FLOOR;
+    }
+    setting
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn init_drain_anchor_floor(network: u8) {
+    DRAIN_ANCHOR_FLOOR.get_or_init(|| {
+        drain_anchor_floor_for(
+            network,
+            std::env::var("QUIL_SEAL_DRAIN_ANCHOR_FLOOR")
+                .ok()
+                .as_deref(),
+        )
+    });
+}
+
+/// The oldest GLOBAL frame a seal's drain header may name as its anchor,
+/// fixed with the seal drain frame at startup ([`init_seal_drain_frame`]).
+pub fn drain_anchor_floor() -> u64 {
+    *DRAIN_ANCHOR_FLOOR.get_or_init(|| {
+        drain_anchor_floor_for(
+            1,
+            std::env::var("QUIL_SEAL_DRAIN_ANCHOR_FLOOR")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// From this GLOBAL frame a seal's drain header may name no anchor older than
+/// [`MAINNET_DRAIN_ANCHOR_RAISED_FLOOR`]. The history above the 2.1 genesis
+/// has holes, the same on every archive, which no peer can serve, so a drain
+/// header anchored into one is unavailable everywhere, for ever, as one below
+/// the genesis is. A floor above them needs this frame, unlike the one below
+/// the genesis: an older build holding a frame under the raised floor accepts
+/// a header its committee anchored there, and a raised build refuses it.
+/// Consensus-affecting for GLOBAL, where only archives execute these headers:
+/// every archive must run a build with it before the frame; regular nodes
+/// follow GLOBAL state and need not. An older archive says nothing at the
+/// frame, and differs only once a header it accepts and a raised one refuses
+/// is packed, so all four must be on it first. Mainnet epoch 1489, about 4.5
+/// days after it was proposed, decided by the longest merge, release and
+/// archive restart times seen; a devnet crossed it first.
+/// `QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME` elsewhere, never by default.
+pub const MAINNET_DRAIN_ANCHOR_RAISE_FRAME: Option<u64> = Some(1_072_080);
+
+/// The oldest anchor from [`MAINNET_DRAIN_ANCHOR_RAISE_FRAME`] on: the frame
+/// committee sessions begin. Drain headers are certified by a session, and a
+/// committee anchors a frame 4 GLOBAL frames behind its head, so an honest
+/// drain header names an older one only if its frame was made within 4 frames
+/// of this one and has stayed undrained since. No first session made a frame
+/// before [`quil_types::consensus::MAINNET_MEMBERSHIP_BOUNDARY_FRAME`], and
+/// refusing such a header would cost its shard a fence, not a halt.
+pub const MAINNET_DRAIN_ANCHOR_RAISED_FLOOR: u64 =
+    quil_types::consensus::MAINNET_COMMITTEE_HANDOFF_FRAME;
+
+static DRAIN_ANCHOR_RAISE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+
+thread_local! {
+    static DRAIN_ANCHOR_RAISE_OVERRIDE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// From which GLOBAL frame, and to which anchor, drain anchors are raised.
+fn drain_anchor_raise_for(network: u8, frame: Option<&str>, floor: Option<&str>) -> (u64, u64) {
+    if network == 0 {
+        return (
+            MAINNET_DRAIN_ANCHOR_RAISE_FRAME.unwrap_or(u64::MAX),
+            MAINNET_DRAIN_ANCHOR_RAISED_FLOOR,
+        );
+    }
+    let parse = |setting: Option<&str>| setting.and_then(|value| value.parse::<u64>().ok());
+    (parse(frame).unwrap_or(u64::MAX), parse(floor).unwrap_or(0))
+}
+
+fn drain_anchor_raise_from_env(network: u8) -> (u64, u64) {
+    drain_anchor_raise_for(
+        network,
+        std::env::var("QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME")
+            .ok()
+            .as_deref(),
+        std::env::var("QUIL_SEAL_DRAIN_ANCHOR_RAISED_FLOOR_FRAME")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn init_drain_anchor_raise(network: u8) {
+    DRAIN_ANCHOR_RAISE.get_or_init(|| drain_anchor_raise_from_env(network));
+}
+
+/// `history`, or the raised floor from the raise's frame on.
+fn drain_anchor_floor_at_for(frame_number: u64, raise: (u64, u64), history: u64) -> u64 {
+    if frame_number >= raise.0 {
+        history.max(raise.1)
+    } else {
+        history
+    }
+}
+
+/// From which GLOBAL frame, and to which anchor, drain anchors are raised:
+/// fixed with the seal drain frame at startup; `u64::MAX` when never.
+pub fn drain_anchor_raise() -> (u64, u64) {
+    DRAIN_ANCHOR_RAISE_OVERRIDE
+        .with(|cell| cell.get())
+        .unwrap_or_else(|| *DRAIN_ANCHOR_RAISE.get_or_init(|| drain_anchor_raise_from_env(1)))
+}
+
+/// The oldest GLOBAL frame a drain header checked at GLOBAL frame
+/// `frame_number` may name as its anchor.
+pub fn drain_anchor_floor_at(frame_number: u64) -> u64 {
+    drain_anchor_floor_at_for(frame_number, drain_anchor_raise(), drain_anchor_floor())
+}
+
+/// Whether a drain header checked at GLOBAL frame `frame_number` must name an
+/// anchor: from the raise's frame. Voters have refused frames naming none
+/// since the required-anchor epoch, so this refuses no honest header, and an
+/// older build executes one, so it takes the raise's frame.
+pub fn drain_anchor_required_at(frame_number: u64) -> bool {
+    frame_number >= drain_anchor_raise().0
+}
+
+/// What is wrong with another network's drain anchor settings: a mistyped one
+/// would otherwise read as unset, and a run would report a false pass. Mainnet
+/// ignores them.
+fn drain_anchor_settings_problem(
+    network: u8,
+    floor: Option<&str>,
+    raise: Option<&str>,
+    raised: Option<&str>,
+) -> Option<String> {
+    if network == 0 {
+        return None;
+    }
+    for (name, setting) in [
+        ("QUIL_SEAL_DRAIN_ANCHOR_FLOOR", floor),
+        ("QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME", raise),
+        ("QUIL_SEAL_DRAIN_ANCHOR_RAISED_FLOOR_FRAME", raised),
+    ] {
+        if setting.is_some_and(|value| value.parse::<u64>().is_err()) {
+            return Some(format!("{name} is not a frame number"));
+        }
+    }
+    (raise.is_some() != raised.is_some()).then(|| {
+        "QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME and QUIL_SEAL_DRAIN_ANCHOR_RAISED_FLOOR_FRAME are \
+         set together"
+            .to_string()
+    })
+}
+
+/// Refuse this process's drain anchor settings when they are not usable.
+pub fn check_drain_anchor_settings(network: u8) -> Result<()> {
+    let setting = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    match drain_anchor_settings_problem(
+        network,
+        setting("QUIL_SEAL_DRAIN_ANCHOR_FLOOR").as_deref(),
+        setting("QUIL_SEAL_DRAIN_ANCHOR_RAISE_FRAME").as_deref(),
+        setting("QUIL_SEAL_DRAIN_ANCHOR_RAISED_FLOOR_FRAME").as_deref(),
+    ) {
+        Some(problem) => Err(QuilError::InvalidArgument(problem)),
+        None => Ok(()),
+    }
+}
+
+/// Set the drain anchor raise, its frame and floor, for the calling thread
+/// only (tests).
+pub fn set_drain_anchor_raise_for_thread(raise: Option<(u64, u64)>) {
+    DRAIN_ANCHOR_RAISE_OVERRIDE.with(|cell| cell.set(raise));
 }
 
 /// From this GLOBAL frame GLOBAL accepts two ways out of a stalled close,
@@ -672,10 +860,13 @@ pub fn set_fenced_successor_eligibility_frame_for_thread(frame: Option<u64>) {
 /// another requests root for any GLOBAL frame that carries one, and every
 /// archive and GLOBAL prover must run a build with it before the frame.
 /// From the same frame GLOBAL records the frame of each session's tip
-/// advance ([`session_tip_frame`]), which an older build does not write
-/// either. Not scheduled on mainnet; `QUIL_PRESENCE_REPORT_FRAME`
+/// advance ([`session_tip_frame`]; also from the signed-frame activation
+/// frame, if earlier: [`tip_frame_recording_frame`]), which an older build
+/// does not write either. Mainnet: 1,024,560, the first frame of epoch 1423,
+/// which GLOBAL cannot reach before 2026-11-07 00:00 UTC even at ten seconds
+/// a frame, with the [`presence_credit_frame`]; `QUIL_PRESENCE_REPORT_FRAME`
 /// elsewhere, never by default.
-pub const MAINNET_PRESENCE_REPORT_FRAME: Option<u64> = None;
+pub const MAINNET_PRESENCE_REPORT_FRAME: Option<u64> = Some(1_024_560);
 
 static PRESENCE_REPORT_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -731,9 +922,10 @@ pub fn set_presence_report_frame_for_thread(frame: Option<u64>) {
 /// [`presence_report_frame`], which an older build may already have set:
 /// it accepts a report and writes nothing, so this frame is a flag day of
 /// its own. Consensus-affecting for GLOBAL: every archive and GLOBAL prover
-/// must run a build with it before the frame. Not scheduled on mainnet;
+/// must run a build with it before the frame. Mainnet: the report frame,
+/// so no report is accepted without being recorded;
 /// `QUIL_PRESENCE_CREDIT_FRAME` elsewhere, never by default.
-pub const MAINNET_PRESENCE_CREDIT_FRAME: Option<u64> = None;
+pub const MAINNET_PRESENCE_CREDIT_FRAME: Option<u64> = MAINNET_PRESENCE_REPORT_FRAME;
 
 static PRESENCE_CREDIT_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -926,9 +1118,10 @@ pub fn set_early_fence_frame_for_thread(frame: Option<u64>) {
 /// one to seat. Consensus-affecting for GLOBAL: every archive and GLOBAL
 /// prover must run a build with it before the frame; an older build
 /// authorizes the successor at the seal and commits another GLOBAL state.
-/// Not scheduled on mainnet; `QUIL_SEAL_SUCCESSOR_ELIGIBILITY_FRAME`
-/// elsewhere, never by default.
-pub const MAINNET_SEAL_SUCCESSOR_ELIGIBILITY_FRAME: Option<u64> = None;
+/// Mainnet: 1,024,560, the first frame of epoch 1423, which GLOBAL cannot reach
+/// before 2026-11-07 00:00 UTC even at ten seconds a frame;
+/// `QUIL_SEAL_SUCCESSOR_ELIGIBILITY_FRAME` elsewhere, never by default.
+pub const MAINNET_SEAL_SUCCESSOR_ELIGIBILITY_FRAME: Option<u64> = Some(1_024_560);
 
 static SEAL_SUCCESSOR_ELIGIBILITY_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -1794,20 +1987,35 @@ pub fn record_session_tip(
     id: &[u8; 32],
     tip: &Checkpoint,
 ) -> Result<()> {
-    if session_tip(state, id)?.is_some_and(|current| current.frame >= tip.frame) {
+    let current = session_tip(state, id)?;
+    if current
+        .as_ref()
+        .is_some_and(|current| current.frame >= tip.frame)
+    {
         return Ok(());
     }
     let mut bytes = Vec::new();
     tip.write(&mut bytes);
     write(state, frame, b"tip", id, &bytes)?;
+    if current.is_none() {
+        silence::note_first_frame(state, frame, id, tip.frame)?;
+    }
     record_tip_frame(state, frame, id)
 }
 
-/// Record GLOBAL frame `frame` as [`session_tip_frame`] of `id`. Before the
-/// [`presence_report_frame`] this writes nothing, so GLOBAL's records and
-/// roots stay those of a build without it.
+/// The first GLOBAL frame that records [`session_tip_frame`]: the earlier
+/// of the [`presence_report_frame`] and the signed-frame activation frame
+/// ([`quil_types::consensus::signed_frame_activation_frame`]), whose
+/// silent-prover fence dates stalls by it.
+pub fn tip_frame_recording_frame() -> u64 {
+    presence_report_frame().min(quil_types::consensus::signed_frame_activation_frame())
+}
+
+/// Record GLOBAL frame `frame` as [`session_tip_frame`] of `id`. Before
+/// [`tip_frame_recording_frame`] this writes nothing, so GLOBAL's records
+/// and roots stay those of a build without it.
 fn record_tip_frame(state: &HypergraphState, frame: u64, id: &[u8; 32]) -> Result<()> {
-    if frame < presence_report_frame() {
+    if frame < tip_frame_recording_frame() {
         return Ok(());
     }
     write(state, frame, b"tip-frame", id, &frame.to_be_bytes())
@@ -1815,7 +2023,7 @@ fn record_tip_frame(state: &HypergraphState, frame: u64, id: &[u8; 32]) -> Resul
 
 /// The GLOBAL frame that last advanced [`session_tip`] of `id`, or that
 /// created the session if its tip has not advanced since. Recorded only from
-/// the [`presence_report_frame`] on: `None` for a session neither created
+/// [`tip_frame_recording_frame`] on: `None` for a session neither created
 /// nor advanced since then.
 pub fn session_tip_frame(state: &impl Records, id: &[u8; 32]) -> Result<Option<u64>> {
     read(state, b"tip-frame", id)?
@@ -1829,7 +2037,7 @@ pub fn session_tip_frame(state: &impl Records, id: &[u8; 32]) -> Result<Option<u
 
 /// How many GLOBAL frames before `frame` [`session_tip`] of `id` last
 /// advanced ([`session_tip_frame`]); zero for a `frame` not after it. Without
-/// a record, the frames since the [`presence_report_frame`]: a lower bound,
+/// a record, the frames since [`tip_frame_recording_frame`]: a lower bound,
 /// since the session has not advanced from it on. `None` before that frame.
 pub fn frames_since_tip_advance(
     state: &impl Records,
@@ -1839,7 +2047,7 @@ pub fn frames_since_tip_advance(
     if let Some(recorded) = session_tip_frame(state, id)? {
         return Ok(Some(frame.saturating_sub(recorded)));
     }
-    Ok(frame.checked_sub(presence_report_frame()))
+    Ok(frame.checked_sub(tip_frame_recording_frame()))
 }
 
 /// The reward ring of each of a session's members, in member order, fixed at
@@ -2047,6 +2255,9 @@ pub mod presence;
 
 #[path = "handoff_exclusion.rs"]
 pub mod exclusion;
+
+#[path = "handoff_silence.rs"]
+pub mod silence;
 
 #[path = "handoff_superseded.rs"]
 pub mod superseded;

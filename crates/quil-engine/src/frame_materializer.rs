@@ -88,6 +88,63 @@ fn finish_frame_header_validation(
     Ok(validated)
 }
 
+/// When the last warning of a shard frame header no certificate can vouch for
+/// was logged, and the refusals quieted since.
+static UNPACKABLE_HEADER_WARNED: std::sync::Mutex<Option<(std::time::Instant, u64)>> =
+    std::sync::Mutex::new(None);
+
+/// At most one such warning per interval; the next one counts the quieted.
+const UNPACKABLE_HEADER_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether a refusal at `now` is due a warning, with the refusals quieted
+/// since the last one; otherwise this refusal is counted as quieted.
+fn unpackable_header_warning_due(
+    last: &mut Option<(std::time::Instant, u64)>,
+    now: std::time::Instant,
+) -> Option<u64> {
+    match *last {
+        Some((at, quieted)) if now.duration_since(at) < UNPACKABLE_HEADER_WARN_INTERVAL => {
+            *last = Some((at, quieted + 1));
+            None
+        }
+        previous => {
+            *last = Some((now, 0));
+            Some(previous.map_or(0, |(_, quieted)| quieted))
+        }
+    }
+}
+
+/// Warn, at most once per interval, when executing GLOBAL frame
+/// `frame_number`, proposed by `prover`, refused a shard frame header before
+/// its certificate: its anchor lies outside the frame's lockstep window, or
+/// its fields do not reproduce its output. The frame skips the header and
+/// goes on.
+fn note_unpackable_header(frame_number: u64, prover: &[u8], error: &QuilError) {
+    use quil_execution::global_intrinsic::{frame_header, prover_shard_update};
+    if !frame_header::anchor_outside_window(error)
+        && !prover_shard_update::output_not_reproduced(error)
+    {
+        return;
+    }
+    let due = unpackable_header_warning_due(
+        &mut UNPACKABLE_HEADER_WARNED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        std::time::Instant::now(),
+    );
+    if let Some(quieted) = due {
+        warn!(
+            frame = frame_number,
+            prover = %hex::encode(&prover[..prover.len().min(8)]),
+            quieted,
+            error = %error,
+            "GLOBAL frame carries a shard frame header anchored outside its lockstep window \
+             or with fields that do not reproduce its output; skipped it, the frame goes on. \
+             Report this line with the frame's prover"
+        );
+    }
+}
+
 /// Frame materializer state. Tracks which frames have been materialized
 /// to ensure idempotency, and manages prover root synchronization.
 pub struct FrameMaterializer {
@@ -215,7 +272,7 @@ pub struct FrameMaterializer {
 
     /// Publish committed shard topology to ingress before announcing progress.
     /// This is a local cache refresh; failures retry on the next frame.
-    shard_admission_refresh: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
+    shard_admission_refresh: Option<Arc<dyn Fn(u64) -> Result<()> + Send + Sync>>,
 
     /// Frame prover + BLS constructor used to BATCH-verify a frame's
     /// shard-`FrameHeader` aggregate signatures before the per-bundle
@@ -285,10 +342,17 @@ pub struct MaterializeResult {
     pub prover_root_matched: bool,
     /// The local prover root after materialization.
     pub local_prover_root: Vec<u8>,
-    /// Canonical bytes of every bundle in the finalized frame. The caller
-    /// feeds these to `MessageCollector::mark_finalized` so the consumed
-    /// messages leave the mempool and aren't re-proposed.
+    /// Canonical bytes of every bundle in the finalized frame that execution
+    /// processed. The caller feeds these to `MessageCollector::mark_finalized`
+    /// so the consumed messages leave the mempool and aren't re-proposed, and
+    /// the shard frames they carried count as carried.
     pub finalized_bundles: Vec<Vec<u8>>,
+    /// Canonical bytes of the frame's other well-formed bundles, those
+    /// execution skipped. Consumed too (`MessageCollector::mark_skipped`), but
+    /// the shard frames they claim are not carried: a GLOBAL leader can pack a
+    /// header no key signed claiming any number, and recorded as carried it
+    /// would make every collector drop the genuine frame of that number.
+    pub skipped_bundles: Vec<Vec<u8>>,
     /// The prover lifecycle filters the frame's bundles carried.
     pub prover_ops: crate::prover_op_tally::ProverOpTally,
 }
@@ -387,9 +451,9 @@ impl FrameMaterializer {
 
     pub fn with_shard_admission_refresh(
         mut self,
-        refresh: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        refresh: Arc<dyn Fn(u64) -> Result<()> + Send + Sync>,
     ) -> Self {
-        if let Err(error) = refresh() {
+        if let Err(error) = refresh(0) {
             warn!(%error, "initial shard admission refresh failed; will retry after commit");
         }
         self.shard_admission_refresh = Some(refresh);
@@ -478,6 +542,7 @@ impl FrameMaterializer {
                 prover_root_matched: true,
                 local_prover_root: Vec::new(),
                 finalized_bundles: Vec::new(),
+                skipped_bundles: Vec::new(),
                 prover_ops: Default::default(),
             });
         }
@@ -501,6 +566,7 @@ impl FrameMaterializer {
                 prover_root_matched: true,
                 local_prover_root: Vec::new(),
                 finalized_bundles: Vec::new(),
+                skipped_bundles: Vec::new(),
                 prover_ops: Default::default(),
             });
         }
@@ -657,6 +723,7 @@ impl FrameMaterializer {
                     Vec::new()
                 },
                 finalized_bundles: Vec::new(),
+                skipped_bundles: Vec::new(),
                 prover_ops: Default::default(),
             });
         }
@@ -769,10 +836,12 @@ impl FrameMaterializer {
         // the global venue (reward mints, uncovered-shard transfers); paid to
         // the frame's prover after the loop.
         let mut global_fee_total: u128 = 0;
-        // Canonical bytes of every well-formed bundle in this frame, fed
-        // to `MessageCollector::mark_finalized` by the caller so consumed
-        // messages leave the mempool.
+        // Canonical bytes of every well-formed bundle in this frame, fed to
+        // the collector by the caller so consumed messages leave the
+        // mempool: those execution processed, whose shard frames count as
+        // carried, and those it skipped, whose claims count for nothing.
         let mut finalized_bundles: Vec<Vec<u8>> = Vec::with_capacity(frame.requests.len());
+        let mut skipped_bundles: Vec<Vec<u8>> = Vec::new();
         // Per-bundle materialization outcome, ONE per `frame.requests` entry in
         // order (so the explorer can align it to each request). Every path
         // through the loop below pushes exactly one. Persisted after the loop.
@@ -876,7 +945,13 @@ impl FrameMaterializer {
                             .expect("spawn a frame header validation thread");
                     }
                 });
-                finish_frame_header_validation(out.into_inner().unwrap())?
+                let results = out.into_inner().unwrap();
+                for (_, result) in &results {
+                    if let Err(error) = result {
+                        note_unpackable_header(frame_number, &header.prover, error);
+                    }
+                }
+                finish_frame_header_validation(results)?
             } else {
                 std::collections::HashMap::new()
             }
@@ -884,6 +959,8 @@ impl FrameMaterializer {
 
         // Concurrent proof pre-verification for confidential token bundles
         // on the global route; the sequential loop below reuses the verdicts.
+        // What this frame's commit refuses from GLOBAL state alone is left
+        // out: the venue refuses it before the proof.
         {
             let mut routed = Vec::new();
             for bundle in &frame.requests {
@@ -896,7 +973,8 @@ impl FrameMaterializer {
                     routed.push((address, bytes));
                 }
             }
-            self.execution_manager.preverify_bundles(&routed);
+            self.execution_manager
+                .preverify_global_bundles(frame_number, &routed);
         }
         // Where message execution goes when it runs slow: per op kind
         // (messages, validate µs, process µs, slowest µs) and the execution
@@ -973,11 +1051,6 @@ impl FrameMaterializer {
                 });
                 continue;
             }
-            // This bundle is part of the finalized frame → it is consumed
-            // from the mempool regardless of whether execution processes
-            // or skips it below.
-            finalized_bundles.push(bundle_bytes.clone());
-
             let request_type = u32::from_be_bytes([
                 bundle_bytes[0],
                 bundle_bytes[1],
@@ -1003,6 +1076,7 @@ impl FrameMaterializer {
                             status: RequestStatus::Skipped,
                             error: format!("invalid fee cost: {e}"),
                         });
+                        skipped_bundles.push(bundle_bytes);
                         continue;
                     }
                 };
@@ -1048,11 +1122,17 @@ impl FrameMaterializer {
                         if e.is_execution_unavailable() {
                             return Err(e);
                         }
+                        note_unpackable_header(frame_number, &header.prover, &e);
                         info!(
                             frame = frame_number,
                             request_type = format!("0x{:08x}", request_type),
                             error = %e,
                             "skipping message that failed signature validation"
+                        );
+                        quil_execution::global_intrinsic::intrinsic::note_packed_drain_anchor_refusal(
+                            frame_number,
+                            &header.prover,
+                            &e,
                         );
                         Some(format!("{e}"))
                     }
@@ -1067,6 +1147,7 @@ impl FrameMaterializer {
                     status: RequestStatus::Rejected,
                     error: reason,
                 });
+                skipped_bundles.push(bundle_bytes);
                 continue;
             }
             let process_started = std::time::Instant::now();
@@ -1104,6 +1185,7 @@ impl FrameMaterializer {
                         status: RequestStatus::Succeeded,
                         error: String::new(),
                     });
+                    finalized_bundles.push(bundle_bytes);
                 }
                 Err(e) => {
                     if e.is_execution_unavailable() {
@@ -1120,6 +1202,7 @@ impl FrameMaterializer {
                         status: RequestStatus::Failed,
                         error: format!("{e}"),
                     });
+                    skipped_bundles.push(bundle_bytes);
                 }
             }
         }
@@ -1305,7 +1388,7 @@ impl FrameMaterializer {
         // workers learn the new global height and submit their first child
         // headers. The remote shard-size task must not overwrite this cache.
         if let Some(refresh) = &self.shard_admission_refresh {
-            if let Err(error) = refresh() {
+            if let Err(error) = refresh(frame_number) {
                 warn!(frame = frame_number, %error, "committed shard admission refresh failed; will retry next frame");
             }
         }
@@ -1705,6 +1788,7 @@ impl FrameMaterializer {
             prover_root_matched,
             local_prover_root: post_root,
             finalized_bundles,
+            skipped_bundles,
             prover_ops,
         })
     }
@@ -2131,26 +2215,52 @@ impl FrameMaterializer {
             return Ok(());
         }
 
-        let txn = self.hypergraph_store.new_transaction(false)?;
-
+        let mut commits = Vec::with_capacity(updates.len());
         for update in &updates {
             if update.public_key.is_empty() {
                 warn!("alt shard update with empty public key, skipping");
                 continue;
             }
 
-            let shard_address = match quil_crypto::poseidon::hash_bytes_to_32(&update.public_key) {
-                Ok(addr) => addr,
-                Err(e) => {
-                    warn!(error = %e, "failed to hash alt shard public key");
-                    continue;
-                }
-            };
+            match quil_crypto::poseidon::hash_bytes_to_32(&update.public_key) {
+                Ok(addr) => commits.push((addr, *update)),
+                Err(e) => warn!(error = %e, "failed to hash alt shard public key"),
+            }
+        }
 
+        // A frame's body is the leader's, and a certified one must execute:
+        // an error here refused the frame's atomic publication and every vote
+        // and proposal over it until it fell back to the in-place path, which
+        // logs the error, keeps the frame and writes none of its updates. Write
+        // none of them here too, so builds with and without this check hold the
+        // same alt shard records. No root covers them.
+        let unstorable = commits
+            .iter()
+            .filter(|(_, update)| !alt_shard_roots_storable(update))
+            .count();
+        if unstorable > 0 {
+            if UNSTORABLE_ALT_SHARD_FRAME.fetch_max(frame_number, Ordering::Relaxed) < frame_number
+            {
+                warn!(
+                    frame = frame_number,
+                    updates = commits.len(),
+                    unstorable,
+                    scope = "the frame's leader",
+                    action = "none on this node; report it if frames keep carrying them",
+                    "GLOBAL frame carries alt shard updates with roots no commit can hold; \
+                     writing none of its updates"
+                );
+            }
+            return Ok(());
+        }
+
+        let txn = self.hypergraph_store.new_transaction(false)?;
+
+        for (shard_address, update) in &commits {
             if let Err(e) = self.hypergraph_store.set_alt_shard_commit(
                 txn.as_ref(),
                 frame_number,
-                &shard_address,
+                shard_address,
                 &update.vertex_adds_root,
                 &update.vertex_removes_root,
                 &update.hyperedge_adds_root,
@@ -2739,9 +2849,49 @@ fn bundle_target_domain(bundle: &quil_types::proto::global::MessageBundle) -> Op
     None
 }
 
+/// The newest frame warned about for unstorable alt shard roots: a frame
+/// executes once per proposal, vote and publication, and warns once.
+static UNSTORABLE_ALT_SHARD_FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a commit can hold all four of the update's roots.
+fn alt_shard_roots_storable(update: &quil_types::proto::global::AltShardUpdate) -> bool {
+    use quil_execution::global_intrinsic::alt_shard_update_materialize::is_storable_alt_shard_root;
+    [
+        &update.vertex_adds_root,
+        &update.vertex_removes_root,
+        &update.hyperedge_adds_root,
+        &update.hyperedge_removes_root,
+    ]
+    .into_iter()
+    .all(|root| is_storable_alt_shard_root(root))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each root is checked, and each length a commit holds passes.
+    #[test]
+    fn an_alt_shard_update_is_storable_only_with_all_four_roots_storable() {
+        let good = quil_types::proto::global::AltShardUpdate {
+            vertex_adds_root: vec![1; 64],
+            vertex_removes_root: vec![2; 74],
+            hyperedge_adds_root: vec![3; 64],
+            hyperedge_removes_root: vec![4; 74],
+            ..Default::default()
+        };
+        assert!(alt_shard_roots_storable(&good));
+        for bad in 0..4 {
+            let mut update = good.clone();
+            *[
+                &mut update.vertex_adds_root,
+                &mut update.vertex_removes_root,
+                &mut update.hyperedge_adds_root,
+                &mut update.hyperedge_removes_root,
+            ][bad] = vec![0; 1];
+            assert!(!alt_shard_roots_storable(&update), "root {bad}");
+        }
+    }
 
     #[test]
     fn replacement_carrier_global_reward_route_is_independent_of_app_coverage() {
@@ -3036,7 +3186,7 @@ mod tests {
         .with_shard_admission_refresh({
             let calls = calls.clone();
             let current = current.clone();
-            Arc::new(move || {
+            Arc::new(move |_frame| {
                 assert_eq!(
                     current.materialized(),
                     0,
@@ -3224,6 +3374,7 @@ mod tests {
             prover_root_matched: true,
             local_prover_root: vec![0xAA; 64],
             finalized_bundles: Vec::new(),
+            skipped_bundles: Vec::new(),
             prover_ops: Default::default(),
         };
         assert_eq!(r.processed, 5);

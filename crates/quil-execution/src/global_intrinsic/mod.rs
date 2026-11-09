@@ -37,6 +37,7 @@ pub mod intrinsic;
 pub mod kick_verify;
 pub mod leaf_root_registration;
 pub mod materialize;
+pub mod persistent_storage;
 pub mod proof_types;
 pub mod prover_filter_ops;
 pub mod prover_join;
@@ -58,6 +59,9 @@ pub mod storage_epoch_proof;
 pub mod storage_seat;
 pub mod storage_snapshot;
 pub mod verify;
+
+#[cfg(test)]
+mod shard_op_binding_tests;
 
 pub use addressed_signature::{
     AddressedSignature, MAX_ADDRESSED_SIG_LEN, TYPE_BLS48581_ADDRESSED_SIGNATURE,
