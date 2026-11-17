@@ -7,11 +7,13 @@
 //! identity. See `node/p2p/peer_authenticator.go` in the Go tree and the
 //! `quil_tls` module here for the cert scheme.
 
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::panic::Location;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::Uri;
 use hyper_util::rt::TokioIo;
@@ -23,7 +25,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tonic::transport::{Channel, Endpoint};
 use tower::Service;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use quil_types::proto::global::app_shard_service_client::AppShardServiceClient;
 use quil_types::proto::global::global_service_client::GlobalServiceClient;
@@ -93,6 +95,21 @@ impl ArchiveClientError {
                 || cause.downcast_ref::<std::io::Error>().is_some()
         })
     }
+
+    /// The connection the call went over is no longer usable: the dial or
+    /// the transport failed. A call that only outran its deadline leaves
+    /// its connection usable.
+    pub fn is_connection_failure(&self) -> bool {
+        matches!(self, Self::Transport(_)) || self.is_transport_failure()
+    }
+
+    /// The request got no answer within its deadline: this client's
+    /// ([`Self::is_timeout`]) or the archive's, which it reports as
+    /// `DeadlineExceeded`.
+    fn missed_deadline(&self) -> bool {
+        self.is_timeout()
+            || matches!(self, Self::Rpc(status) if status.code() == tonic::Code::DeadlineExceeded)
+    }
 }
 
 /// `error` and every cause beneath it.
@@ -134,6 +151,375 @@ pub struct ArchiveClient {
     // app-shard frames for onboarding root cross-checks.
     app_shard: AppShardServiceClient<Channel>,
     endpoint: String,
+    /// Counts the connection as open until its last clone drops (PQNoise
+    /// dials; [`ENDPOINT_CONNECTIONS_WARN`]).
+    _open: Option<Arc<OpenConnection>>,
+}
+
+#[path = "archive_client_shared.rs"]
+pub mod shared;
+
+/// Where a dial was asked for: the caller of a `connect_*` function.
+type Site = &'static Location<'static>;
+
+/// This process's open connections plus dials in progress to one endpoint
+/// above which it warns. A node keeps one or two connections per archive;
+/// dozens mean a caller dials per request, which an archive's peer listener
+/// refuses past its per-source cap for every node behind the same address.
+const ENDPOINT_CONNECTIONS_WARN: usize = 32;
+
+/// The warning repeats at most this often per endpoint while it lasts.
+const ENDPOINT_LOAD_WARN_EVERY: Duration = Duration::from_secs(600);
+
+/// Dials counted for the warning's rate, and the most remembered.
+const DIAL_RATE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_DIALS_REMEMBERED: usize = 4096;
+
+/// Call sites named in the warning.
+const LOGGED_SITES: usize = 3;
+
+/// One endpoint's connections from this process.
+#[derive(Default)]
+struct EndpointLoad {
+    open: usize,
+    dialing: usize,
+    /// Dials started within [`DIAL_RATE_WINDOW`].
+    dials: VecDeque<Instant>,
+    /// Open plus dialing, by call site.
+    sites: HashMap<Site, usize>,
+    warned: Option<Instant>,
+    over_since: Option<Instant>,
+    peak: usize,
+}
+
+/// A line [`EndpointLoad::note`] asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum LoadLine {
+    Many {
+        open: usize,
+        dialing: usize,
+        dials_last_60s: usize,
+        sites: String,
+    },
+    Normal {
+        open: usize,
+        dialing: usize,
+        peak: usize,
+        secs: u64,
+    },
+}
+
+impl EndpointLoad {
+    /// Takes the counts after a change at `now`: a warning when open plus
+    /// dialing passes [`ENDPOINT_CONNECTIONS_WARN`] (at most once per
+    /// [`ENDPOINT_LOAD_WARN_EVERY`]), and one line once it falls back to
+    /// half that.
+    fn note(&mut self, now: Instant) -> Option<LoadLine> {
+        while self
+            .dials
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) > DIAL_RATE_WINDOW)
+        {
+            self.dials.pop_front();
+        }
+        let total = self.open + self.dialing;
+        if total > ENDPOINT_CONNECTIONS_WARN {
+            self.peak = self.peak.max(total);
+            self.over_since.get_or_insert(now);
+            if self
+                .warned
+                .is_some_and(|at| now.saturating_duration_since(at) < ENDPOINT_LOAD_WARN_EVERY)
+            {
+                return None;
+            }
+            self.warned = Some(now);
+            let mut sites: Vec<(Site, usize)> = self
+                .sites
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(site, n)| (*site, *n))
+                .collect();
+            sites.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| (a.0.file(), a.0.line()).cmp(&(b.0.file(), b.0.line())))
+            });
+            let sites = sites
+                .iter()
+                .take(LOGGED_SITES)
+                .map(|(site, n)| format!("{}:{}={n}", site.file(), site.line()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Some(LoadLine::Many {
+                open: self.open,
+                dialing: self.dialing,
+                dials_last_60s: self.dials.len(),
+                sites,
+            });
+        }
+        if total <= ENDPOINT_CONNECTIONS_WARN / 2 {
+            if let Some(since) = self.over_since.take() {
+                return Some(LoadLine::Normal {
+                    open: self.open,
+                    dialing: self.dialing,
+                    peak: std::mem::take(&mut self.peak),
+                    secs: now.saturating_duration_since(since).as_secs(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Nothing open, dialing or owed a line, and no warning left to pace.
+    fn forgettable(&self, now: Instant) -> bool {
+        self.open == 0
+            && self.dialing == 0
+            && self.over_since.is_none()
+            && self
+                .warned
+                .is_none_or(|at| now.saturating_duration_since(at) >= ENDPOINT_LOAD_WARN_EVERY)
+    }
+}
+
+static ENDPOINT_LOADS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, EndpointLoad>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Apply `change` to `endpoint`'s load and log the line it asks for.
+fn update_load(endpoint: &str, change: impl FnOnce(&mut EndpointLoad)) {
+    let now = Instant::now();
+    let line = {
+        let mut loads = ENDPOINT_LOADS.lock();
+        let load = loads.entry(endpoint.to_string()).or_default();
+        change(load);
+        let line = load.note(now);
+        if load.forgettable(now) {
+            loads.remove(endpoint);
+        }
+        line
+    };
+    match line {
+        Some(LoadLine::Many {
+            open,
+            dialing,
+            dials_last_60s,
+            sites,
+        }) => warn!(
+            %endpoint,
+            open,
+            dialing,
+            dials_last_60s,
+            %sites,
+            threshold = ENDPOINT_CONNECTIONS_WARN,
+            action = "this node opens a connection per request to one archive; report this line",
+            "many connections from this node to one archive endpoint (repeated every 10 min while it lasts)"
+        ),
+        Some(LoadLine::Normal {
+            open,
+            dialing,
+            peak,
+            secs,
+        }) => info!(
+            %endpoint,
+            open,
+            dialing,
+            peak,
+            secs,
+            "connections from this node to one archive endpoint back to normal"
+        ),
+        None => {}
+    }
+}
+
+/// A PQNoise dial in progress, counted for its endpoint and call site.
+struct Dialing {
+    endpoint: String,
+    site: Site,
+    done: bool,
+}
+
+impl Dialing {
+    fn start(endpoint: &str, site: Site) -> Self {
+        update_load(endpoint, |load| {
+            load.dialing += 1;
+            *load.sites.entry(site).or_default() += 1;
+            load.dials.push_back(Instant::now());
+            if load.dials.len() > MAX_DIALS_REMEMBERED {
+                load.dials.pop_front();
+            }
+        });
+        Self {
+            endpoint: endpoint.to_string(),
+            site,
+            done: false,
+        }
+    }
+
+    /// The dial connected: counted as open until the last clone drops.
+    fn connected(mut self) -> Arc<OpenConnection> {
+        self.done = true;
+        update_load(&self.endpoint, |load| {
+            load.dialing = load.dialing.saturating_sub(1);
+            load.open += 1;
+        });
+        Arc::new(OpenConnection {
+            endpoint: std::mem::take(&mut self.endpoint),
+            site: self.site,
+        })
+    }
+}
+
+impl Drop for Dialing {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let site = self.site;
+        update_load(&self.endpoint, |load| {
+            load.dialing = load.dialing.saturating_sub(1);
+            if let Some(n) = load.sites.get_mut(site) {
+                *n = n.saturating_sub(1);
+            }
+        });
+    }
+}
+
+/// An open PQNoise connection, counted until its last client clone drops.
+struct OpenConnection {
+    endpoint: String,
+    site: Site,
+}
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        let site = self.site;
+        update_load(&self.endpoint, |load| {
+            load.open = load.open.saturating_sub(1);
+            if let Some(n) = load.sites.get_mut(site) {
+                *n = n.saturating_sub(1);
+            }
+        });
+    }
+}
+
+/// `endpoint`'s open connections and dials in progress (tests).
+#[cfg(test)]
+fn endpoint_load(endpoint: &str) -> (usize, usize) {
+    ENDPOINT_LOADS
+        .lock()
+        .get(endpoint)
+        .map_or((0, 0), |load| (load.open, load.dialing))
+}
+
+/// Requests in flight at once on one shared submission connection; others
+/// wait for a slot, never for another connection. An archive's peer
+/// listener allows 256 streams per connection.
+pub const SUBMISSIONS_IN_FLIGHT: usize = 64;
+
+/// A shared connection nobody used for this long closes.
+pub const SHARED_IDLE: Duration = Duration::from_secs(60);
+
+/// A shared connection's key: the endpoint, the identity dialing it, and
+/// whether it carries submissions over 32 KiB. Those (storage epoch proofs,
+/// up to MBs) take a connection of their own, so a frame header or a
+/// confirmation never waits behind one in the connection's flow-control
+/// window.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SharedKey {
+    endpoint: String,
+    identity: Vec<u8>,
+    large: bool,
+}
+
+type SharedSet = shared::SharedConnections<SharedKey, ArchiveClient, ArchiveClientError>;
+
+/// The shared archive connection for submissions under 32 KiB and short
+/// reads ([`ArchiveClient::shared`]), as its redial warning names it.
+pub const SHARED_SHORT: &str = "archive submissions and short reads";
+
+/// The shared archive connection for submissions over 32 KiB.
+const SHARED_LARGE: &str = "archive submissions over 32 KiB";
+
+/// A redial warning repeats at most this often per class of connection.
+const REDIAL_WARN_EVERY: Duration = Duration::from_secs(600);
+
+/// When each class of shared connection last warned of a redial.
+static REDIAL_WARNED: std::sync::LazyLock<parking_lot::Mutex<HashMap<&'static str, Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl shared::Shared<ArchiveClient> {
+    /// Note how a request over this shared connection of `class` ended: a
+    /// transport failure drops the connection at once, a missed deadline
+    /// counts towards a redial ([`Self::deadline_passed`]), and any other
+    /// outcome is an answer, which ends the count.
+    pub fn settle(&self, outcome: Result<(), &ArchiveClientError>, class: &'static str) {
+        match outcome {
+            Err(error) if error.is_connection_failure() => self.discard(),
+            Err(error) if error.missed_deadline() => self.deadline_passed(class),
+            _ => self.answered(),
+        }
+    }
+
+    /// A request over this shared connection of `class` got no answer
+    /// within its deadline, the caller's own included. The
+    /// [`shared::DEADLINE_FAILURES_BEFORE_REDIAL`]th in a row drops the
+    /// connection, warned once per class every ten minutes.
+    pub fn deadline_passed(&self, class: &'static str) {
+        let Some(failures) = self.timed_out() else {
+            return;
+        };
+        let now = Instant::now();
+        let due = {
+            let mut warned = REDIAL_WARNED.lock();
+            let due = warned
+                .get(class)
+                .is_none_or(|at| now.duration_since(*at) >= REDIAL_WARN_EVERY);
+            if due {
+                warned.insert(class, now);
+            }
+            due
+        };
+        if due {
+            warn!(
+                class,
+                deadline_failures = failures,
+                scope = "peer",
+                repeats_every_s = REDIAL_WARN_EVERY.as_secs(),
+                action = "no action needed: the next request dials a fresh connection; \
+                          if this repeats, the far end or the path to it takes requests \
+                          without answering them",
+                "a shared connection answered none of its last requests in time; dropped it"
+            );
+        } else {
+            debug!(
+                class,
+                deadline_failures = failures,
+                "a shared connection answered none of its last requests in time; dropped it"
+            );
+        }
+    }
+}
+
+/// The connections this process shares with archives for submissions and
+/// short reads, dialed and run on [`archive_io`], which lives as long as the
+/// process, whichever runtime a caller is on.
+fn shared_connections() -> &'static SharedSet {
+    static SET: std::sync::OnceLock<SharedSet> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        shared::SharedConnections::new(
+            SHARED_IDLE,
+            Some(SUBMISSIONS_IN_FLIGHT),
+            Some(archive_io().handle().clone()),
+        )
+    })
+}
+
+/// Why a submission over a shared connection failed.
+#[derive(Debug)]
+pub enum SharedSubmitError {
+    /// No connection could be made; callers that waited on the same dial
+    /// share its error.
+    Dial(Arc<ArchiveClientError>),
+    /// The submission failed on the connection.
+    Submit(ArchiveClientError),
 }
 
 /// Failing connections per archive address. A node retries an archive
@@ -344,6 +730,7 @@ impl ArchiveClient {
                 .max_decoding_message_size(64 * 1024 * 1024)
                 .max_encoding_message_size(64 * 1024 * 1024),
             endpoint: addr.to_string(),
+            _open: None,
         })
     }
 
@@ -351,93 +738,182 @@ impl ArchiveClient {
     /// client cert from the given Ed448 seed and uses a custom rustls
     /// connector that accepts any server cert (Quilibrium peers self-sign;
     /// trust comes from the application-layer cross-signature in the SAN).
-    pub async fn connect_mtls(
-        addr: &str,
-        falcon_signing_key: &[u8],
-    ) -> Result<Self, ArchiveClientError> {
-        Self::connect_pq(addr, QuilPqNoiseConnector::new(falcon_signing_key.to_vec())).await
+    #[track_caller]
+    pub fn connect_mtls<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
+    ) -> impl Future<Output = Result<Self, ArchiveClientError>> + 'a {
+        let site = Location::caller();
+        Self::connect_pq(
+            addr,
+            QuilPqNoiseConnector::new(falcon_signing_key.to_vec()),
+            site,
+        )
     }
 
     /// [`Self::connect_mtls`] to another archive: an endpoint answering with
     /// this node's identity fails with [`ArchiveClientError::is_own_endpoint`].
-    pub async fn connect_archive(
-        addr: &str,
-        falcon_signing_key: &[u8],
-    ) -> Result<Self, ArchiveClientError> {
-        let own = quil_p2p::Keypair::falcon_from_bytes(falcon_signing_key)
-            .map_err(|error| ArchiveClientError::TlsInit(format!("own identity: {error}")))?
-            .public()
-            .to_peer_id();
-        let connector = QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).refusing_peer(own);
-        Self::connect_pq(addr, connector).await
+    #[track_caller]
+    pub fn connect_archive<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
+    ) -> impl Future<Output = Result<Self, ArchiveClientError>> + 'a {
+        let site = Location::caller();
+        async move {
+            let own = quil_p2p::Keypair::falcon_from_bytes(falcon_signing_key)
+                .map_err(|error| ArchiveClientError::TlsInit(format!("own identity: {error}")))?
+                .public()
+                .to_peer_id();
+            let connector =
+                QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).refusing_peer(own);
+            Self::connect_pq(addr, connector, site).await
+        }
     }
 
     /// [`Self::connect_mtls`] to a node that must answer as `peer`: a dial
     /// to an endpoint taken from a peer's signed record, so that the
     /// record cannot name another node's address and have it answer for it.
-    pub async fn connect_peer(
-        addr: &str,
-        falcon_signing_key: &[u8],
+    #[track_caller]
+    pub fn connect_peer<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
         peer: quil_p2p::PeerId,
-    ) -> Result<Self, ArchiveClientError> {
+    ) -> impl Future<Output = Result<Self, ArchiveClientError>> + 'a {
+        let site = Location::caller();
         let connector =
             QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).with_expected_peer(peer);
-        Self::connect_pq(addr, connector).await
+        Self::connect_pq(addr, connector, site)
     }
 
     /// Connect only to this worker's own master, which holds the same Falcon
     /// identity. Historical canonical frames and the archive directory rely
     /// on this pin; possession of an unrelated peer key is insufficient.
-    pub async fn connect_own_master(
-        addr: &str,
-        falcon_signing_key: &[u8],
-    ) -> Result<Self, ArchiveClientError> {
-        let connector =
-            QuilPqNoiseConnector::to_own_master(falcon_signing_key.to_vec()).map_err(|e| *e)?;
-        Self::connect_pq(addr, connector).await
+    #[track_caller]
+    pub fn connect_own_master<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
+    ) -> impl Future<Output = Result<Self, ArchiveClientError>> + 'a {
+        let site = Location::caller();
+        async move {
+            let connector =
+                QuilPqNoiseConnector::to_own_master(falcon_signing_key.to_vec()).map_err(|e| *e)?;
+            Self::connect_pq(addr, connector, site).await
+        }
     }
 
-    /// [`Self::connect_mtls`] for one submission of `bytes` bytes: its
-    /// requests may run for [`submit_deadline`] instead of
-    /// [`REQUEST_TIMEOUT`]. A request carries its body, and a fixed 15 s cut
-    /// a 0.54 MB storage epoch proof off below 36 KB/s to an archive; the
-    /// archives it goes to at once share the node's uplink.
-    pub async fn connect_mtls_for_submit(
+    /// The connection to the archive at `addr` this process shares for
+    /// submissions under 32 KiB and short reads, dialed as
+    /// [`Self::connect_mtls`] dials; each request on it may run for
+    /// [`REQUEST_TIMEOUT`]. Callers that find none wait on one dial. Hold the
+    /// result for the call, and [`shared::Shared::settle`] each request's
+    /// outcome on it with [`SHARED_SHORT`]: a transport failure drops it, and
+    /// so do requests that keep missing their deadline.
+    #[track_caller]
+    pub fn shared<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
+    ) -> impl Future<Output = Result<shared::Shared<Self>, Arc<ArchiveClientError>>> + 'a {
+        let site = Location::caller();
+        Self::shared_lane(addr, falcon_signing_key, false, site)
+    }
+
+    async fn shared_lane(
         addr: &str,
         falcon_signing_key: &[u8],
-        bytes: usize,
-    ) -> Result<Self, ArchiveClientError> {
-        let connector = QuilPqNoiseConnector::new(falcon_signing_key.to_vec());
-        Self::dial_pq(
-            addr,
-            connector.pinned_for(addr),
-            dials_off_this_thread(),
-            submit_deadline(bytes),
-        )
-        .await
+        large: bool,
+        site: Site,
+    ) -> Result<shared::Shared<Self>, Arc<ArchiveClientError>> {
+        let key = SharedKey {
+            endpoint: addr.to_string(),
+            identity: falcon_signing_key.to_vec(),
+            large,
+        };
+        shared_connections()
+            .connect(&key, || {
+                let connector =
+                    QuilPqNoiseConnector::new(falcon_signing_key.to_vec()).pinned_for(addr);
+                // A large submission sets its own deadline on each request,
+                // at most this.
+                let request_timeout = if large {
+                    SUBMIT_DEADLINE_CAP
+                } else {
+                    REQUEST_TIMEOUT
+                };
+                Self::dial_pq(addr, connector, true, request_timeout, site)
+            })
+            .await
+    }
+
+    /// Submit `data` to the archive at `addr` over the connection this
+    /// process shares with it, within [`submit_deadline`] for its size: a
+    /// request carries its body, and a fixed 15 s cut a 0.54 MB storage
+    /// epoch proof off below 36 KB/s to an archive. Submissions over 32 KiB
+    /// share a second connection. At most [`SUBMISSIONS_IN_FLIGHT`] run on
+    /// one connection at once; the rest wait for a slot within their
+    /// deadline. Each submission used to dial its own connection, and a
+    /// burst of them from one address hit the archive's per-source cap.
+    #[track_caller]
+    pub fn submit_shared<'a>(
+        addr: &'a str,
+        falcon_signing_key: &'a [u8],
+        data: Vec<u8>,
+    ) -> impl Future<Output = Result<(), SharedSubmitError>> + 'a {
+        let site = Location::caller();
+        async move {
+            let deadline = submit_deadline(data.len());
+            let large = deadline > REQUEST_TIMEOUT;
+            let key = SharedKey {
+                endpoint: addr.to_string(),
+                identity: falcon_signing_key.to_vec(),
+                large,
+            };
+            let permit = tokio::time::timeout(deadline, shared_connections().permit(&key))
+                .await
+                .map_err(|_| {
+                    SharedSubmitError::Submit(ArchiveClientError::Rpc(
+                        tonic::Status::deadline_exceeded(
+                            "every submission slot on the shared connection stayed taken past the deadline",
+                        ),
+                    ))
+                })?;
+            let mut client = Self::shared_lane(addr, falcon_signing_key, large, site)
+                .await
+                .map_err(SharedSubmitError::Dial)?;
+            let submitted = client.submit_global_message_within(data, deadline).await;
+            drop(permit);
+            client.settle(
+                submitted.as_ref().map(|_| ()),
+                if large { SHARED_LARGE } else { SHARED_SHORT },
+            );
+            submitted.map_err(SharedSubmitError::Submit)
+        }
     }
 
     async fn connect_pq(
         addr: &str,
         connector: QuilPqNoiseConnector,
+        site: Site,
     ) -> Result<Self, ArchiveClientError> {
         Self::dial_pq(
             addr,
             connector.pinned_for(addr),
             dials_off_this_thread(),
             REQUEST_TIMEOUT,
+            site,
         )
         .await
     }
 
     /// [`Self::connect_pq`], on [`archive_io`] when `off_thread`, else on
     /// the caller's runtime; each request on the channel may run for
-    /// `request_timeout`.
+    /// `request_timeout`. Counted for `site` while it dials and stays open
+    /// ([`ENDPOINT_CONNECTIONS_WARN`]).
     async fn dial_pq(
         addr: &str,
         connector: QuilPqNoiseConnector,
         off_thread: bool,
         request_timeout: Duration,
+        site: Site,
     ) -> Result<Self, ArchiveClientError> {
         // Note: scheme is `http://` — tonic's Endpoint refuses `https://`
         // unless its own `tls_config(...)` is set; we bypass that to install
@@ -467,6 +943,7 @@ impl ArchiveClient {
             .keep_alive_while_idle(true);
 
         debug!(%addr, "dialing archive node (PQNoise)");
+        let dialing = Dialing::start(addr, site);
         let dialed = if off_thread {
             // The channel's connection and buffer tasks run where they are
             // spawned: the dial spawns them, and the buffer task those of a
@@ -508,6 +985,7 @@ impl ArchiveClient {
         };
         debug!(%addr, "archive client connected (mTLS)");
         log_connect_outage(addr, connect_outage(addr, true), "");
+        let open = dialing.connected();
         Ok(Self {
             // 64 MiB decode/encode limit (tonic defaults to 4 MiB). Full
             // global frames and app-shard size sets routinely exceed 4 MiB;
@@ -520,6 +998,7 @@ impl ArchiveClient {
                 .max_decoding_message_size(64 * 1024 * 1024)
                 .max_encoding_message_size(64 * 1024 * 1024),
             endpoint: addr.to_string(),
+            _open: Some(open),
         })
     }
 
@@ -534,6 +1013,19 @@ impl ArchiveClient {
         self.inner
             .submit_global_message(SubmitGlobalMessageRequest { data })
             .await?;
+        Ok(())
+    }
+
+    /// [`Self::submit_global_message`] within `deadline`, at most the
+    /// channel's own request timeout; the archive is told it too.
+    pub async fn submit_global_message_within(
+        &mut self,
+        data: Vec<u8>,
+        deadline: Duration,
+    ) -> Result<(), ArchiveClientError> {
+        let mut request = tonic::Request::new(SubmitGlobalMessageRequest { data });
+        request.set_timeout(deadline);
+        self.inner.submit_global_message(request).await?;
         Ok(())
     }
 
@@ -1334,6 +1826,86 @@ fn build_quil_client_config_uncached(
     Ok(Arc::new(config))
 }
 
+/// How long a dial waits on one address before also trying the next: the
+/// connection attempt delay of RFC 8305.
+const CONNECT_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// Connect to `host:port` over every address it resolves to, the families
+/// interleaved from the resolver's first, a new attempt every
+/// [`CONNECT_ATTEMPT_DELAY`] while earlier ones are pending; the first to
+/// connect wins (RFC 8305). A name with a black-holed address of one family
+/// then connects on the other within the dial's budget.
+async fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let addrs = tokio::net::lookup_host((host, port)).await?.collect();
+    happy_eyeballs(
+        interleave_families(addrs),
+        CONNECT_ATTEMPT_DELAY,
+        TcpStream::connect,
+    )
+    .await
+}
+
+/// `addrs` with the two families alternating, the first address's first.
+fn interleave_families(addrs: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
+    let first_v6 = addrs.first().is_some_and(std::net::SocketAddr::is_ipv6);
+    let (mut first, mut second): (Vec<_>, Vec<_>) = addrs
+        .into_iter()
+        .partition(|addr| addr.is_ipv6() == first_v6);
+    let mut out = Vec::with_capacity(first.len() + second.len());
+    first.reverse();
+    second.reverse();
+    while !(first.is_empty() && second.is_empty()) {
+        out.extend(first.pop());
+        out.extend(second.pop());
+    }
+    out
+}
+
+/// Race `connect` over `addrs` in order, starting the next attempt as soon
+/// as one fails, else `delay` after the last start (RFC 8305 section 5); the
+/// first success wins and drops the others.
+/// The error is the last attempt's when every one fails.
+async fn happy_eyeballs<T, F, Fut>(
+    addrs: Vec<std::net::SocketAddr>,
+    delay: Duration,
+    connect: F,
+) -> std::io::Result<T>
+where
+    F: Fn(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let mut next = addrs.into_iter();
+    let mut pending = FuturesUnordered::new();
+    let Some(first) = next.next() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "the name resolves to no address",
+        ));
+    };
+    pending.push(connect(first));
+    let stagger = tokio::time::sleep(delay);
+    tokio::pin!(stagger);
+    loop {
+        let more = next.len() > 0;
+        tokio::select! {
+            Some(result) = pending.next() => match (result, next.next()) {
+                (Ok(stream), _) => return Ok(stream),
+                (Err(_), Some(addr)) => {
+                    pending.push(connect(addr));
+                    stagger.as_mut().reset(tokio::time::Instant::now() + delay);
+                }
+                (Err(error), None) if pending.is_empty() => return Err(error),
+                (Err(_), None) => {}
+            },
+            () = &mut stagger, if more => {
+                pending.extend(next.next().map(&connect));
+                stagger.as_mut().reset(tokio::time::Instant::now() + delay);
+            }
+        }
+    }
+}
+
 /// The host of `uri` as a dial target: `Uri` keeps an IPv6 literal in its
 /// brackets, which name no host to `TcpStream::connect`.
 fn dial_host(uri: &Uri) -> Option<&str> {
@@ -1370,7 +1942,7 @@ impl Service<Uri> for QuilTlsConnector {
         Box::pin(async move {
             let host = dial_host(&uri).ok_or_else(|| "missing host in uri".to_string())?;
             let port = uri.port_u16().unwrap_or(443);
-            let tcp = TcpStream::connect((host, port)).await?;
+            let tcp = connect_tcp(host, port).await?;
             let _ = tcp.set_nodelay(true);
             let connector = TlsConnector::from(config);
             // Quilibrium servers don't validate SNI; "localhost" matches what
@@ -1459,7 +2031,7 @@ impl Service<Uri> for QuilPqNoiseConnector {
         Box::pin(async move {
             let host = dial_host(&uri).ok_or_else(|| "missing host in uri".to_string())?;
             let port = uri.port_u16().unwrap_or(443);
-            let tcp = TcpStream::connect((host, port)).await?;
+            let tcp = connect_tcp(host, port).await?;
             let (peer, stream) =
                 crate::pqnoise_channel::pq_client_handshake(tcp, falcon_signing_key.as_ref())
                     .await?;
@@ -1690,6 +2262,116 @@ mod tests {
 #[cfg(test)]
 mod pinned_archive_tests {
     use super::*;
+
+    /// A dial over an IPv6 address that never answers and a live IPv4 one
+    /// connects on IPv4 while the IPv6 attempt still hangs.
+    #[tokio::test]
+    async fn a_dial_connects_on_the_other_family_while_one_hangs() {
+        let v6: std::net::SocketAddr = "[2001:db8::51]:8340".parse().unwrap();
+        let v4: std::net::SocketAddr = "192.0.2.51:8340".parse().unwrap();
+        let addrs = interleave_families(vec![v6, "[2001:db8::52]:8340".parse().unwrap(), v4]);
+        assert_eq!(addrs[..2], [v6, v4], "families alternate");
+        let connected = tokio::time::timeout(
+            Duration::from_secs(30),
+            happy_eyeballs(addrs, Duration::from_millis(20), |addr| async move {
+                if addr.is_ipv6() {
+                    std::future::pending::<()>().await;
+                }
+                Ok(addr)
+            }),
+        )
+        .await
+        .expect("a hanging IPv6 attempt must not hold the dial");
+        assert_eq!(connected.unwrap(), v4);
+    }
+
+    /// An attempt failing while an earlier one still pends starts the next
+    /// at once, not a stagger later (RFC 8305 section 5).
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_attempt_starts_the_next_at_once() {
+        let hang: std::net::SocketAddr = "[2001:db8::71]:8340".parse().unwrap();
+        let fail: std::net::SocketAddr = "192.0.2.71:8340".parse().unwrap();
+        let live: std::net::SocketAddr = "[2001:db8::72]:8340".parse().unwrap();
+        let delay = Duration::from_secs(10);
+        let start = tokio::time::Instant::now();
+        let connected = happy_eyeballs(vec![hang, fail, live], delay, move |addr| async move {
+            if addr == hang {
+                std::future::pending::<()>().await;
+            }
+            if addr == fail {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+            }
+            Ok(addr)
+        })
+        .await
+        .unwrap();
+        assert_eq!(connected, live);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < delay * 2,
+            "next_attempt_waits_after_failure: connected after {elapsed:?}"
+        );
+    }
+
+    /// The attempt started on a failure gets a full stagger before the next
+    /// starts, as one started on the stagger does (RFC 8305 section 5).
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_started_on_a_failure_gets_a_full_stagger() {
+        let fail: std::net::SocketAddr = "192.0.2.75:8340".parse().unwrap();
+        let hang: std::net::SocketAddr = "[2001:db8::75]:8340".parse().unwrap();
+        let live: std::net::SocketAddr = "192.0.2.76:8340".parse().unwrap();
+        let (delay, fails_after) = (Duration::from_secs(10), Duration::from_secs(4));
+        let start = tokio::time::Instant::now();
+        let connected = happy_eyeballs(vec![fail, hang, live], delay, move |addr| async move {
+            if addr == fail {
+                tokio::time::sleep(fails_after).await;
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+            }
+            if addr == hang {
+                std::future::pending::<()>().await;
+            }
+            Ok(addr)
+        })
+        .await
+        .unwrap();
+        assert_eq!(connected, live);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= fails_after + delay,
+            "stagger_not_reset_on_failure: the third attempt started after {elapsed:?}"
+        );
+    }
+
+    /// A dial whose every attempt fails returns the last attempt's error,
+    /// and one over no address says so.
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_failing_everywhere_returns_the_last_error() {
+        let addrs: Vec<std::net::SocketAddr> =
+            ["192.0.2.73:8340", "[2001:db8::73]:8340", "192.0.2.74:8340"]
+                .iter()
+                .map(|addr| addr.parse().unwrap())
+                .collect();
+        let error = happy_eyeballs(addrs.clone(), Duration::from_secs(10), |addr| async move {
+            Err::<std::net::SocketAddr, _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                addr.to_string(),
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            addrs[2].to_string(),
+            "last_attempt_error_returned"
+        );
+        let none = happy_eyeballs(Vec::new(), Duration::from_secs(10), |addr| async move {
+            Ok::<_, std::io::Error>(addr)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(none.kind(), std::io::ErrorKind::AddrNotAvailable);
+    }
+
 
     #[test]
     fn dial_host_strips_only_the_brackets_of_an_ipv6_literal() {
@@ -2214,6 +2896,7 @@ mod off_thread_dial_tests {
                             QuilPqNoiseConnector::new(key),
                             off_thread,
                             REQUEST_TIMEOUT,
+                            Location::caller(),
                         ));
                         let dial = started.elapsed();
                         ready.wait();
@@ -2493,5 +3176,224 @@ mod flow_control_tests {
             "a {output}-byte response took {took:?} at a {:?} round trip",
             DELAY * 2
         );
+    }
+}
+
+#[cfg(test)]
+mod endpoint_load_tests {
+    use super::*;
+
+    #[track_caller]
+    fn here() -> Site {
+        Location::caller()
+    }
+
+    /// Past 32 connections to one endpoint the node warns once, naming the
+    /// call sites that hold them, again only after ten minutes, and logs one
+    /// line once the count falls back to half.
+    #[test]
+    fn many_connections_to_one_endpoint_warn_once_per_interval_and_end_with_one_line() {
+        let start = Instant::now();
+        let busy = here();
+        let other = here();
+        let mut load = EndpointLoad {
+            open: ENDPOINT_CONNECTIONS_WARN,
+            ..Default::default()
+        };
+        load.sites.insert(busy, ENDPOINT_CONNECTIONS_WARN);
+        assert_eq!(load.note(start), None, "at the threshold");
+        load.dialing = 2;
+        load.sites.insert(other, 2);
+        load.dials.extend([start, start]);
+        let Some(LoadLine::Many {
+            open,
+            dialing,
+            dials_last_60s,
+            sites,
+        }) = load.note(start)
+        else {
+            panic!("no warning past the threshold");
+        };
+        assert_eq!((open, dialing, dials_last_60s), (32, 2, 2));
+        assert_eq!(
+            sites,
+            format!(
+                "{}:{}=32 {}:{}=2",
+                busy.file(),
+                busy.line(),
+                other.file(),
+                other.line()
+            )
+        );
+        let later = start + Duration::from_secs(120);
+        assert_eq!(load.note(later), None, "warned again within ten minutes");
+        let much_later = start + ENDPOINT_LOAD_WARN_EVERY;
+        assert!(matches!(
+            load.note(much_later),
+            Some(LoadLine::Many {
+                dials_last_60s: 0,
+                ..
+            })
+        ));
+        load.open = 20;
+        load.dialing = 0;
+        assert_eq!(
+            load.note(much_later),
+            None,
+            "ended above half the threshold"
+        );
+        load.open = 16;
+        assert_eq!(
+            load.note(much_later + Duration::from_secs(5)),
+            Some(LoadLine::Normal {
+                open: 16,
+                dialing: 0,
+                peak: 34,
+                secs: 605
+            })
+        );
+        assert_eq!(load.note(much_later + Duration::from_secs(6)), None);
+        assert!(
+            !load.forgettable(much_later),
+            "a recent warning still paces"
+        );
+        assert!(!load.forgettable(much_later + ENDPOINT_LOAD_WARN_EVERY));
+        load.open = 0;
+        assert!(load.forgettable(much_later + ENDPOINT_LOAD_WARN_EVERY));
+    }
+
+    /// A PQNoise connection counts as dialing during its dial and as open
+    /// until the last clone of its client drops.
+    #[tokio::test]
+    async fn a_connection_counts_as_open_until_its_last_clone_drops() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server_key = quil_p2p::generate_falcon_signing_key();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let key = server_key.clone();
+                tokio::spawn(async move {
+                    let stream = crate::pqnoise_channel::pq_server_handshake(tcp, &key).await;
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                });
+            }
+        });
+        let key = quil_p2p::generate_falcon_signing_key();
+        assert_eq!(endpoint_load(&address), (0, 0));
+        let client = ArchiveClient::connect_mtls(&address, &key).await.unwrap();
+        let copy = client.clone();
+        assert_eq!(endpoint_load(&address), (1, 0));
+        drop(client);
+        assert_eq!(endpoint_load(&address), (1, 0), "a clone still holds it");
+        drop(copy);
+        assert_eq!(
+            endpoint_load(&address),
+            (0, 0),
+            "the connection stayed counted"
+        );
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = closed.local_addr().unwrap().to_string();
+        drop(closed);
+        assert!(ArchiveClient::connect_mtls(&refused, &key).await.is_err());
+        assert_eq!(
+            endpoint_load(&refused),
+            (0, 0),
+            "a failed dial stayed counted"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shared_redial_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Submissions in a row a connection may leave unanswered before it is
+    /// dropped (`shared::DEADLINE_FAILURES_BEFORE_REDIAL`).
+    const REDIAL_AFTER: usize = 3;
+
+    /// A peer listener that counts the connections it accepted and holds
+    /// each one open without answering any request on it.
+    async fn silent_archive() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server_key = quil_p2p::generate_falcon_signing_key();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let key = server_key.clone();
+                tokio::spawn(async move {
+                    let stream = crate::pqnoise_channel::pq_server_handshake(tcp, &key).await;
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                });
+            }
+        });
+        (address, accepted)
+    }
+
+    /// `count` submissions at once to `address` over the shared connection;
+    /// each must miss its deadline.
+    async fn unanswered_submissions(address: &str, key: &[u8], count: usize) {
+        let submissions = (0..count).map(|_| {
+            let (address, key) = (address.to_string(), key.to_vec());
+            tokio::spawn(
+                async move { ArchiveClient::submit_shared(&address, &key, vec![1; 64]).await },
+            )
+        });
+        for submitted in futures::future::join_all(submissions).await {
+            match submitted.unwrap() {
+                Err(SharedSubmitError::Submit(error)) if error.is_timeout() => {}
+                other => panic!("the submission did not miss its deadline: {other:?}"),
+            }
+        }
+    }
+
+    /// Three submissions in a row that an archive leaves unanswered drop
+    /// the shared connection: the next caller dials a fresh one. It used to
+    /// be kept while traffic kept it from going idle, so every submission
+    /// to an archive that took requests without answering them failed
+    /// until restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submissions_unanswered_three_times_in_a_row_dial_a_fresh_connection() {
+        let (address, accepted) = silent_archive().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let first = ArchiveClient::shared(&address, &key).await.unwrap();
+        let first_id = first.id();
+        drop(first);
+        unanswered_submissions(&address, &key, REDIAL_AFTER).await;
+        eprintln!("REACH submit-redial");
+        let next = ArchiveClient::shared(&address, &key).await.unwrap();
+        assert!(
+            !next.kept() && next.id() != first_id,
+            "unanswered_connection_kept: {REDIAL_AFTER} submissions in a row went unanswered and the next caller rode the same connection"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "unanswered_connection_kept: expected one fresh dial"
+        );
+    }
+
+    /// One submission an archive leaves unanswered keeps the shared
+    /// connection: one slow answer is no reason to dial again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_submission_unanswered_once_keeps_its_connection() {
+        let (address, accepted) = silent_archive().await;
+        let key = quil_p2p::generate_falcon_signing_key();
+        let first = ArchiveClient::shared(&address, &key).await.unwrap();
+        let first_id = first.id();
+        drop(first);
+        unanswered_submissions(&address, &key, 1).await;
+        eprintln!("REACH submit-redial");
+        let next = ArchiveClient::shared(&address, &key).await.unwrap();
+        assert!(
+            next.kept() && next.id() == first_id,
+            "single_timeout_redialed: one unanswered submission dropped the connection"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 }

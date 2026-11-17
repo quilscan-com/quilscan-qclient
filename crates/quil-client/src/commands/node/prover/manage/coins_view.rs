@@ -4,6 +4,8 @@
 
 use std::time::{Instant, SystemTime};
 
+use crate::commands::token::history;
+
 use super::super::mint::{
     Dialog as MintDialog, Preview as MintPreview, Stage as MintStage, Status as MintStatus,
 };
@@ -12,7 +14,7 @@ use super::super::transfer::{
     Dialog as TransferDialog, Form as TransferForm, Kind as TransferKind,
     Preview as TransferPreview,
 };
-use super::coins::{self, CoinsFocus, Middle, ATTENTION};
+use super::coins::{self, CoinsFocus, HistoryRead, Middle, ATTENTION};
 use super::*;
 
 const COLUMNS: [&str; 5] = ["Kind", "Coins", "Amount [Q]", "State", "As of"];
@@ -343,10 +345,15 @@ pub(super) fn notice_lines(m: &mut Model, width: u16) -> Vec<Line<'static>> {
         } else {
             String::new()
         };
+        let mark = if notice.success {
+            ""
+        } else {
+            severity_mark(m, notice.severity)
+        };
         lines.extend(wrap_message(
             Line::from(Span::styled(
                 format!(
-                    "{}{marker}{}",
+                    "{}{mark}{marker}{}",
                     message_timestamp(m.coins.notice_since.get(notice.key).copied()),
                     notice.text
                 ),
@@ -544,17 +551,41 @@ fn keep_in_view(
 /// Rows the panel scrolls: first shown, total and shown.
 type Scroll = Option<(usize, usize, usize)>;
 
-/// A panel's `notes` with no rows above them, pinned to its last lines
-/// as a detail under rows is; a panel too short for them ends in the
-/// enlarge marker.
-fn pinned_notes(notes: Vec<Line<'static>>, width: u16, height: u16) -> Vec<Line<'static>> {
-    pin_detail(Vec::new(), fit_lines(notes, width, height), height)
+/// A middle panel's lines and the rows its notes block takes at their
+/// bottom, the `notes` rule's included; 0 with no notes or no rule.
+type Body = (Vec<Line<'static>>, usize);
+
+/// A panel's `notes` with no rows above them, under their `notes` rule
+/// on its last lines, as under rows; notes exactly as tall as the panel
+/// keep every line without the rule, and a panel too short for them ends
+/// in the enlarge marker.
+fn pinned_notes(notes: Vec<Line<'static>>, width: u16, height: u16) -> Body {
+    if notes.len() == usize::from(height) {
+        return (notes, 0);
+    }
+    let block = notes_block(notes, width, usize::from(height));
+    let taken = block.len();
+    (pin_detail(Vec::new(), block, height), taken)
+}
+
+/// `rows`, then the panel's `notes` under their rule on its last lines,
+/// in the rows [`notes_limit`] leaves under `keep` lines.
+fn pinned_under(
+    rows: Vec<Line<'static>>,
+    notes: Vec<Line<'static>>,
+    width: u16,
+    height: u16,
+    keep: u16,
+) -> Body {
+    let block = notes_block(notes, width, notes_limit(width, height, keep));
+    let taken = block.len();
+    (pin_detail(rows, block, height), taken)
 }
 
 /// The Claim status panel in `height` rows: a mint or claim under way and
 /// the authorizations saved for a claim. The reward's amount, frame and
 /// state are its Balances row's, ‹M› the `Reward claimable` notice's.
-fn claim_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
+fn claim_lines(m: &Model, width: u16, height: u16) -> Body {
     let mut lines = Vec::new();
     if super::super::mint::running(m) {
         lines = wrap_message(
@@ -572,13 +603,14 @@ fn claim_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
         );
     }
     let rest = usize::from(height).saturating_sub(lines.len());
-    lines.extend(saved_lines(m, width, rest));
-    lines
+    let (saved, notes) = saved_lines(m, width, rest);
+    lines.extend(saved);
+    (lines, notes)
 }
 
 /// The authorizations `token mint` saved, newest first, one row each with
 /// the Claim status cursor, in `rows` lines.
-fn saved_lines(m: &Model, width: u16, rows: usize) -> Vec<Line<'static>> {
+fn saved_lines(m: &Model, width: u16, rows: usize) -> Body {
     let help = Style::new().fg(HELP);
     let saved = &m.coins.mint.saved;
     if saved.is_empty() {
@@ -634,20 +666,16 @@ fn saved_lines(m: &Model, width: u16, rows: usize) -> Vec<Line<'static>> {
         Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
     ))];
     let height = u16::try_from(rows).unwrap_or(u16::MAX);
-    let note = fit_detail(
-        wrap_message(
-            Line::from(Span::styled(
-                "State: this node reports no authorization status; ‹C› checks for the finalized \
-                 witness before it claims.",
-                help,
-            )),
-            width,
-        ),
+    let note = wrap_message(
+        Line::from(Span::styled(
+            "State: this node reports no authorization status; ‹C› checks for the finalized \
+             witness before it claims.",
+            help,
+        )),
         width,
-        height,
-        2,
     );
-    let visible = rows.saturating_sub(1 + note.len()).max(1);
+    let shown = notes_block(note.clone(), width, notes_limit(width, height, 2)).len();
+    let visible = rows.saturating_sub(1 + shown).max(1);
     let focused = m.coins.focus == CoinsFocus::Middle;
     let first = m.coins.mint.cursor.saturating_sub(visible - 1);
     for (i, row) in cells.iter().enumerate().skip(first).take(visible) {
@@ -664,12 +692,227 @@ fn saved_lines(m: &Model, width: u16, rows: usize) -> Vec<Line<'static>> {
             style,
         )));
     }
-    pin_detail(lines, note, height)
+    pinned_under(lines, note, width, height, 2)
 }
 
-/// The middle panel's title and lines: a confirmation while one is open;
-/// else the selected Balances row's panel ([`Middle`]).
-fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'static>>, Scroll) {
+/// The History panel's columns.
+const HISTORY_COLUMNS: [&str; 6] = [
+    "When (UTC)",
+    "Action",
+    "Via",
+    "Amount [Q]",
+    "Fee [Q]",
+    "Outcome",
+];
+
+/// A recorded address in the History detail, as the wallet shows it
+/// elsewhere: a recipient by its ends and length, an escrow as the
+/// Transfers panel shows one; hidden in a render.
+fn history_party(m: &Model, party: &history::Party) -> String {
+    let (label, address) = match party {
+        history::Party::Recipient(address) => ("to", address),
+        history::Party::Escrow(address) => ("escrow", address),
+    };
+    let shown = if m.mask_private {
+        "hidden".to_string()
+    } else if !address.is_ascii() {
+        "unreadable".to_string()
+    } else if let history::Party::Recipient(_) = party {
+        address_text(address)
+    } else if m.compact_actions {
+        format!("…{}", &address[address.len().saturating_sub(6)..])
+    } else {
+        format!("0x{address}")
+    };
+    format!("{label} {shown}")
+}
+
+/// The History cursor row's detail: what its cells leave out. In a render
+/// an error is its fixed class reason, as the operator log names it.
+fn history_detail(m: &Model, action: &history::Action) -> String {
+    let (date, time) = history::utc(action.at);
+    let mut parts = vec![if action.started {
+        format!("Started {date} {time} UTC")
+    } else {
+        format!("First record {date} {time} UTC, no start recorded")
+    }];
+    if let Some(took) = action.duration_s {
+        parts.push(format!("took {took}s"));
+    }
+    if let Some(party) = &action.party {
+        parts.push(history_party(m, party));
+    }
+    match action.batches {
+        Some((submitted, Some(planned))) => {
+            parts.push(format!("{submitted} of {planned} batches submitted"));
+        }
+        Some((submitted, None)) => parts.push(format!("{submitted} batches submitted")),
+        None => {}
+    }
+    match (&action.outcome, &action.error) {
+        (history::Outcome::Failed, Some(error)) if m.mask_private => {
+            let reason = crate::commands::token::action_log::error_class(error).1;
+            parts.push(format!("failed: {reason}"));
+        }
+        (history::Outcome::Failed, Some(error)) => parts.push(format!("failed: {error}")),
+        (history::Outcome::Requoted, _) => {
+            parts.push("the fee quote changed; nothing was proved".into());
+        }
+        (history::Outcome::Unrecorded, _) => {
+            parts.push("no outcome recorded: stopped before its end, or still running".into());
+        }
+        _ => {}
+    }
+    format!("{}.", parts.join("; "))
+}
+
+/// The History panel's cells of `action`; its amounts are hidden in a
+/// render.
+fn history_cells(m: &Model, action: &history::Action) -> [Cell; 6] {
+    let amount = |units: Option<u128>| match units {
+        _ if m.mask_private => plain("hidden"),
+        Some(units) => plain(fixed_amount(units)),
+        None => plain("-"),
+    };
+    let outcome = match &action.outcome {
+        history::Outcome::Failed if m.color_coding => ("failed".to_string(), Some(WARNING)),
+        history::Outcome::Failed => plain("failed!"),
+        outcome => plain(outcome.word()),
+    };
+    [
+        plain(history::utc_minute(action.at)),
+        plain(action.name()),
+        plain(action.source.as_deref().unwrap_or("-")),
+        amount(action.amount),
+        amount(action.fee),
+        outcome,
+    ]
+}
+
+/// The History panel in `height` rows `width` wide: one row per recorded
+/// action, newest first, under the panel's cursor, the cursor row's detail
+/// pinned to the bottom under the panel's notes; else the panel's state.
+/// With the lines and the rows of their notes block, the rows it scrolls
+/// and the rows of the detail, whose first the cursor rule takes.
+fn history_lines(m: &Model, width: u16, height: u16) -> (Body, Scroll, usize) {
+    let help = Style::new().fg(HELP);
+    let note = |text: String, style: Style| {
+        let lines = wrap_message(Line::from(Span::styled(text, style)), width);
+        (pinned_notes(lines, width, height), None, 0)
+    };
+    let history = match &m.coins.history.read {
+        None => {
+            let text = format!("{} Reading the action log…", spinner(m));
+            let line = Line::from(Span::styled(text, Style::new().fg(PRIMARY)));
+            return ((vec![line], 0), None, 0);
+        }
+        Some(HistoryRead::Off) => {
+            return note(
+                "History: the action log is off (--no-action-log, or noActionLog: true in the \
+                 qclient config), or this is a render, which never reads it."
+                    .into(),
+                help,
+            );
+        }
+        Some(HistoryRead::Failed(why)) => {
+            return note(
+                format!("History: unavailable, the action log could not be read ({why})."),
+                Style::new().fg(WARNING),
+            );
+        }
+        Some(HistoryRead::Read(history)) if history.actions.is_empty() => {
+            return note(
+                "History: no wallet actions recorded yet. Shields, mints, claims and transfer \
+                 actions run here or by `qclient token` are."
+                    .into(),
+                help,
+            );
+        }
+        Some(HistoryRead::Read(history)) => history,
+    };
+    let cells: Vec<[Cell; 6]> = history
+        .actions
+        .iter()
+        .map(|action| history_cells(m, action))
+        .collect();
+    let mut widths = HISTORY_COLUMNS.map(|name| name.chars().count());
+    for row in &cells {
+        for (width, (text, _)) in widths.iter_mut().zip(row) {
+            *width = (*width).max(text.chars().count());
+        }
+    }
+    // Amounts align right, words left.
+    let pad = |column: usize, text: &str, width: usize| match column {
+        3 | 4 => format!("{text:>width$}  "),
+        _ => format!("{text:<width$}  "),
+    };
+    let bold = Style::new().fg(TEXT).add_modifier(Modifier::BOLD);
+    let header: Vec<Span<'static>> = HISTORY_COLUMNS
+        .iter()
+        .zip(widths)
+        .enumerate()
+        .map(|(column, (name, width))| Span::styled(pad(column, name, width), bold))
+        .collect();
+    let skipped = match history.unreadable {
+        0 => None,
+        1 => Some("1 line of the action log was unreadable and skipped.".to_string()),
+        n => Some(format!(
+            "{n} lines of the action log were unreadable and skipped."
+        )),
+    };
+    let notes = skipped
+        .map(|text| wrap_message(Line::from(Span::styled(text, help)), width))
+        .unwrap_or_default();
+    let cursor = m.coins.history.cursor.min(cells.len() - 1);
+    let detail = Line::from(Span::styled(
+        history_detail(m, &history.actions[cursor]),
+        help,
+    ));
+    let detail = cursor_detail(detail, width, height, 2);
+    // The skipped lines' note sits under its `notes` rule right above the
+    // cursor block.
+    let rows = u16::try_from(detail.len()).unwrap_or(u16::MAX);
+    let room = height.saturating_sub(rows);
+    let notes = notes_block(notes, width, notes_limit(width, room, 2));
+    let total = cells.len();
+    let visible = usize::from(height)
+        .saturating_sub(1 + notes.len() + detail.len())
+        .max(1);
+    let first = cursor.saturating_sub(visible - 1);
+    let focused = m.coins.focus == CoinsFocus::Middle;
+    let mut lines = vec![Line::from(header)];
+    for (i, row) in cells.into_iter().enumerate().skip(first).take(visible) {
+        let background = (i == cursor).then_some(if focused {
+            CURSOR_BG
+        } else {
+            INACTIVE_CURSOR_BG
+        });
+        let spans: Vec<Span<'static>> = row
+            .into_iter()
+            .zip(widths)
+            .enumerate()
+            .map(|(column, ((text, color), width))| {
+                let mut style = Style::new().fg(color.unwrap_or(TEXT));
+                if let Some(background) = background {
+                    style = style.bg(background);
+                }
+                Span::styled(pad(column, &text, width), style)
+            })
+            .collect();
+        lines.push(Line::from(spans));
+    }
+    let taken = notes.len();
+    let rule = detail.len();
+    let mut block = notes;
+    block.extend(detail);
+    let scroll = (total > visible).then_some((first, total, visible));
+    ((pin_detail(lines, block, height), taken), scroll, rule)
+}
+
+/// The middle panel's title, lines, the rows of its notes block and
+/// scroll: a confirmation while one is open; else the selected Balances
+/// row's panel ([`Middle`]).
+fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Body, Scroll) {
     match &m.coins.transfer.dialog {
         Some(TransferDialog::Form(form)) => {
             let title = if form.pending {
@@ -677,20 +920,27 @@ fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'st
             } else {
                 "Transfer"
             };
-            return (title.into(), form_lines(form, width, m.mask_private), None);
+            return (
+                title.into(),
+                (form_lines(form, width, m.mask_private), 0),
+                None,
+            );
         }
         Some(TransferDialog::Confirm(preview)) => {
             let title = format!("Confirm {}", preview.kind.name().to_lowercase());
             let lines = transfer_confirm_lines(preview, width, m.mask_private);
-            return (title, lines, None);
+            return (title, (lines, 0), None);
         }
         Some(TransferDialog::Preparing(_)) => {
             return (
                 Middle::Transfers.title().into(),
-                vec![Line::from(Span::styled(
-                    format!("{} Checking the inputs and quoting the fee…", spinner(m)),
-                    Style::new().fg(PRIMARY),
-                ))],
+                (
+                    vec![Line::from(Span::styled(
+                        format!("{} Checking the inputs and quoting the fee…", spinner(m)),
+                        Style::new().fg(PRIMARY),
+                    ))],
+                    0,
+                ),
                 None,
             );
         }
@@ -703,7 +953,7 @@ fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'st
                 MintStage::Claim { .. } => "Confirm claim",
             };
             let lines = mint_confirm_lines(preview, width, m.mask_private);
-            return (title.into(), lines, None);
+            return (title.into(), (lines, 0), None);
         }
         Some(MintDialog::Preparing(_, claim)) => {
             let text = if *claim {
@@ -713,10 +963,13 @@ fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'st
             };
             return (
                 Middle::Claim.title().into(),
-                vec![Line::from(Span::styled(
-                    format!("{} {text}", spinner(m)),
-                    Style::new().fg(PRIMARY),
-                ))],
+                (
+                    vec![Line::from(Span::styled(
+                        format!("{} {text}", spinner(m)),
+                        Style::new().fg(PRIMARY),
+                    ))],
+                    0,
+                ),
                 None,
             );
         }
@@ -732,6 +985,10 @@ fn middle_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'st
             (Middle::Transfers.title().into(), lines, None)
         }
         Middle::ShieldPlan => plan_lines(m, width, height),
+        Middle::History => {
+            let (body, scroll, _) = history_lines(m, width, height);
+            (Middle::History.title().into(), body, scroll)
+        }
     }
 }
 
@@ -750,7 +1007,7 @@ fn escrow_label(m: &Model, address: &[u8; 32]) -> String {
 
 /// The Transfers panel: one row per pending transfer this wallet can act
 /// on, under the panel's cursor, in `height` rows.
-fn transfer_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
+fn transfer_lines(m: &Model, width: u16, height: u16) -> Body {
     let help = Style::new().fg(HELP);
     let transfers = &m.coins.transfer;
     let note =
@@ -823,12 +1080,13 @@ fn transfer_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
         )
     };
     // The read's time is the shielded row's `As of`.
-    let footer = fit_detail(note(actions.into(), help), width, height, 2);
+    let footer = note(actions.into(), help);
     let mut lines = vec![Line::from(Span::styled(
         line(headers),
         Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
     ))];
-    let visible = usize::from(height).saturating_sub(1 + footer.len()).max(1);
+    let shown = notes_block(footer.clone(), width, notes_limit(width, height, 2)).len();
+    let visible = usize::from(height).saturating_sub(1 + shown).max(1);
     let focused = m.coins.focus == CoinsFocus::Middle;
     let first = transfers.cursor.saturating_sub(visible - 1);
     for (i, row) in cells.iter().enumerate().skip(first).take(visible) {
@@ -845,7 +1103,7 @@ fn transfer_lines(m: &Model, width: u16, height: u16) -> Vec<Line<'static>> {
             style,
         )));
     }
-    pin_detail(lines, footer, height)
+    pinned_under(lines, footer, width, height, 2)
 }
 
 /// A long address by its ends and length; the form and confirmation keep
@@ -1056,22 +1314,25 @@ fn transfer_confirm_lines(preview: &TransferPreview, width: u16, mask: bool) -> 
 
 /// The Shield plan panel's title and lines: the confirmation while it is
 /// open, else one row per `token shield-all` batch and its footer.
-fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'static>>, Scroll) {
+fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Body, Scroll) {
     match &m.coins.shield.dialog {
         Some(Dialog::Confirm(preview)) => {
             return (
                 "Confirm shield".into(),
-                confirm_lines(preview, width, height, m.mask_private),
+                (confirm_lines(preview, width, height, m.mask_private), 0),
                 None,
             );
         }
         Some(Dialog::Preparing(_)) => {
             return (
                 "Shield plan".into(),
-                vec![Line::from(Span::styled(
-                    format!("{} Reading coins and quoting fees…", spinner(m)),
-                    Style::new().fg(PRIMARY),
-                ))],
+                (
+                    vec![Line::from(Span::styled(
+                        format!("{} Reading coins and quoting fees…", spinner(m)),
+                        Style::new().fg(PRIMARY),
+                    ))],
+                    0,
+                ),
                 None,
             );
         }
@@ -1081,7 +1342,7 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
     // Before a read or with no key, the legacy row's `loading`,
     // `unavailable` or `no key` says why there is no plan.
     let Some((Some(snapshot), _, _)) = &m.coins.legacy.answer else {
-        return ("Shield plan".into(), Vec::new(), None);
+        return ("Shield plan".into(), (Vec::new(), 0), None);
     };
     let mut footer = Vec::new();
     if let Some((frame, left)) = coins::shields_open_at(m) {
@@ -1106,11 +1367,14 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
     footer.push(Line::from(Span::styled(summary, help)));
     let rows = &snapshot.batches;
     let count = rows.len();
-    // The footer keeps to the panel's bottom, under batch rows or alone.
-    if count > 0 {
-        footer = fit_detail(footer, width, height, 2);
-    }
-    let visible = usize::from(height).saturating_sub(1 + footer.len()).max(1);
+    // The footer keeps to the panel's bottom under its `notes` rule,
+    // under batch rows or alone.
+    let shown = if count > 0 {
+        notes_block(footer.clone(), width, notes_limit(width, height, 2)).len()
+    } else {
+        0
+    };
+    let visible = usize::from(height).saturating_sub(1 + shown).max(1);
     m.coins.plan_cursor = m.coins.plan_cursor.min(count.saturating_sub(1));
     m.coins.plan_offset = clamp_offset(m.coins.plan_offset, m.coins.plan_cursor, visible, count);
     let mut lines = Vec::new();
@@ -1159,13 +1423,13 @@ fn plan_lines(m: &mut Model, width: u16, height: u16) -> (String, Vec<Line<'stat
             )));
         }
     }
-    let lines = if count > 0 {
-        pin_detail(lines, footer, height)
+    let body = if count > 0 {
+        pinned_under(lines, footer, width, height, 2)
     } else {
         pinned_notes(footer, width, height)
     };
     let scroll = (count > visible).then_some((m.coins.plan_offset, count, visible));
-    ("Shield plan".into(), lines, scroll)
+    ("Shield plan".into(), body, scroll)
 }
 
 /// The mint confirmation: the stage and its exact inputs; `mask` hides the
@@ -1400,6 +1664,7 @@ fn ui_key_rows_esc(m: &Model, width: u16, esc: Option<&str>) -> Vec<Line<'static
         ("A", "accept"),
         ("R", "refund"),
         ("J", "merge"),
+        ("H", "history"),
         ("n", compact),
         ("c", colors),
         ("v", "notice level"),
@@ -1491,24 +1756,34 @@ pub(super) fn render(f: &mut Frame, m: &mut Model, area: Rect) {
     });
     render_cursor_rule(f, chunks[1], inner, detail_rows, border);
     let plan_area = chunks[2];
-    let (title, lines, scroll) = middle_lines(
-        m,
-        plan_area.width.saturating_sub(2),
-        plan_area.height.saturating_sub(2),
-    );
+    let width = plan_area.width.saturating_sub(2);
+    let height = plan_area.height.saturating_sub(2);
+    // The History cursor row's detail sits under the cursor rule, its
+    // notes over it.
+    let (title, (lines, notes), scroll, rule) = if coins::middle(m) == Middle::History {
+        let (body, scroll, rule) = history_lines(m, width, height);
+        (Middle::History.title().to_string(), body, scroll, rule)
+    } else {
+        let (title, body, scroll) = middle_lines(m, width, height);
+        (title, body, scroll, 0)
+    };
     let dialog = matches!(m.coins.shield.dialog, Some(Dialog::Confirm(_)))
         || matches!(m.coins.mint.dialog, Some(MintDialog::Confirm(_)))
         || matches!(
             m.coins.transfer.dialog,
             Some(TransferDialog::Confirm(_) | TransferDialog::Form(_))
         );
-    let block = bordered(title, dialog || m.coins.focus == CoinsFocus::Middle);
+    let focused = dialog || m.coins.focus == CoinsFocus::Middle;
+    let block = bordered(title, focused);
     let inner = block.inner(plan_area);
     f.render_widget(block, plan_area);
     f.render_widget(
         Paragraph::new(fit_lines(lines, inner.width, inner.height)),
         inner,
     );
+    let border = Style::new().fg(if focused { PRIMARY } else { DIM });
+    render_notes_rule(f, plan_area, inner, notes, rule, border);
+    render_cursor_rule(f, plan_area, inner, rule, border);
     if let Some((offset, total, visible)) = scroll {
         render_scroll_hint(f, plan_area, offset, total, visible, 0, 0);
     }
@@ -1949,7 +2224,8 @@ mod coins_render_tests {
     }
 
     /// With the reward row selected the Claim status's note keeps to the
-    /// panel's last lines, blank lines above it, at every size.
+    /// panel's last lines under its `notes` rule, blank lines above it, at
+    /// every size.
     #[test]
     fn the_claim_status_note_keeps_to_the_bottom() {
         let mut m = loaded();
@@ -1963,7 +2239,9 @@ mod coins_render_tests {
             assert!(note[0].starts_with("Saved authorizations: none"), "{text}");
             assert!(claim.len() > note.len(), "{text}");
             assert_eq!(claim[claim.len() - note.len()..], note[..], "{text}");
-            assert!(claim[claim.len() - note.len() - 1].is_empty(), "{text}");
+            let rule = &claim[claim.len() - note.len() - 1];
+            assert!(is_notes_rule(rule), "no notes rule\n{text}");
+            assert!(claim[claim.len() - note.len() - 2].is_empty(), "{text}");
         }
     }
 
@@ -2093,7 +2371,8 @@ mod coins_render_tests {
     }
 
     /// A first read under way shows as the row's `reading` and its
-    /// progress notice; the Transfers panel keeps only its actions note.
+    /// progress notice; the Transfers panel keeps only its actions note
+    /// under its `notes` rule.
     #[test]
     fn a_first_read_shows_in_the_row_and_its_notice_only() {
         let mut m = loaded();
@@ -2103,8 +2382,9 @@ mod coins_render_tests {
         m.coins.transfer.reading = Some(Instant::now());
         let text = render_text(&mut m, 120, 50);
         let transfers = non_blank(&panel_inner(&text, "Transfers"));
-        assert_eq!(transfers.len(), 1, "{text}");
-        assert!(transfers[0].starts_with("‹T› transfers"), "{text}");
+        assert_eq!(transfers.len(), 2, "{text}");
+        assert!(is_notes_rule(&transfers[0]), "{text}");
+        assert!(transfers[1].starts_with("‹T› transfers"), "{text}");
         let notices = panel_inner(&text, "Notifications").join(" ");
         assert!(
             notices.contains("Shielded coins: reading the coins and pending transfers"),
@@ -2213,11 +2493,11 @@ mod coins_render_tests {
         // Claimable, unshielded and the failed read show at the default level.
         assert!(header_line(&m)
             .to_string()
-            .starts_with("‹1› Provers  ‹2› Coins 3!"));
+            .starts_with(" Qclient  ‹1› Provers  ‹2› Coins 3!"));
         m.color_coding = true;
         assert!(header_line(&m)
             .to_string()
-            .starts_with("‹1› Provers  ‹2› Coins 3 "));
+            .starts_with(" Qclient  ‹1› Provers  ‹2› Coins 3 "));
     }
 
     /// A Coins key that does not apply to the selection: left out when
@@ -3126,6 +3406,41 @@ mod coins_render_tests {
         m
     }
 
+    /// A middle panel's notes sit under a `├─ notes ─┤` rule on its last
+    /// lines at 80x24 and wider: the Shield plan's footer under its batch
+    /// rows, the Transfers note with no rows.
+    #[test]
+    fn middle_panel_notes_sit_under_a_notes_rule() {
+        let mut m = with_rows();
+        m.show_key_rows = false;
+        let rule = |inner: &[String], notes: usize, text: &str| {
+            let line = &inner[inner.len() - notes - 1];
+            assert!(is_notes_rule(line), "no notes rule\n{text}");
+        };
+        for (width, height) in [(80, 24), (120, 40)] {
+            m.coins.cursor = 1;
+            let text = render_text(&mut m, width, height);
+            let plan = panel_inner(&text, "Shield plan");
+            assert_eq!(
+                plan.last().map(String::as_str),
+                Some("Batches: 2 of ≤96 coins; 1 coins on no live shard"),
+                "{text}"
+            );
+            rule(&plan, 1, &text);
+            assert!(plan[0].starts_with("Batch"), "{text}");
+            assert!(plan[1].starts_with("1/2"), "{text}");
+            m.coins.cursor = 2;
+            let text = render_text(&mut m, width, height);
+            let transfers = panel_inner(&text, "Transfers");
+            assert_eq!(
+                transfers.last().map(String::as_str),
+                Some("‹T› transfers, ‹P› makes a pending transfer, ‹J› merges coins."),
+                "{text}"
+            );
+            rule(&transfers, 1, &text);
+        }
+    }
+
     /// In a Balances panel taller than its content the cursor row's
     /// detail fills its last lines, as Allocations does, the rows at the
     /// top.
@@ -3266,7 +3581,7 @@ mod coins_render_tests {
             ];
         }
         for height in [2u16, 3] {
-            let (_, lines, _) = plan_lines(&mut m, 100, height);
+            let (_, (lines, _), _) = plan_lines(&mut m, 100, height);
             let lines: Vec<String> = lines.iter().map(Line::to_string).collect();
             assert_eq!(lines.len(), usize::from(height), "{lines:?}");
             assert!(lines[0].starts_with("Batch"), "{lines:?}");
@@ -3284,6 +3599,7 @@ mod coins_render_tests {
     fn claim_text(m: &Model, width: u16) -> Vec<String> {
         non_blank(
             &claim_lines(m, width - 2, 200)
+                .0
                 .iter()
                 .map(|line| line.to_string().trim().to_string())
                 .collect::<Vec<_>>(),
@@ -3295,6 +3611,19 @@ mod coins_render_tests {
             .iter()
             .filter(|line| !line.is_empty())
             .cloned()
+            .collect()
+    }
+
+    /// Whether a trimmed panel line is its `├─ notes ─┤` rule.
+    fn is_notes_rule(line: &str) -> bool {
+        line.starts_with("├─ notes ─") && line.ends_with('┤')
+    }
+
+    /// A panel's lines with text, its `notes` rule left out.
+    fn note_text(lines: &[String]) -> Vec<String> {
+        non_blank(lines)
+            .into_iter()
+            .filter(|line| !is_notes_rule(line))
             .collect()
     }
 
@@ -3315,7 +3644,7 @@ mod coins_render_tests {
         for show in [false, true] {
             m.show_key_rows = show;
             let text = render_text(&mut m, 80, 24);
-            let claim = non_blank(&panel_inner(&text, "Claim status"));
+            let claim = note_text(&panel_inner(&text, "Claim status"));
             if !show || claim.len() >= want.len() {
                 assert!(claim.len() >= want.len(), "{text}");
                 assert_eq!(claim[..want.len()], want[..], "{text}");
@@ -3395,6 +3724,29 @@ mod coins_render_tests {
         assert_eq!(claim[shown], "… enlarge panel for details", "{text}");
     }
 
+    /// A Claim status exactly as tall as its note keeps every note line
+    /// without the `notes` rule, never the rule over the enlarge marker.
+    #[test]
+    fn a_claim_status_as_tall_as_its_note_drops_the_rule() {
+        let mut m = loaded();
+        m.color_coding = false;
+        m.show_key_rows = false;
+        m.coins.cursor = 0;
+        let want = claim_text(&m, 80);
+        assert!(want.len() > 1, "{want:?}");
+        let mut seen = false;
+        for lower in (-8..=0).rev() {
+            m.coins.edges = [0, lower];
+            let text = render_text(&mut m, 80, 24);
+            let claim = panel_inner(&text, "Claim status");
+            if claim.len() == want.len() {
+                assert_eq!(claim, want, "rule over the enlarge marker\n{text}");
+                seen = true;
+            }
+        }
+        assert!(seen, "no Claim status {} lines tall", want.len());
+    }
+
     /// Balances' moved lower edge takes Notifications' spare lines before
     /// the middle panel's: at 80x24 with the edges [1, 0] (a live
     /// `coinsPanelEdges`) the Claim status keeps every line, and while
@@ -3428,10 +3780,179 @@ mod coins_render_tests {
             // The live case, and any split that leaves the middle panel
             // the Claim status's lines.
             if upper <= 1 || middle >= want.len() {
-                let claim = non_blank(&panel_inner(&text, "Claim status"));
+                let claim = note_text(&panel_inner(&text, "Claim status"));
                 assert!(claim.len() >= want.len(), "edges [{upper}, 0]\n{text}");
                 assert_eq!(claim[..want.len()], want[..], "{text}");
             }
         }
+    }
+
+    /// A transfer by the manager and a failed merge by the CLI, as the
+    /// action log records them.
+    fn two_actions() -> coins::HistoryRead {
+        use crate::commands::token::history::{parse, record_line as rec};
+        const T: u64 = 1_763_000_000;
+        let quil = u128::from(crate::util::UNITS_PER_QUIL);
+        let transfer = format!(
+            r#"{{"recipient":"0x{}","amount":"{}","fee":"{}"}}"#,
+            "c3".repeat(60),
+            quil * 2,
+            quil / 1000
+        );
+        let failed = r#"{"outcome":"failed","error":"plan changed at 10.1.2.3"}"#;
+        let log = [
+            rec(T, "transfer", "start", "manager", &transfer),
+            rec(
+                T + 30,
+                "transfer",
+                "outcome",
+                "manager",
+                r#"{"outcome":"ok","duration_s":30}"#,
+            ),
+            rec(T + 100, "merge", "start", "cli", r#"{"fee":"8"}"#),
+            rec(T + 101, "merge", "outcome", "cli", failed),
+        ];
+        coins::HistoryRead::Read(parse(&log.join("\n")))
+    }
+
+    /// The History panel: one row per action, newest first, a failure
+    /// marked, the cursor row's detail under the cursor rule (the
+    /// recipient by its ends, the error); a render hides the amounts, the
+    /// recipient and the error's text. Its states draw as notes.
+    #[test]
+    fn the_history_panel_lists_actions_newest_first() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut m = loaded();
+        m.color_coding = false;
+        coins::handle_key(&mut m, KeyEvent::from(KeyCode::Char('H')));
+        let text = render_text(&mut m, 120, 40);
+        let panel = panel_inner(&text, "History");
+        assert!(panel[0].contains("Reading the action log"), "{text}");
+        coins::apply_history(&mut m, two_actions());
+        let text = render_text(&mut m, 120, 40);
+        let panel = panel_inner(&text, "History");
+        assert!(panel[0].starts_with("When (UTC)") && panel[0].contains("Outcome"));
+        let merge = &panel[1];
+        assert!(merge.starts_with("2025-11-13 02:15  merge"), "{text}");
+        assert!(merge.contains("cli") && merge.contains("failed!"), "{text}");
+        let transfer = &panel[2];
+        assert!(transfer.contains("transfer  manager"), "{text}");
+        assert!(transfer.contains("2.00000") && transfer.contains("0.00100"));
+        assert!(transfer.ends_with("ok"), "{text}");
+        assert_eq!(
+            text.matches("─ cursor ─").count(),
+            2,
+            "history_detail_unruled\n{text}"
+        );
+        assert!(text.contains("failed: plan changed at 10.1.2.3"), "{text}");
+        coins::handle_key(&mut m, KeyEvent::from(KeyCode::Down));
+        let text = render_text(&mut m, 120, 40);
+        assert!(text.contains("took 30s"), "{text}");
+        assert!(
+            text.contains("to 0xc3c3c3c3c3c3…c3c3c3c3c3c3 (60 bytes)"),
+            "{text}"
+        );
+        // A render: amounts, the recipient and the error's text hidden.
+        m.mask_private = true;
+        let text = render_text(&mut m, 120, 40);
+        assert!(text.contains("to hidden"), "{text}");
+        assert!(
+            !text.contains("2.00000") && !text.contains("c3c3"),
+            "{text}"
+        );
+        m.coins.history.cursor = 0;
+        let text = render_text(&mut m, 120, 40);
+        assert!(
+            text.contains("failed: the coins changed since the confirmation"),
+            "{text}"
+        );
+        assert!(!text.contains("10.1.2.3"), "{text}");
+        m.mask_private = false;
+        for (read, note) in [
+            (coins::HistoryRead::Off, "History: the action log is off"),
+            (
+                coins::HistoryRead::Failed("wallet/actions.jsonl is not a regular file".into()),
+                "could not be read (wallet/actions.jsonl is not a regular file)",
+            ),
+            (
+                coins::HistoryRead::Read(Default::default()),
+                "History: no wallet actions recorded yet.",
+            ),
+        ] {
+            coins::apply_history(&mut m, read);
+            let text = render_text(&mut m, 120, 40);
+            let panel = panel_inner(&text, "History").join(" ");
+            assert!(panel.contains(note), "{text}");
+            assert_eq!(text.matches("─ cursor ─").count(), 1, "{text}");
+        }
+        // ‹H› again: the Balances row's panel.
+        coins::handle_key(&mut m, KeyEvent::from(KeyCode::Char('H')));
+        let text = render_text(&mut m, 120, 40);
+        assert!(text.contains("╭ Claim status"), "{text}");
+    }
+
+    /// The History panel's note of skipped log lines sits under its
+    /// `notes` rule right above the cursor row's detail.
+    #[test]
+    fn history_skipped_lines_sit_under_a_notes_rule() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut m = loaded();
+        m.color_coding = false;
+        coins::handle_key(&mut m, KeyEvent::from(KeyCode::Char('H')));
+        let coins::HistoryRead::Read(mut history) = two_actions() else {
+            panic!("two_actions reads");
+        };
+        history.unreadable = 2;
+        coins::apply_history(&mut m, coins::HistoryRead::Read(history));
+        let text = render_text(&mut m, 120, 40);
+        let panel = panel_inner(&text, "History");
+        let want = "2 lines of the action log were unreadable and skipped.";
+        let note = panel
+            .iter()
+            .position(|line| line == want)
+            .unwrap_or_else(|| panic!("no skipped-lines note\n{text}"));
+        assert!(
+            is_notes_rule(&panel[note - 1]),
+            "skipped_note_unruled\n{text}"
+        );
+        assert!(
+            panel[note + 1].starts_with("├─ cursor ─"),
+            "cursor_rule_not_under_note\n{text}"
+        );
+    }
+
+    /// An action's last report reads the log again while History is open,
+    /// and only then.
+    #[test]
+    fn an_ended_action_reads_the_history_again() {
+        use super::super::super::msg::Msg;
+        use super::super::super::transfer::Progress;
+        use super::super::super::update::{apply_msg, Cmd};
+        let mut m = loaded();
+        let done = || Msg::Transfer(Progress::Done(Ok(())));
+        assert!(apply_msg(&mut m, done()).is_empty());
+        coins::handle_key(
+            &mut m,
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('H')),
+        );
+        coins::apply_history(&mut m, coins::HistoryRead::Off);
+        let note = Msg::Transfer(Progress::Note("proving".into()));
+        assert!(apply_msg(&mut m, note).is_empty());
+        assert!(matches!(
+            apply_msg(&mut m, done()).as_slice(),
+            [Cmd::ReadHistory]
+        ));
+        coins::apply_history(&mut m, coins::HistoryRead::Off);
+        let mint = Msg::Mint(super::super::super::mint::Progress::Done(Ok(())));
+        assert!(matches!(
+            apply_msg(&mut m, mint).as_slice(),
+            [Cmd::ReadHistory]
+        ));
+        coins::apply_history(&mut m, coins::HistoryRead::Off);
+        let shield = Msg::Shield(super::super::super::shield::Progress::Done(Ok(())));
+        assert!(matches!(
+            apply_msg(&mut m, shield).as_slice(),
+            [Cmd::ReadHistory]
+        ));
     }
 }

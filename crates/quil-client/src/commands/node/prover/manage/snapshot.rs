@@ -106,7 +106,7 @@ fn allocation_json(row: &AllocationRow, model: &Model, workers: &HashMap<i64, bo
             "automatic"
         }
     });
-    let state = model.execution_state(row.execution.as_ref());
+    let state = model.execution_state(row);
     let execution_detail = execution_detail_with_state(row.execution.as_ref(), state);
 
     json!({

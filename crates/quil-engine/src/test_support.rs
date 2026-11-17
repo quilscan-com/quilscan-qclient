@@ -15,9 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use quil_types::consensus::{
-    ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus,
-};
+use quil_types::consensus::{ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus};
 use quil_types::error::Result;
 
 use crate::worker::{WorkerInfo, WorkerManager};
@@ -41,6 +39,12 @@ pub struct TestProverRegistry {
     /// can pass. See [`Self::register_leaf_root`] / [`ProverRegistry::get_leaf_root`].
     #[allow(clippy::type_complexity)]
     leaf_roots: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)>>,
+    /// Storage seat slots, keyed by `(member, filter, epoch)`
+    /// ([`Self::set_storage_seat_slot`] / [`ProverRegistry::get_storage_seat_slot`]).
+    #[allow(clippy::type_complexity)]
+    seat_slots: Mutex<
+        std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), quil_types::consensus::StorageSeatSlot>,
+    >,
 }
 
 impl Default for TestProverRegistry {
@@ -56,7 +60,21 @@ impl TestProverRegistry {
             summaries: Mutex::new(Vec::new()),
             next_prover: Mutex::new(None),
             leaf_roots: Mutex::new(std::collections::HashMap::new()),
+            seat_slots: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Record `member`'s storage seat slot on `filter` for `slot.epoch`.
+    pub fn set_storage_seat_slot(
+        &self,
+        member: &[u8],
+        filter: &[u8],
+        slot: quil_types::consensus::StorageSeatSlot,
+    ) {
+        self.seat_slots
+            .lock()
+            .unwrap()
+            .insert((member.to_vec(), filter.to_vec(), slot.epoch), slot);
     }
 
     /// Register a member's storage leaf root so `get_leaf_root` returns it (the
@@ -95,6 +113,11 @@ impl TestProverRegistry {
         }
     }
 
+    /// Block every prover read until the guard drops.
+    pub fn hold_provers(&self) -> std::sync::MutexGuard<'_, Vec<ProverInfo>> {
+        self.provers.lock().unwrap()
+    }
+
     pub fn set_provers(&self, provers: Vec<ProverInfo>) {
         *self.provers.lock().unwrap() = provers;
     }
@@ -109,6 +132,19 @@ impl TestProverRegistry {
 }
 
 impl ProverRegistry for TestProverRegistry {
+    fn get_storage_seat_slot(
+        &self,
+        member: &[u8],
+        filter: &[u8],
+        epoch: u64,
+    ) -> Result<Option<quil_types::consensus::StorageSeatSlot>> {
+        Ok(self
+            .seat_slots
+            .lock()
+            .unwrap()
+            .get(&(member.to_vec(), filter.to_vec(), epoch))
+            .cloned())
+    }
     fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>> {
         Ok(self
             .provers
@@ -133,7 +169,12 @@ impl ProverRegistry for TestProverRegistry {
             .cloned())
     }
 
-    fn get_next_prover(&self, _input: &[u8; 32], _filter: &[u8], _frame_number: u64) -> Result<Vec<u8>> {
+    fn get_next_prover(
+        &self,
+        _input: &[u8; 32],
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<Vec<u8>> {
         if let Some(addr) = self.next_prover.lock().unwrap().clone() {
             return Ok(addr);
         }
@@ -146,7 +187,12 @@ impl ProverRegistry for TestProverRegistry {
             .unwrap_or_default())
     }
 
-    fn get_ordered_provers(&self, _: &[u8; 32], _: &[u8], _frame_number: u64) -> Result<Vec<Vec<u8>>> {
+    fn get_ordered_provers(
+        &self,
+        _: &[u8; 32],
+        _: &[u8],
+        _frame_number: u64,
+    ) -> Result<Vec<Vec<u8>>> {
         Ok(self
             .provers
             .lock()
@@ -162,15 +208,30 @@ impl ProverRegistry for TestProverRegistry {
         // remain members, while Joining/Paused are not active proof producers.
         // Allocation-free Active fixtures retain the harness shorthand for
         // an all-shard committee; an empty filter queries global membership.
-        let members = |floor: bool| provers.iter().filter(|p|
-            (p.status == ProverStatus::Active && (filter.is_empty() || p.allocations.is_empty()))
-            || p.allocations.iter().any(|a|
-            a.confirmation_filter == filter && (matches!(a.effective_status(frame_number),
-                quil_types::consensus::EffectiveStatus::Active | quil_types::consensus::EffectiveStatus::Leaving)
-                || (floor && a.status == ProverStatus::Active))))
-            .cloned().collect::<Vec<_>>();
+        let members = |floor: bool| {
+            provers
+                .iter()
+                .filter(|p| {
+                    (p.status == ProverStatus::Active
+                        && (filter.is_empty() || p.allocations.is_empty()))
+                        || p.allocations.iter().any(|a| {
+                            a.confirmation_filter == filter
+                                && (matches!(
+                                    a.effective_status(frame_number),
+                                    quil_types::consensus::EffectiveStatus::Active
+                                        | quil_types::consensus::EffectiveStatus::Leaving
+                                ) || (floor && a.status == ProverStatus::Active))
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let strict = members(false);
-        Ok(if strict.is_empty() && !filter.is_empty() { members(true) } else { strict })
+        Ok(if strict.is_empty() && !filter.is_empty() {
+            members(true)
+        } else {
+            strict
+        })
     }
 
     fn get_prover_count(&self, _filter: &[u8]) -> Result<usize> {
@@ -196,10 +257,7 @@ impl ProverRegistry for TestProverRegistry {
             .collect())
     }
 
-    fn get_prover_shard_summaries(
-        &self,
-        _frame_number: u64,
-    ) -> Result<Vec<ProverShardSummary>> {
+    fn get_prover_shard_summaries(&self, _frame_number: u64) -> Result<Vec<ProverShardSummary>> {
         Ok(self.summaries.lock().unwrap().clone())
     }
 }
@@ -218,8 +276,19 @@ impl ProverRegistry for TestProverRegistry {
 /// plumbing.
 pub struct TestWorkerManager {
     workers: Mutex<HashMap<u32, WorkerInfo>>,
+    /// Configured worker count; `None` uses the number of workers.
+    capacity: Mutex<Option<usize>>,
     evictions: Mutex<Vec<(u32, Vec<Vec<u8>>)>>,
     executions: Mutex<HashMap<u32, (Vec<u8>, quil_types::proto::node::WorkerExecution)>>,
+    unanswered: Mutex<HashMap<u32, (Vec<u8>, &'static str)>>,
+    shard_data: Mutex<HashMap<u32, Vec<(Vec<u8>, u64)>>>,
+    /// Workers above this count drain, as a thread manager's above its
+    /// configured count; `None` drains none.
+    drain_above: Mutex<Option<u32>>,
+    retired: Mutex<Vec<u32>>,
+    refuse_retirement: Mutex<bool>,
+    /// Workers whose eviction requests fail, as when their channel is full.
+    failing_evictions: Mutex<Vec<u32>>,
 }
 
 impl Default for TestWorkerManager {
@@ -232,14 +301,71 @@ impl TestWorkerManager {
     pub fn new() -> Self {
         Self {
             workers: Mutex::new(HashMap::new()),
+            capacity: Mutex::new(None),
             evictions: Mutex::new(Vec::new()),
             executions: Mutex::new(HashMap::new()),
+            unanswered: Mutex::new(HashMap::new()),
+            shard_data: Mutex::new(HashMap::new()),
+            drain_above: Mutex::new(None),
+            retired: Mutex::new(Vec::new()),
+            refuse_retirement: Mutex::new(false),
+            failing_evictions: Mutex::new(Vec::new()),
         }
     }
 
+    /// Configure `count` workers, so those above it drain, as after an
+    /// operator lowers a thread manager's worker count.
+    pub fn set_configured_count(&self, count: u32) {
+        self.set_allocation_capacity(count as usize);
+        *self.drain_above.lock().unwrap() = Some(count);
+    }
+
+    /// Fail every retirement, as when a worker cannot be stopped.
+    pub fn refuse_retirement(&self) {
+        *self.refuse_retirement.lock().unwrap() = true;
+    }
+
+    /// Fail every eviction request to `cores`; failed requests are not
+    /// recorded in [`Self::evictions`].
+    pub fn fail_evictions(&self, cores: &[u32]) {
+        self.failing_evictions.lock().unwrap().extend(cores);
+    }
+
+    /// Workers retired so far, in order.
+    pub fn retired(&self) -> Vec<u32> {
+        self.retired.lock().unwrap().clone()
+    }
+
+    /// The shards whose data `core_id`'s store holds, with their cursors.
+    pub fn set_shard_data(&self, core_id: u32, shards: Vec<(Vec<u8>, u64)>) {
+        self.shard_data.lock().unwrap().insert(core_id, shards);
+    }
+
+    /// Configure fewer workers than there are records, as after an operator
+    /// lowers the worker count.
+    pub fn set_allocation_capacity(&self, capacity: usize) {
+        *self.capacity.lock().unwrap() = Some(capacity);
+    }
+
     /// The execution report `core_id`'s engine gives for `filter`.
-    pub fn set_execution(&self, core_id: u32, filter: &[u8], execution: quil_types::proto::node::WorkerExecution) {
-        self.executions.lock().unwrap().insert(core_id, (filter.to_vec(), execution));
+    pub fn set_execution(
+        &self,
+        core_id: u32,
+        filter: &[u8],
+        execution: quil_types::proto::node::WorkerExecution,
+    ) {
+        self.executions
+            .lock()
+            .unwrap()
+            .insert(core_id, (filter.to_vec(), execution));
+    }
+
+    /// `core_id`, bound to `filter`, does not answer its report request.
+    pub fn set_unanswered(&self, core_id: u32, filter: &[u8], reason: &'static str) {
+        self.unanswered
+            .lock()
+            .unwrap()
+            .insert(core_id, (filter.to_vec(), reason));
     }
 
     /// Payload evictions requested so far, as `(core, protected filters)`.
@@ -272,26 +398,88 @@ impl TestWorkerManager {
 }
 
 impl WorkerManager for TestWorkerManager {
+    fn allocation_capacity(&self) -> Result<usize> {
+        let configured = *self.capacity.lock().unwrap();
+        Ok(configured.unwrap_or_else(|| self.workers.lock().unwrap().len()))
+    }
+
+    fn is_draining(&self, core_id: u32) -> bool {
+        self.drain_above
+            .lock()
+            .unwrap()
+            .is_some_and(|count| core_id > count)
+    }
+
+    /// Like the thread manager: only an idle draining worker is retired.
+    fn retire_worker(&self, core_id: u32) -> Result<()> {
+        if !self.is_draining(core_id) {
+            return Err(quil_types::error::QuilError::InvalidArgument(format!(
+                "worker {core_id} is not draining"
+            )));
+        }
+        if *self.refuse_retirement.lock().unwrap() {
+            return Err(quil_types::error::QuilError::ExecutionUnavailable(format!(
+                "worker {core_id} cannot stop"
+            )));
+        }
+        let mut workers = self.workers.lock().unwrap();
+        if workers
+            .get(&core_id)
+            .is_some_and(|w| !w.filter.is_empty() || w.pending_filter_frame != 0)
+        {
+            return Err(quil_types::error::QuilError::InvalidArgument(format!(
+                "worker {core_id} holds a seat"
+            )));
+        }
+        if workers.remove(&core_id).is_some() {
+            self.retired.lock().unwrap().push(core_id);
+        }
+        Ok(())
+    }
+
     /// Reports set with `set_execution`, for workers still bound to their filter.
     fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
         let workers = self.workers.lock().unwrap();
-        self.executions.lock().unwrap().iter()
-            .filter(|(core_id, (filter, _))| workers.get(core_id).is_some_and(|w| &w.filter == filter))
+        self.executions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(core_id, (filter, _))| {
+                workers.get(core_id).is_some_and(|w| &w.filter == filter)
+            })
             .map(|(core_id, (filter, execution))| (*core_id, filter.clone(), execution.clone()))
             .collect()
     }
 
+    /// Workers set with `set_unanswered`, still bound to their filter.
+    fn unanswered_workers(&self) -> Vec<(u32, Vec<u8>, &'static str)> {
+        let workers = self.workers.lock().unwrap();
+        self.unanswered
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(core_id, (filter, _))| {
+                workers.get(core_id).is_some_and(|w| &w.filter == filter)
+            })
+            .map(|(core_id, (filter, reason))| (*core_id, filter.clone(), *reason))
+            .collect()
+    }
+
     fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
+        if self.failing_evictions.lock().unwrap().contains(&core_id) {
+            return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                "payload eviction: channel full".into(),
+            ));
+        }
         self.evictions.lock().unwrap().push((core_id, keep));
         Ok(())
     }
 
-    fn set_worker_filter(
-        &self,
-        core_id: u32,
-        filter: &[u8],
-        start_consensus: bool,
-    ) -> Result<()> {
+    fn shard_data(&self) -> HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        self.shard_data.lock().unwrap().clone()
+    }
+
+    fn set_worker_filter(&self, core_id: u32, filter: &[u8], start_consensus: bool) -> Result<()> {
         let mut g = self.workers.lock().unwrap();
         let entry = g.entry(core_id).or_insert(WorkerInfo {
             core_id,
@@ -325,8 +513,7 @@ impl WorkerManager for TestWorkerManager {
     }
 
     fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
-        let mut out: Vec<WorkerInfo> =
-            self.workers.lock().unwrap().values().cloned().collect();
+        let mut out: Vec<WorkerInfo> = self.workers.lock().unwrap().values().cloned().collect();
         out.sort_by_key(|w| w.core_id);
         Ok(out)
     }
@@ -413,12 +600,7 @@ impl SpawningWorkerManager {
 }
 
 impl crate::worker::WorkerManager for SpawningWorkerManager {
-    fn set_worker_filter(
-        &self,
-        core_id: u32,
-        filter: &[u8],
-        start_consensus: bool,
-    ) -> Result<()> {
+    fn set_worker_filter(&self, core_id: u32, filter: &[u8], start_consensus: bool) -> Result<()> {
         let mut g = self.workers.lock().unwrap();
         let entry = g.entry(core_id).or_insert(crate::worker::WorkerInfo {
             core_id,
@@ -548,10 +730,7 @@ impl crate::prover_message_transport::ProverMessageTransport for TestProverMessa
         Ok(self.head_header.lock().unwrap().clone())
     }
 
-    async fn publish_prover_bundle(
-        &self,
-        bundle_bytes: Vec<u8>,
-    ) -> quil_types::error::Result<()> {
+    async fn publish_prover_bundle(&self, bundle_bytes: Vec<u8>) -> quil_types::error::Result<()> {
         // Capture and forward.
         let sink = self.sink.lock().unwrap().clone();
         self.outbound.lock().unwrap().push(bundle_bytes.clone());
@@ -675,9 +854,30 @@ pub fn certify_seal(
     signers: &[quil_crypto::FalconSigner],
     seal: &quil_cw_consensus::handoff::Seal,
 ) -> Vec<u8> {
+    certify_proposal(
+        session,
+        signers,
+        seal.view,
+        seal.checkpoint.view,
+        seal.digest(),
+    )
+}
+
+/// A real Simplex finalization by every member of `session` of the proposal
+/// of `digest` at `view` over `parent` (0: the session's genesis).
+pub fn certify_proposal(
+    session: &quil_cw_consensus::handoff::Session,
+    signers: &[quil_crypto::FalconSigner],
+    view: u64,
+    parent: u64,
+    digest: [u8; 32],
+) -> Vec<u8> {
     use quil_cw_consensus::{
         _consensus::{
-            simplex::{scheme::Namespace, types::{Finalization, Proposal, Subject}},
+            simplex::{
+                scheme::Namespace,
+                types::{Finalization, Proposal, Subject},
+            },
             types::{Epoch, Round, View},
         },
         _crypto::{sha256::Digest, Signer as _},
@@ -688,21 +888,43 @@ pub fn certify_seal(
         falcon_simplex::SimplexFalconScheme,
     };
     use quil_types::crypto::Signer as _;
-    let keys: Vec<FalconPrivateKey> = signers.iter()
+    let keys: Vec<FalconPrivateKey> = signers
+        .iter()
         .map(|s| FalconPrivateKey::from_bytes(s.private_key(), s.public_key()).unwrap())
         .collect();
     let proposal = Proposal::new(
-        Round::new(Epoch::new(session.generation), View::new(seal.view)),
-        View::new(seal.checkpoint.view),
-        Digest(seal.digest()),
+        Round::new(Epoch::new(session.generation), View::new(view)),
+        View::new(parent),
+        Digest(digest),
     );
-    let participants: Set<_> = keys.iter().map(|key| key.public_key()).collect::<Vec<_>>().try_into().unwrap();
-    let schemes: Vec<Generic<Namespace>> = keys.iter().cloned()
-        .map(|key| Generic::signer(&session.namespace().unwrap(), participants.clone(), key).unwrap())
+    let participants: Set<_> = keys
+        .iter()
+        .map(|key| key.public_key())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let schemes: Vec<Generic<Namespace>> = keys
+        .iter()
+        .cloned()
+        .map(|key| {
+            Generic::signer(&session.namespace().unwrap(), participants.clone(), key).unwrap()
+        })
         .collect();
-    let votes: Vec<_> = schemes.iter()
-        .map(|scheme| scheme.sign::<SimplexFalconScheme, Digest>(Subject::Finalize { proposal: &proposal }).unwrap())
+    let votes: Vec<_> = schemes
+        .iter()
+        .map(|scheme| {
+            scheme
+                .sign::<SimplexFalconScheme, Digest>(Subject::Finalize {
+                    proposal: &proposal,
+                })
+                .unwrap()
+        })
         .collect();
-    let certificate = schemes[0].assemble::<SimplexFalconScheme, _, N3f1>(votes).unwrap();
-    encode_finalization(&Finalization { proposal, certificate })
+    let certificate = schemes[0]
+        .assemble::<SimplexFalconScheme, _, N3f1>(votes)
+        .unwrap();
+    encode_finalization(&Finalization {
+        proposal,
+        certificate,
+    })
 }

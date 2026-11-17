@@ -20,6 +20,8 @@ pub(crate) mod action_log;
 pub(crate) mod balance;
 #[cfg(feature = "confidential-tokens")]
 mod claimable_rewards;
+pub(crate) mod history;
+mod history_json;
 mod info;
 pub(crate) mod legacy;
 pub(crate) mod output;
@@ -477,6 +479,23 @@ pub enum TokenCommand {
     ClaimableRewards,
     /// Lists all coins under control of the managing account.
     Coins,
+    /// Lists the wallet actions this client recorded in its private action
+    /// log, newest first: shields, mints, claims and transfer actions run
+    /// by `qclient token` or the node manager.
+    ///
+    /// Read from wallet/actions.jsonl in the node config directory; no node
+    /// is asked and no key is read. Coins received and actions run by
+    /// another client, or with the log off, are not in it. `ok` is the
+    /// run's own end: without --wait, submitted, not yet included (`token
+    /// inclusion` checks). `-v` adds each failure's recorded error.
+    History {
+        /// Show the newest N actions (0: all).
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: usize,
+        /// Print the local recorded actions as one versioned JSON document.
+        #[arg(long)]
+        json: bool,
+    },
     /// Lists legacy (pre-2.1) coins, their unshielded total and shield readiness.
     ///
     /// Identities: the node config (--config, repeatable after `legacy`;
@@ -577,12 +596,11 @@ pub enum TokenCommand {
     /// covering them. A submitted batch's coins stay out of new runs for two
     /// hours. Submissions are at least `--min-interval` seconds apart
     /// (default 300, at most 12 per hour).
-    /// The run pauses while the node reports GLOBAL degraded (its head
-    /// unchanged for 120 s, or under 330 frames in the last hour, judged
-    /// once 10 minutes are observed) or its report is unreadable for 60 s,
-    /// and resumes once the node has reported GLOBAL healthy for 10
-    /// minutes. Each pause, resume, submission and inclusion is printed
-    /// with the projected end.
+    /// The run pauses while the node reports GLOBAL stalled (its head
+    /// unchanged for 120 s; slow GLOBAL frames still include, so they do
+    /// not pause it) or its report is unreadable for 60 s, and resumes once
+    /// the node has reported GLOBAL healthy for 10 minutes. Each pause,
+    /// resume, submission and inclusion is printed with the projected end.
     #[cfg(feature = "native-proof")]
     ShieldAll {
         /// Legacy coins per batch (1 to 96).
@@ -834,6 +852,7 @@ impl TokenCommand {
             | TokenCommand::Info { .. }
             | TokenCommand::Balance
             | TokenCommand::Coins
+            | TokenCommand::History { .. }
             | TokenCommand::Legacy(_)
             | TokenCommand::ConfidentialAddress => false,
             #[cfg(feature = "confidential-tokens")]
@@ -1140,6 +1159,17 @@ pub(crate) async fn pay_for_bundle(
 }
 
 pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
+    // Machine history reads only the selected local log: no context, keys,
+    // node YAML, connection options or terminal header are needed.
+    if let TokenCommand::History { limit, json: true } = &args.command {
+        let selected = args.common.single_config()?;
+        let config_dir = if selected.is_empty() || selected == "default" {
+            crate::nodeconfig::default_node_config_dir(global.network.as_deref())?
+        } else {
+            PathBuf::from(selected)
+        };
+        return history_json::run(&config_dir, *limit);
+    }
     // Legacy coins are listed by public key alone: no keystore, and possibly
     // several identities.
     if let TokenCommand::Legacy(listing) = &args.command {
@@ -1148,7 +1178,7 @@ pub async fn run(global: GlobalArgs, args: &TokenArgs) -> anyhow::Result<()> {
     let tc = TokenCtx::load(global, &args.common)?;
     if !matches!(
         args.command,
-        TokenCommand::Account | TokenCommand::Info { .. }
+        TokenCommand::Account | TokenCommand::Info { .. } | TokenCommand::History { .. }
     ) {
         tc.require_keys()?;
     }
@@ -1565,6 +1595,14 @@ async fn run_with_context(tc: &TokenCtx, args: &TokenArgs) -> anyhow::Result<()>
     match &args.command {
         TokenCommand::Account => account::run(&tc),
         TokenCommand::Info { domain } => info::run(tc, domain).await,
+        // The private action log, read back: no key and no node.
+        TokenCommand::History { limit, json } => {
+            if *json {
+                history_json::run(&tc.config_dir, *limit)
+            } else {
+                history::run(&tc.config_dir, *limit)
+            }
+        }
         TokenCommand::Legacy(listing) => {
             let application: [u8; 32] = decoded.as_slice().try_into().expect("checked above");
             legacy::run_loaded(tc, &application, listing).await
@@ -1584,6 +1622,46 @@ mod tests {
     struct TokenCli {
         #[command(flatten)]
         token: TokenArgs,
+    }
+
+    #[test]
+    fn token_history_json_is_opt_in_and_preserves_native_limits_and_config_flags() {
+        let parse = |args: &[&str]| TokenCli::try_parse_from(args).unwrap().token;
+        assert!(matches!(
+            parse(&["token", "history"]).command,
+            TokenCommand::History {
+                limit: 20,
+                json: false
+            }
+        ));
+        assert!(matches!(
+            parse(&["token", "history", "--json"]).command,
+            TokenCommand::History {
+                limit: 20,
+                json: true
+            }
+        ));
+        let selected = parse(&[
+            "token",
+            "history",
+            "--json",
+            "--limit",
+            "0",
+            "--config",
+            "./selected",
+            "--read-rpc",
+            "unused",
+        ]);
+        assert!(matches!(
+            selected.command,
+            TokenCommand::History {
+                limit: 0,
+                json: true
+            }
+        ));
+        assert_eq!(selected.common.config, ["./selected"]);
+        assert!(!selected.command.submits());
+        assert!(TokenCli::try_parse_from(["token", "history", "--json", "--limit", "-1"]).is_err());
     }
 
     #[test]

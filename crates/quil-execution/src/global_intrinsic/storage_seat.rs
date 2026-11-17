@@ -52,6 +52,9 @@ pub const EXPIRY_CLASS: &str = "storage:StorageExpiry";
 
 /// Canonical application participation gate. Missing storage is never an
 /// affirmative result; this reads the committed seat, not an async registry.
+/// From the seal gate recovery epoch sealing gates rewards only
+/// (`quil_types::consensus::seal_gate_rewards_only`): it admits every
+/// member, and [`Seat::earns_in`] decides what a participant earns.
 ///
 /// `epoch` is the header's anchor epoch, `frame` the GLOBAL frame executing
 /// it. Sealing applies by the anchor epoch: a header anchored before the
@@ -74,17 +77,13 @@ pub fn require_sealed_participant(
     }
     let member = <&[u8; 32]>::try_from(member)
         .map_err(|_| QuilError::InvalidArgument("invalid storage member address".into()))?;
+    // An unsealed signer earns nothing; refusing its certified header
+    // stopped the shard (and no snapshot was recorded for it either).
+    if quil_types::consensus::seal_gate_rewards_only(epoch) {
+        return Ok(());
+    }
     let seat = read(state, member, filter)?;
-    let slot = seat
-        .as_ref()
-        .and_then(|seat| seat.slot(epoch))
-        .map(SeatSlot::view);
-    if slot.as_ref().is_none_or(|slot| {
-        slot.leaves.is_empty()
-            || slot
-                .sealed_at
-                .is_none_or(|at| at >= quil_types::consensus::epoch_start_frame(epoch))
-    }) {
+    if !seat.is_some_and(|seat| seat.sealed_before(epoch)) {
         return Err(QuilError::InvalidArgument(format!(
             "unsealed storage participant for epoch {epoch}"
         )));
@@ -471,6 +470,28 @@ impl Seat {
         self.slot(epoch).is_some_and(SeatSlot::is_sealed)
     }
 
+    /// Whether the member holds a registration for `epoch` sealed before the
+    /// epoch began: what the seal gate required of a participant, and from
+    /// the seal gate recovery epoch what earns an issuance share and chains
+    /// an openings root.
+    pub fn sealed_before(&self, epoch: u64) -> bool {
+        self.slot(epoch).is_some_and(|slot| {
+            !slot.leaves.is_empty()
+                && slot
+                    .sealed_at
+                    .is_some_and(|at| at < quil_types::consensus::epoch_start_frame(epoch))
+        })
+    }
+
+    /// Whether the member earns an issuance share and chains openings roots
+    /// in `epoch` with its registration: before the seal gate recovery
+    /// epoch every participant the gate admitted does; from it, as the gate
+    /// admits every member, only one sealed before the epoch began
+    /// ([`Self::sealed_before`]).
+    pub fn earns_in(&self, epoch: u64) -> bool {
+        !quil_types::consensus::seal_gate_rewards_only(epoch) || self.sealed_before(epoch)
+    }
+
     /// Mark `epoch`'s registration sealed at `frame`.
     pub fn seal(&mut self, epoch: u64, frame: u64) -> bool {
         match self.slot_mut(epoch) {
@@ -521,17 +542,33 @@ impl Seat {
 
 /// The seat of `member` on `filter` in committed `state`.
 pub fn read(state: &HypergraphState, member: &[u8; 32], filter: &[u8]) -> Result<Option<Seat>> {
-    read_address(state, &seat_address(member, filter)?)
+    Ok(read_sized(state, member, filter)?.map(|(seat, _)| seat))
+}
+
+/// [`read`], with the size in bytes of the seat's stored record.
+pub fn read_sized(
+    state: &HypergraphState,
+    member: &[u8; 32],
+    filter: &[u8],
+) -> Result<Option<(Seat, usize)>> {
+    read_address_sized(state, &seat_address(member, filter)?)
 }
 
 /// The seat at `address` in committed `state`.
 pub fn read_address(state: &HypergraphState, address: &[u8; 32]) -> Result<Option<Seat>> {
+    Ok(read_address_sized(state, address)?.map(|(seat, _)| seat))
+}
+
+fn read_address_sized(
+    state: &HypergraphState,
+    address: &[u8; 32],
+) -> Result<Option<(Seat, usize)>> {
     let va_disc = crate::hypergraph_state::vertex_adds_discriminator()?;
     match state.get(&GLOBAL_INTRINSIC_ADDRESS[..], address, &va_disc)? {
         Some(blob) if !blob.is_empty() => Seat::from_tree(
             &crate::prover_registry::rebuild_vertex_tree_from_blob(&blob),
         )
-        .map(Some),
+        .map(|seat| Some((seat, blob.len()))),
         _ => Ok(None),
     }
 }

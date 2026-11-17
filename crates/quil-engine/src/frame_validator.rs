@@ -830,7 +830,14 @@ pub struct BlsAppFrameValidator {
     /// today's registry cannot reproduce it (see `historical_committee`).
     historical_committee_source: Option<crate::historical_committee::HistoricalCommitteeSource>,
     historical_committees: crate::historical_committee::HistoricalCommittees,
+    /// Whether execution here routes a shard's messages to the compute
+    /// engine ([`quil_execution::ExecutionEngineManager::routes_to_compute`]).
+    compute_route: Option<ComputeRoute>,
 }
+
+/// Whether this node's execution routes a message addressed to a shard to
+/// the compute engine.
+pub type ComputeRoute = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
 impl BlsAppFrameValidator {
     pub fn new(
@@ -849,6 +856,7 @@ impl BlsAppFrameValidator {
             global_anchor_source: None,
             historical_committee_source: None,
             historical_committees: Default::default(),
+            compute_route: None,
         }
     }
 
@@ -1114,6 +1122,13 @@ impl BlsAppFrameValidator {
         self
     }
 
+    /// Judge compute ops only on shards `route` sends to the compute engine
+    /// ([`Self::cross_domain_compute_now`]).
+    pub fn with_compute_route(mut self, route: ComputeRoute) -> Self {
+        self.compute_route = Some(route);
+        self
+    }
+
     pub fn with_storage_history_source(
         mut self,
         source: crate::storage_history::GlobalVertexProofSource,
@@ -1153,6 +1168,78 @@ impl BlsAppFrameValidator {
         }
         let latest = latest_global_frame_number(self.clock_store.as_ref()?.as_ref())?;
         crate::fees::fee_vote_bounded_at(latest).then_some(latest)
+    }
+
+    /// This node's latest GLOBAL frame, when it has reached the config
+    /// replay frame ([`quil_execution::config_replay`]) while `frame`
+    /// executes before it and carries a token, hypergraph or compute deploy
+    /// or update. Execution judges a shard frame by its GLOBAL anchor (by
+    /// its own number without one, as `materialize_app_shard_requests`
+    /// passes it), which its leader picks: such a frame would apply an
+    /// update signed before the replay frame again, or a replaced deploy. A
+    /// voter refuses it, so no leader replays one by citing an older anchor.
+    /// `None` otherwise, and without a clock.
+    pub fn config_replay_stale_now(&self, frame: &AppShardFrame) -> Option<u64> {
+        use quil_execution::config_replay::{carries_configuration_op, config_replay_guarded_at};
+        let header = frame.header.as_ref()?;
+        let judged = match header.global_frame_number {
+            0 => header.frame_number,
+            anchor => anchor,
+        };
+        if config_replay_guarded_at(judged) {
+            return None;
+        }
+        let latest = latest_global_frame_number(self.clock_store.as_ref()?.as_ref())?;
+        if !config_replay_guarded_at(latest) {
+            return None;
+        }
+        frame
+            .requests
+            .iter()
+            .filter_map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok())
+            .any(|bytes| carries_configuration_op(&bytes))
+            .then_some(latest)
+    }
+
+    /// This node's latest GLOBAL frame, when it has reached the compute
+    /// domain frame ([`quil_execution::compute_domain`]) while `frame` is
+    /// anchored before it (or names no anchor) and carries a compute op
+    /// naming a domain other than its application's: execution, judged by
+    /// the anchor, would run that op, which it refuses from the domain
+    /// frame. A voter refuses such a proposal, so no leader runs the op by
+    /// citing an older anchor. Only a shard the compute engine executes is
+    /// judged ([`Self::with_compute_route`]; without a route, every shard
+    /// is). `None` otherwise, and without a clock.
+    ///
+    /// A frame naming no anchor is judged as before the domain frame, while
+    /// execution judges it by its own number. On mainnet no such frame gets
+    /// here once the domain frame is reached: from the required-anchor
+    /// epoch, which the domain frame follows, a voter refuses it first
+    /// ([`Self::unanchored_after_activation`]).
+    pub fn cross_domain_compute_now(&self, frame: &AppShardFrame) -> Option<u64> {
+        use quil_execution::compute_domain::{compute_domain_guarded_at, crosses_domain};
+        let header = frame.header.as_ref()?;
+        let anchor = header.global_frame_number;
+        if anchor != 0 && compute_domain_guarded_at(anchor) {
+            return None;
+        }
+        let latest = latest_global_frame_number(self.clock_store.as_ref()?.as_ref())?;
+        if !compute_domain_guarded_at(latest) {
+            return None;
+        }
+        if self
+            .compute_route
+            .as_ref()
+            .is_some_and(|routes| !routes(&header.address))
+        {
+            return None;
+        }
+        frame
+            .requests
+            .iter()
+            .filter_map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok())
+            .any(|bytes| crosses_domain(&header.address, &bytes))
+            .then_some(latest)
     }
 
     /// The GLOBAL frame `frame` is anchored to, when this node's clock does
@@ -1364,6 +1451,18 @@ impl BlsAppFrameValidator {
         require_signature: bool,
         verify_storage: bool,
     ) -> Result<bool> {
+        self.validate_checked(frame, require_signature, verify_storage, true)
+    }
+
+    /// [`Self::validate_with_mode`]; `bound_fee_vote` false skips only the
+    /// fee vote bound ([`Self::validate_fee_fence_evidence`]).
+    fn validate_checked(
+        &self,
+        frame: &AppShardFrame,
+        require_signature: bool,
+        verify_storage: bool,
+        bound_fee_vote: bool,
+    ) -> Result<bool> {
         let header = frame
             .header
             .as_ref()
@@ -1394,11 +1493,13 @@ impl BlsAppFrameValidator {
         // leader chose: refuse one outside the bounds every leader computes
         // (a vote of zero would make those writes free). Judged by the anchor,
         // so every replica and archive decides alike.
-        crate::fees::check_fee_vote(
-            header.frame_number,
-            header.global_frame_number,
-            header.fee_multiplier_vote,
-        )?;
+        if bound_fee_vote {
+            crate::fees::check_fee_vote(
+                header.frame_number,
+                header.global_frame_number,
+                header.fee_multiplier_vote,
+            )?;
+        }
 
         // 1. Verify the deterministic app output. The global chain supplies
         // the storage beacon; app frames perform no VDF verification.
@@ -1849,6 +1950,24 @@ impl BlsAppFrameValidator {
     /// before starting consensus, and every sync anchor is that same head.
     pub fn validate_certified_without_storage(&self, frame: &AppShardFrame) -> Result<bool> {
         self.validate_with_mode(frame, true, false)
+    }
+
+    /// Whether `frame` is fee vote fence evidence GLOBAL can take
+    /// (`quil_execution::global_intrinsic::handoff::fee_fence`): it votes out
+    /// of bounds at its anchor, and its certificate, structure and output
+    /// validate as a certified frame's do but for that vote. Its possession
+    /// proof is not checked: GLOBAL never executes the frame.
+    pub fn validate_fee_fence_evidence(&self, frame: &AppShardFrame) -> Result<bool> {
+        let Some(header) = frame.header.as_ref() else {
+            return Ok(false);
+        };
+        if !quil_execution::fee_vote::fee_vote_out_of_bounds_at(
+            header.global_frame_number,
+            header.fee_multiplier_vote,
+        ) {
+            return Ok(false);
+        }
+        self.validate_checked(frame, true, false, false)
     }
 
     /// The same for a frame final only through its certified child, which the
@@ -2655,6 +2774,93 @@ mod tests {
         );
         assert!(!archive_global_body_authenticated(&GlobalFrame::default()));
         quil_types::consensus::set_global_sync_authentication_frame_for_thread(None);
+    }
+
+    /// Without a GLOBAL anchor execution judges a shard frame by its own
+    /// number, and so does a voter's config replay check: past the replay
+    /// frame it refuses an unanchored frame numbered before it that carries
+    /// an owner's update, and not one numbered at it.
+    #[test]
+    fn an_unanchored_frame_is_judged_by_its_own_number_for_config_replay() {
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::global::FrameHeader;
+        use quil_types::store::ClockStore as _;
+        quil_execution::config_replay::set_config_replay_frame_for_thread(Some(100));
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let clock = Arc::new(quil_store::RocksClockStore::new(db.inner()));
+        let txn = clock.new_transaction(false).unwrap();
+        clock
+            .put_global_clock_frame(
+                &GlobalFrame {
+                    header: Some(GlobalFrameHeader {
+                        frame_number: 100,
+                        output: vec![100; 516],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                txn.as_ref(),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        let validator = BlsAppFrameValidator::new(
+            Arc::new(StubProverRegistry::default()),
+            Arc::new(StubBls),
+            Arc::new(StubFrameProver),
+        )
+        .with_clock_store(clock);
+        let update = quil_execution::token_intrinsic::TokenUpdate {
+            config: quil_execution::token_intrinsic::TokenConfiguration {
+                behavior: 1,
+                units: vec![1],
+                name: b"zero".to_vec(),
+                symbol: b"RPL".to_vec(),
+                owner_public_key: quil_crypto::FalconSigner::generate().public_key().to_vec(),
+                ..Default::default()
+            }
+            .to_canonical_bytes()
+            .unwrap(),
+            rdf_schema: Vec::new(),
+            public_key_signature_bls48581: Vec::new(),
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let canonical = CanonicalMessageBundle {
+            requests: vec![Some(CanonicalMessageRequest {
+                inner_type_prefix: u32::from_be_bytes(update[..4].try_into().unwrap()),
+                inner_bytes: update,
+            })],
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        let bundle = crate::consensus_wire::decode_app_message_bundle(&canonical).unwrap();
+        assert_eq!(
+            crate::consensus_wire::app_bundle_to_canonical_bytes(&bundle).unwrap(),
+            canonical,
+            "harness: the update did not survive the frame encoding"
+        );
+        let frame = |frame_number: u64| AppShardFrame {
+            header: Some(FrameHeader {
+                address: vec![1; 32],
+                frame_number,
+                ..Default::default()
+            }),
+            requests: vec![bundle.clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            validator.config_replay_stale_now(&frame(99)),
+            Some(100),
+            "an unanchored frame numbered before the replay frame replayed a configuration update"
+        );
+        assert_eq!(
+            validator.config_replay_stale_now(&frame(100)),
+            None,
+            "voter refused an unanchored frame numbered at the replay frame"
+        );
+        quil_execution::config_replay::set_config_replay_frame_for_thread(None);
     }
 
     // ---- test stubs ----

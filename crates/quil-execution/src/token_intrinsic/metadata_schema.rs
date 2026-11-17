@@ -61,7 +61,7 @@ pub const OUTER_CONFIG_KEY: [u8; 1] = [16u8 << 2]; // 0x40
 /// `unpackAndVerifyTokenConfigurationMetadata`:
 ///
 /// 1. Load `[domain || HYPERGRAPH_METADATA_ADDRESS]` vertex data (outer
-/// tree serialized blob).
+///    tree serialized blob).
 /// 2. Deserialize as a `VectorCommitmentTree`.
 /// 3. Read key `[0x40]` → serialized inner tree bytes.
 /// 4. Deserialize the inner tree.
@@ -126,7 +126,7 @@ pub fn decode_token_config_from_tree(
 
     let mint_strategy = tree
         .get(&field_key(field::MINT_STRATEGY))
-        .map(|b| super::config::decode_mint_strategy_packed(b))
+        .map(super::config::decode_mint_strategy_packed)
         .transpose()?
         .map(|s| s.to_canonical_bytes())
         .transpose()?

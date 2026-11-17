@@ -7,7 +7,7 @@
 //!
 //! - Which QCT3 operations produce proof-bound QUIL fees on the producer domain.
 //! - Which message types **consume** a single fee, based on the boolean
-//! toggles in `Policy`.
+//!   toggles in `Policy`.
 //!
 //! Exported helpers:
 //!
@@ -17,7 +17,7 @@
 //! - [`needs_one_fee`] — per-request boolean predicate
 //! - [`pop_fee`] — pop next fee (zero on underflow, matching Go)
 //! - [`default_fee_market`] — the mainnet policy used by all three app
-//! engines (token, compute, hypergraph)
+//!   engines (token, compute, hypergraph)
 
 use num_bigint::BigInt;
 use num_traits::Zero;
@@ -98,13 +98,10 @@ pub fn collect_bundle_fees(bundle: &MessageBundle, policy: &Policy) -> Vec<BigIn
     let mut queue = Vec::new();
 
     for op in &bundle.requests {
-        match &op.request {
-            Some(MessageRequestInner::TokenOperation(op)) => {
-                if let Some(fee) = token_fee(op, policy) {
-                    queue.push(fee);
-                }
+        if let Some(MessageRequestInner::TokenOperation(op)) = &op.request {
+            if let Some(fee) = token_fee(op, policy) {
+                queue.push(fee);
             }
-            _ => {}
         }
     }
 

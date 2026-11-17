@@ -10,10 +10,10 @@
 //!
 //! What's NOT ported here (needs cross-crate service wiring):
 //! - `prove` — requires `quil-crypto` signer + `VerifiableEncryptor`,
-//! neither of which have a clean trait bound on the execution side yet.
+//!   neither of which have a clean trait bound on the execution side yet.
 //! - `verify` — same dependency story plus an Ed448 key-manager trait.
 //! - `materialize` — requires the hypergraph state bridge
-//! (`HypergraphCrdt` lazy-tree integration).
+//!   (`HypergraphCrdt` lazy-tree integration).
 //!
 //! The intrinsic dispatcher will import these pure helpers
 //! and compose them with service traits it gets from the engine.
@@ -151,8 +151,7 @@ pub fn vertex_add_cost_from_proof_count(proof_count: usize) -> BigInt {
 /// `((len(rawData) + 54) / 55) * 55` — the raw-bytes length rounded up
 /// to the next multiple of 55.
 pub fn vertex_add_cost_from_raw_len(raw_len: usize) -> BigInt {
-    let chunks = (raw_len + (CONFIDENTIAL_FIELD_CHARGE_BYTES as usize - 1))
-        / CONFIDENTIAL_FIELD_CHARGE_BYTES as usize;
+    let chunks = raw_len.div_ceil(CONFIDENTIAL_FIELD_CHARGE_BYTES as usize);
     BigInt::from(chunks as i64 * CONFIDENTIAL_FIELD_CHARGE_BYTES)
 }
 
@@ -376,7 +375,7 @@ mod tests {
     fn vertex_add_cost_formula_matches_go_integer_math() {
         // Go: `((len(rawData)+54) / 55) * 55`
         for raw in [0usize, 1, 54, 55, 56, 100, 110, 1234] {
-            let expected = BigInt::from(((raw + 54) / 55 * 55) as i64);
+            let expected = BigInt::from((raw.div_ceil(55) * 55) as i64);
             assert_eq!(vertex_add_cost_from_raw_len(raw), expected);
         }
     }
@@ -449,8 +448,8 @@ mod tests {
 
     #[test]
     fn vertex_remove_signing_message_rejects_bad_sizes() {
-        assert!(vertex_remove_signing_message(&vec![0u8; 31], &vec![0u8; 32]).is_err());
-        assert!(vertex_remove_signing_message(&vec![0u8; 32], &vec![0u8; 1]).is_err());
+        assert!(vertex_remove_signing_message(&[0u8; 31], &[0u8; 32]).is_err());
+        assert!(vertex_remove_signing_message(&[0u8; 32], &[0u8; 1]).is_err());
     }
 
     // -----------------------------------------------------------------

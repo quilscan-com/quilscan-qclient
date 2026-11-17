@@ -436,17 +436,17 @@ pub fn update_prover_status_from_allocations(
 /// paths:
 ///
 /// - **Confirm join** (status 0→1): set Status=Active, JoinConfirmFrameNumber,
-/// LastActiveFrameNumber, Epoch=epoch_for_frame(frame)+1. The flipped Active
-/// byte does NOT make the prover a committee member until the activation
-/// boundary E+2 — `effective_status` reads it as `Joining` until then
-/// (deferred activation, keyed on JoinConfirmFrameNumber).
+///   LastActiveFrameNumber, Epoch=epoch_for_frame(frame)+1. The flipped Active
+///   byte does NOT make the prover a committee member until the activation
+///   boundary E+2 — `effective_status` reads it as `Joining` until then
+///   (deferred activation, keyed on JoinConfirmFrameNumber).
 /// - **Re-confirm** (status 1, stays Active): renew Epoch one ahead +
-/// LastActiveFrameNumber. Does NOT touch JoinConfirmFrameNumber (so the
-/// established member's activation epoch stays in the past).
+///   LastActiveFrameNumber. Does NOT touch JoinConfirmFrameNumber (so the
+///   established member's activation epoch stays in the past).
 /// - **Confirm leave** (status 3, stays Leaving): set LeaveConfirmFrameNumber.
-/// The byte stays Leaving; the prover serves notice through the rest of the
-/// epoch and departs at E+2 via `effective_status` (ExpiredLeaving). Keeping
-/// the byte avoids changing committee membership mid-epoch.
+///   The byte stays Leaving; the prover serves notice through the rest of the
+///   epoch and departs at E+2 via `effective_status` (ExpiredLeaving). Keeping
+///   the byte avoids changing committee membership mid-epoch.
 ///
 /// A join confirm or re-confirm also records the confirm's `release`, when it
 /// carries one in effect ([`super::prover_release::confirmed_release`]); one
@@ -511,9 +511,9 @@ pub fn materialize_prover_confirm(
 /// Materialize a ProverReject for a single allocation. Two paths:
 ///
 /// - **Reject join** (status 0→4): set Status=Kicked,
-/// JoinRejectFrameNumber.
+///   JoinRejectFrameNumber.
 /// - **Reject leave** (status 3→1): set Status=Active,
-/// LeaveRejectFrameNumber, LastActiveFrameNumber.
+///   LeaveRejectFrameNumber, LastActiveFrameNumber.
 pub fn materialize_prover_reject(
     allocation_tree: &mut quil_tries::VectorCommitmentTree,
     frame_number: u64,
@@ -1377,14 +1377,14 @@ pub fn create_spent_merge_tree(prover_address: &[u8]) -> Result<quil_tries::Vect
 ///
 /// 1. Reads the prover's current Seniority from `prover_tree`.
 /// 2. Adds `merge_seniority` (pre-computed from the merge targets'
-/// Ed448 peer IDs via `compat::GetAggregatedSeniority`).
+///    Ed448 peer IDs via `compat::GetAggregatedSeniority`).
 /// 3. Writes the new Seniority value.
 /// 4. Creates spent-merge marker trees for each merge target.
 ///
 /// The caller is responsible for:
 /// - Computing `merge_seniority` from the merge targets (requires
-/// Ed448 key → peer ID conversion + seniority DB lookup, which are
-/// not available in the pure-data layer).
+///   Ed448 key → peer ID conversion + seniority DB lookup, which are
+///   not available in the pure-data layer).
 /// - Writing the prover tree and spent markers to the CRDT.
 ///
 /// Go equivalent: `ProverSeniorityMerge::Materialize` at
@@ -1719,11 +1719,11 @@ pub fn materialize_shard_merge(
 /// each participating prover on the shard:
 ///
 /// 1. **Reward distribution**: calculates the per-ring reward share
-/// based on difficulty, world size, and prover ring assignment, then
-/// adds it to the prover's reward balance.
+///    based on difficulty, world size, and prover ring assignment, then
+///    adds it to the prover's reward balance.
 ///
 /// 2. **Activity tracking**: updates the allocation's
-/// `LastActiveFrameNumber` to the current frame number.
+///    `LastActiveFrameNumber` to the current frame number.
 ///
 /// Both require runtime dependencies (prover registry, frame prover
 /// for BLS signature verification, reward issuance calculator,
@@ -1778,7 +1778,7 @@ mod tests {
                 &filter,
                 &prefix,
                 epoch,
-                &vec![lr; 74],
+                &[lr; 74],
                 (epoch * 10) + 1,
                 1000,
             )
@@ -2134,8 +2134,8 @@ mod tests {
     #[test]
     fn allocation_address_differs_by_filter() {
         let pk = vec![0xAAu8; 585];
-        let a1 = allocation_address(&pk, &vec![0x01u8; 32]).unwrap();
-        let a2 = allocation_address(&pk, &vec![0x02u8; 32]).unwrap();
+        let a1 = allocation_address(&pk, &[0x01u8; 32]).unwrap();
+        let a2 = allocation_address(&pk, &[0x02u8; 32]).unwrap();
         assert_ne!(a1, a2);
     }
 
@@ -2704,8 +2704,7 @@ mod tests {
     #[test]
     fn lifecycle_join_then_reject() {
         let prover_addr = [0xCCu8; 32];
-        let mut alloc =
-            create_allocation_vertex_tree(&prover_addr, &vec![0xDDu8; 32], 100).unwrap();
+        let mut alloc = create_allocation_vertex_tree(&prover_addr, &[0xDDu8; 32], 100).unwrap();
 
         // Reject join → kicked
         materialize_prover_reject(&mut alloc, 460).unwrap();
@@ -2723,8 +2722,7 @@ mod tests {
     #[test]
     fn lifecycle_leave_then_reject_returns_to_active() {
         let prover_addr = [0xEEu8; 32];
-        let mut alloc =
-            create_allocation_vertex_tree(&prover_addr, &vec![0xFFu8; 32], 100).unwrap();
+        let mut alloc = create_allocation_vertex_tree(&prover_addr, &[0xFFu8; 32], 100).unwrap();
 
         // Confirm join
         materialize_prover_confirm(&mut alloc, 460, None).unwrap();
@@ -2781,8 +2779,8 @@ mod tests {
     #[test]
     fn set_reward_delegate_address_overwrites() {
         let mut tree = quil_tries::VectorCommitmentTree::new();
-        set_reward_delegate_address(&mut tree, &vec![0x11u8; 32]).unwrap();
-        set_reward_delegate_address(&mut tree, &vec![0x22u8; 32]).unwrap();
+        set_reward_delegate_address(&mut tree, &[0x11u8; 32]).unwrap();
+        set_reward_delegate_address(&mut tree, &[0x22u8; 32]).unwrap();
         assert_eq!(
             read_field(&tree, "reward:ProverReward", "DelegateAddress").unwrap(),
             vec![0x22u8; 32]
@@ -2863,8 +2861,7 @@ mod tests {
     #[test]
     fn kick_allocation_sets_status_and_frame() {
         let prover_addr = [0xBBu8; 32];
-        let mut alloc =
-            create_allocation_vertex_tree(&prover_addr, &vec![0xCCu8; 32], 100).unwrap();
+        let mut alloc = create_allocation_vertex_tree(&prover_addr, &[0xCCu8; 32], 100).unwrap();
         // Simulate confirm
         write_field(
             &mut alloc,
@@ -3017,8 +3014,8 @@ mod tests {
 
     #[test]
     fn spent_seniority_merge_address_differs_by_key() {
-        let a1 = spent_seniority_merge_address(&vec![0x01u8; 57]).unwrap();
-        let a2 = spent_seniority_merge_address(&vec![0x02u8; 57]).unwrap();
+        let a1 = spent_seniority_merge_address(&[0x01u8; 57]).unwrap();
+        let a2 = spent_seniority_merge_address(&[0x02u8; 57]).unwrap();
         assert_ne!(a1, a2);
     }
 
@@ -3044,7 +3041,7 @@ mod tests {
 
     #[test]
     fn shard_split_rejects_short_parent() {
-        assert!(materialize_shard_split(&vec![0xAAu8; 31], &[], false).is_err());
+        assert!(materialize_shard_split(&[0xAAu8; 31], &[], false).is_err());
     }
 
     #[test]
@@ -3313,8 +3310,7 @@ mod tests {
     #[test]
     fn frame_header_activity_updates_last_active() {
         let prover_addr = [0xAAu8; 32];
-        let mut alloc =
-            create_allocation_vertex_tree(&prover_addr, &vec![0xBBu8; 32], 100).unwrap();
+        let mut alloc = create_allocation_vertex_tree(&prover_addr, &[0xBBu8; 32], 100).unwrap();
         // Simulate confirm
         write_field(
             &mut alloc,
@@ -3339,8 +3335,7 @@ mod tests {
     #[test]
     fn frame_header_activity_overwrites_previous() {
         let prover_addr = [0xCCu8; 32];
-        let mut alloc =
-            create_allocation_vertex_tree(&prover_addr, &vec![0xDDu8; 32], 100).unwrap();
+        let mut alloc = create_allocation_vertex_tree(&prover_addr, &[0xDDu8; 32], 100).unwrap();
 
         materialize_frame_header_activity(&mut alloc, 500).unwrap();
         materialize_frame_header_activity(&mut alloc, 600).unwrap();

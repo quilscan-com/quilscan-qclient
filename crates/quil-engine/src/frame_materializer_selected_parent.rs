@@ -77,7 +77,10 @@ impl Default for GlobalParentLimits {
             },
             max_ancestors: 32,
             max_ancestry_bytes: 64 << 20,
-            max_proposal_message_bytes: 8 << 20,
+            // The seal share (8 MiB, `SEAL_BYTES_PER_PROPOSAL`) beside a
+            // third for shard proofs; under the 15 MiB finalized-frame gossip
+            // ceiling and `MAX_GLOBAL_FRAME_BYTES` with room for the rest.
+            max_proposal_message_bytes: 12 << 20,
             max_proposal_message_items: 100_000,
             max_elapsed: Duration::from_secs(60),
             max_kept_age: MAX_KEPT_EXECUTION_AGE,
@@ -804,6 +807,16 @@ impl GlobalParentExecutor {
         (number > published && finalized > published).then_some((published, finalized))
     }
 
+    /// The first shard header the proposal `frame` carries whose bodies this
+    /// archive does not hold, with what asking for them did
+    /// ([`GlobalLeaderProvider::unheld_shard_body`]).
+    pub(crate) fn unheld_shard_body(
+        &self,
+        frame: &quil_types::proto::global::GlobalFrame,
+    ) -> Option<crate::leader_provider::UnheldShardBody> {
+        self.leader.unheld_shard_body(frame)
+    }
+
     /// Whether finalization ingests application frames before executing a
     /// GLOBAL frame here ([`Self::sequence_with_ingest`]): a private execution
     /// of a finalized frame before its publication then differs from it.
@@ -900,7 +913,10 @@ impl GlobalParentExecutor {
             }
         };
         let mut captured = Instant::now();
-        let mut branch = self.source.capture_execution_branch(self.limits.branch)?;
+        let mut branch = self.source.capture_execution_branch_as(
+            self.limits.branch,
+            crate::execution_summary::ExecutionRole::Proposal,
+        )?;
         timing.mark("capture branch");
         let cursor = branch.cursor()?;
         if !self.within_window(cursor, number) {

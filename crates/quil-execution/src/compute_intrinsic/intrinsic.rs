@@ -25,6 +25,34 @@ pub fn verify_code_deployment(compiler: &dyn CircuitCompiler, circuit: &[u8]) ->
     Ok(true)
 }
 
+/// Refuse a CodeDeployment or CodeExecute whose domain is not the
+/// application the message is routed to, or is a system-managed domain.
+///
+/// Both ops write a vertex into their own `domain` field, while the
+/// engine, its fee and its shard are chosen by the routing address. An op
+/// naming another application would write that application's state from a
+/// message routed (and paid) elsewhere; the compute base domain routes to
+/// this engine itself, so a deploy there must not land in it either.
+pub fn check_op_domain(op: &str, op_domain: &[u8; 32], routing: &[u8]) -> Result<()> {
+    if routing.get(..32) != Some(&op_domain[..]) {
+        return Err(QuilError::InvalidArgument(format!(
+            "{op}: domain {} is not the routing domain {}",
+            hex::encode(op_domain),
+            hex::encode(routing),
+        )));
+    }
+    if *op_domain == crate::domains::GLOBAL
+        || *op_domain == crate::domains::COMPUTE
+        || *op_domain == crate::domains::QUIL_TOKEN
+    {
+        return Err(QuilError::InvalidArgument(format!(
+            "{op}: write into system-managed domain {} rejected",
+            hex::encode(op_domain),
+        )));
+    }
+    Ok(())
+}
+
 /// Get the cost of a code deployment (proportional to circuit size).
 pub fn code_deployment_cost(circuit: &[u8]) -> BigInt {
     BigInt::from(circuit.len() as i64)
@@ -96,18 +124,18 @@ pub fn code_finalize_signing_message(f: &CodeFinalize) -> Result<Vec<u8>> {
 /// 1. Require at least one execution result.
 /// 2. Every `StateTransition` must have 32-byte domain and address.
 /// 3. Re-serialize the finalize with `proof_of_execution = nil` as the
-/// signed message.
+///    signed message.
 /// 4. Domain is raw bytes `compute_app_domain || "CODE_FINALIZE"`.
 /// 5. Validate the Ed448 signature stored in `proof_of_execution` via
-/// the `KeyManager`.
+///    the `KeyManager`.
 ///
 /// Arguments:
 /// - `finalize`: the decoded CodeFinalize op.
 /// - `compute_app_domain`: the 32-byte compute-application domain
-/// (the `domain` field on Go's `CodeFinalize`; not a proto field,
-/// it's carried in the message envelope).
+///   (the `domain` field on Go's `CodeFinalize`; not a proto field,
+///   it's carried in the message envelope).
 /// - `write_public_key`: the Ed448 write key from the deployed
-/// `ComputeConfiguration` for that application.
+///   `ComputeConfiguration` for that application.
 /// - `key_manager`: signature validator.
 pub fn verify_code_finalize(
     finalize: &CodeFinalize,
@@ -161,7 +189,7 @@ pub fn verify_code_finalize(
                 "verify: invalid code finalize: state change {} targets \
                  domain {} which differs from compute app domain {}",
                 i,
-                hex::encode(&sc.domain),
+                hex::encode(sc.domain),
                 hex::encode(compute_app_domain),
             )));
         }
@@ -218,10 +246,10 @@ fn is_zero_payer(pk: &[u8]) -> bool {
 /// (`compute_intrinsic_code_execute.go:350-370`):
 ///
 /// - `proof_of_payment[0]` is the payer's DECAF448 public key (56
-/// bytes). If it is all-zeros the alt-fee path is skipped and only
-/// DAG validation runs (matches the Go `Prove` sentinel).
+///   bytes). If it is all-zeros the alt-fee path is skipped and only
+///   DAG validation runs (matches the Go `Prove` sentinel).
 /// - `proof_of_payment[1]` is a DECAF448 Schnorr "simple" signature
-/// over the `rendezvous`.
+///   over the `rendezvous`.
 /// - DAG validation must succeed.
 pub fn verify_code_execute(execute: &CodeExecute) -> Result<bool> {
     // Reserved-address guard. `materialize_code_execute` writes a vertex at

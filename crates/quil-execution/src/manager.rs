@@ -1,3 +1,5 @@
+#[cfg(feature = "confidential-tokens")]
+pub use quil_lattice_ct::confidential::relation::backend::worker_client::FrameCheck;
 #[cfg(all(test, feature = "confidential-tokens"))]
 use quil_lattice_ct::confidential::relation::membership::IDENTITY_BYTES;
 use std::collections::HashMap;
@@ -298,14 +300,74 @@ pub struct OperationEstimate {
 
 /// How a pre-verification pass runs: at most `parallelism` operations at once
 /// (default: the worker's slots), each finished one counted into `done`, none
-/// started while `pause` returns true, and as `background` work (no finalized
-/// frame waits on it) leaving the first node-wide worker slot free.
+/// started while `pause` returns true, as `background` work (no finalized
+/// frame waits on it) leaving the first node-wide worker slot free, or as
+/// work a finalized frame waits on (`frame`, told to the worker's memory
+/// admission), and ahead of `executing` (default: a frame not known yet).
 #[derive(Default)]
 pub struct PreverifyPacing<'a> {
     pub parallelism: Option<usize>,
     pub done: Option<&'a std::sync::atomic::AtomicUsize>,
     pub pause: Option<&'a (dyn Fn() -> bool + Sync)>,
     pub background: bool,
+    #[cfg(feature = "confidential-tokens")]
+    pub frame: FrameCheck,
+    pub executing: ExecutingFrame,
+}
+
+/// The frame that executes an operation judged ahead of it, as far as the
+/// judging caller knows it. A caller holding the frame's header passes its
+/// anchor: a frame anchored before a gate executes what the gate refuses
+/// there, however far past the gate this node saw GLOBAL since.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutingFrame {
+    /// One not known yet: a frame a later proposal carries.
+    #[default]
+    Later,
+    /// An app-shard frame anchored at this GLOBAL frame (`None`: without an
+    /// anchor).
+    App(Option<u64>),
+    /// GLOBAL frame N in the global venue, anchored at N - 1.
+    Global(u64),
+}
+
+/// How far behind the latest GLOBAL frame this process saw a frame not known
+/// yet may be anchored: an app-shard frame anchors
+/// `GLOBAL_ANCHOR_SAFETY_MARGIN` behind its proposer's latest GLOBAL frame,
+/// and its proposer may be as far again behind this node (the slack a mint
+/// claim's citation keeps). A later GLOBAL frame is anchored past every
+/// frame seen.
+#[cfg(feature = "native-proof")]
+const LATER_ANCHOR_LAG: u64 = crate::token_intrinsic::constants::MINT_CLAIM_CITATION_LAG;
+
+#[cfg(feature = "native-proof")]
+impl ExecutingFrame {
+    /// The lowest GLOBAL anchor a frame executing the operation can have,
+    /// `head` being the latest GLOBAL frame this process saw: its own where
+    /// it is known (the global venue's N - 1), and for a frame not known yet
+    /// `LATER_ANCHOR_LAG` behind `head` (none before `head` reaches it). A
+    /// gate that opens once and is active there is active at every frame
+    /// that can still carry the operation.
+    fn anchor_floor(self, head: u64) -> Option<u64> {
+        match self {
+            Self::Later => head.checked_sub(LATER_ANCHOR_LAG),
+            Self::App(anchor) => anchor,
+            Self::Global(frame) => frame.checked_sub(1),
+        }
+    }
+
+    /// [`Self::anchor_floor`] at the latest GLOBAL frame this process saw.
+    fn anchor_floor_now(self) -> Option<u64> {
+        self.anchor_floor(quil_types::consensus::frame_time_head())
+    }
+
+    /// The GLOBAL frame whose commit the global venue makes inline.
+    fn commit_frame(self) -> Option<u64> {
+        match self {
+            Self::Global(frame) => Some(frame),
+            Self::Later | Self::App(_) => None,
+        }
+    }
 }
 
 impl ExecutionEngineManager {
@@ -561,7 +623,7 @@ impl ExecutionEngineManager {
         bundles: &[(Vec<u8>, Vec<u8>)],
         pacing: &PreverifyPacing<'_>,
     ) -> PreverifyCounts {
-        self.preverify_routed(bundles, pacing, None)
+        self.preverify_routed(bundles, pacing)
     }
 
     /// [`Self::preverify_bundles`] ahead of the global venue's execution of
@@ -575,14 +637,44 @@ impl ExecutionEngineManager {
         frame: u64,
         bundles: &[(Vec<u8>, Vec<u8>)],
     ) -> PreverifyCounts {
-        self.preverify_routed(bundles, &PreverifyPacing::default(), Some(frame))
+        self.preverify_routed(
+            bundles,
+            &PreverifyPacing {
+                executing: ExecutingFrame::Global(frame),
+                // The frame waits on these lanes as it executes.
+                #[cfg(feature = "confidential-tokens")]
+                frame: FrameCheck::Inline,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// [`Self::preverify_bundles`] ahead of executing an app-shard frame
+    /// anchored at GLOBAL frame `anchor` (`None`: without an anchor): what
+    /// execution refuses before the proof from that anchor on (an owner
+    /// that is not a canonical identity) is not verified, and what it
+    /// admits there is, whatever GLOBAL frame this node saw since.
+    pub fn preverify_app_frame_bundles(
+        &self,
+        anchor: Option<u64>,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+    ) -> PreverifyCounts {
+        self.preverify_routed(
+            bundles,
+            &PreverifyPacing {
+                executing: ExecutingFrame::App(anchor),
+                // The frame waits on these lanes as it executes.
+                #[cfg(feature = "confidential-tokens")]
+                frame: FrameCheck::Inline,
+                ..Default::default()
+            },
+        )
     }
 
     fn preverify_routed(
         &self,
         bundles: &[(Vec<u8>, Vec<u8>)],
         pacing: &PreverifyPacing<'_>,
-        commit_frame: Option<u64>,
     ) -> PreverifyCounts {
         #[cfg(feature = "native-proof")]
         {
@@ -609,8 +701,9 @@ impl ExecutionEngineManager {
             match verifier {
                 Some((policy, worker)) => {
                     let network = policy.network;
+                    let frame = pacing.executing;
                     let refused = |address: &[u8], bytes: &[u8], tp: u32| {
-                        self.proof_refused(&network, address, bytes, tp, commit_frame)
+                        self.proof_refused(&network, address, bytes, tp, frame)
                     };
                     TokenExecutionEngine::preverify_with(policy, &worker, &routed, pacing, &refused)
                 }
@@ -619,18 +712,30 @@ impl ExecutionEngineManager {
         }
         #[cfg(not(feature = "native-proof"))]
         {
-            let _ = (bundles, pacing, commit_frame);
+            let _ = (bundles, pacing);
             PreverifyCounts::default()
         }
     }
 
     /// The confidential token operations in `bundles` whose verdicts are not
     /// cached yet, as their verification is estimated: what materializing
-    /// them would still verify (not those execution refuses before their
-    /// proof, which [`Self::preverify_bundles_paced`] leaves unverified).
-    /// Empty when every proof is verified, and without a worker.
+    /// them in a frame not known yet would still verify (not those
+    /// execution refuses before their proof, which
+    /// [`Self::preverify_bundles_paced`] leaves unverified). Empty when
+    /// every proof is verified, and without a worker.
     pub fn unverified_confidential_operations(
         &self,
+        bundles: &[(Vec<u8>, Vec<u8>)],
+    ) -> Vec<OperationEstimate> {
+        self.unverified_confidential_operations_for(ExecutingFrame::Later, bundles)
+    }
+
+    /// [`Self::unverified_confidential_operations`] of `bundles` executed by
+    /// `frame`: a frame anchored before a gate still verifies what the gate
+    /// refuses.
+    pub fn unverified_confidential_operations_for(
+        &self,
+        frame: ExecutingFrame,
         bundles: &[(Vec<u8>, Vec<u8>)],
     ) -> Vec<OperationEstimate> {
         #[cfg(feature = "native-proof")]
@@ -659,7 +764,7 @@ impl ExecutionEngineManager {
             match policy {
                 Some(policy) => {
                     let refused = |address: &[u8], bytes: &[u8], tp: u32| {
-                        self.proof_refused(&policy.network, address, bytes, tp, None)
+                        self.proof_refused(&policy.network, address, bytes, tp, frame)
                     };
                     TokenExecutionEngine::unverified_operation_estimates(&policy, &routed, &refused)
                 }
@@ -668,7 +773,7 @@ impl ExecutionEngineManager {
         }
         #[cfg(not(feature = "native-proof"))]
         {
-            let _ = bundles;
+            let _ = (frame, bundles);
             Vec::new()
         }
     }
@@ -679,11 +784,11 @@ impl ExecutionEngineManager {
         #[cfg(feature = "native-proof")]
         {
             let engines = self.engines.read().ok()?;
-            return engines
+            engines
                 .get("token")
                 .and_then(|e| e.as_any())
                 .and_then(|e| e.downcast_ref::<TokenExecutionEngine>())
-                .and_then(|token| token.verification_budget());
+                .and_then(|token| token.verification_budget())
         }
         #[cfg(not(feature = "native-proof"))]
         None
@@ -695,10 +800,10 @@ impl ExecutionEngineManager {
     pub fn verification_known_to_fit(operation_bytes: usize, budget_secs: f64) -> bool {
         #[cfg(feature = "native-proof")]
         {
-            return crate::token_intrinsic::dispatch::verification_known_to_fit(
+            crate::token_intrinsic::dispatch::verification_known_to_fit(
                 operation_bytes,
                 budget_secs,
-            );
+            )
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -715,11 +820,11 @@ impl ExecutionEngineManager {
     pub fn operation_known_to_fit(operation: &OperationEstimate, budget_secs: f64) -> bool {
         #[cfg(feature = "native-proof")]
         {
-            return crate::token_intrinsic::dispatch::operation_known_to_fit(
+            crate::token_intrinsic::dispatch::operation_known_to_fit(
                 operation.bytes,
                 operation.floor_secs,
                 budget_secs,
-            );
+            )
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -734,10 +839,10 @@ impl ExecutionEngineManager {
     pub fn estimated_operation_secs(operation: &OperationEstimate) -> f64 {
         #[cfg(feature = "native-proof")]
         {
-            return crate::token_intrinsic::dispatch::estimated_operation_secs(
+            crate::token_intrinsic::dispatch::estimated_operation_secs(
                 operation.bytes,
                 operation.floor_secs,
-            );
+            )
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -751,7 +856,7 @@ impl ExecutionEngineManager {
     pub fn estimated_verify_secs(operation_bytes: usize) -> f64 {
         #[cfg(feature = "native-proof")]
         {
-            return crate::token_intrinsic::dispatch::estimated_verify_secs(operation_bytes);
+            crate::token_intrinsic::dispatch::estimated_verify_secs(operation_bytes)
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -765,11 +870,11 @@ impl ExecutionEngineManager {
     pub fn confidential_operation_count(address: &[u8], bundle_bytes: &[u8]) -> usize {
         #[cfg(feature = "native-proof")]
         {
-            return TokenExecutionEngine::confidential_operations(&[(
+            TokenExecutionEngine::confidential_operations(&[(
                 address.to_vec(),
                 bundle_bytes.to_vec(),
             )])
-            .len();
+            .len()
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -784,10 +889,10 @@ impl ExecutionEngineManager {
     pub fn confidential_operation_sizes(bundles: &[(Vec<u8>, Vec<u8>)]) -> Vec<usize> {
         #[cfg(feature = "native-proof")]
         {
-            return TokenExecutionEngine::confidential_operations(bundles)
+            TokenExecutionEngine::confidential_operations(bundles)
                 .into_iter()
                 .map(|(_, bytes, _)| bytes.len())
-                .collect();
+                .collect()
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -801,7 +906,7 @@ impl ExecutionEngineManager {
     pub fn frame_verification_budget_secs() -> f64 {
         #[cfg(feature = "native-proof")]
         {
-            return crate::token_intrinsic::dispatch::verification_budget_secs();
+            crate::token_intrinsic::dispatch::verification_budget_secs()
         }
         #[cfg(not(feature = "native-proof"))]
         0.0
@@ -825,6 +930,18 @@ impl ExecutionEngineManager {
             }
         }
         1
+    }
+
+    /// Whether this node routes a message addressed to `address` to the
+    /// compute engine, as execution does: the compute base domain, or an
+    /// application deployed with the compute type domain. Only the compute
+    /// engine runs a compute op that crosses its domain
+    /// ([`crate::compute_domain::crosses_domain`]): a token or hypergraph
+    /// application's engine ignores it on either side of the domain frame,
+    /// so a bundle routed there is never counted.
+    pub fn routes_to_compute(&self, address: &[u8]) -> bool {
+        self.select_engine(address)
+            .is_ok_and(|engine| engine == "compute")
     }
 
     /// Whether a canonical bundle holds an operation dispatch refuses before
@@ -889,7 +1006,7 @@ impl ExecutionEngineManager {
             let bundle =
                 crate::message_envelope::CanonicalMessageBundle::from_canonical_bytes(bundle_bytes)
                     .ok()?;
-            return bundle
+            bundle
                 .requests
                 .into_iter()
                 .flatten()
@@ -898,7 +1015,7 @@ impl ExecutionEngineManager {
                 })
                 .find_map(|request| {
                     quil_lattice_ct::confidential::shield::source_address(&request.inner_bytes)
-                });
+                })
         }
         #[cfg(not(feature = "native-proof"))]
         {
@@ -1053,7 +1170,8 @@ impl ExecutionEngineManager {
         let mut needs = spend_entries::commit_needs(application, tp, bytes)?;
         let mut held = None;
         if let Some((shard, network)) = shard {
-            match Self::execution_standing(shard, network, application, tp, bytes) {
+            let anchor = ExecutingFrame::Later.anchor_floor_now();
+            match Self::execution_standing(shard, network, application, tp, bytes, anchor) {
                 Some(lasting @ Standing::Lasting(_)) => return Some(lasting),
                 pending => held = pending,
             }
@@ -1080,10 +1198,13 @@ impl ExecutionEngineManager {
     /// pending claim its branch's authority did not sign and a settlement
     /// whose terms execution refuses (lasting: both are read from the bytes
     /// alone, by execution's own checks), a custom mint the policy held here
-    /// does not authorize (pending). `None` for every other operation and
-    /// when it cannot say. When a refund falls due, a batch shield's
-    /// activation and a source outside the executing shard are judged by
-    /// the executing frame only: no frame is known ahead of it.
+    /// does not authorize (pending), and an owner that is not a canonical
+    /// identity once that check is active at GLOBAL frame `anchor`, the
+    /// lowest anchor of a frame that can still execute it
+    /// ([`ExecutingFrame::anchor_floor`]; lasting). `None` for every other
+    /// operation and when it cannot say. When a refund falls due, a batch
+    /// shield's activation and a source outside the executing shard are
+    /// judged by the executing frame only: no frame is known ahead of it.
     #[cfg(feature = "native-proof")]
     fn execution_standing(
         shard: &crate::hypergraph_state::HypergraphState,
@@ -1091,6 +1212,7 @@ impl ExecutionEngineManager {
         application: &[u8; 32],
         tp: u32,
         bytes: &[u8],
+        anchor: Option<u64>,
     ) -> Option<crate::token_intrinsic::global_commit::Standing> {
         use crate::token_engine::{
             TYPE_LATTICE_MINT, TYPE_LATTICE_PENDING_CLAIM, TYPE_LATTICE_SETTLEMENT,
@@ -1098,9 +1220,21 @@ impl ExecutionEngineManager {
         };
         use crate::token_intrinsic::{
             commit_verify, custom_mint,
-            global_commit::Standing,
+            global_commit::{self, Standing},
             shield::{self, SourceStanding},
+            spend_entries,
         };
+        // Execution refuses an operation naming an owner that is not a
+        // canonical identity before its proof once that check is active at
+        // the executing frame's anchor (`dispatch_for_commit`,
+        // `dispatch_global_mint`). The check reads the bytes alone and its
+        // gate opens once, so active at `anchor` it is active at every frame
+        // that can still carry the operation.
+        if global_commit::canonical_owners_active(anchor)
+            && spend_entries::names_noncanonical_owner(network, application, tp, bytes)
+        {
+            return Some(Standing::Lasting("an owner is not a canonical identity"));
+        }
         if tp == TYPE_LATTICE_PENDING_CLAIM {
             let claim = quil_lattice_ct::confidential::pending_claim::PendingClaim::decode(
                 bytes,
@@ -1153,12 +1287,12 @@ impl ExecutionEngineManager {
     /// `address` needs no verification here: execution against this node's
     /// store refuses it before its proof ([`Self::execution_standing`]), so
     /// no frame that carries it verifies it, here or on any node holding
-    /// that state; and, with `commit_frame`, in the global venue that
-    /// commits it at that frame, the commit refuses it from GLOBAL state
-    /// alone (`commit_apply::refused_before_proof`), as the venue does
-    /// before the proof. A frame reading a store that gains what refused it
-    /// (a source still syncing, a root an earlier operation of the frame
-    /// publishes) verifies it when it executes, as before.
+    /// that state, as `frame` executes it; and, when `frame` is GLOBAL frame
+    /// N, in the global venue that commits it at N, the commit refuses it
+    /// from GLOBAL state alone (`commit_apply::refused_before_proof`), as
+    /// the venue does before the proof. A frame reading a store that gains
+    /// what refused it (a source still syncing, a root an earlier operation
+    /// of the frame publishes) verifies it when it executes, as before.
     #[cfg(feature = "native-proof")]
     fn proof_refused(
         &self,
@@ -1166,16 +1300,18 @@ impl ExecutionEngineManager {
         address: &[u8],
         bytes: &[u8],
         tp: u32,
-        commit_frame: Option<u64>,
+        frame: ExecutingFrame,
     ) -> bool {
         let Some(Ok(application)) = address.get(..32).map(<[u8; 32]>::try_from) else {
             return false;
         };
         let store = crate::hypergraph_state::HypergraphState::new(self.crdt());
-        if Self::execution_standing(&store, network, &application, tp, bytes).is_some() {
+        let anchor = frame.anchor_floor_now();
+        let standing = Self::execution_standing(&store, network, &application, tp, bytes, anchor);
+        if standing.is_some() {
             return true;
         }
-        commit_frame.is_some_and(|frame| {
+        frame.commit_frame().is_some_and(|frame| {
             crate::token_intrinsic::spend_entries::commits_globally(&application, tp)
                 && crate::token_intrinsic::commit_apply::refused_before_proof(
                     &store,
@@ -2776,13 +2912,13 @@ impl ExecutionEngineManager {
     /// (execution_manager.go:357-549):
     /// - `0xff*32` (GLOBAL) → global engine.
     /// - a base domain (COMPUTE / HYPERGRAPH_BASE / TOKEN_BASE /
-    /// QUIL_TOKEN) → that engine directly.
+    ///   QUIL_TOKEN) → that engine directly.
     /// - any other address is a DEPLOYED app: read its base type-domain
-    /// from the metadata vertex at `(addr, 0xff*32)`, key `0xff*32`
-    /// (written at deploy by `init_metadata_vertex`), and route by it.
+    ///   from the metadata vertex at `(addr, 0xff*32)`, key `0xff*32`
+    ///   (written at deploy by `init_metadata_vertex`), and route by it.
     /// - no metadata / unknown type-domain → error (Go errors "no
-    /// execution engine found"; we do NOT silently default to
-    /// hypergraph — that was the prior bug that mis-routed everything).
+    ///   execution engine found"; we do NOT silently default to
+    ///   hypergraph — that was the prior bug that mis-routed everything).
     fn select_engine(&self, address: &[u8]) -> Result<String> {
         if address.len() < 32 {
             return Err(QuilError::InvalidArgument("address too short".into()));
@@ -4854,6 +4990,134 @@ mod tests {
         );
 
         assert_eq!(m.select_engine(&deployed).unwrap(), "token");
+    }
+
+    /// Only the compute engine runs a CodeExecute or CodeDeployment, so only
+    /// a bundle routed to it can carry one that crosses its domain: the
+    /// compute base domain and an application deployed as compute count, a
+    /// token or hypergraph application and an unknown address (no engine,
+    /// refused alike on both sides of the domain frame) do not.
+    #[test]
+    fn a_compute_op_crosses_its_domain_only_where_compute_runs() {
+        use crate::compute_intrinsic::{CodeDeployment, CodeExecute};
+        use crate::hypergraph_state::HypergraphState;
+        let inclusion_prover: Arc<dyn InclusionProver> = Arc::new(NoopInclusionProver);
+        let mem_store: Arc<dyn quil_types::store::HypergraphStore> = Arc::new(MemStore::new());
+        let crdt = Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            mem_store,
+            inclusion_prover.clone(),
+        ));
+        let deploy_as = |app: &[u8; 32], intrinsic: &[u8; 32]| {
+            let state = HypergraphState::new(crdt.clone());
+            let mut config = quil_tries::VectorCommitmentTree::new();
+            config
+                .insert(&[0x40u8], b"cfg", &[], &num_bigint::BigInt::from(3))
+                .unwrap();
+            let mut additional: Vec<Option<quil_tries::VectorCommitmentTree>> =
+                (0..14).map(|_| None).collect();
+            additional[13] = Some(config);
+            state
+                .init_metadata_vertex(
+                    app,
+                    &mut quil_tries::VectorCommitmentTree::new(),
+                    &mut quil_tries::VectorCommitmentTree::new(),
+                    "schema",
+                    &mut additional,
+                    intrinsic,
+                    1,
+                    inclusion_prover.as_ref(),
+                )
+                .unwrap();
+            state.commit().unwrap();
+        };
+        let compute_app = [0x42u8; 32];
+        let token_app = [0x43u8; 32];
+        deploy_as(&compute_app, &domains::COMPUTE);
+        deploy_as(
+            &token_app,
+            &crate::token_intrinsic::constants::token_base_domain(),
+        );
+        let stubs = crate::testing::NoopExecutionCrypto::new();
+        let m = ExecutionEngineManager::new(
+            inclusion_prover,
+            stubs.key_manager.clone(),
+            crdt,
+            stubs.circuit_compiler,
+            stubs.clock_store,
+            Arc::new(crate::testing::NoopHypergraphConfigResolver),
+            true,
+        );
+        let bundle = |inner: Vec<u8>| {
+            crate::message_envelope::CanonicalMessageBundle {
+                requests: vec![Some(crate::message_envelope::CanonicalMessageRequest {
+                    inner_type_prefix: u32::from_be_bytes(inner[..4].try_into().unwrap()),
+                    inner_bytes: inner,
+                })],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let execute = |domain: [u8; 32]| {
+            bundle(
+                CodeExecute {
+                    proof_of_payment: vec![vec![0u8; 57]],
+                    domain,
+                    rendezvous: [0x44; 32],
+                    execute_operations: Vec::new(),
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+            )
+        };
+        let deploy = |domain: [u8; 32]| {
+            bundle(
+                CodeDeployment {
+                    circuit: vec![0xAA; 16],
+                    input_types: Vec::new(),
+                    output_types: Vec::new(),
+                    domain,
+                }
+                .to_canonical_bytes()
+                .unwrap(),
+            )
+        };
+        let foreign = [0x22u8; 32];
+        // As the leader and the voter judge a bundle: its ops, then its route.
+        let crosses = |address: &[u8; 32], message: &[u8]| {
+            crate::compute_domain::crosses_domain(address, message) && m.routes_to_compute(address)
+        };
+
+        assert!(
+            crosses(&compute_app, &execute(foreign)),
+            "a compute application's foreign execute was not counted"
+        );
+        assert!(
+            crosses(&compute_app, &deploy(foreign)),
+            "a compute application's foreign deploy was not counted"
+        );
+        assert!(
+            !crosses(&compute_app, &execute(compute_app)),
+            "an execute naming its own compute application was counted"
+        );
+        assert!(
+            crosses(&domains::COMPUTE, &execute(domains::COMPUTE)),
+            "an execute into the compute base domain was not counted"
+        );
+        for (route, what) in [
+            (token_app, "a token application"),
+            (domains::QUIL_TOKEN, "the QUIL token"),
+            (
+                crate::hypergraph_intrinsic::hypergraph_base_domain(),
+                "the hypergraph base",
+            ),
+            ([0x45u8; 32], "an unknown address"),
+        ] {
+            assert!(
+                !crosses(&route, &execute(foreign)),
+                "{what} counted a compute op it never runs"
+            );
+        }
     }
 
     #[test]

@@ -644,6 +644,17 @@ fn renewal_grace(frame_number: u64) -> Option<(u64, u64)> {
     })
 }
 
+/// The epoch whose snapshots a node started at GLOBAL `frame_number`
+/// requests at its registry load when they were noted encoding
+/// ([`ProverLifecycle::noted_snapshot_encodes`]): the epoch a renewal then
+/// registers, from its snapshot frame until the renewal's grace frame.
+pub(crate) fn noted_encode_epoch(frame_number: u64) -> Option<u64> {
+    let (epoch, grace_frame) = renewal_grace(frame_number)?;
+    (frame_number >= quil_types::consensus::storage_snapshot_frame(epoch)
+        && frame_number < grace_frame)
+        .then_some(epoch)
+}
+
 /// Tracks the lifecycle state for this node's prover.
 pub struct ProverLifecycle {
     /// Serialize candidate construction and accepted-plan bookkeeping across
@@ -787,6 +798,11 @@ pub struct ProverLifecycle {
     /// epoch (`note_renewal_storage`); kept in the node's store from
     /// `configure_leave_decision_store` on, so a restart keeps them.
     renewal_storage: super::renewal_storage::RenewalStorageNotes,
+    /// Which session each bound seat's worker was last seen hosting, kept
+    /// in the node's store from `configure_leave_decision_store` on, so a
+    /// restart spares a seat that hosted until then the settle period
+    /// (`super::session_hosting::SessionHosting::resume`).
+    hosted_sessions: super::hosted_sessions::HostedSessions,
     /// Seats whose renewal a leave skipped while their storage work was
     /// under way, with the epoch they were last warned of in
     /// (`renewal_awaits_leave`).
@@ -913,6 +929,7 @@ impl ProverLifecycle {
             renewal_skips_reported: std::sync::Mutex::new(HashMap::new()),
             leave_landing_reported: std::sync::Mutex::new(HashMap::new()),
             renewal_storage: super::renewal_storage::RenewalStorageNotes::default(),
+            hosted_sessions: super::hosted_sessions::HostedSessions::default(),
             storage_skips_warned: std::sync::Mutex::new(HashMap::new()),
             unbound_renewals_reported: std::sync::Mutex::new(HashMap::new()),
             unlanded_leaves_reported: Default::default(),
@@ -1190,14 +1207,22 @@ impl ProverLifecycle {
     }
 
     /// Load durable rejection decisions before enabling lifecycle dispatch,
-    /// and the capacity shed's storage notes (`note_renewal_storage`): the
+    /// the capacity shed's storage notes (`note_renewal_storage`): the
     /// first shed after a restart runs before the confirm pipeline prepares
-    /// any seat again.
+    /// any seat again, and the seats' hosting records, read at each seat's
+    /// first observation (`super::session_hosting::SessionHosting::resume`).
     pub fn configure_leave_decision_store(&self, db: Arc<quil_store::RocksDb>) -> Result<()> {
         self.allocation_reasons
             .attach(db.clone(), &self.prover_address)?;
         self.renewal_storage
             .attach(db.clone(), &self.prover_address);
+        let hosted = self
+            .hosted_sessions
+            .attach(db.clone(), &self.prover_address);
+        self.session_hosting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .restore(hosted);
         self.leave_decisions.attach(db, &self.prover_address)
     }
 
@@ -1414,6 +1439,19 @@ impl ProverLifecycle {
     ) {
         let epoch = quil_types::consensus::epoch_for_frame(frame_number) + 1;
         self.renewal_storage.note(epoch, encoded, encoding);
+    }
+
+    /// The seats whose storage for the epoch a renewal at `frame_number`
+    /// registers was last noted encoding (`note_renewal_storage`), restored
+    /// from before a restart, between that epoch's snapshot frame and the
+    /// renewal's grace frame: their snapshots are requested at the registry
+    /// load (`crate::prover_pipeline::ProverPipeline::request_noted_snapshots`),
+    /// not first at a renewal the settle period or a GLOBAL frame may hold.
+    pub fn noted_snapshot_encodes(&self, frame_number: u64) -> Vec<Vec<u8>> {
+        let Some(epoch) = noted_encode_epoch(frame_number) else {
+            return Vec::new();
+        };
+        self.renewal_storage.encoding(epoch)
     }
 
     /// `filter`'s storage work for the epoch a renewal at `frame_number`
@@ -2218,8 +2256,10 @@ impl ProverLifecycle {
     }
 
     /// Pick auto-managed Active filters to leave when the prover holds
-    /// more than it may. Picks (`SurplusSelection::picks`) the lowest-scoring active filters when total active allocs
-    /// exceed `total_capacity` (the configured worker count). Manually-managed pins are
+    /// more than it may. Picks (`SurplusSelection::picks`) the seats of
+    /// draining workers first, then the lowest-scoring active filters, when
+    /// total active allocs exceed `total_capacity` (the configured worker
+    /// count). Manually-managed pins are
     /// protected — they're never picked as leave candidates — but
     /// they DO count toward capacity (an idle manual worker is still
     /// a worker, capable of hosting whichever filter the operator
@@ -2312,20 +2352,21 @@ impl ProverLifecycle {
             self.strategy,
             &excluded,
         );
-        // Among equal scores, a seat bound to a draining worker (one above
-        // the configured count) goes before one of a worker the node keeps,
-        // so the draining worker can stop; the score still decides first.
+        // A seat bound to a draining worker (one above the configured count)
+        // goes before any other, lowest score first, so the draining worker
+        // can stop. Shedding a kept worker's seat instead idles that worker
+        // while the draining one keeps its seat; the node is then at its
+        // count, so the idle worker cannot join and no seat is surplus, and
+        // the draining worker never stops.
         ranked.sort_by(|a, b| {
-            a.1.cmp(&b.1)
+            draining_filters
+                .contains(&b.0)
+                .cmp(&draining_filters.contains(&a.0))
+                .then_with(|| a.1.cmp(&b.1))
                 .then_with(|| {
                     bound_filters
                         .contains(&a.0)
                         .cmp(&bound_filters.contains(&b.0))
-                })
-                .then_with(|| {
-                    draining_filters
-                        .contains(&b.0)
-                        .cmp(&draining_filters.contains(&a.0))
                 })
         });
         let eligible = ranked.len();
@@ -3102,6 +3143,9 @@ impl ProverLifecycle {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let epoch_frames = quil_types::consensus::epoch_length_frames();
+            // Member seats whose worker hosts the session, for the record a
+            // restart reads (`hosted_sessions`).
+            let mut hosted_now: Vec<(Vec<u8>, u32, [u8; 32])> = Vec::new();
             for (core_id, filter) in &bound {
                 use super::session_hosting::{classify, Hosting, Seat};
                 let report = executions
@@ -3115,7 +3159,7 @@ impl ProverLifecycle {
                     report.unwrap_or(&Default::default()),
                     now,
                 );
-                let seat = if members.contains(filter) {
+                let seat = if members.contains_key(filter) {
                     Seat::Member
                 } else if lapsed.contains(filter.as_slice()) {
                     Seat::Lapsed
@@ -3145,6 +3189,11 @@ impl ProverLifecycle {
                     observed,
                     Hosting::Hosting | Hosting::Voting | Hosting::Silent { .. }
                 );
+                let session = members.get(filter);
+                if let Some(session) = session.filter(|_| observed.able(seat)) {
+                    hosted_now.push((filter.clone(), *core_id, *session));
+                }
+                hosting.resume(frame_number, epoch_frames, filter, *core_id, session);
                 let instance = super::session_hosting::Instance::of(report);
                 let events = hosting.observe_votes(
                     frame_number,
@@ -3186,7 +3235,26 @@ impl ProverLifecycle {
                     );
                 }
             }
+            for (filter, run) in hosting.take_resumed() {
+                tracing::info!(frame = frame_number, filter = hex::encode(&filter), core_id = run.core_id,
+                    hosted_until = run.since, frames_since = frame_number.saturating_sub(run.since),
+                    state = %run.state, blocker = %run.blocker, scope = "local",
+                    reason = "its worker hosted the session that counts it until this node stopped",
+                    "seat renewal skips the settle period after this start: its worker is not hosting yet, \
+                     and the seat is withheld only if its worker cannot host for an epoch from the frame \
+                     named, as without the restart");
+            }
             hosting.retain_bound(&worker_bound_filters);
+            hosting.expire_restored(frame_number, epoch_frames);
+            drop(hosting);
+            if membership_known {
+                self.hosted_sessions.note(
+                    frame_number,
+                    epoch_frames,
+                    &hosted_now,
+                    &worker_bound_filters,
+                );
+            }
         }
         // A worker whose seat was withheld for sending no vote takes no new
         // seats until it votes, restarts on that seat or the hold expires
@@ -3226,8 +3294,22 @@ impl ProverLifecycle {
             .filter(|a| self.allocator.expiry_awaits_view(a, frame_number).is_some())
             .map(|a| &a.confirmation_filter)
             .collect();
-        let unbound_held_count = all_our_filters
+        // A seat the allocator gives up is owed no worker: it binds none to
+        // it, and its committee does not seat it (`WorkerAllocator::gives_up`).
+        // Counted as owed one, seats lapsed over a node's downtime held every
+        // free worker until their leaves ended, two epochs (2026-11-10, an
+        // operator's node: 5 of 6 workers idle).
+        let held_filters: Vec<&Vec<u8>> = all_our_filters
             .iter()
+            .filter(|f| {
+                self.allocator
+                    .given_up_among(own_allocations, f, frame_number)
+                    .is_none()
+            })
+            .collect();
+        let unbound_held_count = held_filters
+            .iter()
+            .copied()
             .chain(expiry_held.iter().copied())
             .filter(|f| !worker_bound_filters.contains(*f))
             .collect::<std::collections::HashSet<_>>()
@@ -3240,8 +3322,9 @@ impl ProverLifecycle {
         // excess, but it does not count confirmations still in flight, so a
         // re-ranking between evaluations can confirm it too; the surplus leave
         // path then sheds it unless the halt-risk shield protects that shard.
-        let occupied = all_our_filters
+        let occupied = held_filters
             .iter()
+            .copied()
             .chain(&worker_bound_filters)
             .chain(expiry_held.iter().copied())
             .collect::<std::collections::HashSet<_>>()
@@ -3979,6 +4062,12 @@ impl ProverLifecycle {
                     Some(_) => true,
                     None => self.allocator.renewal_recovering(a, frame_number),
                 })
+                // Nor a seat the allocator gives up, unless a worker still
+                // serves it: it binds none to it.
+                .filter(|a| {
+                    worker_bound_filters.contains(&a.confirmation_filter)
+                        || self.allocator.gives_up(a, frame_number).is_none()
+                })
                 .collect();
             let owed_workers = held
                 .iter()
@@ -4223,7 +4312,7 @@ impl ProverLifecycle {
                 &pending_leave_filters,
             );
             // Over-capacity filters: allocations this prover cannot
-            // staff, worst-scoring first.
+            // staff, draining workers' seats first, then worst-scoring.
             //
             // Rank the whole held set, including unbound allocations: a
             // crash or delayed join can leave the valuable holding unstaffed.
@@ -4277,12 +4366,19 @@ impl ProverLifecycle {
                     self.strategy,
                     &excluded,
                 );
+                // As the surplus leave picks: a draining worker's seat
+                // first, then lowest score first, unbound seats first among
+                // equals.
                 ranked.sort_by(|a, b| {
-                    a.1.cmp(&b.1).then_with(|| {
-                        bound_filters
-                            .contains(&a.0)
-                            .cmp(&bound_filters.contains(&b.0))
-                    })
+                    draining_filters
+                        .contains(&b.0)
+                        .cmp(&draining_filters.contains(&a.0))
+                        .then_with(|| a.1.cmp(&b.1))
+                        .then_with(|| {
+                            bound_filters
+                                .contains(&a.0)
+                                .cmp(&bound_filters.contains(&b.0))
+                        })
                 });
                 // As in `select_excess_active_filters`, a seat whose storage
                 // renewal is under way is spared until it lands or its grace
@@ -4812,8 +4908,8 @@ impl ProverLifecycle {
                 .filter(|d| d.size > 0 && d.active_count <= proposer::HALT_RISK_PROVER_COUNT)
                 .map(|d| d.filter.clone())
                 .collect();
-            // As the surplus leave picks: lowest score first, and among equal
-            // scores a draining worker's seat first.
+            // As the surplus leave picks: a draining worker's seat first, then
+            // lowest score first.
             let mut capacity_ranked = proposer::rank_allocated_by_score_ascending(
                 &held_descriptors,
                 difficulty,
@@ -4823,11 +4919,10 @@ impl ProverLifecycle {
                 &shielded,
             );
             capacity_ranked.sort_by(|a, b| {
-                a.1.cmp(&b.1).then_with(|| {
-                    draining_filters
-                        .contains(&b.0)
-                        .cmp(&draining_filters.contains(&a.0))
-                })
+                draining_filters
+                    .contains(&b.0)
+                    .cmp(&draining_filters.contains(&a.0))
+                    .then_with(|| a.1.cmp(&b.1))
             });
             let capacity_needed = serving.saturating_sub(worker_capacity);
             let capacity_ready: Vec<Vec<u8>> = capacity_ranked
@@ -8518,6 +8613,172 @@ mod proposal_loop_tests {
         lc.halt_state().mark_halted(vec![0xB5; 32]);
         assert!(evaluate(&lc, 1442));
         assert!(lc.session_hosting.lock().unwrap().held_back().is_empty());
+    }
+
+    /// A restart at a renewal boundary: five frames past the snapshot
+    /// frame, thirty before the grace frame, sixty before the epoch's end.
+    /// A seat whose worker hosted the session that counts it until the node
+    /// stopped renews at the first evaluation after the start while the
+    /// worker is still starting. Without the saved record the seat waits the
+    /// settle period, which sixty frames before the epoch's end leaves no
+    /// renewal window; a record older than a settle period at the first
+    /// observation waits too.
+    #[test]
+    fn a_seat_hosted_until_a_restart_at_a_boundary_renews_without_the_settle_period() {
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::node::WorkerExecution;
+
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let signers: Vec<_> = (0..2)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
+        let [local, other] = [0, 1].map(|i| signers[i].public_key().to_vec());
+        let address = vec![0xCD; 32];
+        let held = vec![0xB1; 32];
+        let seated = session_authority(&[(&held, vec![local.clone(), other.clone()])]);
+        let report = |state: &str| WorkerExecution {
+            state: state.into(),
+            blocker: "shard catch-up after the restart".into(),
+            observed_unix_ms: crate::worker_execution::now_ms(),
+            ..Default::default()
+        };
+        let renews = |actions: &[LifecycleAction]| {
+            actions.iter().any(|a|
+            matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held)))
+        };
+        // Registered through epoch 1: it renews for epoch 2 in epoch 1.
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(ProverInfo {
+            public_key: local.clone(),
+            ..prover(address.clone(), vec![renewing(held.clone())])
+        });
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let workers = |state: &str| {
+            let wm = Arc::new(ConfigurableWorkerManager::new());
+            wm.add(allocated_worker(1, held.clone()));
+            wm.set_execution(1, &held, report(state));
+            wm
+        };
+        let started = |wm: &Arc<ConfigurableWorkerManager>,
+                       db: Option<&Arc<quil_store::RocksDb>>| {
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.allocator.set_session_authority(seated.clone());
+            if let Some(db) = db {
+                lc.configure_leave_decision_store(db.clone()).unwrap();
+            }
+            lc
+        };
+        let evaluate = |lc: &ProverLifecycle, wm: &ConfigurableWorkerManager, frame: u64| {
+            lc.set_prover_root_verified_frame(frame);
+            lc.evaluate(frame, 50_000, reg.as_ref(), wm).unwrap()
+        };
+        let snapshot = quil_types::consensus::storage_snapshot_frame(2);
+        let grace = snapshot + quil_types::consensus::storage_snapshot_grace();
+        let end = quil_types::consensus::epoch_length_frames() * 2;
+        let settle = crate::provers::session_hosting::settle_frames(
+            quil_types::consensus::epoch_length_frames(),
+        );
+        assert!(
+            end - 60 + settle >= end,
+            "the settle period outlasts the epoch"
+        );
+        for restart in [snapshot + 5, grace - 30, end - 60] {
+            let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+            let serving = workers("serving");
+            let before = started(&serving, Some(&db));
+            evaluate(&before, &serving, restart - 3);
+
+            let starting = workers("syncing");
+            let after = started(&starting, Some(&db));
+            let actions = evaluate(&after, &starting, restart);
+            assert!(
+                renews(&actions),
+                "settle_hold_not_skipped at {restart}: {actions:?}"
+            );
+
+            let unsaved = started(&starting, None);
+            assert!(
+                !renews(&evaluate(&unsaved, &starting, restart)),
+                "without the record the seat waits at {restart}"
+            );
+            let late = started(&starting, Some(&db));
+            assert!(
+                !renews(&evaluate(&late, &starting, restart - 3 + settle + 1)),
+                "stale_record_skipped_the_hold at {restart}"
+            );
+        }
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+    }
+
+    /// After a restart, a seat the allocator binds to its worker only after
+    /// the first evaluation still skips the settle period, and its saved
+    /// record survives that evaluation for the next start.
+    #[test]
+    fn a_seat_bound_after_the_first_evaluation_after_a_restart_skips_the_settle_period() {
+        use quil_types::crypto::Signer as _;
+        use quil_types::proto::node::WorkerExecution;
+
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(Some(0));
+        let signers: Vec<_> = (0..2)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
+        let [local, other] = [0, 1].map(|i| signers[i].public_key().to_vec());
+        let address = vec![0xCD; 32];
+        let held = vec![0xB2; 32];
+        let seated = session_authority(&[(&held, vec![local.clone(), other.clone()])]);
+        let report = |state: &str| WorkerExecution {
+            state: state.into(),
+            blocker: "shard catch-up after the restart".into(),
+            observed_unix_ms: crate::worker_execution::now_ms(),
+            ..Default::default()
+        };
+        let renews = |actions: &[LifecycleAction]| {
+            actions.iter().any(|a|
+            matches!(a, LifecycleAction::ReconfirmEpoch { filters, .. } if filters.contains(&held)))
+        };
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(ProverInfo {
+            public_key: local.clone(),
+            ..prover(address.clone(), vec![renewing(held.clone())])
+        });
+        reg.set_summaries(vec![shard_summary(held.clone(), 50)]);
+        let started = |wm: &Arc<ConfigurableWorkerManager>, db: &Arc<quil_store::RocksDb>| {
+            let lc = make_lifecycle(address.clone(), wm.clone(), reg.clone());
+            lc.allocator.set_session_authority(seated.clone());
+            lc.configure_leave_decision_store(db.clone()).unwrap();
+            lc
+        };
+        let evaluate = |lc: &ProverLifecycle, wm: &ConfigurableWorkerManager, frame: u64| {
+            lc.set_prover_root_verified_frame(frame);
+            lc.evaluate(frame, 50_000, reg.as_ref(), wm).unwrap()
+        };
+        let snapshot = quil_types::consensus::storage_snapshot_frame(2);
+        let restart = snapshot + quil_types::consensus::storage_snapshot_grace() - 30;
+        let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
+        let serving = Arc::new(ConfigurableWorkerManager::new());
+        serving.add(allocated_worker(1, held.clone()));
+        serving.set_execution(1, &held, report("serving"));
+        evaluate(&started(&serving, &db), &serving, restart - 3);
+
+        // The first evaluation after the start sees the worker unbound.
+        let starting = Arc::new(ConfigurableWorkerManager::new());
+        starting.add(idle_worker(1));
+        let after = started(&starting, &db);
+        evaluate(&after, &starting, restart);
+        starting.add(allocated_worker(1, held.clone()));
+        starting.set_execution(1, &held, report("syncing"));
+        let again = started(&starting, &db);
+        assert!(
+            renews(&evaluate(&after, &starting, restart + 3)),
+            "unbound_seat_record_dropped: the seat bound after the first evaluation waits"
+        );
+        assert!(
+            renews(&evaluate(&again, &starting, restart + 3)),
+            "unbound_seat_record_dropped: the saved record was dropped"
+        );
+        quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
     }
 
     /// A seat whose renewal was withheld because its worker cannot host
@@ -12840,6 +13101,87 @@ mod proposal_loop_tests {
         );
     }
 
+    /// Sets the calling thread's leaver currency frame, cleared on drop.
+    struct LeaverCurrency;
+    impl LeaverCurrency {
+        fn at(frame: Option<u64>) -> Self {
+            quil_execution::prover_registry::set_leaver_currency_frame_for_thread(frame);
+            Self
+        }
+    }
+    impl Drop for LeaverCurrency {
+        fn drop(&mut self) {
+            quil_execution::prover_registry::set_leaver_currency_frame_for_thread(None);
+        }
+    }
+
+    /// A seat registered for epoch 2 on `filter`, left at `leave`; its leave
+    /// confirmed at `confirm` (0: not yet).
+    fn left_lapsed(filter: &[u8], leave: u64, confirm: u64) -> ProverAllocationInfo {
+        ProverAllocationInfo {
+            epoch: 2,
+            leave_frame_number: leave,
+            leave_confirm_frame_number: confirm,
+            ..alloc(filter.to_vec(), ProverStatus::Leaving, 10)
+        }
+    }
+
+    /// Seats lapsed over a node's downtime and left after it are given up:
+    /// the allocator binds no worker to them and their committees do not
+    /// seat them. They take no free worker from joins, neither while the
+    /// leave awaits its confirm nor while a confirmed one serves out its
+    /// epoch. Counted as owed a worker, they kept 5 of an operator's 6
+    /// workers idle for two epochs after a restart (2026-11-10).
+    #[test]
+    fn seats_given_up_take_no_free_worker_from_joins() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let _currency = LeaverCurrency::at(Some(0));
+        let e = quil_types::consensus::epoch_length_frames();
+        let frame = 20 * e + 5;
+        let address = vec![0xCDu8; 32];
+        let left = filter_bytes(0xA1);
+        let departing = filter_bytes(0xA2);
+        let seats = vec![
+            left_lapsed(&left, 20 * e + 1, 0),
+            left_lapsed(&departing, 19 * e + 1, 20 * e + 1),
+        ];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(idle_worker(1));
+        wm.add(idle_worker(2));
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(address.clone(), seats.clone()));
+        reg.set_summaries(vec![
+            shard_summary(left.clone(), 50),
+            shard_summary(departing.clone(), 50),
+            shard_summary(filter_bytes(0xB1), 1),
+            shard_summary(filter_bytes(0xB2), 1),
+        ]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        for seat in &seats {
+            assert_eq!(
+                lifecycle.allocator.gives_up(seat, frame),
+                Some(crate::worker_allocator::GivenUp::LeftLapsed),
+                "fixture: {}",
+                hex::encode(&seat.confirmation_filter)
+            );
+        }
+        lifecycle.set_prover_root_verified_frame(frame);
+        let actions = lifecycle
+            .evaluate(frame, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        let mut joined = proposed_join_filters(&actions);
+        joined.sort();
+        assert_eq!(
+            joined,
+            vec![filter_bytes(0xB1), filter_bytes(0xB2)],
+            "both free workers join other shards, none waits on a seat given up: {actions:?}"
+        );
+    }
+
     #[test]
     fn moving_to_fewer_cores_proposes_leaves_for_surplus() {
         let address = vec![0xCDu8; 32];
@@ -13963,11 +14305,210 @@ mod proposal_loop_tests {
         );
     }
 
+    /// After the count is lowered, the surplus leave sheds the draining
+    /// workers' seats before a seat of a worker within the count, even one
+    /// of lower reward. A kept worker's seat shed instead idles that worker
+    /// while the draining one keeps its seat; the node is then at its count,
+    /// so nothing joins or leaves again and the draining worker never stops.
+    /// Here, once the proposed leaves depart, every draining worker retires.
+    #[test]
+    fn a_lowered_count_drains_extra_workers_before_kept_seats_of_lower_reward() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        // The registry holds only this prover, so every seat is on the same
+        // ring and its reward follows its shard's size; each shard has 10
+        // active provers, above the shield. Cores 1..=6, within the count,
+        // sit on small shards, and cores 7..=9, draining, on ten times
+        // larger ones, so their seats pay more.
+        let size = |core: u32| {
+            let base = if core <= 6 { 100_000 } else { 1_000_000 };
+            base + u64::from(core)
+        };
+        let seat = |core: u32| filter_bytes(0xC0 + core as u8);
+        let mut allocs: Vec<ProverAllocationInfo> = Vec::new();
+        for core in 1..=9u32 {
+            wm.add(allocated_worker(core, seat(core)));
+            allocs.push(alloc(seat(core), ProverStatus::Active, 10));
+        }
+        wm.set_configured_count(6);
+        reg.set_prover(prover(address.clone(), allocs.clone()));
+        reg.set_summaries(
+            (1..=9u32)
+                .map(|core| ProverShardSummary {
+                    total_size: size(core),
+                    ..shard_summary(seat(core), 10)
+                })
+                .collect(),
+        );
+        let lifecycle = make_lifecycle(
+            address.clone(),
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+        let actions = lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        let left = proposed_leave_filters(&actions);
+        assert_eq!(left.len(), 3, "{actions:?}");
+        let left_cores: Vec<u32> = (1..=9u32).filter(|c| left.contains(&seat(*c))).collect();
+
+        // The proposed leaves depart and their workers go idle.
+        allocs.retain(|a| !left.contains(&a.confirmation_filter));
+        reg.set_prover(prover(address, allocs));
+        for core in &left_cores {
+            wm.deallocate_worker(*core).unwrap();
+        }
+        let after = lifecycle
+            .evaluate(101, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        let mut retired = wm.retired();
+        retired.sort_unstable();
+        assert_eq!(
+            retired,
+            vec![7, 8, 9],
+            "drain_stalled: the surplus leave took the seats of cores {left_cores:?}; after they \
+             departed: {after:?}"
+        );
+    }
+
+    /// At the confirm boundary, the capacity rule confirms a draining
+    /// worker's pending leave before a kept worker's of lower reward; the
+    /// kept one goes through the score rule, which rejects it with no better
+    /// shard open. The extra worker drains and the kept one keeps serving.
+    #[test]
+    fn the_capacity_rule_confirms_a_draining_seats_leave_before_a_kept_ones() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let address = vec![0xCDu8; 32];
+        let (kept_low, kept, draining) =
+            (filter_bytes(0xD1), filter_bytes(0xD2), filter_bytes(0xD3));
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(allocated_worker(1, kept_low.clone()));
+        wm.add(allocated_worker(2, kept.clone()));
+        wm.add(allocated_worker(3, draining.clone()));
+        wm.set_configured_count(2);
+        let reg = Arc::new(ConfigurableRegistry::new());
+        // One ring for every seat (the registry holds only this prover), so
+        // the reward follows the size: the kept seat on the small shard pays
+        // least.
+        reg.set_summaries(vec![
+            ProverShardSummary {
+                total_size: 100_000,
+                ..shard_summary(kept_low.clone(), 10)
+            },
+            shard_summary(kept.clone(), 10),
+            shard_summary(draining.clone(), 10),
+        ]);
+        let mut allocs = vec![
+            alloc(kept_low.clone(), ProverStatus::Active, 10),
+            alloc(kept, ProverStatus::Active, 10),
+            alloc(draining.clone(), ProverStatus::Active, 10),
+        ];
+        reg.set_prover(prover(address.clone(), allocs.clone()));
+        let lifecycle = make_lifecycle(
+            address.clone(),
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+        lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        // Whatever was proposed, decide pending leaves of the kept seat of
+        // lowest reward and of the draining seat in their confirm epoch.
+        for i in [0, 2] {
+            allocs[i].status = ProverStatus::Leaving;
+            allocs[i].leave_frame_number = 100;
+        }
+        reg.set_prover(prover(address, allocs));
+        lifecycle.set_prover_root_verified_frame(800);
+        let actions = lifecycle
+            .evaluate(800, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        let decided = |confirm: bool| -> Vec<Vec<u8>> {
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    LifecycleAction::ConfirmLeaves { filters, .. } if confirm => Some(filters),
+                    LifecycleAction::RejectLeaves { filters, .. } if !confirm => Some(filters),
+                    _ => None,
+                })
+                .flatten()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            (decided(true), decided(false)),
+            (vec![draining], vec![kept_low]),
+            "capacity_order: {actions:?}"
+        );
+    }
+
+    /// The overcapacity leave also sheds a draining worker's seat before a
+    /// kept worker's of lower reward. It proposes when the surplus leave
+    /// does not: here a manual worker's join is pending, so its seat is not
+    /// Active and the surplus leave counts no surplus, while the
+    /// overcapacity leave counts that worker against the auto-managed
+    /// capacity and sheds one seat.
+    #[test]
+    fn the_overcapacity_leave_sheds_a_draining_seat_before_a_kept_one() {
+        let address = vec![0xCDu8; 32];
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        let reg = Arc::new(ConfigurableRegistry::new());
+        // One ring for every seat (the registry holds only this prover), so
+        // the reward follows the size. Core 1 is manual with its join
+        // pending; cores 2..=6, within the count, sit on small shards, and
+        // core 7, draining, on a ten times larger one, so its seat pays
+        // more.
+        let size = |core: u32| {
+            let base = if core <= 6 { 100_000 } else { 1_000_000 };
+            base + u64::from(core)
+        };
+        let seat = |core: u32| filter_bytes(0xE0 + core as u8);
+        let mut allocs: Vec<ProverAllocationInfo> = Vec::new();
+        for core in 1..=7u32 {
+            let mut worker = allocated_worker(core, seat(core));
+            worker.manually_managed = core == 1;
+            wm.add(worker);
+            let status = if core == 1 {
+                ProverStatus::Joining
+            } else {
+                ProverStatus::Active
+            };
+            allocs.push(alloc(seat(core), status, 99));
+        }
+        wm.set_configured_count(6);
+        reg.set_prover(prover(address.clone(), allocs));
+        reg.set_summaries(
+            (1..=7u32)
+                .map(|core| ProverShardSummary {
+                    total_size: size(core),
+                    ..shard_summary(seat(core), 10)
+                })
+                .collect(),
+        );
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        lifecycle.set_prover_root_verified_frame(100);
+        let actions = lifecycle
+            .evaluate(100, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert_eq!(
+            proposed_leave_filters(&actions),
+            vec![seat(7)],
+            "overcapacity_order: {actions:?}"
+        );
+    }
+
     /// An operator's case at scale: 48 configured, 103 seated workers, the
     /// seats of 30 draining workers on shards the shield holds. 55 seats are
     /// surplus and 73 eligible: the 25 draining seats the shield does not
-    /// hold go first among equal rewards, then 30 of the workers within the
-    /// count; every shielded seat stays, and the summary counts them.
+    /// hold go first, then 30 of the workers within the count; every
+    /// shielded seat stays, and the summary counts them.
     #[test]
     fn a_103_worker_node_configured_for_48_sheds_55_eligible_seats() {
         let address = vec![0xCDu8; 32];
@@ -14378,6 +14919,68 @@ mod proposal_loop_tests {
             decide(false),
             (false, true),
             "the free worker is owed to the confirmed join"
+        );
+    }
+
+    /// A seat this node gives up is owed no worker at the confirm cap
+    /// either: the allocator binds none to it. A join proposed beside seats
+    /// lapsed over a downtime confirms in the epoch their leaves serve out
+    /// instead of being rejected for the worker they never get.
+    #[test]
+    fn a_pending_join_confirms_beside_a_seat_given_up() {
+        let _epoch = super::buckets_tests::epoch_length_guard();
+        let _currency = LeaverCurrency::at(Some(0));
+        let e = quil_types::consensus::epoch_length_frames();
+        let frame = 21 * e + 5;
+        let address = vec![0xCDu8; 32];
+        let waiting = filter_bytes(0xB0);
+        let given_up = left_lapsed(&filter_bytes(0xB1), 20 * e + 1, 21 * e + 1);
+        let wm = Arc::new(ConfigurableWorkerManager::new());
+        wm.add(WorkerInfo {
+            core_id: 1,
+            filter: waiting.clone(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        });
+        let reg = Arc::new(ConfigurableRegistry::new());
+        reg.set_prover(prover(
+            address.clone(),
+            vec![
+                alloc(waiting.clone(), ProverStatus::Joining, 20 * e + 10),
+                given_up.clone(),
+            ],
+        ));
+        let mut counts = HashMap::new();
+        counts.insert(ProverStatus::Active, 2);
+        reg.set_summaries(vec![
+            ProverShardSummary {
+                filter: waiting.clone(),
+                status_counts: counts,
+                total_size: 1_000,
+            },
+            shard_summary(given_up.confirmation_filter.clone(), 5),
+        ]);
+        let lifecycle = make_lifecycle(
+            address,
+            wm.clone() as Arc<dyn WorkerManager>,
+            reg.clone() as Arc<dyn ProverRegistry>,
+        );
+        assert_eq!(
+            lifecycle.allocator.gives_up(&given_up, frame),
+            Some(crate::worker_allocator::GivenUp::LeftLapsed),
+            "fixture"
+        );
+        lifecycle.set_prover_root_verified_frame(frame);
+        let actions = lifecycle
+            .evaluate(frame, 1, reg.as_ref(), wm.as_ref())
+            .unwrap();
+        assert!(
+            count_confirms(&actions).contains(&waiting)
+                && !count_reject_filters(&actions).contains(&waiting),
+            "the join's worker is owed to no seat it could serve: {actions:?}"
         );
     }
 

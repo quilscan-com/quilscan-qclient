@@ -162,9 +162,9 @@ pub fn verify_signed_slot_equivocation(kick: &ProverKick) -> bool {
 /// 1. Equivocation check (`verify_kick_equivocation`).
 /// 2. BLS aggregate signature verify on both conflicting frames.
 /// 3. Traversal-proof check against the prover tree at `frame N-1`
-/// (loaded from the `ClockStore`).
+///    (loaded from the `ClockStore`).
 /// 4. Multiproof verify of `[PublicKey, Status]` for the kicked prover
-/// against the supplied `proof`.
+///    against the supplied `proof`.
 ///
 /// The multi-message multiproof check (Go `rdfMultiprover.VerifyWithType`)
 /// is a best-effort call through the supplied `InclusionProver`; the
@@ -472,7 +472,7 @@ pub fn verify_kick_frame_signers(
 /// 1. Extract each frame's BLS aggregate signature bitmask.
 /// 2. Compute the kicked prover's address = `poseidon(pubkey)`.
 /// 3. Look up active provers for the frame's filter/address via
-/// `prover_registry.get_active_provers`.
+///    `prover_registry.get_active_provers`.
 /// 4. Find the kicked prover's index in that set.
 /// 5. Check both bitmasks have that bit set.
 ///
@@ -1139,7 +1139,7 @@ mod tests {
 
     #[test]
     fn extract_rejects_unknown_type_prefix() {
-        let mut bytes = app_frame_bytes(&vec![0xCDu8; 32], &[0x01]);
+        let mut bytes = app_frame_bytes(&[0xCDu8; 32], &[0x01]);
         bytes[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
         assert!(extract_kick_frame_filter_and_bitmask(&bytes).is_err());
     }

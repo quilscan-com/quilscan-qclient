@@ -1386,6 +1386,24 @@ impl AppLeaderProvider {
         resolve_global_anchor(self.global_anchor_store.as_ref())
     }
 
+    /// The fee multiplier vote this leader proposes in a frame anchored at
+    /// GLOBAL frame `anchor`: its fee window's base moved by the frame
+    /// cadence, kept inside the bounds members enforce once they apply there
+    /// (a no-op for every vote computed today; see
+    /// `fees::MIN_FEE_MULTIPLIER_VOTE`).
+    fn proposal_fee_vote(&self, anchor: u64, now_ms: i64, previous_timestamp_ms: i64) -> u64 {
+        crate::fees::proposer_fee_vote(
+            anchor,
+            crate::fees::compute_fee_multiplier_vote(
+                self.fee_manager.as_ref(),
+                &self.filter,
+                now_ms,
+                previous_timestamp_ms,
+                self.reward_greedy,
+            ),
+        )
+    }
+
     /// The GLOBAL frame whose EPOCH defines this shard's committee. Prover
     /// lifecycle (join/leave activation, epoch re-confirm) is GLOBAL-frame-defined
     /// (`JoinConfirmFrameNumber`/`Epoch` are written by the global intrinsic), so
@@ -1396,6 +1414,82 @@ impl AppLeaderProvider {
     fn committee_anchor_gfn(&self) -> u64 {
         self.resolve_global_anchor().0
     }
+
+    /// Which of `canonical`, the bundles of a proposal anchored at `anchor`,
+    /// it keeps; `None` keeps them all. While [`leader_drops_cross_domain`]
+    /// holds and this shard runs on the compute engine, a bundle carrying a
+    /// compute op naming another application
+    /// ([`quil_execution::compute_domain::crosses_domain`]) is left out and
+    /// leaves the mempool for good (`raw(index)` is its collected message):
+    /// voters that reached the compute domain frame refuse a proposal
+    /// carrying it, and no frame anchored at or after that frame runs it.
+    /// The route is resolved once per proposal, only when a bundle crosses.
+    fn cross_domain_keep(
+        &self,
+        frame_number: u64,
+        anchor: u64,
+        canonical: &[Vec<u8>],
+        raw: impl Fn(usize) -> Vec<u8>,
+    ) -> Option<Vec<bool>> {
+        let manager = self.execution_engine.as_ref()?;
+        let latest = self
+            .global_anchor_store
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|frame| frame.header.map(|header| header.frame_number))
+            .unwrap_or(0);
+        if !leader_drops_cross_domain(anchor, latest) {
+            return None;
+        }
+        let keep: Vec<bool> = canonical
+            .iter()
+            .map(|canon| !quil_execution::compute_domain::crosses_domain(&self.app_address, canon))
+            .collect();
+        if keep.iter().all(|keep| *keep) || !manager.routes_to_compute(&self.app_address) {
+            return None;
+        }
+        let dropped: Vec<Vec<u8>> = keep
+            .iter()
+            .enumerate()
+            .filter(|(_, keep)| !**keep)
+            .map(|(index, _)| raw(index))
+            .collect();
+        info!(
+            filter = %hex::encode(&self.filter),
+            frame = frame_number,
+            anchor,
+            latest_global = latest,
+            dropped = dropped.len(),
+            scope = "a submitter",
+            action = "none here: no frame can run them once the compute domain frame is reached",
+            "dropping bundles with a compute op naming another application: voters at the \
+             compute domain frame refuse a proposal carrying one"
+        );
+        self.mempool.mark_skipped(&dropped);
+        Some(keep)
+    }
+}
+
+/// How many GLOBAL frames before the compute domain frame a leader starts
+/// leaving out cross-domain compute ops ([`leader_drops_cross_domain`]). A
+/// voter refuses them once its own latest GLOBAL frame reaches the domain
+/// frame, whatever anchor the proposal names, so a voter up to this many
+/// frames ahead of the leader no longer refuses its proposal. A voter
+/// further ahead still does: that view fails and a later leader proposes,
+/// a bounded stall. A wider lead drops more ops that the domain frame is
+/// about to refuse.
+const LEADER_DROP_LEAD: u64 = 2;
+
+/// Whether a leader anchoring a proposal at `anchor`, its latest GLOBAL frame
+/// `latest`, leaves out bundles a voter refuses from the compute domain frame
+/// ([`quil_execution::compute_domain`]): the anchor is before that frame (or
+/// names none, as a voter judges it), and `latest` is within
+/// [`LEADER_DROP_LEAD`] frames of it. From an anchor at the domain frame,
+/// execution refuses the op itself.
+pub(crate) fn leader_drops_cross_domain(anchor: u64, latest: u64) -> bool {
+    use quil_execution::compute_domain::compute_domain_guarded_at;
+    (anchor == 0 || !compute_domain_guarded_at(anchor))
+        && compute_domain_guarded_at(latest.saturating_add(LEADER_DROP_LEAD))
 }
 
 impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeaderProvider {
@@ -1493,21 +1587,22 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
         // Committee epoch is GLOBAL-frame-defined; read it at the anchor, NOT the
         // app-shard-local clock tip (unrelated to global). See `committee_anchor_gfn`.
         let committee_frame = anchor_gfn;
-        if quil_types::consensus::sealed_storage_required_at(anchor_gfn) {
-            let slot = self.prover_registry.get_storage_seat_slot(
-                &self.local_prover_address,
-                &self.filter,
-                quil_types::consensus::epoch_for_frame(anchor_gfn),
-            )?;
-            if !quil_types::consensus::storage_seat_eligible(
-                &self.filter,
-                anchor_gfn,
-                slot.as_ref(),
-            ) {
-                return Err(QuilError::NoVote(
-                    "local storage is not sealed for this epoch".into(),
-                ));
-            }
+        // From the seal gate recovery epoch an unsealed member proposes as
+        // GLOBAL admits its header; it earns no issuance share.
+        if !quil_types::consensus::storage_participant_admitted(
+            &self.filter,
+            anchor_gfn,
+            |epoch| {
+                self.prover_registry.get_storage_seat_slot(
+                    &self.local_prover_address,
+                    &self.filter,
+                    epoch,
+                )
+            },
+        )? {
+            return Err(QuilError::NoVote(
+                "local storage is not sealed for this epoch".into(),
+            ));
         }
         let active = self
             .prover_registry
@@ -1810,6 +1905,22 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 );
             }
         }
+        // A compute op naming another application, in a frame anchored before
+        // the compute domain frame, is refused by voters that reached it, and
+        // from it no frame runs the op: drop the bundle for good rather than
+        // have the proposal refused.
+        let crossing =
+            self.cross_domain_keep(frame_number, anchor_gfn, &canonical_requests, |index| {
+                raw_messages[origins[index]].clone()
+            });
+        if let Some(keep) = crossing {
+            retain_kept(
+                &keep,
+                &mut request_bundles,
+                &mut canonical_requests,
+                &mut origins,
+            );
+        }
         // Each confidential bundle is proposed by one designated shard of the
         // application, chosen by its hash over the live shards, instead of by
         // every shard that collected it. One the
@@ -2050,6 +2161,34 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 }
             }
         }
+        // Members, followers and archives refuse a frame past the bundles
+        // and requests a frame may carry (`frame_bound`). Of the bundles
+        // every hold above left, the frame takes each, in collection order,
+        // while it has room, keeping room for the coin deliveries added
+        // below (each a bundle of one request); the rest stay in the
+        // collector for a later frame, within its retention.
+        let deliveries = 2 * quil_execution::token_intrinsic::delivery::MAX_DELIVERIES_PER_FRAME;
+        let fits = crate::frame_bound::FrameItemBudget::within(
+            crate::frame_bound::MAX_APP_FRAME_ITEMS - deliveries,
+        )
+        .fit(request_bundles.iter().map(|bundle| bundle.requests.len()));
+        let deferred = fits.iter().filter(|fits| !**fits).count();
+        if deferred > 0 {
+            info!(
+                frame = frame_number,
+                rank,
+                deferred,
+                limit = crate::frame_bound::MAX_APP_FRAME_ITEMS,
+                action = "an expected wait: a later frame proposes them",
+                "deferring bundles past the bundles and requests a frame may carry"
+            );
+            retain_kept(
+                &fits,
+                &mut request_bundles,
+                &mut canonical_requests,
+                &mut origins,
+            );
+        }
         // The leader executes these after finalization like every member;
         // start verifying their proofs now.
         if let Some(exec) = self.execution_engine.as_ref() {
@@ -2059,6 +2198,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
                 &canonical_requests,
                 &self.filter,
                 frame_number,
+                (anchor_gfn != 0).then_some(anchor_gfn),
             );
         }
         // Deliveries of globally committed outputs this shard owns, each its
@@ -2158,18 +2298,7 @@ impl quil_consensus::leader_provider::LeaderProvider<AppShardState> for AppLeade
             .map(|h| h.timestamp)
             .unwrap_or(now_ms - 10_000); // assume 10s at genesis
 
-        // Kept inside the bounds members enforce once they apply (a no-op
-        // for every vote computed today; see `fees::MIN_FEE_MULTIPLIER_VOTE`).
-        let fee_multiplier_vote = crate::fees::proposer_fee_vote(
-            anchor_gfn,
-            crate::fees::compute_fee_multiplier_vote(
-                self.fee_manager.as_ref(),
-                &self.filter,
-                now_ms,
-                previous_timestamp_ms,
-                self.reward_greedy,
-            ),
-        );
+        let fee_multiplier_vote = self.proposal_fee_vote(anchor_gfn, now_ms, previous_timestamp_ms);
 
         // Per-frame shard state roots: 4 × 64-byte phase commitments
         // (vertex_adds / vertex_removes / hyperedge_adds /
@@ -2962,6 +3091,35 @@ fn prepare_app_cw_journal(
     Ok((candidate_anchor, candidate_frame))
 }
 
+/// The most reward proofs held for their late-vote windows: past it the
+/// oldest goes out at once. A window lasts at most
+/// [`quil_cw_consensus::late_finalize::LATE_VOTE_WINDOW`], so a few frames
+/// are held at a time.
+const MAX_HELD_REWARD_PROOFS: usize = 32;
+
+/// A finalized frame's reward proof held until its late-vote window closes
+/// ([`AppConsensusEngine::publish_reward_proof`]).
+struct HeldRewardProof {
+    frame: quil_types::proto::global::AppShardFrame,
+    /// Its finalization certificate as this node holds it.
+    cert: Vec<u8>,
+    /// The host that finalized it; `None`: it goes out as it is.
+    late: Option<Arc<quil_cw_consensus::late_finalize::LateFinalizes>>,
+    /// The latest its window closes, when the engine wakes to send it; set
+    /// again when it is first in line, as its window can open after it was
+    /// held.
+    due: Option<std::time::Instant>,
+}
+
+impl HeldRewardProof {
+    /// While its window is open at `now`, the latest it closes.
+    fn open_until(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        self.late
+            .as_ref()
+            .and_then(|late| late.open_until(&self.cert, now))
+    }
+}
+
 /// App shard consensus engine. Owns a HotStuff event loop and
 /// processes messages for a single shard identified by `filter`.
 pub struct AppConsensusEngine {
@@ -3197,7 +3355,7 @@ pub struct AppConsensusEngine {
     lineage_record_absent: bool,
 
     // Identity
-    sector_signer: Box<dyn quil_types::crypto::Signer>,
+    sector_signer: Arc<dyn quil_types::crypto::Signer>,
     local_prover_address: Vec<u8>,
     local_bls_pubkey: Vec<u8>,
 
@@ -3210,6 +3368,22 @@ pub struct AppConsensusEngine {
     /// Callback that publishes finalized FrameHeader canonical bytes
     /// on `GLOBAL_PROVER`. Optional so legacy/test paths still work.
     coverage_publish: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    /// The running consensus host's finalize votes that came after a
+    /// certificate ([`quil_cw_consensus::late_finalize`]).
+    late_finalizes: Option<Arc<quil_cw_consensus::late_finalize::LateFinalizes>>,
+    /// This shard's late finalize votes across hosts, logged hourly.
+    late_vote_census: Arc<quil_cw_consensus::late_finalize::LateVoteCensus>,
+    /// Reward proofs waiting for their late-vote windows, in finalization
+    /// order.
+    held_reward_proofs: VecDeque<HeldRewardProof>,
+
+    /// This seat's storage epoch proof checks, run off the consensus
+    /// thread one at a time ([`Self::request_storage_epoch_check`]).
+    storage_epoch_checks: Arc<crate::storage_epoch_check::Checks>,
+    /// Run each check on the asking thread, as tests reading what it did
+    /// right after, under their thread's overrides, need.
+    #[cfg(test)]
+    storage_epoch_check_inline: bool,
 
     /// Backing KV store for persistent consensus + liveness state.
     /// `None` falls back to the in-memory stub.
@@ -3235,6 +3409,11 @@ pub struct AppConsensusEngine {
     /// The authorized committee session the running `cw_handle` was built for.
     /// `None` on the legacy registry-committee path.
     cw_session: Option<quil_cw_consensus::handoff::Session>,
+    /// Failed reads of `cw_session`'s state from committed GLOBAL state by
+    /// [`Self::observe_consensus_phase`], other than this node's GLOBAL
+    /// state sync withholding it: logged at the first, at most every ten
+    /// minutes while they last, and at the read that ends them.
+    session_state_reads: std::sync::Mutex<crate::worker_execution::FailureStreak>,
     /// The committee keys of the running `cw_handle`, sorted: block ingress
     /// stores bodies only from them ([`Self::admits_block_sender`]).
     cw_members: Vec<Vec<u8>>,
@@ -3503,17 +3682,24 @@ impl AppConsensusEngine {
             discarded_records_dropped: false,
             start_pace: StartPace::default(),
             lineage_record_absent: false,
-            sector_signer: deps.bls_signer,
+            sector_signer: Arc::from(deps.bls_signer),
+            storage_epoch_checks: Default::default(),
+            #[cfg(test)]
+            storage_epoch_check_inline: false,
             local_prover_address: deps.local_prover_address,
             local_bls_pubkey: deps.local_bls_pubkey,
             halted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             coverage_publish: deps.coverage_publish,
+            late_finalizes: None,
+            late_vote_census: Arc::new(quil_cw_consensus::late_finalize::LateVoteCensus::new()),
+            held_reward_proofs: VecDeque::new(),
             kv_db: deps.kv_db,
             cw_handle: None,
             cw_host_epoch: 0,
             cw_discarded_through_epoch: None,
             cw_committee_fp: None,
             cw_session: None,
+            session_state_reads: Default::default(),
             cw_members: Vec::new(),
             session_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_liveness: None,
@@ -3610,6 +3796,125 @@ impl AppConsensusEngine {
             &quil_store::encoding::consensus_materialized_cursor_key(&self.filter),
             &frame.to_be_bytes(),
         )
+    }
+
+    /// What this seat's storage epoch proof check reads, owned, so that it
+    /// runs off the consensus thread.
+    fn storage_epoch_check(&self) -> StorageEpochCheck {
+        StorageEpochCheck {
+            filter: self.filter.clone(),
+            local_prover_address: self.local_prover_address.clone(),
+            global_anchor_store: self.global_anchor_store.clone(),
+            global_anchor_source: self.global_anchor_source.clone(),
+            global_hypergraph: self.global_hypergraph.clone(),
+            coverage_publish: self.coverage_publish.clone(),
+            sector_signer: self.sector_signer.clone(),
+            prover_registry: self.prover_registry.clone(),
+            kv_db: self.kv_db.clone(),
+            hypergraph: self.hypergraph.clone(),
+        }
+    }
+
+    /// Ask for this seat's storage epoch proof check at `ask`
+    /// ([`StorageEpochCheck::prove_storage_epoch_if_due`]). It reads this
+    /// node's store, so it runs on a blocking thread, never on this
+    /// engine's consensus thread, one check at a time; what is asked while
+    /// one runs is checked once after it, at the newest frame asked
+    /// (`crate::storage_epoch_check`). A GLOBAL frame asked is noted at
+    /// once (`crate::storage_snapshot::note_global_frame`), however long
+    /// a check runs.
+    fn request_storage_epoch_check(&self, ask: crate::storage_epoch_check::Ask) {
+        use crate::storage_epoch_check::{Ask, Asking};
+        if let Ask::Frame(frame) = ask {
+            crate::storage_snapshot::note_global_frame(frame);
+        }
+        #[cfg(test)]
+        if self.storage_epoch_check_inline {
+            let check = self.storage_epoch_check();
+            let frame = match ask {
+                Ask::Frame(frame) => Some(frame),
+                Ask::Head => check.head(),
+            };
+            if let Some(frame) = frame {
+                check.prove_storage_epoch_if_due(frame);
+            }
+            return;
+        }
+        let running = match self
+            .storage_epoch_checks
+            .ask(ask, std::time::Instant::now())
+        {
+            Asking::Start(running) => running,
+            Asking::Queued(None) => return,
+            Asking::Queued(Some(ran)) => {
+                warn!(core_id = self.core_id, filter = %hex::encode(&self.filter), seconds = ran.as_secs(),
+                    scope = "this node",
+                    action = "the check reads this node's store: compare the 'store latency' line's fsync_probe_ms and max_write_ms; slow there is this node's disk",
+                    "storage epoch proof check still running: consensus does not wait for it, the frames asked meanwhile are checked once after it, and this seat's seals and settlements wait for it");
+                return;
+            }
+        };
+        let check = self.storage_epoch_check();
+        let work = move || {
+            let filter = check.filter.clone();
+            running.run(&filter, |asked| {
+                if let Some(frame) = asked.frame(|| check.head()) {
+                    check.prove_storage_epoch_if_due(frame);
+                }
+            });
+        };
+        // Dropped unrun (a runtime shutting down, a thread not spawned),
+        // the work frees the engine's run, and the next ask starts one.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(work)),
+            Err(_) => {
+                if let Err(error) = std::thread::Builder::new()
+                    .name("storage epoch check".into())
+                    .spawn(work)
+                {
+                    warn!(core_id = self.core_id, %error,
+                        "storage epoch proof check not started: no thread for it; the next GLOBAL frame asks again");
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn prove_storage_epoch_if_due(&self, global_frame_number: u64) {
+        self.storage_epoch_check()
+            .prove_storage_epoch_if_due(global_frame_number);
+    }
+
+    #[cfg(test)]
+    fn label_storage_ahead(&self, global_frame_number: u64) {
+        self.storage_epoch_check()
+            .label_storage_ahead(global_frame_number);
+    }
+}
+
+/// What a seat's storage epoch proof check reads, owned so that it runs on
+/// a blocking thread ([`AppConsensusEngine::request_storage_epoch_check`]).
+struct StorageEpochCheck {
+    filter: Vec<u8>,
+    local_prover_address: Vec<u8>,
+    global_anchor_store: Arc<dyn ClockStore>,
+    global_anchor_source: Option<crate::global_anchor::GlobalAnchorSource>,
+    global_hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+    coverage_publish: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    sector_signer: Arc<dyn quil_types::crypto::Signer>,
+    prover_registry: Arc<dyn ProverRegistry>,
+    kv_db: Option<Arc<dyn quil_types::store::KvDb>>,
+    hypergraph: Option<Arc<quil_hypergraph::HypergraphCrdt>>,
+}
+
+impl StorageEpochCheck {
+    /// The newest GLOBAL frame stored.
+    fn head(&self) -> Option<u64> {
+        self.global_anchor_store
+            .get_latest_global_clock_frame()
+            .ok()
+            .and_then(|frame| frame.header)
+            .map(|header| header.frame_number)
     }
 
     /// Hash storage proofs (decided 2026-10-26): label the leaves this member
@@ -3916,7 +4221,7 @@ impl AppConsensusEngine {
         };
         let missing = |number: u64| {
             self.global_anchor_store
-                .get_global_clock_frame(number)
+                .get_global_clock_frame_header(number)
                 .is_err()
         };
         // Near the window's end, or a retry interval into it, a seal whose
@@ -3935,9 +4240,9 @@ impl AppConsensusEngine {
         let beacon_output = match &seal {
             Some(slot) => match self
                 .global_anchor_store
-                .get_global_clock_frame(slot.registered_at + 1)
+                .get_global_clock_frame_header(slot.registered_at + 1)
                 .ok()
-                .and_then(|frame| frame.header.map(|header| header.output))
+                .map(|header| header.output)
             {
                 Some(output) => output,
                 None => {
@@ -4224,7 +4529,9 @@ impl AppConsensusEngine {
             crate::storage_jobs::spawn(lane, label, move || job(part.seals, part.settles));
         }
     }
+}
 
+impl AppConsensusEngine {
     /// Put this frame's materialization off while its confidential proofs
     /// verify on a background thread (`admission_verify`), so the engine
     /// keeps serving consensus, storage proofs and confirmations instead of
@@ -4243,15 +4550,20 @@ impl AppConsensusEngine {
     /// (inline, as before), or the background verification cannot finish
     /// them (not queued, released after failing in the worker, or ended
     /// without a verdict [`MAX_DEFERRAL_RESTARTS`] times), in which case
-    /// materialization verifies inline as before.
+    /// materialization verifies inline as before. The frame's operations
+    /// are judged as it executes them, at its GLOBAL `anchor`: one anchored
+    /// before a gate verifies what the gate refuses, however far past the
+    /// gate this node saw GLOBAL since.
     fn defer_for_proof_verification(
         &self,
         exec: &Arc<quil_execution::ExecutionEngineManager>,
         requests: &[quil_types::proto::global::MessageBundle],
         frame_number: u64,
+        anchor: Option<u64>,
     ) -> Option<QuilError> {
         let application = &self.app_address[..self.app_address.len().min(32)];
         let queue = crate::admission_verify::global();
+        let executing = quil_execution::manager::ExecutingFrame::App(anchor);
         let budget_secs = exec.token_verification_budget();
         // Operations not known to verify within the budget; the others verify
         // when the frame executes, as before.
@@ -4266,18 +4578,24 @@ impl AppConsensusEngine {
             let Ok(canon) = crate::consensus_wire::app_bundle_to_canonical_bytes(bundle) else {
                 continue;
             };
-            let sizes =
-                exec.unverified_confidential_operations(&[(application.to_vec(), canon.clone())]);
+            let digest = crate::admission_verify::digest(&canon);
+            // Counts an undesignated arrival of it as needed.
+            queue.note_needed(&digest);
+            let pair = [(application.to_vec(), canon.clone())];
+            let sizes = exec.unverified_confidential_operations_for(executing, &pair);
             if !verifies_in_background(&sizes, budget_secs) {
                 continue;
             }
             unverified.extend(sizes);
-            let digest = crate::admission_verify::digest(&canon);
             waiting.push(digest);
             restarted |= !(queue.pending(&digest) || proof_prewarm_running(&canon));
-            verifying &=
-                crate::admission_verify::offer_submission(queue, exec, application, &canon, true)
-                    || proof_prewarm_running(&canon);
+            verifying &= crate::admission_verify::offer_frame_submission(
+                queue,
+                exec,
+                application,
+                &canon,
+                anchor,
+            ) || proof_prewarm_running(&canon);
             queued_ahead = queued_ahead.max(queue.queued_ahead(&digest).unwrap_or(0));
         }
         // This frame finalized and asked for its own submissions above
@@ -4666,12 +4984,17 @@ impl AppConsensusEngine {
         if let Some(held) = self.hold_for_data_import(frame_number, pre_state) {
             return Err(held);
         }
-        self.prove_storage_epoch_if_due(global_frame_number);
+        self.request_storage_epoch_check(crate::storage_epoch_check::Ask::Frame(
+            global_frame_number,
+        ));
         #[cfg(test)]
         if let Some(held) = held_for_proofs(&self.filter, frame_number) {
             return Err(held);
         }
-        if let Some(pending) = self.defer_for_proof_verification(&exec, &requests, frame_number) {
+        let anchor = (global_frame_number != 0).then_some(global_frame_number);
+        if let Some(pending) =
+            self.defer_for_proof_verification(&exec, &requests, frame_number, anchor)
+        {
             return Err(pending);
         }
         // Every GLOBAL frame the reward citations name is held before any
@@ -5006,6 +5329,28 @@ impl AppConsensusEngine {
                 );
                 return Ok(false);
             }
+            crate::app_handoff::FenceRewind::Unapplied {
+                fence,
+                fenced,
+                generation,
+                dropped,
+            } => {
+                let records = self.finalized_records_directory().map_or(0, |directory| {
+                    crate::cw_app_seams::FinalizedRecords::open(directory).map_or(0, |records| {
+                        records.discard_unapplied_above(fence, &fenced, generation)
+                    })
+                });
+                if dropped > 0 || records > 0 {
+                    info!(core_id = self.core_id, filter = hex::encode(&self.filter), generation,
+                        fence, dropped_frames = dropped, dropped_records = records,
+                        "dropped the fenced session's frames past the fence, which this worker never applied");
+                }
+                self.end_unrewindable_fence(
+                    "nothing to rewind past the fence: none applied there",
+                    std::time::Instant::now(),
+                );
+                return Ok(false);
+            }
             crate::app_handoff::FenceRewind::Unrewindable { fence, error } => {
                 let now = std::time::Instant::now();
                 self.note_unrewindable_fence(&fence, error.as_ref(), now);
@@ -5026,15 +5371,21 @@ impl AppConsensusEngine {
         self.set_materialized_frame(fence);
         self.shard_frame_number = fence;
         let _ = self.fee_manager.rewind_to_frame(&self.filter, fence);
-        if let Some(base) = self.cw_storage_base.as_ref() {
-            let directory = base
-                .join("cw-app-consensus")
-                .join(format!("finalized-{}", hex::encode(&self.filter)));
+        if let Some(directory) = self.finalized_records_directory() {
             if let Ok(records) = crate::cw_app_seams::FinalizedRecords::open(directory) {
                 records.discard_above(fence);
             }
         }
         Ok(true)
+    }
+
+    /// Where this shard's finalized records are kept, if anywhere
+    /// ([`crate::cw_app_seams::FinalizedRecords`]).
+    fn finalized_records_directory(&self) -> Option<std::path::PathBuf> {
+        self.cw_storage_base.as_ref().map(|base| {
+            base.join("cw-app-consensus")
+                .join(format!("finalized-{}", hex::encode(&self.filter)))
+        })
     }
 
     /// Tell the archive recovery turns whether an owed re-anchor's requested
@@ -6045,6 +6396,11 @@ impl AppConsensusEngine {
         if let Some(source) = &self.historical_committee_source {
             validator = validator.with_historical_committee_source(source.clone());
         }
+        if let Some(manager) = &self.execution_engine {
+            let manager = manager.clone();
+            validator = validator
+                .with_compute_route(Arc::new(move |address| manager.routes_to_compute(address)));
+        }
         let validator = Arc::new(validator);
         self.app_frame_validator = Some(validator.clone());
         validator
@@ -6290,7 +6646,10 @@ impl AppConsensusEngine {
                     })
                     .map(|canon| (application.clone(), canon))
                     .collect();
-                exec.unverified_confidential_operations(&bundles).len()
+                let anchor = crate::archive_preverify::frame_anchor(frame);
+                let executing = quil_execution::manager::ExecutingFrame::App(anchor);
+                exec.unverified_confidential_operations_for(executing, &bundles)
+                    .len()
             }
             _ => 0,
         };
@@ -8182,12 +8541,9 @@ impl AppConsensusEngine {
                     // withholds it for a settlement left undone (before epoch
                     // 1342: kicks the member)
                     // (an in-process engine receives no GLOBAL frame messages).
-                    // `claim_epoch_proof` paces the attempts.
-                    if let Some(head) = self.global_anchor_store.get_latest_global_clock_frame().ok()
-                        .and_then(|frame| frame.header).map(|header| header.frame_number)
-                    {
-                        self.prove_storage_epoch_if_due(head);
-                    }
+                    // `claim_epoch_proof` paces the attempts. The check
+                    // reads the GLOBAL head itself, off this thread.
+                    self.request_storage_epoch_check(crate::storage_epoch_check::Ask::Head);
                     // This timer also handles dynamic-committee rebuilds below.
                     // Keep *both* paths behind the transport barrier: otherwise
                     // a timer tick while CW is still waiting for a subscribed
@@ -8326,6 +8682,18 @@ impl AppConsensusEngine {
                     break;
                 }
 
+                // The oldest held reward proof's late-vote window runs out.
+                // A notarization closes it earlier, which the upkeep below
+                // sees at the next message.
+                _ = tokio::time::sleep_until(
+                    self.held_reward_proofs
+                        .front()
+                        .and_then(|proof| proof.due)
+                        .map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std),
+                ), if !self.held_reward_proofs.is_empty() => {
+                    self.release_reward_proofs(std::time::Instant::now(), false);
+                }
+
                 // A running outgoing-history walk's next batch, at its pace,
                 // when nothing above is ready. The walk ends with a start
                 // attempt: the member votes as soon as it can.
@@ -8345,6 +8713,7 @@ impl AppConsensusEngine {
             }
 
             probe::step(probe::Section::EngineUpkeep);
+            self.release_reward_proofs(std::time::Instant::now(), false);
             // Process any pending parent seal (queued by QC handler)
             if let Some(child_rank) = self.pending_seal_rank.take() {
                 self.try_seal_parent_with_child(child_rank).await;
@@ -8357,6 +8726,8 @@ impl AppConsensusEngine {
             self.execution.observe();
             self.publish_sizes();
         }
+        // What is held goes out with the votes so far.
+        self.release_reward_proofs(std::time::Instant::now(), true);
         if let Some(old) = self.cw_handle.take() {
             if let Err(e) = old.shutdown_and_join().await {
                 warn!(core_id = self.core_id, error = %e, "app consensus host stopped with an error");
@@ -8535,10 +8906,21 @@ impl AppConsensusEngine {
 
     /// The latest GLOBAL frame this node holds a header of.
     fn latest_global_header_frame(&self) -> Option<u64> {
+        self.latest_global_header().map(|(frame, _)| frame)
+    }
+
+    /// The latest GLOBAL frame this node holds a header of, with the
+    /// header's timestamp (Unix ms).
+    fn latest_global_header(&self) -> Option<(u64, i64)> {
         self.global_anchor_store
             .get_latest_global_clock_frame()
             .ok()
-            .and_then(|frame| frame.header.as_ref().map(|header| header.frame_number))
+            .and_then(|frame| {
+                frame
+                    .header
+                    .as_ref()
+                    .map(|header| (header.frame_number, header.timestamp))
+            })
     }
 
     /// Log the transitions of a published seal without a drain waiting to
@@ -8571,19 +8953,30 @@ impl AppConsensusEngine {
             RecordStall::Began(state) => (state, true),
             RecordStall::Continues(state) => (state, false),
         };
-        let latest_global_frame = self.latest_global_header_frame();
-        let (scope, action, waits_on) =
-            crate::seal_follow::record_stall_scope(committed_frame, latest_global_frame);
+        let latest = self.latest_global_header();
+        let latest_global_frame = latest.map(|(frame, _)| frame);
+        let stamp = latest.map(|(_, stamp)| stamp);
+        let now_ms = crate::worker_execution::now_ms();
+        let first_copy_ms = now_ms.saturating_sub(state.waited_secs.saturating_mul(1000));
+        let latest_global_age_secs = crate::seal_follow::global_view_age_secs(stamp, now_ms);
+        let (scope, action, waits_on) = crate::seal_follow::record_stall_scope(
+            committed_frame,
+            latest_global_frame,
+            stamp,
+            first_copy_ms,
+        );
         if began {
             warn!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
-                latest_global_frame, published_global_frame = state.published_head,
+                latest_global_frame, latest_global_age_secs,
+                published_global_frame = state.published_head,
                 global_executed = state.executed, checkpoint = state.checkpoint, drain = state.reason,
                 copies = state.copies, waited_secs = state.waited_secs, scope, action, waits_on,
                 "closing session's seal not recorded: this worker's GLOBAL view passed the frame \
                  its copy lands by and has not shown the seal recorded for over 5 min");
         } else {
             warn!(core_id = self.core_id, filter = %filter, session = %session, committed_frame,
-                latest_global_frame, published_global_frame = state.published_head,
+                latest_global_frame, latest_global_age_secs,
+                published_global_frame = state.published_head,
                 global_executed = state.executed, checkpoint = state.checkpoint, drain = state.reason,
                 copies = state.copies, waited_secs = state.waited_secs, scope, action, waits_on,
                 "closing session's seal still not recorded");
@@ -9682,7 +10075,7 @@ impl AppConsensusEngine {
                  a spend GLOBAL skipped there stays uncommitted until its sender submits it again");
         }
         for frame in self.relay_watch.due() {
-            let bundles = match unrelayed_bundles(
+            let found = match unrelayed_bundles(
                 self.clock_store.as_ref(),
                 global,
                 &application,
@@ -9690,7 +10083,7 @@ impl AppConsensusEngine {
                 frame,
                 self.last_materialized_frame,
             ) {
-                Ok(bundles) => bundles,
+                Ok(found) => found,
                 Err(error) => {
                     // Another member holds it, or the next jump's pass reads it.
                     info!(filter = %filter, source_frame = frame, executed_tip = tip, error = %error,
@@ -9700,7 +10093,7 @@ impl AppConsensusEngine {
                 }
             };
             let mut retry = false;
-            for canonical in bundles {
+            for canonical in found.bundles {
                 let hash: [u8; 32] = sha3::Sha3_256::digest(&canonical).into();
                 let bundle = hex::encode(&hash[..4]);
                 if !self.relay_watch.may_reoffer(&hash) {
@@ -9731,6 +10124,14 @@ impl AppConsensusEngine {
                 }
             }
             if !retry {
+                if let Some(first) = found.stranded.first() {
+                    warn!(filter = %filter, source_frame = frame, executed_tip = tip,
+                        stranded = found.stranded.len(), tx = %hex::encode(&first[..8]),
+                        scope = "network: GLOBAL executed past every header relaying these operations",
+                        action = "they stay uncommitted and consumed nothing: their senders submit them again",
+                        "cannot re-offer spends GLOBAL skipped: their bundle also changed the shard \
+                         itself or does not decode");
+                }
                 self.relay_watch.examined(frame);
             }
         }
@@ -10101,8 +10502,26 @@ impl AppConsensusEngine {
                 })
                 .transpose();
             match closing {
-                Ok(closing) => closing.unwrap_or(false),
-                Err(_) => {
+                Ok(closing) => {
+                    self.note_session_state_read(None);
+                    closing.unwrap_or(false)
+                }
+                // This node's GLOBAL state sync withholds committed GLOBAL
+                // state until its last chunk installs: an expected wait, not
+                // an unknown state. Read as one, every allocation of a node
+                // mid GLOBAL sync reported "session state unavailable"
+                // (2026-11-13).
+                Err(error)
+                    if quil_execution::global_intrinsic::handoff::global_sync_in_progress(
+                        &error,
+                    ) =>
+                {
+                    self.execution
+                        .state("waiting", "awaiting GLOBAL state sync");
+                    return;
+                }
+                Err(error) => {
+                    self.note_session_state_read(Some(&error));
                     self.execution.state("unknown", "session state unavailable");
                     return;
                 }
@@ -10112,6 +10531,44 @@ impl AppConsensusEngine {
         };
         self.execution
             .consensus_phase(ready, closing, session_id, sealed_id);
+    }
+
+    /// Log a failed read of this worker's session state from committed
+    /// GLOBAL state (`Some`), bounded, or a read that ended a logged run of
+    /// them (`None`).
+    fn note_session_state_read(&self, error: Option<&QuilError>) {
+        use crate::worker_execution::StreakLog;
+        let now = std::time::Instant::now();
+        let logged = {
+            let mut reads = self
+                .session_state_reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match error {
+                Some(_) => reads.failed("session_state", now, 1),
+                None => reads.succeeded(now),
+            }
+        };
+        match (logged, error) {
+            (Some(StreakLog::Failing { failures, duration }), Some(error)) => {
+                info!(core_id = self.core_id, filter = hex::encode(&self.filter), %error, failures,
+                    failing_secs = duration.as_secs(),
+                    "worker health cannot read its committee session's state from committed \
+                     GLOBAL state and reads unknown until a read succeeds; report it with this \
+                     line if it persists");
+            }
+            (Some(StreakLog::Ended { failures, duration }), _) => {
+                info!(
+                    core_id = self.core_id,
+                    filter = hex::encode(&self.filter),
+                    failures,
+                    failing_secs = duration.as_secs(),
+                    "worker health reads its committee session's state from committed GLOBAL \
+                     state again"
+                );
+            }
+            _ => {}
+        }
     }
 
     /// One batch of `session`'s outgoing-history walk through `through`, and
@@ -10817,25 +11274,20 @@ impl AppConsensusEngine {
             Arc::new(move |frame: &quil_types::proto::global::AppShardFrame| {
                 if let Some(header) = frame.header.as_ref() {
                     let anchor = header.global_frame_number;
-                    if quil_types::consensus::sealed_storage_required_at(anchor) {
-                        for address in [&member[..], &header.prover[..]] {
-                            let slot = registry
-                                .get_storage_seat_slot(
-                                    address,
-                                    &filter,
-                                    quil_types::consensus::epoch_for_frame(anchor),
-                                )
-                                .map_err(|error| ("storage seal unavailable", error.to_string()))?;
-                            if !quil_types::consensus::storage_seat_eligible(
-                                &filter,
-                                anchor,
-                                slot.as_ref(),
-                            ) {
-                                return Err((
-                                    "unsealed storage participant",
-                                    format!("anchor {anchor}"),
-                                ));
-                            }
+                    // From the seal gate recovery epoch unsealed members
+                    // vote and propose, as GLOBAL admits their headers.
+                    for address in [&member[..], &header.prover[..]] {
+                        let admitted = quil_types::consensus::storage_participant_admitted(
+                            &filter,
+                            anchor,
+                            |epoch| registry.get_storage_seat_slot(address, &filter, epoch),
+                        )
+                        .map_err(|error| ("storage seal unavailable", error.to_string()))?;
+                        if !admitted {
+                            return Err((
+                                "unsealed storage participant",
+                                format!("anchor {anchor}"),
+                            ));
                         }
                     }
                 }
@@ -11098,6 +11550,12 @@ impl AppConsensusEngine {
                 crate::worker_stall::route_this_thread(core_id)
             })),
         };
+        // A member whose finalize vote misses a certificate can still sign
+        // the copy this node publishes to GLOBAL.
+        let late_finalizes = Arc::new(quil_cw_consensus::late_finalize::LateFinalizes::new(
+            scheme.clone(),
+            self.late_vote_census.clone(),
+        ));
         let handle = crate::cw_app_seams::activate_app_consensus_cw(
             scheme,
             peers,
@@ -11121,7 +11579,9 @@ impl AppConsensusEngine {
             self.private_parents.clone(),
             finalized_records,
             reporting,
+            Some(late_finalizes.clone()),
         )?;
+        self.late_finalizes = Some(late_finalizes);
         if let Some(session) = session.as_ref() {
             info!(filter = %hex::encode(&self.filter), generation = session.generation,
                 base_frame = session.base_frame, members = session.members.len(),
@@ -11655,8 +12115,84 @@ impl AppConsensusEngine {
         // `public_key_signature_bls48581` is empty — verification of CW shard
         // frames checks the deterministic output, storage and committee certificate.
         // The CW frame carries the simplex finalization cert (magic-prefixed)
-        // in the sig field, as stored, so the global reward path can verify
-        // CW-finalized shard work against the shard committee.
+        // in the sig field, so the global reward path can verify CW-finalized
+        // shard work against the shard committee; the copy sent may carry
+        // more signers than the stored one (`publish_reward_proof`).
+        self.publish_reward_proof(frame, cert, std::time::Instant::now());
+    }
+
+    /// Send a finalized frame's certified header to GLOBAL as its reward
+    /// proof, in finalization order. One this engine's consensus host
+    /// finalized waits until its late-vote window closes, then goes out
+    /// signed also by the members whose finalize votes came in it: GLOBAL
+    /// pays only a certificate's signers, and the batcher built it from the
+    /// first quorum it verified ([`quil_cw_consensus::late_finalize`]). The
+    /// stored frame keeps the certificate it finalized with.
+    fn publish_reward_proof(
+        &mut self,
+        frame: quil_types::proto::global::AppShardFrame,
+        cert: &[u8],
+        now: std::time::Instant,
+    ) {
+        let late = self.late_finalizes.clone().filter(|_| !cert.is_empty());
+        let due = late.as_ref().and_then(|late| late.open_until(cert, now));
+        self.held_reward_proofs.push_back(HeldRewardProof {
+            frame,
+            cert: cert.to_vec(),
+            late,
+            due,
+        });
+        self.release_reward_proofs(now, false);
+    }
+
+    /// Send the held reward proofs, oldest first, up to the first whose
+    /// window is still open at `now`; every one when `all`, or while more
+    /// than [`MAX_HELD_REWARD_PROOFS`] are held.
+    fn release_reward_proofs(&mut self, now: std::time::Instant, all: bool) {
+        loop {
+            let over = self.held_reward_proofs.len() > MAX_HELD_REWARD_PROOFS;
+            let Some(front) = self.held_reward_proofs.front_mut() else {
+                break;
+            };
+            let open = if all || over {
+                None
+            } else {
+                front.open_until(now)
+            };
+            if let Some(until) = open {
+                // Held with no window behind an open one, its window may have
+                // opened since: the engine wakes when it closes, not at once
+                // on every turn until then.
+                front.due = Some(until);
+                break;
+            }
+            let Some(proof) = self.held_reward_proofs.pop_front() else {
+                break;
+            };
+            let extended = proof
+                .late
+                .as_ref()
+                .and_then(|late| late.extend(&proof.cert, now));
+            self.send_reward_proof(proof.frame, extended);
+        }
+    }
+
+    /// Emit `frame`'s canonical header, its certificate replaced by `cert`
+    /// when one is given.
+    fn send_reward_proof(
+        &self,
+        mut frame: quil_types::proto::global::AppShardFrame,
+        cert: Option<Vec<u8>>,
+    ) {
+        if let (Some(cert), Some(signature)) = (
+            cert,
+            frame
+                .header
+                .as_mut()
+                .and_then(|header| header.public_key_signature_bls48581.as_mut()),
+        ) {
+            signature.signature = quil_cw_consensus::app_cert::wrap_cert_for_header(&cert);
+        }
         if let Ok(canon_bytes) = crate::app_handoff::canonical_header(&frame) {
             let _ = self.event_tx.send(AppEngineEvent::ShardFrameFinalized {
                 filter: self.filter.clone(),
@@ -11666,6 +12202,40 @@ impl AppConsensusEngine {
                 cb(canon_bytes);
             }
         }
+    }
+
+    /// The hourly line on finalize votes that came after this shard's
+    /// certificates, once an hour of them is counted.
+    fn log_late_votes(&self, now: std::time::Instant) {
+        let Some((span, c)) = self.late_vote_census.take_due(now) else {
+            return;
+        };
+        info!(
+            core_id = self.core_id,
+            filter = hex::encode(&self.filter),
+            secs = span.as_secs(),
+            frames = c.frames,
+            committee = c.committee,
+            quorum = c.quorum,
+            quorum_signers = c.quorum_signers,
+            published_signers = c.published_signers,
+            added = c.added,
+            early = c.early,
+            within_250ms = c.within_250ms,
+            within_1s = c.within_1s,
+            within_2s = c.within_2s,
+            after_2s = c.after_2s,
+            invalid = c.invalid,
+            other_proposal = c.other_proposal,
+            closed_by_notarization = c.closed_by_notarization,
+            closed_by_window = c.closed_by_window,
+            window_ms = quil_cw_consensus::late_finalize::LATE_VOTE_WINDOW.as_millis() as u64,
+            "finalize votes that came after this node held a frame's certificate, by delay \
+             since it: votes inside the window (until a later view notarizes, at most \
+             window_ms) sign the copy published to GLOBAL (added), which pays its signers \
+             the frame's reward share; many after_2s votes or windows closed_by_window would \
+             credit more members with a longer window"
+        );
     }
 
     /// Handle a full frame a peer published on this shard's frame topic.
@@ -11682,8 +12252,7 @@ impl AppConsensusEngine {
         if self.halted.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        let Ok(frame) = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(data)
-        else {
+        let Some(frame) = crate::frame_bound::decode_frame("shard frame topic", data) else {
             return;
         };
         let Some(h) = frame.header.as_ref() else {
@@ -12225,7 +12794,9 @@ impl AppConsensusEngine {
         // whose committee stalls in the settlement window must still settle
         // what it committed, or GLOBAL withholds its storage share (before
         // epoch 1342: kicks it).
-        self.prove_storage_epoch_if_due(global_frame_number);
+        self.request_storage_epoch_check(crate::storage_epoch_check::Ask::Frame(
+            global_frame_number,
+        ));
 
         // Update difficulty from global frame header
         self.current_difficulty
@@ -12361,15 +12932,18 @@ impl AppConsensusEngine {
     /// Verify an arriving submission's confidential proofs now, in the
     /// background, so the proposal that carries it and the frame that
     /// executes it find the verdicts cached instead of verifying for
-    /// minutes. Only on the shard that proposes it (every shard of the
-    /// application collects a submission that may reach it past the routing
-    /// fallback), and only what may still execute: one the
-    /// collector did not take as new (`collected`: a finalized frame
-    /// consumed it, the collector holds it, or its rank is full), one that
-    /// fails dispatch's checks before native work, and one the global
+    /// minutes. On every shard of the application (each collects a
+    /// submission that may reach it past the routing fallback), once per
+    /// node, the shard that proposes it first ahead of the others
+    /// ([`crate::admission_verify::offer_arrival`]): frames of a node's
+    /// other shards waited 2-4 minutes on bundles that had reached the node
+    /// minutes before (mainnet, 2026-11-10). Only what may still execute:
+    /// one the collector did not take as new (`collected`: a finalized
+    /// frame consumed it, the collector holds it, or its rank is full), one
+    /// that fails dispatch's checks before native work, and one the global
     /// commit already decided are not queued; nor arrivals past the
-    /// admission budget ([`crate::admission_verify::offer_arrival`]). A
-    /// proposal or frame carrying any of them queues it then.
+    /// admission budget or their share of it. A proposal or frame carrying
+    /// any of them queues it then.
     fn verify_on_arrival(&self, data: &[u8], collected: bool, now: std::time::Instant) {
         let Some(exec) = self.execution_engine.as_ref() else {
             return;
@@ -12384,15 +12958,12 @@ impl AppConsensusEngine {
         }
         // Remembered for the line of a frame that later waits on its proofs.
         let digest = crate::admission_verify::digest(data);
-        if !arrival_designated(
+        let designated = arrival_designated(
             &self.filter,
             routing_shards(&self.app_address).as_deref(),
             &digest,
             quil_execution::ExecutionEngineManager::shield_source(data),
-        ) {
-            note_arrival(digest, ArrivalVerdict::NotDesignated, now);
-            return;
-        }
+        );
         let queue = crate::admission_verify::global();
         if !collected {
             queue.note_arrival_skipped();
@@ -12410,6 +12981,7 @@ impl AppConsensusEngine {
                 &self.app_address,
                 data,
                 &sizes,
+                designated,
                 now,
             ),
             Err(_) => {
@@ -12884,6 +13456,7 @@ impl AppConsensusEngine {
         );
         self.note_gossip_refusals_quiet();
         self.report_arrivals_left();
+        self.log_late_votes(now);
     }
 
     /// Retry only previously authorized seals, in rank order, at cleanup cadence.
@@ -13808,6 +14381,7 @@ pub(crate) fn build_requests_root_check(
                 &canonical,
                 &filter_for_verify,
                 header.frame_number,
+                (header.global_frame_number != 0).then_some(header.global_frame_number),
             );
             Ok(())
         },
@@ -13867,15 +14441,18 @@ static PROOF_PREWARM_THREADS: std::sync::atomic::AtomicUsize =
 /// behind the submissions finalized frames wait on, bounded, and dropped
 /// once its time passed or `shard` materialized `frame`, since the proposal
 /// may never finalize (a leader could otherwise queue unbounded work ahead
-/// of every honest frame).
+/// of every honest frame). The proposal's operations are judged as it
+/// executes them once finalized, at its GLOBAL `anchor`.
 pub(crate) fn prewarm_proof_verdicts(
     exec: &Arc<quil_execution::ExecutionEngineManager>,
     app_address: &[u8],
     canonical: &[Vec<u8>],
     shard: &[u8],
     frame: u64,
+    anchor: Option<u64>,
 ) {
     let addr = app_address[..app_address.len().min(32)].to_vec();
+    let executing = quil_execution::manager::ExecutingFrame::App(anchor);
     let bundles: Vec<Vec<u8>> = canonical
         .iter()
         .filter(|bundle| {
@@ -13890,7 +14467,10 @@ pub(crate) fn prewarm_proof_verdicts(
     let budget = exec.token_verification_budget();
     let (long, bundles): (Vec<Vec<u8>>, Vec<Vec<u8>>) = bundles.into_iter().partition(|bundle| {
         verifies_in_background(
-            &exec.unverified_confidential_operations(&[(addr.clone(), bundle.clone())]),
+            &exec.unverified_confidential_operations_for(
+                executing,
+                &[(addr.clone(), bundle.clone())],
+            ),
             budget,
         )
     });
@@ -13902,6 +14482,7 @@ pub(crate) fn prewarm_proof_verdicts(
             bundle,
             shard,
             frame,
+            anchor,
         );
     }
     if bundles.is_empty() {
@@ -13930,7 +14511,13 @@ pub(crate) fn prewarm_proof_verdicts(
                 .into_iter()
                 .map(|bundle| (addr.clone(), bundle))
                 .collect();
-            exec.preverify_bundles(&pairs);
+            exec.preverify_bundles_paced(
+                &pairs,
+                &quil_execution::manager::PreverifyPacing {
+                    executing,
+                    ..Default::default()
+                },
+            );
             release_proof_prewarm(&claimed);
             PROOF_PREWARM_THREADS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         });
@@ -14040,7 +14627,7 @@ fn block_sync_from(
         let seal = quil_cw_consensus::handoff::Seal::decode(bytes).ok()?;
         return (seal.checkpoint.frame > cursor && session() == Some(seal.session)).then_some(next);
     }
-    let frame = <quil_types::proto::global::AppShardFrame as prost::Message>::decode(bytes).ok()?;
+    let frame = crate::frame_bound::decode_frame("consensus block", bytes)?;
     (frame.header?.frame_number > next).then_some(next)
 }
 
@@ -14904,12 +15491,13 @@ fn routing_shards(application: &[u8]) -> Option<Vec<Vec<u8>>> {
         .cloned()
 }
 
-/// Whether shard `filter` verifies an arriving confidential bundle's proofs:
-/// whether it is the shard [`routed_selection`] has propose it first. A
-/// shield goes to the shard holding its source; another bundle to its
-/// designated shard of `shards` (the live shards as this node last listed
-/// them), and to every shard while no list is known. A shard that proposes
-/// a bundle later, past the routing fallback, queues it then.
+/// Whether shard `filter` verifies an arriving confidential bundle's proofs
+/// ahead of the other shards' arrivals: whether it is the shard
+/// [`routed_selection`] has propose it first. A shield goes to the shard
+/// holding its source; another bundle to its designated shard of `shards`
+/// (the live shards as this node last listed them), and to every shard
+/// while no list is known. The others verify it within their share of the
+/// arrival budget ([`crate::admission_verify::offer_arrival`]).
 fn arrival_designated(
     filter: &[u8],
     shards: Option<&[Vec<u8>]>,
@@ -15831,8 +16419,12 @@ pub(crate) fn materialize_app_shard_requests(
         frame_number,
     };
 
+    // The GLOBAL frame this frame is anchored at; none without an anchor.
+    let anchor = (global_frame_number != 0).then_some(global_frame_number);
     // Verify every confidential token proof of the frame concurrently before
     // the sequential state loop below; the loop then finds verdicts cached.
+    // What execution refuses before the proof at the frame's anchor is not
+    // verified.
     let canonical: Vec<(Vec<u8>, Vec<u8>)> = requests
         .iter()
         .filter_map(|bundle| crate::consensus_wire::app_bundle_to_canonical_bytes(bundle).ok())
@@ -15842,7 +16434,7 @@ pub(crate) fn materialize_app_shard_requests(
     let preverify_start = std::time::Instant::now();
     {
         let _step = StepTimer::start(&mut steps.preverify, probe::Section::AppFramePreverify);
-        execution_manager.preverify_bundles(&canonical);
+        execution_manager.preverify_app_frame_bundles(anchor, &canonical);
     }
     if preverify_start.elapsed() > std::time::Duration::from_secs(1) {
         info!(
@@ -15971,7 +16563,7 @@ pub(crate) fn materialize_app_shard_requests(
         let outcome = execution_manager.process_message_with_context(
             quil_types::execution::FrameExecutionContext {
                 frame_number,
-                finalized_global_frame: (global_frame_number != 0).then_some(global_frame_number),
+                finalized_global_frame: anchor,
                 shard,
                 // Workers and archives replay app-shard frames alike: always
                 // in the application venue, never committing inline.
@@ -21245,6 +21837,293 @@ mod tests {
         (engine, handle, received)
     }
 
+    /// A finalized frame's reward proof waits for its late-vote window and
+    /// goes out signed also by the member whose vote came inside it; the
+    /// next frame, whose window this host does not know, goes out behind it.
+    /// One held across a host replacement keeps the host that finalized it.
+    /// At most [`MAX_HELD_REWARD_PROOFS`] wait: one more sends the oldest.
+    #[test]
+    fn reward_proofs_wait_for_late_votes_and_keep_their_order() {
+        use quil_cw_consensus::{
+            _consensus::{
+                simplex::{
+                    scheme::Namespace,
+                    types::{Finalization, Finalize, Proposal, Subject},
+                },
+                types::{Epoch, Round, View},
+            },
+            _crypto::{sha256::Digest, Signer as _},
+            _utils::{ordered::Set, N3f1},
+            app_cert::{encode_finalization, unverified_signers, unwrap_cert_from_header},
+            falcon_base::FalconPrivateKey,
+            falcon_scheme::Generic,
+            falcon_simplex::SimplexFalconScheme,
+            late_finalize::{LateFinalizes, LateVoteCensus, LATE_VOTE_WINDOW},
+        };
+        use quil_execution::global_intrinsic::frame_header::FrameHeader;
+        use quil_types::crypto::Signer as _;
+        let keys: Vec<_> = (0..4)
+            .map(|_| {
+                let key = quil_crypto::FalconSigner::generate();
+                FalconPrivateKey::from_bytes(key.private_key(), key.public_key()).unwrap()
+            })
+            .collect();
+        let set: Set<_> = keys
+            .iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let namespace = b"appshard-reward-proof";
+        let signers: Vec<_> = keys
+            .into_iter()
+            .map(|key| Generic::<Namespace>::signer(namespace, set.clone(), key).unwrap())
+            .collect();
+        let proposal = |view: u64| {
+            Proposal::new(
+                Round::new(Epoch::new(0), View::new(view)),
+                View::new(view - 1),
+                Digest([view as u8; 32]),
+            )
+        };
+        let vote = |member: usize, proposal: &Proposal<Digest>| Finalize {
+            proposal: proposal.clone(),
+            attestation: signers[member]
+                .sign::<SimplexFalconScheme, Digest>(Subject::Finalize { proposal })
+                .unwrap(),
+        };
+        // Quorum of four is three.
+        let quorum = |proposal: Proposal<Digest>| {
+            let votes = (0..3).map(|member| vote(member, &proposal).attestation);
+            Finalization {
+                certificate: signers[0]
+                    .assemble::<SimplexFalconScheme, _, N3f1>(votes)
+                    .unwrap(),
+                proposal,
+            }
+        };
+        let frame = |number: u64, cert: &[u8]| quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                frame_number: number,
+                rank: number,
+                public_key_signature_bls48581: Some(
+                    quil_types::proto::keys::Bls48581AggregateSignature {
+                        signature: quil_cw_consensus::app_cert::wrap_cert_for_header(cert),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let published = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = published.clone();
+        engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
+        let host = || {
+            Arc::new(LateFinalizes::new(
+                SimplexFalconScheme::verifier(namespace, set.clone()),
+                Arc::new(LateVoteCensus::new()),
+            ))
+        };
+        let late = host();
+        engine.late_finalizes = Some(late.clone());
+        let t0 = std::time::Instant::now();
+        let first = quorum(proposal(5));
+        late.finalized(&first, t0);
+        late.vote(vote(3, &first.proposal), t0 + Duration::from_millis(300));
+        let first_cert = encode_finalization(&first);
+        engine.publish_reward_proof(frame(5, &first_cert), &first_cert, t0);
+        // Frame 6's certificate is unknown to the host: it goes out as it is,
+        // after frame 5.
+        let second_cert = encode_finalization(&quorum(proposal(6)));
+        engine.publish_reward_proof(
+            frame(6, &second_cert),
+            &second_cert,
+            t0 + Duration::from_millis(500),
+        );
+        assert!(published.lock().unwrap().is_empty(), "held for the window");
+        engine.release_reward_proofs(t0 + LATE_VOTE_WINDOW / 2, false);
+        assert!(published.lock().unwrap().is_empty(), "still open");
+        engine.release_reward_proofs(t0 + LATE_VOTE_WINDOW, false);
+        let sent = || -> Vec<(u64, Option<(usize, usize)>)> {
+            published
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|bytes| {
+                    let header = FrameHeader::from_canonical_bytes(bytes).unwrap();
+                    (
+                        header.frame_number,
+                        unwrap_cert_from_header(&header.public_key_signature_bls48581)
+                            .and_then(unverified_signers),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(sent(), vec![(5, Some((4, 4))), (6, Some((4, 3)))]);
+
+        // Held across a host replacement, a proof keeps the host that
+        // finalized it; the new host, holding another proposal of the view,
+        // extends nothing of it.
+        published.lock().unwrap().clear();
+        let t2 = t0 + Duration::from_secs(5);
+        let replaced = quorum(proposal(7));
+        late.finalized(&replaced, t2);
+        late.vote(vote(3, &replaced.proposal), t2 + Duration::from_millis(100));
+        let replaced_cert = encode_finalization(&replaced);
+        engine.publish_reward_proof(frame(7, &replaced_cert), &replaced_cert, t2);
+        let next = host();
+        next.finalized(
+            &quorum(Proposal::new(
+                Round::new(Epoch::new(0), View::new(7)),
+                View::new(6),
+                Digest([0xEE; 32]),
+            )),
+            t2,
+        );
+        engine.late_finalizes = Some(next.clone());
+        assert_eq!(next.open_until(&replaced_cert, t2), None);
+        assert_eq!(
+            next.extend(&replaced_cert, t2 + LATE_VOTE_WINDOW),
+            None,
+            "another proposal of the view"
+        );
+        engine.release_reward_proofs(t2 + LATE_VOTE_WINDOW, false);
+        assert_eq!(
+            sent(),
+            vec![(7, Some((4, 4)))],
+            "extended by the host that finalized it"
+        );
+
+        // Each from its own host, so that no frame's finalization closes
+        // another's window.
+        published.lock().unwrap().clear();
+        let t1 = t0 + Duration::from_secs(10);
+        for view in 10..=10 + MAX_HELD_REWARD_PROOFS as u64 {
+            let certified = quorum(proposal(view));
+            let late = host();
+            late.finalized(&certified, t1);
+            engine.late_finalizes = Some(late);
+            let cert = encode_finalization(&certified);
+            engine.publish_reward_proof(frame(view, &cert), &cert, t1);
+        }
+        assert_eq!(published.lock().unwrap().len(), 1, "the oldest went out");
+        assert_eq!(engine.held_reward_proofs.len(), MAX_HELD_REWARD_PROOFS);
+    }
+
+    /// A reward proof held with no window behind an open one, whose window
+    /// opens meanwhile, wakes the engine when that window closes once it is
+    /// first in line: with no wake time, the select loop's sleep arm fires at
+    /// once on every turn until the window closes.
+    #[test]
+    fn a_window_opened_while_held_sets_the_wake() {
+        use quil_cw_consensus::{
+            _consensus::{
+                simplex::{
+                    scheme::Namespace,
+                    types::{Finalization, Proposal, Subject},
+                },
+                types::{Epoch, Round, View},
+            },
+            _crypto::{sha256::Digest, Signer as _},
+            _utils::{ordered::Set, N3f1},
+            app_cert::encode_finalization,
+            falcon_base::FalconPrivateKey,
+            falcon_scheme::Generic,
+            falcon_simplex::SimplexFalconScheme,
+            late_finalize::{LateFinalizes, LateVoteCensus, LATE_VOTE_WINDOW},
+        };
+        use quil_types::crypto::Signer as _;
+        let keys: Vec<_> = (0..4)
+            .map(|_| {
+                let key = quil_crypto::FalconSigner::generate();
+                FalconPrivateKey::from_bytes(key.private_key(), key.public_key()).unwrap()
+            })
+            .collect();
+        let set: Set<_> = keys
+            .iter()
+            .map(|key| key.public_key())
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let namespace = b"appshard-reward-wake";
+        let signers: Vec<_> = keys
+            .into_iter()
+            .map(|key| Generic::<Namespace>::signer(namespace, set.clone(), key).unwrap())
+            .collect();
+        let quorum = |view: u64| {
+            let proposal = Proposal::new(
+                Round::new(Epoch::new(0), View::new(view)),
+                View::new(view - 1),
+                Digest([view as u8; 32]),
+            );
+            let votes = (0..3).map(|member| {
+                signers[member]
+                    .sign::<SimplexFalconScheme, Digest>(Subject::Finalize {
+                        proposal: &proposal,
+                    })
+                    .unwrap()
+            });
+            Finalization {
+                certificate: signers[0]
+                    .assemble::<SimplexFalconScheme, _, N3f1>(votes)
+                    .unwrap(),
+                proposal,
+            }
+        };
+        let frame = |number: u64, cert: &[u8]| quil_types::proto::global::AppShardFrame {
+            header: Some(quil_types::proto::global::FrameHeader {
+                frame_number: number,
+                rank: number,
+                public_key_signature_bls48581: Some(
+                    quil_types::proto::keys::Bls48581AggregateSignature {
+                        signature: quil_cw_consensus::app_cert::wrap_cert_for_header(cert),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let published = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = published.clone();
+        engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
+        let late = Arc::new(LateFinalizes::new(
+            SimplexFalconScheme::verifier(namespace, set.clone()),
+            Arc::new(LateVoteCensus::new()),
+        ));
+        engine.late_finalizes = Some(late.clone());
+        let ms = Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        let first = quorum(5);
+        late.finalized(&first, t0);
+        let first_cert = encode_finalization(&first);
+        engine.publish_reward_proof(frame(5, &first_cert), &first_cert, t0);
+        // The host does not hold frame 6's view yet: no window to wait for,
+        // but it waits behind frame 5.
+        let second = quorum(6);
+        let second_cert = encode_finalization(&second);
+        engine.publish_reward_proof(frame(6, &second_cert), &second_cert, t0 + ms(100));
+        assert_eq!(engine.held_reward_proofs.len(), 2);
+        assert_eq!(engine.held_reward_proofs[1].due, None);
+        // Now it does, which closes frame 5's window.
+        late.finalized(&second, t0 + ms(200));
+        engine.release_reward_proofs(t0 + ms(300), false);
+        assert_eq!(published.lock().unwrap().len(), 1, "frame 5 went out");
+        assert_eq!(
+            engine.held_reward_proofs[0].due,
+            Some(t0 + ms(200) + LATE_VOTE_WINDOW),
+            "the sleep arm wakes when frame 6's window closes"
+        );
+        engine.release_reward_proofs(t0 + ms(200) + LATE_VOTE_WINDOW, false);
+        assert_eq!(published.lock().unwrap().len(), 2, "frame 6 went out");
+        assert!(engine.held_reward_proofs.is_empty());
+    }
+
     /// An application submission of `size` bytes, distinct by `i`.
     fn app_message(i: u32, size: usize) -> Vec<u8> {
         let mut message = vec![0xa5; size];
@@ -21342,6 +22221,7 @@ mod tests {
         engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
         let db = Arc::new(quil_store::RocksDb::open_in_memory().unwrap());
         engine.kv_db = Some(db.clone());
+        engine.storage_epoch_check_inline = true;
         engine.cw_handle = Some(crate::cw_app_seams::AppConsensusCwHandle::idle_for_test());
         let window = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
         let store_frame = |number: u64| {
@@ -21860,6 +22740,7 @@ mod tests {
         let sink = published.clone();
         engine.coverage_publish = Some(Arc::new(move |bytes| sink.lock().unwrap().push(bytes)));
         engine.kv_db = Some(Arc::new(quil_store::RocksDb::open_in_memory().unwrap()));
+        engine.storage_epoch_check_inline = true;
         engine.cw_handle = Some(crate::cw_app_seams::AppConsensusCwHandle::idle_for_test());
         let epoch = 5;
         let (_, until) = quil_execution::global_intrinsic::storage_seat::settlement_window(epoch);
@@ -21910,6 +22791,90 @@ mod tests {
         assert!(
             announced,
             "a settlement due on a running, stalled committee is prepared from a GLOBAL frame"
+        );
+    }
+
+    /// A store whose range reads wait while `slow` is set, up to 5 s: a
+    /// disk an epoch boundary's storage work saturates. Counts every range
+    /// read in `reads`.
+    struct SlowRangeReads {
+        inner: quil_store::RocksDb,
+        slow: Arc<std::sync::atomic::AtomicBool>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl quil_types::store::KvDb for SlowRangeReads {
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+            quil_types::store::KvDb::get(&self.inner, key)
+        }
+        fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            quil_types::store::KvDb::set(&self.inner, key, value)
+        }
+        fn delete(&self, key: &[u8]) -> Result<()> {
+            quil_types::store::KvDb::delete(&self.inner, key)
+        }
+        fn new_batch(&self, indexed: bool) -> Result<Box<dyn quil_types::store::Transaction>> {
+            quil_types::store::KvDb::new_batch(&self.inner, indexed)
+        }
+        fn new_iter(
+            &self,
+            lower: &[u8],
+            upper: &[u8],
+        ) -> Result<Box<dyn quil_types::store::Iterator>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.reads.fetch_add(1, SeqCst);
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while self.slow.load(SeqCst) && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            quil_types::store::KvDb::new_iter(&self.inner, lower, upper)
+        }
+        fn compact(&self, start: &[u8], end: &[u8], parallelize: bool) -> Result<()> {
+            quil_types::store::KvDb::compact(&self.inner, start, end, parallelize)
+        }
+        fn compact_all(&self) -> Result<()> {
+            quil_types::store::KvDb::compact_all(&self.inner)
+        }
+        fn close(&self) -> Result<()> {
+            quil_types::store::KvDb::close(&self.inner)
+        }
+        fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+            quil_types::store::KvDb::delete_range(&self.inner, start, end)
+        }
+    }
+
+    /// The storage epoch proof check reads this node's store. On a disk an
+    /// epoch boundary's storage work saturated, it took 35-72 s on every
+    /// worker's consensus thread at once: votes waited, and the workers
+    /// refused proposals after (mainnet, 2026-11-10: 26-28 workers of one
+    /// node). A GLOBAL frame returns at once, and the check still reads.
+    #[tokio::test]
+    async fn a_slow_store_holds_no_consensus_thread_in_the_storage_epoch_proof_check() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let registry = Arc::new(crate::test_support::TestProverRegistry::new());
+        let (mut engine, _handle, _events) = test_engine(registry);
+        let slow = Arc::new(AtomicBool::new(true));
+        let reads = Arc::new(AtomicUsize::new(0));
+        engine.kv_db = Some(Arc::new(SlowRangeReads {
+            inner: quil_store::RocksDb::open_in_memory().unwrap(),
+            slow: slow.clone(),
+            reads: reads.clone(),
+        }));
+        let started = std::time::Instant::now();
+        at_global_frame(&mut engine, 1_000);
+        let held = started.elapsed();
+        slow.store(false, SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while reads.load(SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            held < Duration::from_secs(1),
+            "CHECK-ON-CONSENSUS-THREAD: a GLOBAL frame held the consensus thread {held:?} while the storage epoch proof check read a slow store"
+        );
+        assert!(
+            reads.load(SeqCst) > 0,
+            "CHECK-NOT-RUN: the storage epoch proof check never read the store"
         );
     }
 
@@ -22879,6 +23844,37 @@ mod tests {
         assert_eq!(block_sync_from(&frame(2506), 2504, ours), Some(2505));
     }
 
+    /// A consensus block past the bundles and requests a frame may carry is
+    /// refused unread and asks for no sync; one at the bound is read.
+    #[test]
+    fn a_consensus_block_past_the_frame_bound_is_refused_unread() {
+        use crate::frame_bound::{bundles_of, refused_here, MAX_APP_FRAME_ITEMS};
+        let carrying = |items: usize| {
+            prost::Message::encode_to_vec(&quil_types::proto::global::AppShardFrame {
+                header: Some(quil_types::proto::global::FrameHeader {
+                    frame_number: 2506,
+                    ..Default::default()
+                }),
+                requests: bundles_of(items),
+                ..Default::default()
+            })
+        };
+        let ours = || Some([7; 32]);
+        let before = refused_here();
+        assert_eq!(
+            block_sync_from(&carrying(MAX_APP_FRAME_ITEMS + 1), 2504, ours),
+            None,
+            "FRAME-BOUND: a consensus block past the bound was read"
+        );
+        assert_eq!(refused_here(), before + 1);
+        assert_eq!(
+            block_sync_from(&carrying(MAX_APP_FRAME_ITEMS), 2504, ours),
+            Some(2505),
+            "a block at the bound is read"
+        );
+        assert_eq!(refused_here(), before + 1);
+    }
+
     /// Archive requests for one missing frame go at once, then after a
     /// minute, doubling to ten minutes; another frame starts afresh.
     #[test]
@@ -23842,10 +24838,10 @@ mod tests {
         assert!(!verifies_in_background(&[op(177_490)], None));
     }
 
-    /// An arriving confidential bundle is verified on the shard that
-    /// proposes it first: a shield on the shard holding its source, another
-    /// bundle on its designated shard of the known list, on every shard while
-    /// none is known.
+    /// An arriving confidential bundle is verified ahead of other arrivals on
+    /// the shard that proposes it first: a shield on the shard holding its
+    /// source, another bundle on its designated shard of the known list, on
+    /// every shard while none is known.
     #[test]
     fn arriving_bundles_verify_on_their_designated_shard() {
         let app = [0x11u8; 32];
@@ -25879,6 +26875,87 @@ mod tests {
             error.to_string(),
             format!("execution unavailable: {GLOBAL_SYNC_IN_PROGRESS}")
         );
+    }
+
+    /// An engine whose worker serves the head session of
+    /// [`engine_with_sessions_from_seven`], its shard data staged, and
+    /// GLOBAL's state.
+    fn engine_serving_its_head_session(
+    ) -> (AppConsensusEngine, Arc<quil_hypergraph::HypergraphCrdt>) {
+        use quil_execution::global_intrinsic::handoff::{self, CommittedView};
+        let (mut engine, _, _, global) = engine_with_sessions_from_seven(0x43, None);
+        let view = CommittedView::capture(&global).unwrap();
+        engine.cw_session = handoff::head(&view, &engine.filter).unwrap();
+        drop(view);
+        assert!(engine.cw_session.is_some());
+        engine
+            .data_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        (engine, global)
+    }
+
+    /// The phase and reason this worker's record gives once the engine
+    /// observed its consensus phase.
+    fn observed_phase(engine: &AppConsensusEngine) -> (String, String) {
+        engine.observe_consensus_phase();
+        let record = engine.execution.snapshot();
+        (record.state, record.blocker)
+    }
+
+    /// A worker's session state read from committed GLOBAL state that this
+    /// node's GLOBAL state sync withholds while it installs reads as that
+    /// wait, not as an unknown state: so read, every allocation of a regular
+    /// node mid GLOBAL sync reported "unknown / session state unavailable"
+    /// (2026-11-13).
+    #[tokio::test]
+    async fn a_global_sync_install_reads_as_its_wait_in_the_consensus_phase() {
+        use crate::outage::test_logs::CapturedLogs;
+        let (engine, global) = engine_serving_its_head_session();
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        assert_eq!(observed_phase(&engine), ("serving".into(), String::new()));
+        begin_global_sync(&global);
+        assert_eq!(
+            observed_phase(&engine),
+            ("waiting".into(), "awaiting GLOBAL state sync".into()),
+            "sync_wait_unlabelled"
+        );
+        assert!(
+            logs.lines_with("cannot read its committee session's state")
+                .is_empty(),
+            "a GLOBAL sync install is a wait, no failed read"
+        );
+    }
+
+    /// Any other failed read of a worker's session state from committed
+    /// GLOBAL state reads unknown, logged once with its error, not on every
+    /// observation, and the read that ends it is logged too: the failed
+    /// read's error was dropped (2026-11-13).
+    #[tokio::test]
+    async fn a_failed_session_state_read_is_logged_once_and_its_end() {
+        use crate::outage::test_logs::CapturedLogs;
+        let (mut engine, global) = engine_serving_its_head_session();
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        engine.global_hypergraph = None;
+        for _ in 0..3 {
+            assert_eq!(
+                observed_phase(&engine),
+                ("unknown".into(), "session state unavailable".into())
+            );
+        }
+        let failed = logs.lines_with("cannot read its committee session's state");
+        assert_eq!(failed.len(), 1, "read_failure_unlogged: {failed:?}");
+        assert!(
+            failed[0].contains("GLOBAL state unavailable") && failed[0].contains("failures=1"),
+            "{}",
+            failed[0]
+        );
+        engine.global_hypergraph = Some(global);
+        assert_eq!(observed_phase(&engine), ("serving".into(), String::new()));
+        let ended = logs.lines_with("committed GLOBAL state again");
+        assert_eq!(ended.len(), 1, "read_end_unlogged: {ended:?}");
+        assert!(ended[0].contains("failures=3"), "{}", ended[0]);
     }
 
     /// GLOBAL fenced generation 1 of QUIL_TOKEN at its base 0 without
@@ -29734,6 +30811,88 @@ mod tests {
         handoff::set_seal_drain_frame_for_thread(None);
     }
 
+    /// The same unrecorded seal, with this worker's view at this node's
+    /// latest GLOBAL frame: stamped 2 s ago, a current view, it is reported
+    /// to the network; stamped 120 s ago, after the first copy went out 300 s
+    /// ago (GLOBAL halted since), too; stamped 3 h ago, before the seal's
+    /// first copy went out, it is this node's GLOBAL view lag, with how far
+    /// behind, as on a node whose view was hours behind and the seals on
+    /// chain.
+    #[tokio::test]
+    async fn an_unrecorded_seal_from_a_view_stamped_hours_ago_is_reported_as_local() {
+        use quil_execution::global_intrinsic::handoff;
+        handoff::set_seal_drain_frame_for_thread(Some(0));
+        handoff::set_seal_recovery_frame_for_thread(Some(0));
+        let hours_ms = 3 * 60 * 60 * 1000;
+        for (age_ms, lagging, tag) in [
+            (2_000, false, "current_view_not_network"),
+            (120_000, false, "after_copy_view_not_network"),
+            (hours_ms, true, "lagging_view_not_local"),
+        ] {
+            let (global, id, mut engines) = sealed_drain_committee(1);
+            execute_drain_part(&global, &id, 40, 2);
+            let logs = crate::outage::test_logs::CapturedLogs::default();
+            let _guard = logs.install();
+            let (engine, sent) = &mut engines[0];
+            engine.maintain_committee_session().await;
+            assert_eq!(sent.lock().unwrap().len(), 1);
+            assert!(engine.seal_record.waiting(), "the copy carried no drain");
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            engine
+                .global_anchor_store
+                .put_global_clock_frame(
+                    &quil_types::proto::global::GlobalFrame {
+                        header: Some(quil_types::proto::global::GlobalFrameHeader {
+                            frame_number: 2,
+                            timestamp: now_ms - age_ms,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    &AppNoopTxn,
+                )
+                .unwrap();
+            engine
+                .seal_record
+                .backdate(crate::seal_follow::SEAL_UNRECORDED_AFTER);
+            engine.maintain_committee_session().await;
+            let stalled = logs.lines_with("seal not recorded");
+            assert_eq!(stalled.len(), 1, "no_stall_line: {stalled:?}");
+            let line = &stalled[0];
+            println!("seal record stall judged: stamped {age_ms} ms ago");
+            assert!(line.contains("committed_frame=2"), "{line}");
+            assert!(line.contains("latest_global_frame=2"), "{line}");
+            if !lagging {
+                assert!(
+                    line.contains("scope=\"network\"") && line.contains("action=\"report\""),
+                    "{tag}: stamped {age_ms} ms ago: {line}"
+                );
+                continue;
+            }
+            assert!(
+                line.contains("scope=\"local\""),
+                "{tag}: a view stamped 3 h ago: {line}"
+            );
+            for field in ["action=\"check\"", "GLOBAL sync"] {
+                assert!(line.contains(field), "lagging_view_field {field}: {line}");
+            }
+            let age: Option<u64> = line
+                .split("latest_global_age_secs=")
+                .nth(1)
+                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|digits| digits.parse().ok());
+            assert!(
+                age.is_some_and(|age| (10_800..=10_805).contains(&age)),
+                "lagging_view_field latest_global_age_secs {age:?}: {line}"
+            );
+        }
+        handoff::set_seal_recovery_frame_for_thread(None);
+        handoff::set_seal_drain_frame_for_thread(None);
+    }
+
     /// A view stuck past `seal_follow::SEAL_UNRECORDED_AFTER`, then moving onto
     /// the seal's record, shows no stall: whether the seal is recorded is read
     /// from the view that moved, before the wait's age is judged. On a tick
@@ -29949,6 +31108,33 @@ mod gossip_frame_tests {
 
     fn encode(frame: &AppShardFrame) -> Vec<u8> {
         prost::Message::encode_to_vec(frame)
+    }
+
+    /// A frame on the frame topic carrying more bundles and requests than
+    /// a frame may is refused unread; one at the limit is read.
+    #[tokio::test]
+    async fn a_frame_past_the_frame_bound_is_refused_unread() {
+        use crate::frame_bound::{bundles_of, refused_here, MAX_APP_FRAME_ITEMS};
+        let (mut engine, _handle) = build(None, false);
+        // At the cursor: a frame read is dropped right after its header.
+        let carrying = |items| {
+            let mut frame = unanchored(0, 0, vec![0; 32]);
+            frame.requests = bundles_of(items);
+            encode(&frame)
+        };
+        let before = refused_here();
+        engine
+            .handle_frame_message(&carrying(MAX_APP_FRAME_ITEMS + 1))
+            .await;
+        assert_eq!(
+            refused_here(),
+            before + 1,
+            "FRAME-BOUND: a frame past the bound was decoded"
+        );
+        engine
+            .handle_frame_message(&carrying(MAX_APP_FRAME_ITEMS))
+            .await;
+        assert_eq!(refused_here(), before + 1, "a frame at the bound is read");
     }
 
     /// Frame-topic gossip fills its own queue: a flood of it leaves the
@@ -30487,6 +31673,10 @@ mod relay_tests;
 #[cfg(test)]
 #[path = "app_engine_shield_hold_tests.rs"]
 mod shield_hold_tests;
+
+#[cfg(test)]
+#[path = "app_engine_compute_domain_tests.rs"]
+mod compute_domain_tests;
 
 #[cfg(test)]
 #[path = "app_engine_cited_frame_fetch_tests.rs"]

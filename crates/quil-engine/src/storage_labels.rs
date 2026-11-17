@@ -235,7 +235,12 @@ const LABEL_AHEAD_MARGIN_PERCENT: u64 = 10;
 /// the worker's layer buffers, allocator margin and the layer write buffer
 /// ([`FLUSH_CHUNK_BYTES`]).
 pub(crate) fn label_ahead_bytes(n: u64) -> u64 {
-    let peak = quil_crypto::storage_proof::label_leaf_peak_bytes(n, &SdrParams::default());
+    let params = SdrParams::default();
+    let peak = quil_crypto::storage_proof::label_leaf_peak_bytes_with_budget(
+        n,
+        &params,
+        crate::storage_jobs::label_scratch_bytes(n, &params),
+    );
     peak.saturating_add(peak / 100 * LABEL_AHEAD_MARGIN_PERCENT)
         .saturating_add(FLUSH_CHUNK_BYTES as u64)
 }
@@ -582,6 +587,13 @@ struct Candidate {
     /// Before the epoch of the last sweep ([`LabelStore::sweep`]): no seal
     /// needs them.
     stale: bool,
+    /// Needed for an epoch where persistent storage holds: a sector's
+    /// labels, kept until GLOBAL certifies it. Released, they are labelled
+    /// again, needing twice their size free again, while the labels of
+    /// seats before that epoch serve one seat's registrations each and that
+    /// epoch's sweep removes them: those go first (2026-11-08: a release
+    /// took sectors' labels first, as the latest needed).
+    sector: bool,
     bytes: u64,
 }
 
@@ -630,6 +642,120 @@ pub struct LabelStore {
     /// The release of labels for free space this process last saw
     /// ([`Self::keep_floor`]).
     seen: Arc<Mutex<Option<Shortage>>>,
+    /// Leaves this process found complete labels for or labelled, by
+    /// directory, and what of this process removed them since: labelling
+    /// ahead names why it labels a leaf again ([`Self::ahead_reason`]).
+    held: Arc<Mutex<HashMap<PathBuf, Held>>>,
+    /// The leaves of each member's shard at its last labelling ahead in
+    /// this process, by member and shard ([`Self::note_pass`]).
+    passes: Arc<Mutex<Passes>>,
+}
+
+/// The leaves of each member's shard at its last labelling ahead, by
+/// member and shard ([`LabelStore::note_pass`]).
+type Passes = HashMap<(Vec<u8>, Vec<u8>), HashSet<Vec<u8>>>;
+
+/// Complete labels this process found or made for a leaf
+/// ([`LabelStore::note_held`]).
+#[derive(Debug, Clone)]
+struct Held {
+    member: Vec<u8>,
+    leaf_id: Vec<u8>,
+    /// Their node count.
+    n: u64,
+    /// What of this process removed them since, if anything did.
+    removed_by: Option<&'static str>,
+}
+
+/// Why labelling ahead labels a leaf ([`precompute`]): what this process
+/// can tell of the labels kept for it before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AheadReason {
+    /// Labels bind the epoch (before the stable replica key epoch): every
+    /// epoch's are labelled anew.
+    Epoch,
+    /// Whole layers are kept at a count the leaf's data allows: labelling
+    /// goes on from them.
+    Partial,
+    /// Labels are kept at a count the data allows but could not be opened
+    /// whole.
+    Unreadable,
+    /// Labels are kept only at counts the data outgrew, the largest `was`.
+    Grown { was: u64 },
+    /// Labels are kept only at counts too large for the data, the largest
+    /// `was`.
+    Shrunk { was: u64 },
+    /// None are kept, while this process found or made them at `was`
+    /// nodes; `by` names what of this process removed them (the sweep of
+    /// unused counts, a release for free space, a failed check), none when
+    /// another process or something else did.
+    Dropped { was: u64, by: Option<&'static str> },
+    /// None are kept, and the shard's last pass in this process had the
+    /// leaf without labels kept (refused room, given up).
+    Retry,
+    /// None are kept, and the shard's last pass in this process had no
+    /// such leaf: a new leaf, or the shard's leaves cut anew (their ids
+    /// changed).
+    New,
+    /// None are kept, and this process has had no pass of the shard since
+    /// it started.
+    First,
+}
+
+impl std::fmt::Display for AheadReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Epoch => f.write_str("epoch"),
+            Self::Partial => f.write_str("partial"),
+            Self::Unreadable => f.write_str("unreadable"),
+            Self::Grown { was } => write!(f, "grown(was {was})"),
+            Self::Shrunk { was } => write!(f, "shrunk(was {was})"),
+            Self::Dropped { was, by: Some(by) } => write!(f, "dropped(was {was} by {by})"),
+            Self::Dropped { was, by: None } => write!(f, "dropped(was {was} elsewhere)"),
+            Self::Retry => f.write_str("retry"),
+            Self::New => f.write_str("new"),
+            Self::First => f.write_str("first"),
+        }
+    }
+}
+
+/// Leaves named in the line of a pass of labelling ahead ([`precompute`]);
+/// the others labelled are counted.
+const LABELLED_LEAVES_LOGGED: usize = 8;
+
+/// A leaf's path under its shard, short and public: its bits (`0110`),
+/// `root` for the shard's one leaf, else its prefix's values dotted.
+fn leaf_path(prefix: &[u32]) -> String {
+    match prefix.strip_prefix(&[quil_forest::BIT_PATH_PREFIX_SENTINEL]) {
+        Some([]) => "root".into(),
+        Some(bits) if bits.iter().all(|&bit| bit <= 1) => bits
+            .iter()
+            .map(|&bit| if bit == 1 { '1' } else { '0' })
+            .collect(),
+        _ => prefix
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+    }
+}
+
+/// The leaves a pass of labelling ahead labelled, each as
+/// `<path>:<nodes>:<reason>` ([`leaf_path`], [`AheadReason`]), the first
+/// [`LABELLED_LEAVES_LOGGED`] named and the rest counted; `none` for none.
+fn labelled_leaves_text(leaves: &[(String, u64, AheadReason)]) -> String {
+    if leaves.is_empty() {
+        return "none".into();
+    }
+    let mut parts: Vec<String> = leaves
+        .iter()
+        .take(LABELLED_LEAVES_LOGGED)
+        .map(|(path, n, reason)| format!("{path}:{n}:{reason}"))
+        .collect();
+    if leaves.len() > LABELLED_LEAVES_LOGGED {
+        parts.push(format!("+{} more", leaves.len() - LABELLED_LEAVES_LOGGED));
+    }
+    parts.join(", ")
 }
 
 /// Room a leaf's labels were refused: the free bytes they needed, beside
@@ -687,7 +813,102 @@ impl LabelStore {
             refused: Arc::new(Mutex::new(HashSet::new())),
             swept: Arc::new(AtomicU64::new(0)),
             seen: Arc::new(Mutex::new(None)),
+            held: Arc::new(Mutex::new(HashMap::new())),
+            passes: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn held(&self) -> MutexGuard<'_, HashMap<PathBuf, Held>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Note that `member`'s leaf `leaf_id` has complete labels at `n` nodes
+    /// in `dir`, found or just labelled.
+    fn note_held(&self, dir: &Path, member: &[u8], leaf_id: &[u8], n: u64) {
+        let mut held = self.held();
+        if held
+            .get(dir)
+            .is_some_and(|held| held.n == n && held.removed_by.is_none())
+        {
+            return;
+        }
+        held.insert(
+            dir.to_path_buf(),
+            Held {
+                member: member.to_vec(),
+                leaf_id: leaf_id.to_vec(),
+                n,
+                removed_by: None,
+            },
+        );
+    }
+
+    /// Note that `by` removed the labels at `n` nodes in `dir`.
+    fn note_removed(&self, dir: &Path, n: u64, by: &'static str) {
+        if let Some(held) = self.held().get_mut(dir).filter(|held| held.n == n) {
+            held.removed_by = Some(by);
+        }
+    }
+
+    /// Why labelling ahead labels `member`'s leaf `leaf_id` of shard
+    /// `filter` for `epoch`, its data taking `exact` nodes, no labels kept
+    /// at a count the data allows having been found ([`Self::find`]): what
+    /// is kept for it on disk, else what this process saw of it before.
+    pub(crate) fn ahead_reason(
+        &self,
+        epoch: u64,
+        member: &[u8],
+        filter: &[u8],
+        leaf_id: &[u8],
+        exact: u64,
+    ) -> AheadReason {
+        use quil_crypto::storage_proof::padded_nodes_allowed;
+        if !quil_types::consensus::stable_replica_keys_at(epoch) {
+            return AheadReason::Epoch;
+        }
+        let allowed = |n| padded_nodes_allowed(exact, n);
+        if self.resumable(epoch, member, leaf_id, allowed).is_some() {
+            return AheadReason::Partial;
+        }
+        let dir = self.leaf_dir(epoch, member, leaf_id);
+        let ready = counts_with(&dir, ".ready");
+        if ready.iter().any(|&n| allowed(n)) {
+            return AheadReason::Unreadable;
+        }
+        if let Some(&was) = ready.iter().max() {
+            return if exact > was {
+                AheadReason::Grown { was }
+            } else {
+                AheadReason::Shrunk { was }
+            };
+        }
+        if let Some(held) = self.held().get(&dir) {
+            return AheadReason::Dropped {
+                was: held.n,
+                by: held.removed_by,
+            };
+        }
+        let passes = self.passes.lock().unwrap_or_else(PoisonError::into_inner);
+        match passes.get(&(member.to_vec(), filter.to_vec())) {
+            None => AheadReason::First,
+            Some(leaves) if leaves.contains(leaf_id) => AheadReason::Retry,
+            Some(_) => AheadReason::New,
+        }
+    }
+
+    /// Note the leaves `leaf_ids` of `member`'s shard `filter` at a pass of
+    /// labelling ahead, forgetting what was held of its leaves gone since.
+    pub(crate) fn note_pass(&self, member: &[u8], filter: &[u8], leaf_ids: HashSet<Vec<u8>>) {
+        let of_shard = |leaf_id: &[u8]| {
+            leaf_id.starts_with(filter) && leaf_id.get(filter.len()) == Some(&0xFF)
+        };
+        self.held().retain(|_, held| {
+            held.member != member || !of_shard(&held.leaf_id) || leaf_ids.contains(&held.leaf_id)
+        });
+        self.passes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((member.to_vec(), filter.to_vec()), leaf_ids);
     }
 
     /// Override this store's local free-space policy, for an isolated benchmark.
@@ -886,6 +1107,9 @@ impl LabelStore {
     /// process or one before it, stay for this one to resume from
     /// ([`Admitted::resumes_from`]) as far as each matches its digest
     /// ([`verify_kept_with_params`]); whatever else an attempt left is removed first.
+    /// A sector's labels (an epoch where persistent storage holds) short of
+    /// that room take it first from the labels kept for seats before that
+    /// epoch ([`Self::make_sector_room`]).
     /// `None` when refused, leaving none of its files, logged once a leaf,
     /// epoch and stage: the leaf is then labelled where it is needed, as by
     /// a process that keeps no labels. `None` too while that count is being
@@ -973,6 +1197,9 @@ impl LabelStore {
         let bytes = self
             .label_bytes(n)
             .saturating_sub(kept as u64 * layer_bytes(n));
+        if quil_types::consensus::persistent_storage_at(epoch) {
+            self.make_sector_room(epoch, leaf_id, &dir, n, bytes.saturating_mul(DISK_MARGIN));
+        }
         // Held until this store's record counts the leaf; taken first, so
         // this process's labels being written need not wait for it.
         let turn = self.labels_turn();
@@ -1118,6 +1345,7 @@ impl LabelStore {
         for path in [ready, layers, columns, kept_path(&dir, n)] {
             let _ = fs::remove_file(path);
         }
+        self.note_removed(&dir, n, "check");
         if let Some(writer) = writer {
             end_claim(&dir, n, writer);
         }
@@ -1244,6 +1472,7 @@ impl LabelStore {
             return None;
         }
         note_used(&dir, n, epoch);
+        self.note_held(&dir, member, leaf_id, n);
         Some(Kept {
             n,
             comm_c,
@@ -1323,6 +1552,7 @@ impl LabelStore {
                             let _ = fs::remove_file(path);
                         }
                         counts_removed += 1;
+                        self.note_removed(&dir, n, "sweep");
                     }
                     Some(_) => {}
                 }
@@ -1348,9 +1578,11 @@ impl LabelStore {
     /// the floor ([`disk_floor`]): they are a cache, and the node's stores
     /// and logs beside them must not fail for them. Every count no
     /// labelling or seal of this process or another holds ([`hold_layers`])
-    /// may go, until free space is [`release_band`] above the floor: those
-    /// of epochs already swept first, then the latest needed, the smallest
-    /// first within an epoch. A seal opens its labels within the hour after
+    /// may go, until free space is [`release_band`] above the floor: the
+    /// labels of seats before persistent storage first, sectors' last
+    /// ([`Candidate::sector`]); within each, those of epochs already swept
+    /// first, then the latest needed, the smallest first within an epoch.
+    /// A seal opens its labels within the hour after
     /// its snapshot, too soon to label a large leaf again, while labels for
     /// a later epoch may be labelled ahead again before their snapshot; and
     /// small leaves are labelled again at their snapshot within the
@@ -1384,7 +1616,7 @@ impl LabelStore {
             return None;
         }
         let target = floor.saturating_add(release_band(floor));
-        let released = self.release(usage.free_bytes, target);
+        let released = self.release(usage.free_bytes, target, |_| true);
         let now = unix_now();
         let marked = self.shortage();
         let first = marked.is_none();
@@ -1461,14 +1693,69 @@ impl LabelStore {
         );
     }
 
-    /// Release the counts [`Self::keep_floor`] may take, in its order, until
-    /// `free` and what they held reach `target`.
-    fn release(&self, free: u64, target: u64) -> Released {
+    /// Make room for the labels of `member`'s sector `leaf_id` of `n` nodes
+    /// for `epoch`, where persistent storage holds, in its directory `own`:
+    /// when `bytes` do not fit above the floor, release the labels kept for
+    /// seats before persistent storage ([`Candidate::sector`]), in the order
+    /// [`Self::keep_floor`] takes them, until they fit or none is left, and
+    /// log what went. Those labels are a cache that the persistent storage
+    /// epoch's sweep removes, while a sector not certified by then leaves
+    /// its seat without storage reward; [`Self::keep_floor`] releases
+    /// nothing above the floor, so a node whose free space sits less than
+    /// twice a sector's labels above it, beside hundreds of GiB of seats'
+    /// labels, started no sector again (2026-11-08: 3.5 GiB above a floor of
+    /// 91.5 GiB). Nothing while another process releases labels.
+    fn make_sector_room(&self, epoch: u64, leaf_id: &[u8], own: &Path, n: u64, bytes: u64) {
+        let pending = *self.pending();
+        let Err(Shortfall {
+            needed,
+            free: Some(free),
+        }) = self.room(pending, bytes)
+        else {
+            return;
+        };
+        let Ok(dir) = File::open(&self.dir) else {
+            return;
+        };
+        if dir.try_lock().is_err() {
+            return;
+        }
+        let released = self.release(free, needed, |candidate| {
+            !candidate.sector && candidate.dir != own
+        });
+        drop(dir);
+        if released.counts == 0 {
+            return;
+        }
+        let free_after = self.usage().map_or(free, |usage| usage.free_bytes);
+        let epochs = released
+            .epochs
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(epoch, leaf = %hex::encode(leaf_id), nodes = n, needed_bytes = needed,
+            free_bytes = free, free_after_bytes = free_after, released_bytes = released.bytes,
+            released_counts = released.counts, in_use_counts = released.in_use,
+            epochs = %epochs, fits = free_after >= needed, scope = "local",
+            "storage labels kept for seats released for a sector: the sector's labels needed \
+             needed_bytes free on the labels' filesystem (twice their size, above the floor and \
+             the labels being written) and it had free_bytes; the released labels serve only \
+             registrations before the persistent storage epoch, whose sweep removes them, and \
+             their seats' snapshots label them again at need (about an hour per GiB on a core)");
+    }
+
+    /// Release the counts [`Self::keep_floor`] may take that `take` takes,
+    /// in its order, until `free` and what they held reach `target`.
+    fn release(&self, free: u64, target: u64, take: impl Fn(&Candidate) -> bool) -> Released {
         let mut released = Released::default();
         let mut free = free;
         for candidate in self.candidates() {
             if free >= target {
                 break;
+            }
+            if !take(&candidate) {
+                continue;
             }
             let lock = leaf_lock(&candidate.dir);
             let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1499,6 +1786,7 @@ impl LabelStore {
             free = free.saturating_add(bytes);
             released.bytes = released.bytes.saturating_add(bytes);
             released.counts += 1;
+            self.note_removed(&candidate.dir, candidate.n, "release");
             if !released.epochs.contains(&candidate.epoch) {
                 released.epochs.push(candidate.epoch);
             }
@@ -1552,14 +1840,16 @@ impl LabelStore {
                         n,
                         epoch,
                         stale: epoch < swept,
+                        sector: quil_types::consensus::persistent_storage_at(epoch),
                         bytes,
                     });
                 }
             }
         }
         candidates.sort_by(|a, b| {
-            b.stale
-                .cmp(&a.stale)
+            a.sector
+                .cmp(&b.sector)
+                .then(b.stale.cmp(&a.stale))
                 .then(b.epoch.cmp(&a.epoch))
                 .then(a.bytes.cmp(&b.bytes))
                 .then(a.dir.cmp(&b.dir))
@@ -1807,7 +2097,7 @@ impl Admitted<'_> {
         let paths = paths(&self.dir, self.n);
         let tally = FlushTally::default();
         let result = quil_crypto::storage_proof::with_label_memory_budget(
-            quil_crypto::storage_proof::label_scratch_memory_bytes(self.n, params),
+            crate::storage_jobs::label_scratch_bytes(self.n, params),
             || self.write(params, &paths, stop, layers, &tally),
         );
         tally.log(self.epoch, &self.leaf_id, self.n, self.stage);
@@ -2051,6 +2341,8 @@ impl Admitted<'_> {
         let staged = staged(&self.dir, self.n);
         fs::write(&staged, comm_c).map_err(|e| io("write", &staged, e))?;
         fs::rename(&staged, ready_path).map_err(|e| io("rename", ready_path, e))?;
+        self.store
+            .note_held(&self.dir, &self.member, &self.leaf_id, self.n);
         // Complete: `ready` stands for the layers from now on.
         let _ = fs::remove_file(kept_path(&self.dir, self.n));
         let finished = finishing.elapsed();
@@ -2534,10 +2826,27 @@ impl Drop for FlushPermit<'_> {
     }
 }
 
+/// Bytes this process wrote through [`ChunkedWriter`]s: to leaves' label
+/// files (layers and columns), and to sectors' last layers
+/// ([`write_digests_paced`]).
+static LABEL_FILE_BYTES: AtomicU64 = AtomicU64::new(0);
+static SECTOR_FILE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `(label files, sector files)` bytes this process wrote since it started
+/// ([`LABEL_FILE_BYTES`], [`SECTOR_FILE_BYTES`]).
+pub fn file_bytes_written() -> (u64, u64) {
+    (
+        LABEL_FILE_BYTES.load(Ordering::Relaxed),
+        SECTOR_FILE_BYTES.load(Ordering::Relaxed),
+    )
+}
+
 /// What writing a leaf's labels waited for and took ([`ChunkedWriter`]),
 /// logged once its labelling ends ([`Self::log`]).
 #[derive(Default)]
 struct FlushTally {
+    /// Whether the bytes are a sector's last layer's, not labels'.
+    sector: bool,
     /// Chunks written and pushed to disk, and their bytes.
     chunks: Cell<u64>,
     bytes: Cell<u64>,
@@ -2565,6 +2874,12 @@ impl FlushTally {
         self.chunks.set(self.chunks.get() + 1);
         self.bytes.set(self.bytes.get() + bytes);
         self.disk.set(self.disk.get() + took);
+        let files = if self.sector {
+            &SECTOR_FILE_BYTES
+        } else {
+            &LABEL_FILE_BYTES
+        };
+        files.fetch_add(bytes, Ordering::Relaxed);
     }
 
     fn synced(&self, took: Duration) {
@@ -2782,7 +3097,10 @@ impl<W: ChunkSink> Write for ChunkedWriter<'_, W> {
 /// once and then synced held the stores' synced commits behind all of it
 /// (2026-11-07).
 pub(crate) fn write_digests_paced(path: &Path, digests: &[Digest]) -> std::io::Result<()> {
-    let tally = FlushTally::default();
+    let tally = FlushTally {
+        sector: true,
+        ..FlushTally::default()
+    };
     let mut writer =
         ChunkedWriter::new(File::create(path)?, 0, chunk_bytes(), flush_gate(), &tally);
     for digests in digests.chunks(1024) {
@@ -2900,6 +3218,38 @@ impl Kept {
             labels.push(hash::to_bytes(&last[v as usize]));
             if column_digest(&labels)? != hash::to_bytes(&columns[v as usize]) {
                 return None;
+            }
+        }
+        (MerkleTree::from_digests(columns).commitment(Tree::Column) == self.comm_c).then_some(last)
+    }
+
+    /// [`Self::verified_last_layer`] at every node, not a sample: for a
+    /// sector set up once from these labels, whose certificate would commit
+    /// to any damaged node a sample missed. Reads each layer once, a chunk
+    /// of nodes at a time.
+    pub fn wholly_verified_last_layer(&self) -> Option<Vec<Digest>> {
+        use quil_crypto::storage_proof::{column_digest, MerkleTree, Tree};
+        let n = self.n;
+        let columns = self.columns()?;
+        let last = self.last_layer().filter(|last| last.len() as u64 == n)?;
+        let size = n * NODE_BYTES as u64;
+        for at in (0..n).step_by(1024) {
+            let count = (n - at).min(1024) as usize;
+            let mut layers = Vec::with_capacity(self.depth - 1);
+            for layer in 0..(self.depth - 1) as u64 {
+                let offset = layer * size + at * NODE_BYTES as u64;
+                layers.push(self.read(offset, count * NODE_BYTES)?);
+            }
+            for i in 0..count {
+                let (v, from) = (at as usize + i, i * NODE_BYTES);
+                let mut labels = Vec::with_capacity(self.depth);
+                for layer in &layers {
+                    labels.push(Node::try_from(&layer[from..from + NODE_BYTES]).ok()?);
+                }
+                labels.push(hash::to_bytes(&last[v]));
+                if column_digest(&labels)? != hash::to_bytes(&columns[v]) {
+                    return None;
+                }
             }
         }
         (MerkleTree::from_digests(columns).commitment(Tree::Column) == self.comm_c).then_some(last)
@@ -3099,7 +3449,8 @@ pub(crate) fn ahead_orders(
 /// gives it back, keeping its whole layers, and goes on from them once its
 /// memory fits again ([`label_leaf_ahead`]). Nothing is labelled once GLOBAL
 /// reached the epoch's snapshot frame ([`expired`]). Removes the labels of
-/// epochs that have begun.
+/// epochs that have begun. Its line names each leaf labelled, at its
+/// count, and why ([`AheadReason`]).
 pub fn precompute(
     store: &LabelStore,
     crdt: &Arc<HypergraphCrdt>,
@@ -3135,12 +3486,12 @@ pub fn precompute(
         .collect::<Result<Vec<u128>>>()?;
     let orders = ahead_orders(epoch, crate::storage_jobs::ahead_place(), &sizes);
     let leaves: Vec<usize> = (0..captured.prefixes.len()).collect();
-    let labelled = crate::storage_jobs::for_each_parallel(&leaves, |&index| {
+    let outcomes = crate::storage_jobs::for_each_parallel(&leaves, |&index| {
         let (prefix, size, order) = (&captured.prefixes[index], sizes[index], orders[index]);
         let leaf_id = quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix);
         // Past the epoch's snapshot frame, leaves not started yet are skipped.
         if expired(epoch) {
-            return Ok(Some(0));
+            return Ok((Some(0), None));
         }
         // A leaf's data is at least its values (`leaf_size`): one whose
         // labels at that count have no room is refused before its read,
@@ -3149,23 +3500,44 @@ pub fn precompute(
         if !store.holds(epoch, member, &leaf_id)
             && !store.may_admit(epoch, member, &leaf_id, least, Stage::Ahead)
         {
-            return Ok(None);
+            return Ok((None, None));
         }
         let exact = captured.node_count(prefix)?;
         if store
             .find(epoch, member, &leaf_id, |n| padded_nodes_allowed(exact, n))
             .is_some()
         {
-            return Ok(Some(0));
+            return Ok((Some(0), None));
         }
+        let reason = store.ahead_reason(epoch, member, filter, &leaf_id, exact);
         let leaf = Leaf {
             member,
             filter,
             leaf_id: &leaf_id,
             epoch,
         };
-        label_leaf_ahead(store, &leaf, exact, order, &params)
+        Ok((
+            label_leaf_ahead(store, &leaf, exact, order, &params)?,
+            Some(reason),
+        ))
     })?;
+    store.note_pass(
+        member,
+        filter,
+        captured
+            .prefixes
+            .iter()
+            .map(|prefix| quil_execution::global_intrinsic::leaf_id_bytes(filter, prefix))
+            .collect(),
+    );
+    let named: Vec<(String, u64, AheadReason)> = outcomes
+        .iter()
+        .zip(&captured.prefixes)
+        .filter_map(|(&(n, reason), prefix)| {
+            Some((leaf_path(prefix), n.filter(|&n| n > 0)?, reason?))
+        })
+        .collect();
+    let labelled: Vec<Option<u64>> = outcomes.into_iter().map(|(n, _)| n).collect();
     let refused = labelled.iter().filter(|n| n.is_none()).count();
     let outcome = if expired(epoch) {
         "stopped at the epoch's snapshot frame: its snapshot labels the leaves not labelled by then"
@@ -3184,6 +3556,7 @@ pub fn precompute(
     info!(epoch, filter = %hex::encode(filter), leaves = labelled.len(),
         labelled = labelled.iter().filter(|n| n.is_some_and(|n| n > 0)).count(), refused,
         nodes = labelled.iter().flatten().sum::<u64>(), seconds = started.elapsed().as_secs_f64(),
+        labelled_leaves = %labelled_leaves_text(&named),
         outcome, "storage labels computed ahead of the epoch's snapshot");
     Ok(())
 }
@@ -3754,6 +4127,33 @@ mod tests {
                  well under {FLUSH_TARGET:?}: labelling is slowed for nothing"
             );
         }
+    }
+
+    /// Bytes a chunked writer writes count as label files', and those of a
+    /// sector's last layer as sector files'.
+    #[test]
+    fn written_bytes_count_as_label_or_sector_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = hash::from_bytes(&[0u8; NODE_BYTES]).unwrap();
+        let before = file_bytes_written();
+        write_digests_paced(&dir.path().join("last"), &[digest; 100]).unwrap();
+        let sector = file_bytes_written();
+        assert_eq!(
+            (sector.0 - before.0, sector.1 - before.1),
+            (0, 100 * NODE_BYTES as u64),
+            "sector_as_labels"
+        );
+        let tally = FlushTally::default();
+        let file = File::create(dir.path().join("layers")).unwrap();
+        let mut writer = ChunkedWriter::new(file, 0, 4096, flush_gate(), &tally);
+        writer.write_all(&[1u8; 10_000]).unwrap();
+        writer.finish().unwrap();
+        let labels = file_bytes_written();
+        assert_eq!(
+            (labels.0 - sector.0, labels.1 - sector.1),
+            (10_000, 0),
+            "labels_uncounted"
+        );
     }
 
     /// A disk too slow even for the smallest chunk in [`FLUSH_TARGET`]
@@ -4690,6 +5090,102 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The line of a pass of labelling ahead names each leaf it labels, at
+    /// its count, and why: a leaf new to the shard, one whose data outgrew
+    /// the count kept, and one at the count it had, whose labels the sweep
+    /// removed (2026-11-08: four relabels of seats' leaves at the count
+    /// labelled before could not be told from the line); a process's first
+    /// pass of a shard and a leaf it refused before say so, labels bound
+    /// to their epoch too, and the list stays bounded.
+    #[test]
+    fn labelling_ahead_names_each_leaf_its_count_and_why() {
+        use quil_crypto::storage_proof::precompute_nodes;
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        let dir = temp_dir("ahead-reasons");
+        let store = LabelStore::with_space(dir.clone(), ample_space());
+        let (member, filter) = ([7u8; 32], [0x5Au8; 32]);
+        let prefix = |bits: &[u32]| {
+            let mut prefix = vec![quil_forest::BIT_PATH_PREFIX_SENTINEL];
+            prefix.extend_from_slice(bits);
+            prefix
+        };
+        let id = |prefix: &[u32]| quil_execution::global_intrinsic::leaf_id_bytes(&filter, prefix);
+        let (grown, retry, same, new) = (
+            prefix(&[0, 0]),
+            prefix(&[0, 1]),
+            prefix(&[1, 0]),
+            prefix(&[1, 1]),
+        );
+        let reason = |epoch, prefix: &[u32], exact| {
+            store.ahead_reason(epoch, &member, &filter, &id(prefix), exact)
+        };
+        assert_eq!(
+            reason(8, &grown, 100),
+            AheadReason::Epoch,
+            "labels bound to their epoch misnamed"
+        );
+        assert_eq!(
+            reason(10, &grown, 100),
+            AheadReason::First,
+            "a first pass misnamed"
+        );
+
+        // A pass for epoch 10 labels two leaves; the third had no room.
+        let (grown_was, same_n) = (precompute_nodes(100), precompute_nodes(200));
+        keep(&store, 10, &member, &id(&grown), grown_was);
+        keep(&store, 10, &member, &id(&same), same_n);
+        store.note_pass(
+            &member,
+            &filter,
+            [id(&grown), id(&retry), id(&same)].into_iter().collect(),
+        );
+        // One leaf is looked for in the epochs after; the other's labels
+        // go at the sweep of an epoch nothing looked for them for.
+        for epoch in [11, 12] {
+            assert!(store.find(epoch, &member, &id(&grown), |_| true).is_some());
+            store.sweep(epoch);
+        }
+        assert!(!store.holds(12, &member, &id(&same)), "swept");
+
+        // The next pass: one leaf's data outgrew its count, one is labelled
+        // again at the count it had, one is new, one was refused before.
+        let grown_exact = grown_was + 1;
+        let leaves = [
+            (
+                &grown,
+                precompute_nodes(grown_exact),
+                reason(13, &grown, grown_exact),
+            ),
+            (&same, same_n, reason(13, &same, 200)),
+            (&new, precompute_nodes(300), reason(13, &new, 300)),
+            (&retry, precompute_nodes(400), reason(13, &retry, 400)),
+        ]
+        .map(|(prefix, n, why)| (leaf_path(prefix), n, why));
+        assert_eq!(
+            labelled_leaves_text(&leaves),
+            format!(
+                "00:{}:grown(was {grown_was}), 10:{same_n}:dropped(was {same_n} by sweep), \
+                 11:{}:new, 01:{}:retry",
+                precompute_nodes(grown_exact),
+                precompute_nodes(300),
+                precompute_nodes(400),
+            ),
+            "the line misnamed a leaf, its count or why it was labelled"
+        );
+
+        // A shard's one leaf, and a bounded list.
+        assert_eq!(leaf_path(&prefix(&[])), "root");
+        assert_eq!(labelled_leaves_text(&[]), "none");
+        let many: Vec<_> = (0..LABELLED_LEAVES_LOGGED as u64 + 2)
+            .map(|n| ("root".to_string(), n, AheadReason::New))
+            .collect();
+        let text = labelled_leaves_text(&many);
+        assert_eq!(text.matches(":new").count(), LABELLED_LEAVES_LOGGED);
+        assert!(text.ends_with(", +2 more"), "{text}");
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// While a count is labelled, a later epoch, which looks in the same
     /// directory from the stable replica key epoch, neither finds it nor
     /// labels it again: it finds it once complete.
@@ -5094,7 +5590,7 @@ mod tests {
         let dir = store.leaf_dir(epoch, member, leaf);
         fs::create_dir_all(&dir).unwrap();
         let [layers, columns, ready] = paths(&dir, n);
-        let depth = SdrParams::default().layers as u64;
+        let depth = store.params().layers as u64;
         File::create(layers)
             .unwrap()
             .set_len(n * depth * NODE_BYTES as u64)
@@ -5188,6 +5684,133 @@ mod tests {
                 .admit(11, &member, b"next", n, Stage::Ahead)
                 .expect("labelling ahead resumes"),
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A release takes the labels kept for seats before persistent storage
+    /// first and sectors' labels last: released, a sector's labels are
+    /// labelled again, needing twice their size free again, while the
+    /// seats' go at the persistent storage epoch's sweep anyway. Taken as
+    /// the latest needed, sectors' labels went first, and a node near the
+    /// floor labelled them over and over (2026-11-08).
+    #[test]
+    fn a_release_takes_seats_labels_before_a_sectors() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(20));
+        let dir = temp_dir("seats-first");
+        let base = Arc::new(AtomicU64::new(1 << 50));
+        let store = LabelStore::with_space(dir.clone(), space_less_files(&base, &dir));
+        let three = store.for_profile(quil_types::consensus::StorageSealProfile::Three);
+        let floor = disk_floor(TOTAL);
+        let member = [9u8; 32];
+        // 1.5 GiB each: the two cover the release band (2.5 GiB).
+        let seats = [b"seat-a", b"seat-b"]
+            .map(|leaf| kept_sparse(&store, 10, &member, leaf, 4 * EIGHTH_NODES));
+        // A sector's labels, 1 GiB, needed latest.
+        let sector = kept_sparse(&three, 20, &member, b"sector", 8 * EIGHTH_NODES);
+        assert_eq!(bytes_under(&sector), GIB + 32 + 8);
+
+        base.store(floor - 1 + bytes_under(&dir), Ordering::SeqCst);
+        let released = store.keep_floor().expect("below the floor");
+        assert_eq!(
+            files_under(&sector).len(),
+            4,
+            "sectorroom: a sector's labels went before seats': {released:?}"
+        );
+        assert!(
+            three.find(20, &member, b"sector", |_| true).is_some(),
+            "sectorroom: the sector's labels are kept"
+        );
+        assert_eq!(
+            (released.counts, released.epochs.clone()),
+            (2, vec![10]),
+            "sectorroom: the seats' labels went: {released:?}"
+        );
+        for seat in &seats {
+            assert_eq!(
+                files_under(seat),
+                Vec::<PathBuf>::new(),
+                "sectorroom: {seat:?}"
+            );
+        }
+
+        // With no seats' labels left, a sector's go too: the stores come
+        // first.
+        base.store(floor - 1 + bytes_under(&dir), Ordering::SeqCst);
+        let released = store.keep_floor().expect("below the floor");
+        assert_eq!(released.counts, 1, "sectorroom: {released:?}");
+        assert_eq!(files_under(&sector), Vec::<PathBuf>::new(), "sectorroom");
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A sector refused room above the floor takes it from the labels kept
+    /// for seats before persistent storage, until it fits and no further,
+    /// and never from another sector's labels; with no seats' labels it is
+    /// refused as before. The floor's own release starts below the floor
+    /// only, so a node 3.5 GiB above it, its labels' filesystem mostly
+    /// seats' labels, started no sector again (2026-11-08).
+    #[test]
+    fn a_sector_short_of_room_above_the_floor_takes_it_from_seats_labels() {
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(Some(9));
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(Some(20));
+        let dir = temp_dir("sector-room");
+        let base = Arc::new(AtomicU64::new(1 << 50));
+        let store = LabelStore::with_space(dir.clone(), space_less_files(&base, &dir));
+        let three = store.for_profile(quil_types::consensus::StorageSealProfile::Three);
+        let floor = disk_floor(TOTAL);
+        let member = [10u8; 32];
+        // A sector of 1 GiB of labels needs 2 GiB free above the floor.
+        let n = 8 * EIGHTH_NODES;
+        assert_eq!(three.label_bytes(n) * DISK_MARGIN, 2 * GIB);
+        // Another sector's labels, not certified yet.
+        let other = kept_sparse(&three, 20, &member, b"other", n);
+
+        // Half a GiB above the floor, with no seats' labels: refused, and
+        // the other sector's labels stay.
+        base.store(floor + GIB / 2 + bytes_under(&dir), Ordering::SeqCst);
+        assert!(
+            three
+                .admit(20, &member, b"sector", n, Stage::Snapshot)
+                .is_none(),
+            "sectorroom: no room"
+        );
+        assert_eq!(
+            files_under(&other).len(),
+            4,
+            "sectorroom: another sector's labels went for a sector"
+        );
+
+        // Seats' labels of 3/4 GiB each: two of them make the room.
+        let seats: Vec<PathBuf> = [b"seat-a", b"seat-b", b"seat-c", b"seat-d"]
+            .iter()
+            .map(|leaf| kept_sparse(&store, 10, &member, *leaf, 2 * EIGHTH_NODES))
+            .collect();
+        base.store(floor + GIB / 2 + bytes_under(&dir), Ordering::SeqCst);
+        let admitted = three
+            .admit(20, &member, b"sector", n, Stage::Snapshot)
+            .expect("sectorroom: a sector short of room above the floor stays refused");
+        let left = seats
+            .iter()
+            .filter(|seat| !files_under(seat).is_empty())
+            .count();
+        assert_eq!(
+            left, 2,
+            "sectorroom: released until the sector fits, no further"
+        );
+        assert_eq!(
+            files_under(&other).len(),
+            4,
+            "sectorroom: another sector's labels went for a sector"
+        );
+        assert!(
+            store.shortage().is_none(),
+            "sectorroom: above the floor, no shortage"
+        );
+        drop(admitted);
+        quil_types::consensus::set_persistent_storage_epoch_for_thread(None);
+        quil_types::consensus::set_stable_replica_key_epoch_for_thread(None);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -422,10 +422,8 @@ impl ShardExecutionEngine for GlobalExecutionEngine {
                         "global: a presence report must be its bundle's only request".into(),
                     ));
                 }
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        validate_inner(&r.inner_bytes, r.inner_type_prefix)?;
-                    }
+                for r in bundle.requests.iter().flatten() {
+                    validate_inner(&r.inner_bytes, r.inner_type_prefix)?;
                 }
                 Ok(())
             }
@@ -754,10 +752,17 @@ impl TokenExecutionEngine {
         if operations.is_empty() {
             return counts;
         }
-        let background;
+        // The lanes verify on threads of their own: what the caller knows
+        // of the verification travels in the worker, not in thread state.
+        let paced;
         let worker = if pacing.background {
-            background = worker.background();
-            &background
+            paced = worker.background();
+            &paced
+        } else if pacing.frame
+            != quil_lattice_ct::confidential::relation::backend::worker_client::FrameCheck::No
+        {
+            paced = worker.for_frame(pacing.frame);
+            &paced
         } else {
             worker
         };
@@ -833,12 +838,15 @@ impl TokenExecutionEngine {
     }
 
     /// The per-frame verification budget, in worker-seconds (budget seconds
-    /// times the worker's concurrency); `None` without a configured worker.
+    /// times the slots it counts, [`WorkerVerifier::budget_concurrency`]);
+    /// `None` without a configured worker.
+    ///
+    /// [`WorkerVerifier::budget_concurrency`]: quil_lattice_ct::confidential::relation::backend::worker_client::WorkerVerifier::budget_concurrency
     #[cfg(feature = "native-proof")]
     pub fn verification_budget(&self) -> Option<f64> {
         self.token_worker.as_ref().map(|worker| {
             crate::token_intrinsic::dispatch::verification_budget_secs()
-                * worker.concurrency().max(1) as f64
+                * worker.budget_concurrency().max(1) as f64
         })
     }
 
@@ -847,9 +855,9 @@ impl TokenExecutionEngine {
     #[cfg(feature = "native-proof")]
     pub fn verification_capacity(&self) -> usize {
         match self.token_worker.as_ref() {
-            Some(worker) => {
-                crate::token_intrinsic::dispatch::frame_verification_capacity(worker.concurrency())
-            }
+            Some(worker) => crate::token_intrinsic::dispatch::frame_verification_capacity(
+                worker.budget_concurrency(),
+            ),
             None => usize::MAX,
         }
     }
@@ -990,15 +998,15 @@ impl ShardExecutionEngine for TokenExecutionEngine {
         // A token write to a system-managed domain would let the
         // token materialize at materialize-time write into the wrong
         // tree.
-        if _address.len() >= 32 {
-            if _address[..32] == crate::domains::GLOBAL || _address[..32] == crate::domains::COMPUTE
-            {
-                return Err(QuilError::InvalidArgument(format!(
-                    "token engine: refusing to validate message addressed to \
+        if _address.len() >= 32
+            && (_address[..32] == crate::domains::GLOBAL
+                || _address[..32] == crate::domains::COMPUTE)
+        {
+            return Err(QuilError::InvalidArgument(format!(
+                "token engine: refusing to validate message addressed to \
                      system-managed domain {}",
-                    hex::encode(&_address[..32]),
-                )));
-            }
+                hex::encode(&_address[..32]),
+            )));
         }
         if message.len() < 4 {
             return Ok(());
@@ -1054,10 +1062,8 @@ impl ShardExecutionEngine for TokenExecutionEngine {
         match tp {
             TYPE_MESSAGE_BUNDLE => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        validate_token_inner(&r.inner_bytes, r.inner_type_prefix)?;
-                    }
+                for r in bundle.requests.iter().flatten() {
+                    validate_token_inner(&r.inner_bytes, r.inner_type_prefix)?;
                 }
                 Ok(())
             }
@@ -1204,6 +1210,14 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             inner_tp,
                         )
                     });
+                    // Execution runs only frames, finalized or replayed:
+                    // the frame waits on these checks, on this thread, within
+                    // their caller's deadline.
+                    let frame_worker = self.token_worker.as_ref().map(|worker| {
+                        worker.for_frame(
+                            quil_lattice_ct::confidential::relation::backend::worker_client::FrameCheck::Inline,
+                        )
+                    });
                     if commits {
                         return match effective_mode(self.mode, context) {
                             ExecutionMode::Application => policy.dispatch_for_commit(
@@ -1213,7 +1227,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                                 _address,
                                 inner_bytes,
                                 inner_tp,
-                                self.token_worker.as_ref(),
+                                frame_worker.as_ref(),
                                 paid_allowance.take(),
                             ),
                             ExecutionMode::Global => policy.dispatch_commit_inline(
@@ -1223,7 +1237,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                                 _address,
                                 inner_bytes,
                                 inner_tp,
-                                self.token_worker.as_ref(),
+                                frame_worker.as_ref(),
                                 paid_allowance.take(),
                             ),
                         };
@@ -1235,7 +1249,7 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                             self.clock_store.as_ref(),
                             _address,
                             inner_bytes,
-                            self.token_worker.as_ref(),
+                            frame_worker.as_ref(),
                         );
                     }
                     // Every other confidential operation commits through the
@@ -1322,141 +1336,138 @@ impl ShardExecutionEngine for TokenExecutionEngine {
                         self.config_resolver.invalidate(&derived);
                     }
                 }
-                crate::token_intrinsic::TYPE_TOKEN_UPDATE => {
-                    if _address.len() == 32 {
-                        let update =
-                            crate::token_intrinsic::TokenUpdate::from_canonical_bytes(inner_bytes)?;
-                        if !update.config.is_empty() {
-                            let new_cfg =
-                                crate::token_intrinsic::TokenConfiguration::from_canonical_bytes(
-                                    &update.config,
-                                )?;
+                crate::token_intrinsic::TYPE_TOKEN_UPDATE if _address.len() == 32 => {
+                    let update =
+                        crate::token_intrinsic::TokenUpdate::from_canonical_bytes(inner_bytes)?;
+                    if !update.config.is_empty() {
+                        let new_cfg =
+                            crate::token_intrinsic::TokenConfiguration::from_canonical_bytes(
+                                &update.config,
+                            )?;
 
-                            // Update gates: BLS signature on the
-                            // existing owner key, then behavior
-                            // parity + supply non-decrease. Read
-                            // prior config from the metadata vertex.
-                            let metadata_addr =
-                                crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
-                            let mut prior_cfg: Option<crate::token_intrinsic::TokenConfiguration> =
-                                None;
-                            if let Ok(Some(blob)) = state.get(_address, &metadata_addr, &va_disc) {
-                                if let Ok(root) = quil_tries::deserialize_go_tree(&blob) {
-                                    let outer = quil_tries::VectorCommitmentTree { root };
-                                    if let Some(inner_blob) = outer.get(
-                                        &crate::token_intrinsic::materialize::TOKEN_CONFIG_OUTER_KEY,
-                                    ) {
-                                        if let Ok(inner_root) =
-                                            quil_tries::deserialize_go_tree(inner_blob)
-                                        {
-                                            let inner_tree =
-                                                quil_tries::VectorCommitmentTree { root: inner_root };
-                                            if let Ok(prior) =
+                        // Update gates: BLS signature on the
+                        // existing owner key, then behavior
+                        // parity + supply non-decrease. Read
+                        // prior config from the metadata vertex.
+                        let metadata_addr = crate::hypergraph_state::HYPERGRAPH_METADATA_ADDRESS;
+                        let mut prior_cfg: Option<crate::token_intrinsic::TokenConfiguration> =
+                            None;
+                        if let Ok(Some(blob)) = state.get(_address, &metadata_addr, &va_disc) {
+                            if let Ok(root) = quil_tries::deserialize_go_tree(&blob) {
+                                let outer = quil_tries::VectorCommitmentTree { root };
+                                if let Some(inner_blob) = outer.get(
+                                    &crate::token_intrinsic::materialize::TOKEN_CONFIG_OUTER_KEY,
+                                ) {
+                                    if let Ok(inner_root) =
+                                        quil_tries::deserialize_go_tree(inner_blob)
+                                    {
+                                        let inner_tree =
+                                            quil_tries::VectorCommitmentTree { root: inner_root };
+                                        if let Ok(prior) =
                                                 crate::token_intrinsic::metadata_schema::decode_token_config_from_tree(&inner_tree)
                                             {
                                                 prior_cfg = Some(prior);
                                             }
-                                        }
                                     }
                                 }
                             }
+                        }
 
-                            // BLS owner-key signature gate. Mirrors
-                            // Go's `TokenIntrinsic.Deploy` update
-                            // branch at `token_intrinsic.go:145-154`.
-                            // The signed message is the canonical-bytes
-                            // encoding of the TokenUpdate with its
-                            // signature field cleared, domain
-                            // `address || "TOKEN_UPDATE"`, followed from
-                            // the config replay frame by the digest of the
-                            // metadata vertex it replaces, so an update
-                            // applies once.
-                            let prior = prior_cfg.as_ref().ok_or_else(|| {
-                                QuilError::InvalidArgument(
-                                    "token update: prior config not found — \
+                        // BLS owner-key signature gate. Mirrors
+                        // Go's `TokenIntrinsic.Deploy` update
+                        // branch at `token_intrinsic.go:145-154`.
+                        // The signed message is the canonical-bytes
+                        // encoding of the TokenUpdate with its
+                        // signature field cleared, domain
+                        // `address || "TOKEN_UPDATE"`, followed from
+                        // the config replay frame by the digest of the
+                        // metadata vertex it replaces, so an update
+                        // applies once.
+                        let prior = prior_cfg.as_ref().ok_or_else(|| {
+                            QuilError::InvalidArgument(
+                                "token update: prior config not found — \
                                      cannot verify owner-key signature"
-                                        .into(),
-                                )
-                            })?;
-                            if prior.owner_public_key.is_empty() {
-                                return Err(QuilError::InvalidArgument(
-                                    "token update: prior config has empty owner_public_key".into(),
-                                ));
-                            }
-                            // Re-encode the update with the signature
-                            // field cleared to recover the signed
-                            // message bytes.
-                            let mut without_sig = update.clone();
-                            without_sig.public_key_signature_bls48581 = Vec::new();
-                            let signed_message = without_sig.to_canonical_bytes()?;
-                            // Post-quantum owner auth: a single FALCON signature
-                            // (no aggregation envelope — the field carries the
-                            // Falcon sig bytes directly now).
-                            if update.public_key_signature_bls48581.is_empty() {
-                                return Err(QuilError::InvalidArgument(
-                                    "token update: missing signature".into(),
-                                ));
-                            }
-                            let guarded = crate::config_replay::config_replay_guarded(context);
-                            let binding = if guarded {
-                                crate::config_replay::stored_binding(state, _address)?
-                            } else {
-                                None
-                            };
-                            let domain = crate::config_replay::update_signing_domain(
-                                _address,
-                                crate::config_replay::TOKEN_UPDATE_TAG,
-                                binding.as_deref(),
-                            );
-                            let ok = self.key_manager.validate_signature(
-                                quil_types::crypto::KeyType::Falcon512,
-                                &prior.owner_public_key,
-                                &signed_message,
-                                &update.public_key_signature_bls48581,
-                                &domain,
-                            )?;
-                            if !ok {
-                                return Err(QuilError::InvalidArgument(
-                                    "token update: signature does not verify against \
+                                    .into(),
+                            )
+                        })?;
+                        if prior.owner_public_key.is_empty() {
+                            return Err(QuilError::InvalidArgument(
+                                "token update: prior config has empty owner_public_key".into(),
+                            ));
+                        }
+                        // Re-encode the update with the signature
+                        // field cleared to recover the signed
+                        // message bytes.
+                        let mut without_sig = update.clone();
+                        without_sig.public_key_signature_bls48581 = Vec::new();
+                        let signed_message = without_sig.to_canonical_bytes()?;
+                        // Post-quantum owner auth: a single FALCON signature
+                        // (no aggregation envelope — the field carries the
+                        // Falcon sig bytes directly now).
+                        if update.public_key_signature_bls48581.is_empty() {
+                            return Err(QuilError::InvalidArgument(
+                                "token update: missing signature".into(),
+                            ));
+                        }
+                        let guarded = crate::config_replay::config_replay_guarded(context);
+                        let binding = if guarded {
+                            crate::config_replay::stored_binding(state, _address)?
+                        } else {
+                            None
+                        };
+                        let domain = crate::config_replay::update_signing_domain(
+                            _address,
+                            crate::config_replay::TOKEN_UPDATE_TAG,
+                            binding.as_deref(),
+                        );
+                        let ok = self.key_manager.validate_signature(
+                            quil_types::crypto::KeyType::Falcon512,
+                            &prior.owner_public_key,
+                            &signed_message,
+                            &update.public_key_signature_bls48581,
+                            &domain,
+                        )?;
+                        if !ok {
+                            return Err(QuilError::InvalidArgument(
+                                "token update: signature does not verify against \
                                      prior config's owner public key"
-                                        .into(),
-                                ));
-                            }
-                            if prior.behavior != new_cfg.behavior {
+                                    .into(),
+                            ));
+                        }
+                        if prior.behavior != new_cfg.behavior {
+                            return Err(QuilError::InvalidArgument(
+                                "token update: behavior cannot be updated".into(),
+                            ));
+                        }
+                        // Supply non-decrease (compare big-endian unsigned).
+                        if !prior.supply.is_empty() && !new_cfg.supply.is_empty() {
+                            use num_bigint::BigUint;
+                            let prior_sup = BigUint::from_bytes_be(&prior.supply);
+                            let new_sup = BigUint::from_bytes_be(&new_cfg.supply);
+                            if new_sup < prior_sup {
                                 return Err(QuilError::InvalidArgument(
-                                    "token update: behavior cannot be updated".into(),
+                                    "token update: supply cannot be reduced".into(),
                                 ));
-                            }
-                            // Supply non-decrease (compare big-endian unsigned).
-                            if !prior.supply.is_empty() && !new_cfg.supply.is_empty() {
-                                use num_bigint::BigUint;
-                                let prior_sup = BigUint::from_bytes_be(&prior.supply);
-                                let new_sup = BigUint::from_bytes_be(&new_cfg.supply);
-                                if new_sup < prior_sup {
-                                    return Err(QuilError::InvalidArgument(
-                                        "token update: supply cannot be reduced".into(),
-                                    ));
-                                }
-                            }
-
-                            check_post_quantum_token_config(&new_cfg)?;
-                            crate::token_intrinsic::materialize::materialize_token_deploy(
-                                state,
-                                _address,
-                                &new_cfg,
-                                _frame_number,
-                                self.inclusion_prover.as_ref(),
-                            )?;
-                            if guarded {
-                                crate::config_replay::advance_update_sequence(
-                                    state,
-                                    _address,
-                                    _frame_number,
-                                )?;
                             }
                         }
-                        self.config_resolver.invalidate(_address);
+
+                        check_post_quantum_token_config(&new_cfg)?;
+                        crate::token_intrinsic::materialize::materialize_token_deploy(
+                            state,
+                            _address,
+                            &new_cfg,
+                            _frame_number,
+                            self.inclusion_prover.as_ref(),
+                        )?;
+                        if guarded {
+                            crate::config_replay::advance_update_sequence(
+                                state,
+                                _address,
+                                _frame_number,
+                            )?;
+                        }
                     }
+                    self.config_resolver.invalidate(_address);
                 }
                 _ => {}
             }
@@ -2248,11 +2259,9 @@ impl ShardExecutionEngine for ComputeExecutionEngine {
         match tp {
             TYPE_MESSAGE_BUNDLE => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        if crate::compute_engine::is_compute_type_prefix(r.inner_type_prefix) {
-                            crate::compute_engine::peek_compute_message_kind(&r.inner_bytes)?;
-                        }
+                for r in bundle.requests.iter().flatten() {
+                    if crate::compute_engine::is_compute_type_prefix(r.inner_type_prefix) {
+                        crate::compute_engine::peek_compute_message_kind(&r.inner_bytes)?;
                     }
                 }
                 Ok(())
@@ -2334,6 +2343,13 @@ impl ComputeExecutionEngine {
                     let dep = crate::compute_intrinsic::CodeDeployment::from_canonical_bytes(
                         inner_bytes,
                     )?;
+                    if crate::compute_domain::compute_domain_guarded(context) {
+                        crate::compute_intrinsic::intrinsic::check_op_domain(
+                            "code deploy",
+                            &dep.domain,
+                            address,
+                        )?;
+                    }
                     let _ = crate::compute_intrinsic::intrinsic::verify_code_deployment(
                         cc,
                         &dep.circuit,
@@ -2349,6 +2365,13 @@ impl ComputeExecutionEngine {
                 crate::compute_intrinsic::TYPE_CODE_EXECUTE => {
                     let ex =
                         crate::compute_intrinsic::CodeExecute::from_canonical_bytes(inner_bytes)?;
+                    if crate::compute_domain::compute_domain_guarded(context) {
+                        crate::compute_intrinsic::intrinsic::check_op_domain(
+                            "code execute",
+                            &ex.domain,
+                            address,
+                        )?;
+                    }
                     let ok = crate::compute_intrinsic::intrinsic::verify_code_execute(&ex)?;
                     if !ok {
                         return Err(QuilError::InvalidArgument(
@@ -2557,10 +2580,8 @@ impl ComputeExecutionEngine {
         match tp {
             TYPE_MESSAGE_BUNDLE => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        invoke_compute(&r.inner_bytes, r.inner_type_prefix)?;
-                    }
+                for r in bundle.requests.iter().flatten() {
+                    invoke_compute(&r.inner_bytes, r.inner_type_prefix)?;
                 }
                 Ok(ProcessMessageResult {
                     messages: Vec::new(),
@@ -2811,9 +2832,9 @@ impl HypergraphExecutionEngine {
     /// and Ed448-verify the op's signature. Behavior by resolver state:
     ///
     /// - `None` (no resolver configured): logs a warning and accepts.
-    /// Existing system-shard gate is still enforced upstream.
+    ///   Existing system-shard gate is still enforced upstream.
     /// - `Some` but `write_public_key(domain) == None`: rejects.
-    /// An op against an undeployed hypergraph is always invalid.
+    ///   An op against an undeployed hypergraph is always invalid.
     /// - `Some` and key resolves: rejects on signature mismatch.
     fn verify_op_authority(&self, msg: &hg_dispatch::DispatchedMessage) -> Result<()> {
         use crate::hypergraph_intrinsic::auth::{verify_op_signature, OpForAuth};
@@ -3134,10 +3155,8 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
         match kind {
             crate::hypergraph_engine::MessageKindTopLevel::Bundle => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        self.validate_inner_op(address, r.inner_type_prefix, &r.inner_bytes, None)?;
-                    }
+                for r in bundle.requests.iter().flatten() {
+                    self.validate_inner_op(address, r.inner_type_prefix, &r.inner_bytes, None)?;
                 }
                 Ok(())
             }
@@ -3210,15 +3229,13 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
             match kind {
                 crate::hypergraph_engine::MessageKindTopLevel::Bundle => {
                     let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
-                    for req in &bundle.requests {
-                        if let Some(r) = req {
-                            self.process_inner_op(
-                                context,
-                                address,
-                                r.inner_type_prefix,
-                                &r.inner_bytes,
-                            )?;
-                        }
+                    for r in bundle.requests.iter().flatten() {
+                        self.process_inner_op(
+                            context,
+                            address,
+                            r.inner_type_prefix,
+                            &r.inner_bytes,
+                        )?;
                     }
                 }
                 crate::hypergraph_engine::MessageKindTopLevel::Request => {
@@ -3287,14 +3304,11 @@ impl ShardExecutionEngine for HypergraphExecutionEngine {
             Ok(crate::hypergraph_engine::MessageKindTopLevel::Bundle) => {
                 let bundle = CanonicalMessageBundle::from_canonical_bytes(message)?;
                 let mut all_addrs = Vec::new();
-                for req in &bundle.requests {
-                    if let Some(r) = req {
-                        if crate::hypergraph_engine::is_hypergraph_type_prefix(r.inner_type_prefix)
-                        {
-                            if let Ok(msg) = hg_dispatch::decode_message(&r.inner_bytes) {
-                                let (_, writes) = msg.lock_addresses()?;
-                                all_addrs.extend(writes);
-                            }
+                for r in bundle.requests.iter().flatten() {
+                    if crate::hypergraph_engine::is_hypergraph_type_prefix(r.inner_type_prefix) {
+                        if let Ok(msg) = hg_dispatch::decode_message(&r.inner_bytes) {
+                            let (_, writes) = msg.lock_addresses()?;
+                            all_addrs.extend(writes);
                         }
                     }
                 }
@@ -4124,6 +4138,395 @@ mod tests {
             .unwrap();
         assert!(r.messages.is_empty());
         assert!(r.state.is_empty());
+    }
+
+    // =================================================================
+    // Compute ops write only into the application they are routed to
+    // =================================================================
+
+    /// A compiler that accepts every circuit, so a CodeDeployment reaches
+    /// its domain checks and materialization.
+    struct AcceptingCompiler;
+
+    impl quil_types::execution::CircuitCompiler for AcceptingCompiler {
+        fn compile(&self, _: &str, _: &[Vec<i32>]) -> Result<Vec<u8>> {
+            Ok(vec![0xAA; 16])
+        }
+        fn validate_circuit(&self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    const APP_A: [u8; 32] = [0x11; 32];
+    const APP_B: [u8; 32] = [0x22; 32];
+
+    fn compute_crdt() -> Arc<quil_hypergraph::HypergraphCrdt> {
+        Arc::new(quil_hypergraph::HypergraphCrdt::new(
+            Arc::new(quil_hypergraph::testing::MemStore::new()),
+            Arc::new(quil_types::crypto::NoopInclusionProver),
+        ))
+    }
+
+    fn compute_engine_on(crdt: &Arc<quil_hypergraph::HypergraphCrdt>) -> ComputeExecutionEngine {
+        let stubs = crate::testing::NoopExecutionCrypto::new();
+        ComputeExecutionEngine::new_with_state(
+            ExecutionMode::Application,
+            crdt.clone(),
+            stubs.key_manager,
+            Arc::new(AcceptingCompiler),
+        )
+    }
+
+    /// A one-request bundle carrying `inner` (canonical bytes with prefix).
+    fn compute_bundle(inner: Vec<u8>) -> Vec<u8> {
+        compute_bundle_of(vec![inner])
+    }
+
+    /// A bundle carrying each of `inners` as a request, in order.
+    fn compute_bundle_of(inners: Vec<Vec<u8>>) -> Vec<u8> {
+        CanonicalMessageBundle {
+            requests: inners
+                .into_iter()
+                .map(|inner| {
+                    Some(CanonicalMessageRequest {
+                        inner_type_prefix: u32::from_be_bytes(inner[..4].try_into().unwrap()),
+                        inner_bytes: inner,
+                    })
+                })
+                .collect(),
+            timestamp: 0,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// Run `message` routed to `route` through the engine and say what it did.
+    fn route_compute(
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+        route: &[u8; 32],
+        message: &[u8],
+    ) -> Result<ProcessMessageResult> {
+        route_compute_in(crdt, Placement::Bare(7), route, message)
+    }
+
+    /// The frame a compute op executes in, with the context production
+    /// passes for it.
+    #[derive(Clone, Copy, Debug)]
+    enum Placement {
+        /// GLOBAL frame `n`: the GLOBAL materializer passes `n - 1` as its
+        /// finalized GLOBAL frame, in the global venue.
+        Global(u64),
+        /// An application shard's frame `frame`, anchored at GLOBAL frame
+        /// `anchor`, in the application venue.
+        Shard { frame: u64, anchor: u64 },
+        /// A context naming no GLOBAL frame (an unanchored application frame,
+        /// a direct `process_message`), judged by its own number.
+        Bare(u64),
+    }
+
+    impl Placement {
+        fn context(self) -> quil_types::execution::FrameExecutionContext {
+            use quil_types::execution::Venue;
+            let (frame_number, finalized_global_frame, venue) = match self {
+                Placement::Global(n) => (n, n.checked_sub(1), Some(Venue::Global)),
+                Placement::Shard { frame, anchor } => {
+                    (frame, Some(anchor), Some(Venue::Application))
+                }
+                Placement::Bare(n) => (n, None, None),
+            };
+            quil_types::execution::FrameExecutionContext {
+                frame_number,
+                finalized_global_frame,
+                venue,
+                shard: quil_types::execution::ShardPath::WHOLE,
+            }
+        }
+    }
+
+    /// As [`route_compute`], in the frame `placement` names.
+    fn route_compute_in(
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+        placement: Placement,
+        route: &[u8; 32],
+        message: &[u8],
+    ) -> Result<ProcessMessageResult> {
+        let result = compute_engine_on(crdt).process_message_with_context(
+            placement.context(),
+            &BigInt::from(0),
+            route,
+            message,
+        );
+        println!(
+            "REACH compute op routed to {} in {placement:?} processed: {}",
+            hex::encode(&route[..4]),
+            match &result {
+                Ok(_) => "admitted".to_string(),
+                Err(e) => format!("refused ({e})"),
+            }
+        );
+        result
+    }
+
+    fn vertex_at(
+        crdt: &Arc<quil_hypergraph::HypergraphCrdt>,
+        domain: &[u8; 32],
+        address: &[u8; 32],
+    ) -> Option<Vec<u8>> {
+        let disc = crate::hypergraph_state::vertex_adds_discriminator().unwrap();
+        crate::hypergraph_state::HypergraphState::new(crdt.clone())
+            .get(domain, address, &disc)
+            .unwrap()
+    }
+
+    /// A free (zero-payer) CodeExecute naming `domain`, writing `rendezvous`.
+    fn free_execute(domain: [u8; 32], rendezvous: [u8; 32], identifier: &[u8]) -> Vec<u8> {
+        use crate::compute_intrinsic::intrinsic::EXECUTION_CONTEXT_HYPERGRAPH;
+        use crate::compute_intrinsic::{Application, CodeExecute, ExecuteOperation};
+        let operation = ExecuteOperation {
+            application: Application {
+                address: domain.to_vec(),
+                execution_context: EXECUTION_CONTEXT_HYPERGRAPH,
+            }
+            .to_canonical_bytes()
+            .unwrap(),
+            identifier: identifier.to_vec(),
+            dependencies: Vec::new(),
+        }
+        .to_canonical_bytes()
+        .unwrap();
+        CodeExecute {
+            proof_of_payment: vec![vec![0u8; 57]],
+            domain,
+            rendezvous,
+            execute_operations: vec![operation],
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    fn code_deploy(domain: [u8; 32], circuit: &[u8]) -> Vec<u8> {
+        crate::compute_intrinsic::CodeDeployment {
+            circuit: circuit.to_vec(),
+            input_types: Vec::new(),
+            output_types: Vec::new(),
+            domain,
+        }
+        .to_canonical_bytes()
+        .unwrap()
+    }
+
+    /// A free CodeExecute routed to application A may not overwrite a vertex
+    /// of application B: the op's domain must be the routing domain.
+    #[test]
+    fn compute_code_execute_refuses_a_domain_other_than_its_route() {
+        let crdt = compute_crdt();
+        // B's own vertex, written by an op routed to B (the control: an op
+        // naming its routing domain executes).
+        let victim_address = [0x33; 32];
+        let victim = compute_bundle(free_execute(APP_B, victim_address, b"owner"));
+        route_compute(&crdt, &APP_B, &victim).unwrap();
+        let before = vertex_at(&crdt, &APP_B, &victim_address);
+        assert!(before.is_some());
+
+        let foreign = compute_bundle(free_execute(APP_B, victim_address, b"intruder"));
+        let result = route_compute(&crdt, &APP_A, &foreign);
+        assert_eq!(
+            vertex_at(&crdt, &APP_B, &victim_address),
+            before,
+            "foreign domain written: a bundle routed to A overwrote B's vertex"
+        );
+        assert!(result.is_err(), "foreign domain admitted: {result:?}");
+    }
+
+    /// A bundle routed to A whose first op names A and whose second names B
+    /// fails as a whole: neither op's vertex is written, so a foreign op
+    /// cannot ride behind an op of the application it is routed to, and the
+    /// refusal leaves no partial write behind.
+    #[test]
+    fn compute_bundle_with_a_foreign_op_writes_none_of_its_ops() {
+        let own_address = [0x55; 32];
+        let foreign_address = [0x66; 32];
+        let own = free_execute(APP_A, own_address, b"owner");
+
+        // Control: the first op alone is written.
+        let alone = compute_crdt();
+        route_compute(&alone, &APP_A, &compute_bundle(own.clone())).unwrap();
+        assert!(vertex_at(&alone, &APP_A, &own_address).is_some());
+
+        let crdt = compute_crdt();
+        let mixed = compute_bundle_of(vec![own, free_execute(APP_B, foreign_address, b"intruder")]);
+        let result = route_compute(&crdt, &APP_A, &mixed);
+        assert!(
+            vertex_at(&crdt, &APP_B, &foreign_address).is_none(),
+            "mixed bundle wrote its foreign op"
+        );
+        assert!(result.is_err(), "mixed bundle admitted: {result:?}");
+        assert!(
+            vertex_at(&crdt, &APP_A, &own_address).is_none(),
+            "mixed bundle kept its own-domain op"
+        );
+    }
+
+    /// A CodeDeployment may not write into GLOBAL (routed to the compute base
+    /// domain, as a bundle opening with a ComputeDeploy is) nor into an
+    /// application it is not routed to.
+    #[test]
+    fn compute_code_deploy_refuses_global_and_foreign_domains() {
+        let crdt = compute_crdt();
+        let circuit = b"circuit".to_vec();
+        let at = |domain: &[u8; 32]| {
+            crate::compute_intrinsic::intrinsic::code_deployment_address(domain, &circuit).unwrap()
+        };
+
+        // Control: a deployment into its own application is written.
+        route_compute(&crdt, &APP_A, &compute_bundle(code_deploy(APP_A, &circuit))).unwrap();
+        assert!(vertex_at(&crdt, &APP_A, &at(&APP_A)).is_some());
+
+        let global = route_compute(
+            &crdt,
+            &domains::COMPUTE,
+            &compute_bundle(code_deploy(domains::GLOBAL, &circuit)),
+        );
+        assert!(
+            vertex_at(&crdt, &domains::GLOBAL, &at(&domains::GLOBAL)).is_none(),
+            "deploy into global written"
+        );
+        assert!(global.is_err(), "deploy into global admitted: {global:?}");
+
+        let foreign = route_compute(&crdt, &APP_A, &compute_bundle(code_deploy(APP_B, &circuit)));
+        assert!(
+            vertex_at(&crdt, &APP_B, &at(&APP_B)).is_none(),
+            "foreign deploy written"
+        );
+        assert!(foreign.is_err(), "foreign deploy admitted: {foreign:?}");
+    }
+
+    /// A CodeDeployment routed to the compute base domain may not write into
+    /// that system-managed domain itself.
+    #[test]
+    fn compute_code_deploy_refuses_the_compute_base_domain() {
+        let crdt = compute_crdt();
+        let circuit = b"circuit".to_vec();
+        let result = route_compute(
+            &crdt,
+            &domains::COMPUTE,
+            &compute_bundle(code_deploy(domains::COMPUTE, &circuit)),
+        );
+        let at = crate::compute_intrinsic::intrinsic::code_deployment_address(
+            &domains::COMPUTE,
+            &circuit,
+        )
+        .unwrap();
+        assert!(
+            vertex_at(&crdt, &domains::COMPUTE, &at).is_none(),
+            "compute base deploy written"
+        );
+        assert!(result.is_err(), "compute base deploy admitted: {result:?}");
+    }
+
+    /// The GLOBAL frame the domain frame tests pin through the test-network
+    /// setting; nextest runs each test in its own process.
+    const DOMAIN_FRAME: u64 = 100;
+
+    fn pin_domain_frame() {
+        std::env::set_var("QUIL_COMPUTE_DOMAIN_FRAME", DOMAIN_FRAME.to_string());
+    }
+
+    /// On a fresh state, whether a free CodeExecute routed to A naming B and
+    /// a CodeDeployment into GLOBAL routed to the compute base domain each
+    /// wrote its vertex, in the frame `placement` names.
+    fn cross_domain_writes(placement: Placement) -> [bool; 2] {
+        let crdt = compute_crdt();
+        let rendezvous = [0x44; 32];
+        let execute = compute_bundle(free_execute(APP_B, rendezvous, b"intruder"));
+        let executed = route_compute_in(&crdt, placement, &APP_A, &execute);
+        let circuit = b"circuit".to_vec();
+        let deploy = compute_bundle(code_deploy(domains::GLOBAL, &circuit));
+        let deployed = route_compute_in(&crdt, placement, &domains::COMPUTE, &deploy);
+        let at = crate::compute_intrinsic::intrinsic::code_deployment_address(
+            &domains::GLOBAL,
+            &circuit,
+        )
+        .unwrap();
+        let written = [
+            vertex_at(&crdt, &APP_B, &rendezvous).is_some(),
+            vertex_at(&crdt, &domains::GLOBAL, &at).is_some(),
+        ];
+        assert_eq!(
+            written,
+            [executed.is_ok(), deployed.is_ok()],
+            "an op wrote only if admitted: {executed:?} {deployed:?}"
+        );
+        written
+    }
+
+    /// Before the domain frame a cross-domain compute op executes as older
+    /// builds execute it, so replayed history and a mixed network agree.
+    /// GLOBAL frame `DOMAIN_FRAME` is judged by the frame before it, and an
+    /// application shard's frame by its GLOBAL anchor, whatever its own
+    /// number.
+    #[test]
+    fn compute_cross_domain_ops_run_before_the_domain_frame() {
+        pin_domain_frame();
+        for placement in [
+            Placement::Global(2),
+            Placement::Global(DOMAIN_FRAME),
+            Placement::Shard {
+                frame: DOMAIN_FRAME + 400,
+                anchor: DOMAIN_FRAME - 1,
+            },
+            Placement::Bare(DOMAIN_FRAME - 1),
+        ] {
+            assert_eq!(
+                cross_domain_writes(placement),
+                [true, true],
+                "refused before the domain frame: {placement:?}"
+            );
+        }
+    }
+
+    /// At the domain frame both cross-domain ops are refused: by GLOBAL from
+    /// frame `DOMAIN_FRAME + 1` (judged by `DOMAIN_FRAME`), and in an
+    /// application shard's frame anchored at `DOMAIN_FRAME`.
+    #[test]
+    fn compute_cross_domain_ops_are_refused_at_the_domain_frame() {
+        pin_domain_frame();
+        for placement in [
+            Placement::Global(DOMAIN_FRAME + 1),
+            Placement::Shard {
+                frame: 5,
+                anchor: DOMAIN_FRAME,
+            },
+            Placement::Bare(DOMAIN_FRAME),
+        ] {
+            assert_eq!(
+                cross_domain_writes(placement),
+                [false, false],
+                "written at the domain frame: {placement:?}"
+            );
+        }
+    }
+
+    /// After the domain frame both cross-domain ops stay refused, whatever
+    /// an application frame's own number.
+    #[test]
+    fn compute_cross_domain_ops_are_refused_after_the_domain_frame() {
+        pin_domain_frame();
+        for placement in [
+            Placement::Global(DOMAIN_FRAME + 2),
+            Placement::Global(1_000_000),
+            Placement::Shard {
+                frame: 5,
+                anchor: DOMAIN_FRAME + 1,
+            },
+            Placement::Bare(DOMAIN_FRAME + 1),
+        ] {
+            assert_eq!(
+                cross_domain_writes(placement),
+                [false, false],
+                "written after the domain frame: {placement:?}"
+            );
+        }
     }
 
     // =================================================================

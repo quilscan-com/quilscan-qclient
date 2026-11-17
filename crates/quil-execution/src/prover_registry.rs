@@ -8,23 +8,23 @@
 //!
 //! - `prover_cache: HashMap<Vec<u8>, ProverInfo>` — address → info
 //! - `filter_cache: HashMap<Vec<u8>, Vec<Vec<u8>>>` — confirmation
-//! filter → sorted list of prover addresses with an active
-//! allocation under that filter
+//!   filter → sorted list of prover addresses with an active
+//!   allocation under that filter
 //! - `address_to_filters: HashMap<Vec<u8>, Vec<Vec<u8>>>` — reverse
-//! index from prover address to the filters it's allocated under
+//!   index from prover address to the filters it's allocated under
 //!
 //! Differences from Go:
 //!
 //! 1. We don't yet implement the `RollingFrecencyCritbitTrie` that Go
-//! uses for `FindNearestAndApproximateNeighbors`. For now we store
-//! filter → sorted `Vec<Vec<u8>>` and do a linear scan. Fine up to
-//! ~10 K provers per filter.
+//!    uses for `FindNearestAndApproximateNeighbors`. For now we store
+//!    filter → sorted `Vec<Vec<u8>>` and do a linear scan. Fine up to
+//!    ~10 K provers per filter.
 //! 2. We iterate the persisted blob cache
-//! (a retained hypergraph-store snapshot), not a
-//! live hypergraph iterator.
+//!    (a retained hypergraph-store snapshot), not a
+//!    live hypergraph iterator.
 //! 3. No locking — the registry is rebuilt from scratch on each
-//! `refresh()` and is read-only after that. Concurrent readers can
-//! wrap in an `Arc<RwLock<_>>` at the call site if needed.
+//!    `refresh()` and is read-only after that. Concurrent readers can
+//!    wrap in an `Arc<RwLock<_>>` at the call site if needed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -269,6 +269,46 @@ impl InMemoryProverRegistry {
             .filter(|snapshot| snapshot.epoch == epoch)
     }
 
+    /// Cache `info` on its allocations' filters, as a refresh reading its
+    /// rows would, for tests outside this crate.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn insert_prover_for_tests(&mut self, info: ProverInfo) {
+        for alloc in &info.allocations {
+            let filter = alloc.confirmation_filter.clone();
+            let members = self.filter_cache.entry(filter).or_default();
+            if !members.contains(&info.address) {
+                members.push(info.address.clone());
+                members.sort();
+            }
+        }
+        self.prover_cache.insert(info.address.clone(), info);
+    }
+
+    /// Cache `member`'s storage seat slot on `filter`, for tests outside
+    /// this crate.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn insert_storage_seat_slot_for_tests(
+        &mut self,
+        member: &[u8],
+        filter: &[u8],
+        slot: quil_types::consensus::StorageSeatSlot,
+    ) {
+        let key = (member.to_vec(), filter.to_vec());
+        self.seat_cache.entry(key).or_default().push(slot);
+    }
+
+    /// Cache a storage snapshot GLOBAL recorded for `filter`, for tests
+    /// outside this crate.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn insert_storage_snapshot_for_tests(
+        &mut self,
+        filter: &[u8],
+        snapshot: quil_types::consensus::StorageSnapshotRoots,
+    ) {
+        let key = (filter.to_vec(), (snapshot.epoch % 4) as u8);
+        self.snapshot_cache.insert(key, snapshot);
+    }
+
     /// Total cached leaf-root epoch entries across all members (diagnostics).
     /// One registration contributes up to three entries; use
     /// `leaf_root_vertex_count` for the number of registration vertices.
@@ -440,7 +480,7 @@ impl InMemoryProverRegistry {
                 Ok(Some(r)) => r,
                 _ => continue,
             };
-            let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+            let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
                 self.unknown_vertex_count += 1;
                 continue;
             };
@@ -496,7 +536,7 @@ impl InMemoryProverRegistry {
                 Ok(Some(r)) => r,
                 _ => continue,
             };
-            let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+            let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
                 continue;
             };
             if type_hash != TYPE_HASH_ALLOCATION {
@@ -644,15 +684,9 @@ impl InMemoryProverRegistry {
     }
 
     fn storage_eligible(&self, member: &[u8], filter: &[u8], frame: u64) -> bool {
-        if filter.is_empty() || !quil_types::consensus::sealed_storage_required_at(frame) {
-            return true;
-        }
-        let slot = self.get_storage_seat_slot(
-            member,
-            filter,
-            quil_types::consensus::epoch_for_frame(frame),
-        );
-        quil_types::consensus::storage_seat_eligible(filter, frame, slot)
+        quil_types::consensus::storage_member_eligible(filter, frame, |epoch| {
+            self.get_storage_seat_slot(member, filter, epoch)
+        })
     }
 
     pub fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Vec<&ProverInfo> {
@@ -1477,14 +1511,14 @@ pub fn limit_evictions_to_shard_floor(
 /// - `Paused` → `Some(Paused)`
 /// - `Leaving` (within grace) → `Some(Leaving)`
 /// - `ExpiredLeaving` (leave attempt never confirmed/rejected) →
-/// `None` (excluded). The prover socially left the shard even
-/// though the LeaveConfirm never landed — they stopped proving
-/// when they submitted the Leave. Counting them as Active would
-/// inflate every shard's live coverage by the number of stuck
-/// leaves, which hides real halt-risk shards from the proposer
-/// and coverage monitor: a halt-risk shard (active ≤ 3) with 1+
-/// ExpiredLeaving allocations would otherwise be classified as ≥4
-/// active.
+///   `None` (excluded). The prover socially left the shard even
+///   though the LeaveConfirm never landed — they stopped proving
+///   when they submitted the Leave. Counting them as Active would
+///   inflate every shard's live coverage by the number of stuck
+///   leaves, which hides real halt-risk shards from the proposer
+///   and coverage monitor: a halt-risk shard (active ≤ 3) with 1+
+///   ExpiredLeaving allocations would otherwise be classified as ≥4
+///   active.
 /// - `ExpiredJoining`, `Rejected`, `Kicked` → `None` (excluded)
 /// - `Unknown` → `None`
 ///
@@ -2471,6 +2505,14 @@ impl SharedProverRegistry {
         let guard = self.inner.read().expect("prover registry lock poisoned");
         f(&guard)
     }
+
+    /// Edit the inner registry under a write lock, for tests outside this
+    /// crate that read a canonical registry over chosen rows.
+    #[cfg(any(test, feature = "testing-stubs"))]
+    pub fn write_for_tests<R>(&self, f: impl FnOnce(&mut InMemoryProverRegistry) -> R) -> R {
+        let mut guard = self.inner.write().expect("prover registry lock poisoned");
+        f(&mut guard)
+    }
 }
 
 impl Default for SharedProverRegistry {
@@ -3327,7 +3369,7 @@ impl CommittedProverScan {
                     Ok(Some(r)) => r,
                     _ => return,
                 };
-                let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+                let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
                     return;
                 };
                 if type_hash == crate::global_schema::type_hash_storage_seat() {
@@ -3543,20 +3585,22 @@ impl CommittedProverScan {
     }
 
     pub fn active_on_filter(&self, filter: &[u8], frame_number: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let epoch = quil_types::consensus::epoch_for_frame(frame_number);
+        // From the seal gate recovery epoch sealing gates rewards only, so an
+        // unsealed member is scheduled as a sealed one is.
+        let sealed_only = !filter.is_empty()
+            && quil_types::consensus::sealed_storage_required(epoch)
+            && !quil_types::consensus::seal_gate_rewards_only(epoch);
         let collect = |lenient: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
             let mut v: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             for (prover_ref, alloc) in &self.allocations {
                 if alloc.confirmation_filter != filter
                     || !committee_eligible(alloc, frame_number, lenient)
-                    || (!filter.is_empty()
-                        && quil_types::consensus::sealed_storage_required_at(frame_number)
+                    || (sealed_only
                         && !self
                             .seats
                             .get(&(prover_ref.clone(), filter.to_vec()))
-                            .is_some_and(|epochs| {
-                                epochs
-                                    .contains(&quil_types::consensus::epoch_for_frame(frame_number))
-                            }))
+                            .is_some_and(|epochs| epochs.contains(&epoch)))
                 {
                     continue;
                 }
@@ -3627,7 +3671,7 @@ pub fn all_provers_with_allocations_committed(
             Ok(Some(r)) => r,
             _ => return,
         };
-        let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+        let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
             return;
         };
         if type_hash == TYPE_HASH_ALLOCATION {
@@ -3692,7 +3736,7 @@ pub fn all_provers_with_active_allocations_committed(
             Ok(Some(r)) => r,
             _ => return,
         };
-        let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+        let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
             return;
         };
         if type_hash == TYPE_HASH_ALLOCATION {
@@ -3784,7 +3828,7 @@ pub fn allocation_status_breakdown(
             Ok(Some(r)) => r,
             _ => return,
         };
-        let Some(type_hash) = root.find_leaf_value(&vec![0xFFu8; 32]) else {
+        let Some(type_hash) = root.find_leaf_value(&[0xFFu8; 32]) else {
             return;
         };
         if type_hash != TYPE_HASH_ALLOCATION {
@@ -3933,10 +3977,7 @@ pub fn rebuild_vertex_tree_from_blob(blob: &[u8]) -> quil_tries::VectorCommitmen
 /// Serialize a `VectorCommitmentTree` to a blob for CRDT storage.
 /// Uses Go's `SerializeNonLazyTree` format for wire compatibility.
 pub fn vertex_tree_to_blob(tree: &quil_tries::VectorCommitmentTree) -> Vec<u8> {
-    match quil_tries::serialize_go_tree(tree.root.as_ref()) {
-        Ok(data) => data,
-        Err(_) => Vec::new(),
-    }
+    quil_tries::serialize_go_tree(tree.root.as_ref()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3979,7 +4020,7 @@ mod tests {
             &filter,
             &prefix,
             19,
-            &vec![0x11; 74],
+            &[0x11; 74],
             1234,
             900_000,
         )
@@ -4026,7 +4067,7 @@ mod tests {
                     &filter,
                     &prefix,
                     epoch,
-                    &vec![root_byte; 74],
+                    &[root_byte; 74],
                     8,
                     1000,
                 )
@@ -4280,7 +4321,7 @@ mod tests {
             &filter,
             &prefix,
             5,
-            &vec![0x22; 74],
+            &[0x22; 74],
             64,
             100,
         )
@@ -4320,7 +4361,7 @@ mod tests {
                 &filter,
                 &prefix,
                 epoch,
-                &vec![lr; 74],
+                &[lr; 74],
                 (epoch * 10) + 1,
                 1000,
             )
@@ -8003,7 +8044,7 @@ mod tests {
         seed_shard_floor(
             &store,
             &shard,
-            &vec![0x77u8; 64],
+            &[0x77u8; 64],
             quil_types::consensus::EVICTION_INACTIVITY_START_FRAME + 900,
             0xE0,
         );
@@ -8758,6 +8799,113 @@ mod tests {
             .get_ordered_provers(&[0; 32], &filter, boundary)
             .is_empty());
         assert!(scan.active_on_filter(&filter, boundary).is_empty());
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
+    }
+
+    /// From the seal gate recovery epoch sealing gates rewards only: a
+    /// shard's unsealed members are its committee, its leaders and its
+    /// scheduled members, whether or not GLOBAL recorded its snapshot or a
+    /// split parent's. Counting only sealed members once a snapshot was
+    /// recorded left a shard whose snapshot came after its members' renewal
+    /// grace with every member unsealed and no leader that would propose.
+    /// Before the recovery epoch only sealed members count. Epoch 2000 is
+    /// past the mainnet recovery epoch.
+    #[test]
+    fn unsealed_members_are_a_shards_committee_from_the_recovery_epoch() {
+        quil_types::consensus::set_sealed_storage_epoch_for_thread(Some(1467));
+        let epoch = 2000;
+        let frame = quil_types::consensus::epoch_start_frame(epoch) + 20;
+        let parent = [vec![0x72; 32], vec![0, 8]].concat();
+        let filter = [parent.clone(), vec![11]].concat();
+        let mut registry = InMemoryProverRegistry::new();
+        for id in 1..=3 {
+            let address = vec![id; 32];
+            let mut alloc = leaving_alloc(filter.clone(), epoch, 0, 0);
+            alloc.status = ProverStatus::Active;
+            registry.prover_cache.insert(
+                address.clone(),
+                ProverInfo {
+                    public_key: vec![id; 897],
+                    address: address.clone(),
+                    status: ProverStatus::Active,
+                    kick_frame_number: 0,
+                    allocations: vec![alloc],
+                    available_storage: 0,
+                    seniority: 0,
+                    delegate_address: vec![],
+                },
+            );
+            registry
+                .filter_cache
+                .entry(filter.clone())
+                .or_default()
+                .push(address);
+        }
+        let scan = CommittedProverScan::from_parts(
+            registry
+                .prover_cache
+                .iter()
+                .map(|(a, p)| (a.clone(), p.public_key.clone()))
+                .collect(),
+            registry
+                .prover_cache
+                .iter()
+                .map(|(a, p)| (a.clone(), p.allocations[0].clone()))
+                .collect(),
+        );
+        let recorded = |filter: &[u8]| {
+            (
+                (filter.to_vec(), (epoch % 4) as u8),
+                quil_types::consensus::StorageSnapshotRoots {
+                    epoch,
+                    frame: 90,
+                    anchor: frame - 700,
+                    roots: [[4; 32]; 4],
+                },
+            )
+        };
+        for (shard, why) in [
+            (None, "no snapshot"),
+            (Some(&filter), "its own snapshot"),
+            (Some(&parent), "its split parent's snapshot"),
+        ] {
+            let key = shard.map(|shard| {
+                let (key, snapshot) = recorded(shard.as_slice());
+                registry.snapshot_cache.insert(key.clone(), snapshot);
+                key
+            });
+            assert_eq!(
+                registry.get_active_provers(&filter, frame).len(),
+                3,
+                "with {why} recorded no unsealed member counts, so no leader proposes and \
+                 the shard produces nothing in epoch {epoch}"
+            );
+            assert_eq!(
+                registry.get_ordered_provers(&[0; 32], &filter, frame).len(),
+                3,
+                "{why}: leader order"
+            );
+            assert_eq!(
+                scan.active_on_filter(&filter, frame).len(),
+                3,
+                "{why}: an unsealed member is not scheduled"
+            );
+            if let Some(key) = key {
+                registry.snapshot_cache.remove(&key);
+            }
+        }
+        let before = quil_types::consensus::epoch_start_frame(1470) + 20;
+        assert!(
+            registry.get_active_provers(&filter, before).is_empty(),
+            "before the recovery epoch an unsealed member does not count"
+        );
+        assert!(registry
+            .get_ordered_provers(&[0; 32], &filter, before)
+            .is_empty());
+        assert!(
+            scan.active_on_filter(&filter, before).is_empty(),
+            "before the recovery epoch an unsealed member is not scheduled"
+        );
         quil_types::consensus::set_sealed_storage_epoch_for_thread(None);
     }
 }

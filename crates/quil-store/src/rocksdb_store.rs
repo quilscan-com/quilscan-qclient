@@ -339,20 +339,38 @@ impl RocksDb {
     /// unless `QUIL_ROCKSDB_BLOCK_CACHE_MB` gives each store its own of that
     /// size, as before the shared cache.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_block_cache(path, None)
+        Self::open_with_block_cache(path, None, None)
     }
 
     /// [`Self::open`] for an archive's store, with its own block cache sized
     /// from memory ([`archive_block_cache_bytes`]).
     pub fn open_archive(path: &Path) -> Result<Self> {
-        Self::open_with_block_cache(path, Some(archive_block_cache_bytes()))
+        Self::open_with_block_cache(path, Some(archive_block_cache_bytes()), None)
+    }
+
+    /// [`Self::open`] for one of the node's stores, its disk writes counted
+    /// under `class` ([`crate::write_stats`]).
+    pub fn open_counted(path: &Path, class: crate::write_stats::StoreClass) -> Result<Self> {
+        Self::open_with_block_cache(path, None, Some(class))
+    }
+
+    /// [`Self::open_archive`], its disk writes counted under `class`.
+    pub fn open_archive_counted(
+        path: &Path,
+        class: crate::write_stats::StoreClass,
+    ) -> Result<Self> {
+        Self::open_with_block_cache(path, Some(archive_block_cache_bytes()), Some(class))
     }
 
     /// A store with its own block cache of `block_cache_bytes`, or the
     /// shared one (`None`); `QUIL_ROCKSDB_BLOCK_CACHE_MB` gives every store
-    /// its own of that size.
-    fn open_with_block_cache(path: &Path, block_cache_bytes: Option<usize>) -> Result<Self> {
-        let (opts, shared) = Self::store_options_for(block_cache_bytes);
+    /// its own of that size. Its writes are counted under `class`, if any.
+    fn open_with_block_cache(
+        path: &Path,
+        block_cache_bytes: Option<usize>,
+        class: Option<crate::write_stats::StoreClass>,
+    ) -> Result<Self> {
+        let (opts, shared) = Self::store_options_for(block_cache_bytes, class);
         let db = rocksdb::DB::open(&opts, path)
             .map_err(|e| QuilError::Store(format!("failed to open rocksdb: {}", e)))?;
 
@@ -371,13 +389,29 @@ impl RocksDb {
     /// open with them too.
     #[cfg(test)]
     pub(crate) fn store_options(block_cache_bytes: usize) -> rocksdb::Options {
-        Self::store_options_for(Some(block_cache_bytes)).0
+        Self::store_options_for(Some(block_cache_bytes), None).0
+    }
+
+    /// A store opened with `opts` as they are, without migrations: tests
+    /// that size its levels or count its writes.
+    #[cfg(test)]
+    pub(crate) fn open_with_options(path: &Path, opts: &rocksdb::Options) -> Result<Self> {
+        let db = rocksdb::DB::open(opts, path)
+            .map_err(|e| QuilError::Store(format!("failed to open rocksdb: {}", e)))?;
+        Ok(Self {
+            db: Self::coordinated(db),
+            shared_block_cache: false,
+        })
     }
 
     /// [`Self::store_options`], with the process's shared block cache for
-    /// `None`; and whether the cache is the shared one.
-    fn store_options_for(block_cache_bytes: Option<usize>) -> (rocksdb::Options, bool) {
-        let mut opts = rocksdb::Options::default();
+    /// `None`, counting writes under `class` if any; and whether the cache
+    /// is the shared one.
+    fn store_options_for(
+        block_cache_bytes: Option<usize>,
+        class: Option<crate::write_stats::StoreClass>,
+    ) -> (rocksdb::Options, bool) {
+        let mut opts = class.map_or_else(rocksdb::Options::default, |class| class.options());
         opts.create_if_missing(true);
 
         opts.set_write_buffer_size(64 * 1024 * 1024);
@@ -872,6 +906,25 @@ impl store::KvDb for RocksDb {
         self.make_iter(lower, upper)
     }
 
+    /// One seek of a bounded iterator, its key copied alone: the
+    /// [`RocksIterator`] of [`Self::new_iter`] copies every value in its
+    /// bounds first. The blocks it reads stay out of the block cache.
+    fn first_key_in(&self, lower: &[u8], upper: &[u8]) -> Result<Option<Vec<u8>>> {
+        if lower >= upper {
+            return Ok(None);
+        }
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_iterate_upper_bound(upper.to_vec());
+        options.fill_cache(false);
+        let mut iter = self.db.raw_iterator_opt(options);
+        iter.seek(lower);
+        if let Some(key) = iter.key() {
+            return Ok(Some(key.to_vec()));
+        }
+        iter.status().map_err(|e| QuilError::Store(e.to_string()))?;
+        Ok(None)
+    }
+
     fn compact(&self, start: &[u8], end: &[u8], _parallelize: bool) -> Result<()> {
         self.db.compact_range(Some(start), Some(end));
         Ok(())
@@ -1133,5 +1186,36 @@ impl store::Iterator for RocksIterator {
         }
         self.pos = self.entries.len() as i64 - 1;
         true
+    }
+}
+
+#[cfg(test)]
+mod first_key_tests {
+    use super::*;
+    use quil_types::store::KvDb;
+
+    /// A range's first key is its first live one: keys a range deletion
+    /// hides are stepped over, and a key at the range's end is past it.
+    #[test]
+    fn first_key_in_finds_the_first_live_key_within_its_bounds() {
+        let rocks = RocksDb::open_in_memory().unwrap();
+        let db: &dyn KvDb = &rocks;
+        for key in [b"a1", b"b1", b"b2", b"b3", b"c1"] {
+            db.set(key, &[7; 64]).unwrap();
+        }
+        db.delete_range(b"b1", b"b3").unwrap();
+        let first = |lower: &[u8], upper: &[u8]| db.first_key_in(lower, upper).unwrap();
+        assert_eq!(
+            first(b"b", b"c"),
+            Some(b"b3".to_vec()),
+            "PROBE-HIDDEN: the first key of b.. is b3, b1 and b2 deleted"
+        );
+        assert_eq!(
+            first(b"a2", b"b3"),
+            None,
+            "PROBE-BOUND: a2..b3 holds no live key; b3 is its end"
+        );
+        assert_eq!(first(b"a", b"z"), Some(b"a1".to_vec()));
+        assert_eq!(first(b"c", b"b"), None, "an empty range holds no key");
     }
 }

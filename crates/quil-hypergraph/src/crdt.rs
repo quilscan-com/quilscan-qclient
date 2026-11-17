@@ -7,14 +7,14 @@
 //!
 //! Two stores work together, and neither is a KZG trie:
 //! - **The forest** holds the *commitment* — each vertex's fields flattened
-//! into Level-3 leaves (`l3_leaf_key(id, field_key)`), so a branch commit is
-//! a hash, not a G1 multiexp. An empty value is a tombstone leaf keyed by the
-//! id (OR-set `removes` / add-side placeholder) so the phase root reflects
-//! removals.
+//!   into Level-3 leaves (`l3_leaf_key(id, field_key)`), so a branch commit is
+//!   a hash, not a G1 multiexp. An empty value is a tombstone leaf keyed by the
+//!   id (OR-set `removes` / add-side placeholder) so the phase root reflects
+//!   removals.
 //! - **The `HypergraphStore` KV keyspace** holds the per-vertex *blobs*
-//! (`save_vertex_underlying`/`load_vertex_underlying_raw`), keyed by id and
-//! RocksDB-prefix-scannable. Reads (`get_vertex_data`) and the PoRep /
-//! shard-info path navigation read from here — plain key-value, no trie.
+//!   (`save_vertex_underlying`/`load_vertex_underlying_raw`), keyed by id and
+//!   RocksDB-prefix-scannable. Reads (`get_vertex_data`) and the PoRep /
+//!   shard-info path navigation read from here — plain key-value, no trie.
 //!
 //! Mutations stage leaf deltas + blobs in memory; `commit` applies the deltas
 //! to the forest (JMT `put_value_set` is natively incremental) and persists the
@@ -234,6 +234,39 @@ pub const MAX_SYNC_CHUNK_LEAVES: usize = 1024;
 pub struct CommittedShardSnapshot {
     pub roots: [[u8; 32]; 4],
     pub records: Arc<dyn quil_types::store::SnapshotReadable>,
+}
+
+/// GLOBAL vertex reads at retained roots over one committed view
+/// ([`HypergraphCrdt::committed_global_view`]). Every read of one view sees
+/// the same commits; none waits for the commit lock.
+pub struct CommittedGlobalView(Arc<dyn quil_types::store::SnapshotReadable>);
+
+impl CommittedGlobalView {
+    /// The blob of the GLOBAL vertex at `data_address` in the tree whose root
+    /// is `root`: the read [`HypergraphCrdt::global_vertex_present_at_root`]
+    /// makes under the commit lock. A root this view does not index is
+    /// `ExecutionUnavailable`, as there.
+    pub fn vertex_blob_at_root(
+        &self,
+        root: &[u8; 32],
+        data_address: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>> {
+        let app = [0xff; 32];
+        let (version, _) = self
+            .0
+            .root_version("vertex", "adds", &app, root)?
+            .ok_or_else(|| {
+                QuilError::ExecutionUnavailable("historical global reward root unavailable".into())
+            })?;
+        let shard = ShardKey {
+            l1: [0; 3],
+            l2: app,
+        };
+        let mut vertex = app.to_vec();
+        vertex.extend_from_slice(data_address);
+        self.0
+            .vertex_underlying_at("vertex", "adds", &shard, &vertex, version)
+    }
 }
 
 /// An authenticated diff whose complete reconstruction was checked before
@@ -1393,7 +1426,7 @@ impl HypergraphCrdt {
     /// Commit one shard/phase tree's flattened L3 leaves, staging the forest node
     /// writes + the DB head-version into `txn`, and record the version (in-memory
     /// + DB) so version-exact reads address it. Returns the new 32-byte root.
-    /// `forest` is the caller's held read guard.
+    ///   `forest` is the caller's held read guard.
     ///
     /// The commit version is this TREE's own last version + 1 (0 for a first
     /// commit) — JMT builds an incremental commit on the root at `version - 1`,
@@ -5463,6 +5496,16 @@ impl HypergraphCrdt {
             .is_some())
     }
 
+    /// A committed view for GLOBAL vertex reads at retained roots, taken as
+    /// [`Self::capture_committed_snapshot`] takes it: once any capture has
+    /// returned (a node's periodic health read makes one), it waits for no
+    /// commit lock holder. A GLOBAL finalization holds that lock while it
+    /// executes a frame, minutes when the frame carries a large proof, and
+    /// a holder changes nothing readers see until it releases.
+    pub fn committed_global_view(&self) -> Result<CommittedGlobalView> {
+        Ok(CommittedGlobalView(self.capture_committed_snapshot()?))
+    }
+
     /// `(version, vertex key, blob)` of a GLOBAL vertex at a retained root. The
     /// caller holds the commit lock.
     fn global_vertex_blob_at_root(
@@ -7252,9 +7295,10 @@ mod size_index_tests {
         assert!(hg.world_size_at(299).is_some());
     }
 
-    /// A coin-shaped vertex whose data-address top bits route it to a shard: byte0
-    /// selects the top-of-tree bit-path (so `< 0x04` → shard `[0]`, `0x04` → `[1]`
-    /// in the binary grid the tests below use), the rest disambiguates the leaf.
+    /// A coin-shaped vertex whose data-address top bits route it to a shard.
+    /// The binary grid `[0]`/`[1]` the tests below use resolves to the one-bit
+    /// paths `0`/`1`, so byte0's top bit selects the shard (`< 0x80` → `[0]`,
+    /// `>= 0x80` → `[1]`); the rest disambiguates the leaf.
     fn at(app: [u8; 32], b0: u8, b1: u8, b2: u8) -> Location {
         Location {
             app_address: app,
@@ -7279,15 +7323,15 @@ mod size_index_tests {
         let app = [7u8; 32];
         let c = crdt();
         c.set_unified_tree(true);
-        // Binary split grid: shard `[0]` (top-6-bits 000000) and `[1]` (000001).
+        // Binary split grid: shard `[0]` (top address bit 0) and `[1]` (bit 1).
         c.set_app_shard_prefixes(app, vec![vec![0u32], vec![1u32]]);
-        // Three leaves under `[0]` (byte0 == 0x00) + one under `[1]` (byte0 0x04).
+        // Three leaves under `[0]` (byte0 0x00) + one under `[1]` (byte0 0x80).
         c.add_vertex(&at(app, 0x00, 0xFF, 0x11), b"coin-a").unwrap();
         c.add_vertex(&at(app, 0x00, 0xFE, 0x22), b"coin-bb")
             .unwrap();
         c.add_vertex(&at(app, 0x00, 0xF0, 0x33), b"coin-ccc")
             .unwrap();
-        c.add_vertex(&at(app, 0x04, 0xAB, 0x44), b"coin-dddd")
+        c.add_vertex(&at(app, 0x80, 0xAB, 0x44), b"coin-dddd")
             .unwrap();
         c.commit(1).unwrap();
 
@@ -7299,6 +7343,10 @@ mod size_index_tests {
         assert!(
             scan.values().any(|(cnt, _)| *cnt > 0),
             "precondition: scan found leaves (grid/version wired)"
+        );
+        assert!(
+            nonzero(&scan).len() >= 2,
+            "precondition: leaves populate both shards\nscan={scan:?}"
         );
         assert_eq!(
             forest, scan,
@@ -7320,7 +7368,7 @@ mod size_index_tests {
         c.set_unified_tree(true);
         c.set_app_shard_prefixes(app, vec![vec![0u32], vec![1u32]]);
         c.add_vertex(&at(app, 0x00, 0xFF, 0x11), b"coin-a").unwrap();
-        c.add_vertex(&at(app, 0x04, 0xAB, 0x44), b"coin-dddd")
+        c.add_vertex(&at(app, 0x80, 0xAB, 0x44), b"coin-dddd")
             .unwrap();
         // Add then remove a leaf under `[0]` — a spent coin, removed TWICE (the
         // second remove must not zero the tombstone's recorded size).
@@ -7331,9 +7379,9 @@ mod size_index_tests {
         // Remove an id that was never added — an empty add placeholder + tombstone.
         c.remove_vertex(&at(app, 0x00, 0x77, 0x77)).unwrap();
         // A live hyperedge and a removed one under `[1]`.
-        c.add_hyperedge(&at(app, 0x04, 0x01, 0x02), b"edge-live")
+        c.add_hyperedge(&at(app, 0x80, 0x01, 0x02), b"edge-live")
             .unwrap();
-        let dead_edge = at(app, 0x04, 0x03, 0x04);
+        let dead_edge = at(app, 0x80, 0x03, 0x04);
         c.add_hyperedge(&dead_edge, b"edge-dead-longer").unwrap();
         c.remove_hyperedge(&dead_edge).unwrap();
         c.commit(1).unwrap();
@@ -7343,6 +7391,10 @@ mod size_index_tests {
         let mut forest = HashMap::new();
         c.forest_app_buckets(&app, &mut forest).unwrap();
 
+        assert!(
+            nonzero(&scan).len() >= 2,
+            "precondition: leaves populate both shards\nscan={scan:?}"
+        );
         assert_eq!(
             forest, scan,
             "forest vs scan must agree under removes (spent, double-remove, \

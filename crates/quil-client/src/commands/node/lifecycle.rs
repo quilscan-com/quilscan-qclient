@@ -6,14 +6,18 @@
 
 use std::path::Path;
 
+use quil_config::release_source::{owner_and_mode, Stat};
+
+use crate::release_source::{self, ReleaseSource, ReleaseSourceArgs};
 use crate::{release, system};
 
 /// Take the exclusive lock at `path` (created 0600 if absent) until the
 /// returned file closes; fail at once if another run holds it. `node
-/// install` and `node update` hold [`system::update_lock_path`] while they
-/// change the node install, so auto-update runs (every 10 minutes) and
-/// manual runs never overlap.
-fn lock_node_updates(path: &Path) -> anyhow::Result<std::fs::File> {
+/// install`, `node update`, `node link`, `qclient update` and `node
+/// auto-update enable` naming a source hold [`system::update_lock_path`]
+/// while they change the install or its release source, so auto-update
+/// runs (every 10 minutes) and manual runs never overlap.
+pub(crate) fn lock_node_updates(path: &Path) -> anyhow::Result<std::fs::File> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| anyhow::anyhow!("create {}: {e} (root required)", dir.display()))?;
@@ -31,7 +35,8 @@ fn lock_node_updates(path: &Path) -> anyhow::Result<std::fs::File> {
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-            "another qclient node install or update is running (it holds {}); nothing done",
+            "another qclient install, update or release source change is running (it \
+             holds {}); nothing done",
             path.display()
         ),
         Err(std::fs::TryLockError::Error(e)) => {
@@ -40,14 +45,21 @@ fn lock_node_updates(path: &Path) -> anyhow::Result<std::fs::File> {
     }
 }
 
-/// `node install [version]` — download+verify+install the node binary, then
-/// install the system service. An older version than the linked one needs
-/// `allow_downgrade`.
-pub async fn install(version: Option<&str>, allow_downgrade: bool) -> anyhow::Result<()> {
+/// `node install [version]` — download+verify+install the node binary from
+/// the release source `source` names (else the stored or official one),
+/// then install the system service. An older version than the linked one
+/// needs `allow_downgrade`.
+pub async fn install(
+    version: Option<&str>,
+    allow_downgrade: bool,
+    source: &ReleaseSourceArgs,
+) -> anyhow::Result<()> {
+    let source = release_source::active(source)?;
     let _lock = lock_node_updates(&system::update_lock_path())?;
-    let version = resolve_version(version).await?;
+    let version = resolve_version(version, &source).await?;
     println!("Installing Quilibrium node {version}...");
     let installed = release::download_and_install(
+        &source,
         system::RELEASE_TYPE_NODE,
         &version,
         &system::default_node_symlink_path(),
@@ -60,37 +72,68 @@ pub async fn install(version: Option<&str>, allow_downgrade: bool) -> anyhow::Re
 }
 
 /// `node update [version] [--restart] [--allow-downgrade]` — install a newer
-/// node version and optionally restart the service. An older version than
-/// the linked one needs `allow_downgrade`.
+/// node version from the release source `source` names (else the stored or
+/// official one) and optionally restart the service if it runs; a stopped
+/// service stays stopped. An older version than the linked one needs
+/// `allow_downgrade`.
 pub async fn update(
     version: Option<&str>,
     restart: bool,
     allow_downgrade: bool,
+    source: &ReleaseSourceArgs,
 ) -> anyhow::Result<()> {
+    let source = release_source::active(source)?;
     let _lock = lock_node_updates(&system::update_lock_path())?;
-    let version = resolve_version(version).await?;
+    let version = resolve_version(version, &source).await?;
     println!("Updating Quilibrium node to {version}...");
     let installed = release::download_and_install(
+        &source,
         system::RELEASE_TYPE_NODE,
         &version,
         &system::default_node_symlink_path(),
         allow_downgrade,
     )
     .await?;
-    if !installed.fresh {
+    finish_update(installed.fresh, &installed.path, restart, &version)
+}
+
+/// What `node update` does once `version` is installed at `path`
+/// (`fresh`: by this run): with `restart`, restart the node service only
+/// if it runs ([`restart_after_update`]).
+fn finish_update(fresh: bool, path: &Path, restart: bool, version: &str) -> anyhow::Result<()> {
+    if !fresh {
         println!("Node {version} is already installed; nothing to update");
         return Ok(());
     }
-    println!("Updated node to {}", installed.path.display());
-    if restart {
-        super::service::run("restart")?;
+    println!("Updated node to {}", path.display());
+    let line = restart_after_update(restart, version, super::service::restart_if_running)?;
+    if let Some(line) = line {
+        println!("{line}");
     }
     Ok(())
 }
 
+/// The service step of `node update` after a fresh install: with
+/// `restart`, only `restart_if_running`
+/// ([`super::service::restart_if_running`]), so a stopped node stays
+/// stopped. Returns the line saying so when it did not run.
+fn restart_after_update(
+    restart: bool,
+    version: &str,
+    restart_if_running: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<Option<String>> {
+    if restart && !restart_if_running()? {
+        return Ok(Some(format!(
+            "The node service is not running; node {version} applies at its next start"
+        )));
+    }
+    Ok(None)
+}
+
 /// `node link [version]` — point `/usr/local/bin/quilibrium-node` at an
-/// installed version (latest if unspecified) whose release signatures
-/// verify.
+/// installed version (latest if unspecified) that the node's startup check
+/// starts: signed by the official signatories, or by the release source
+/// stored in its install root.
 pub fn link(version: Option<&str>) -> anyhow::Result<()> {
     let version = match version {
         Some(v) if !v.is_empty() && v != "latest" => v.to_string(),
@@ -98,20 +141,39 @@ pub fn link(version: Option<&str>) -> anyhow::Result<()> {
     };
     let base = release::release_filename(system::RELEASE_TYPE_NODE, &version)?;
     let bin_path = system::node_data_path().join(&version).join(&base);
+    let link = system::default_node_symlink_path();
+    link_startable(
+        &bin_path,
+        &version,
+        &link,
+        &system::update_lock_path(),
+        &owner_and_mode,
+    )?;
+    println!("Linked {} → {}", link.display(), bin_path.display());
+    Ok(())
+}
+
+/// Point `link` at the installed release `bin_path` (of `version`) only if
+/// the node's and qclient's startup check ([`release::check_starts`])
+/// starts it, reading its install root's stored release source with
+/// `stat`. Both run under the update lock at `lock`, so no install, update
+/// or source change runs between the check and the link: linked, a
+/// release the check refuses stops the node at its next start.
+fn link_startable(
+    bin_path: &Path,
+    version: &str,
+    link: &Path,
+    lock: &Path,
+    stat: Stat,
+) -> anyhow::Result<()> {
+    let _lock = lock_node_updates(lock)?;
     if !bin_path.exists() {
         anyhow::bail!("node binary not found: {}", bin_path.display());
     }
-    release::verify_installed(&bin_path).map_err(|e| {
-        anyhow::anyhow!(
-            "{} does not verify against its release signatures: {e}; reinstall it with \
-             'qclient node install {version}'",
-            bin_path.display()
-        )
+    release::check_starts(bin_path, stat).map_err(|e| {
+        anyhow::anyhow!("{e}; or reinstall it with 'qclient node install {version}'")
     })?;
-    let link = system::default_node_symlink_path();
-    release::switch_symlink(&bin_path, &link)?;
-    println!("Linked {} → {}", link.display(), bin_path.display());
-    Ok(())
+    release::switch_symlink(bin_path, link)
 }
 
 /// `node uninstall` — stop+remove the service and delete the node binaries +
@@ -132,16 +194,23 @@ const CRON_MARKER: &str = "# quilibrium-auto-update";
 
 /// `node auto-update [enable|disable|status]` — manage a cron job that runs
 /// `qclient node update --restart` every 10 minutes. The job lives in
-/// root's crontab, so each action needs root.
-pub fn auto_update(action: &str) -> anyhow::Result<()> {
-    let run: fn() -> anyhow::Result<()> = match action {
-        "enable" => cron_enable,
-        "disable" => cron_disable,
-        "status" => cron_status,
+/// root's crontab, so each action needs root. `enable` stores the release
+/// source `source` names for the job ([`release_source::store`]).
+pub fn auto_update(action: &str, source: &ReleaseSourceArgs) -> anyhow::Result<()> {
+    let named = source.named()?;
+    if named.is_some() && action != "enable" {
+        anyhow::bail!("--release-source is taken by 'auto-update enable' only");
+    }
+    match action {
+        "enable" | "disable" | "status" => {}
         other => anyhow::bail!("must specify 'enable', 'disable', or 'status' (got {other:?})"),
-    };
+    }
     require_root(action, system::is_root())?;
-    run()
+    match action {
+        "enable" => cron_enable(named),
+        "disable" => cron_disable(),
+        _ => cron_status(),
+    }
 }
 
 /// Fail unless `is_root`. The job installs node releases and restarts the
@@ -324,9 +393,28 @@ fn check_cron_target(_target: &Path, _install_root: &Path) -> anyhow::Result<()>
     anyhow::bail!("auto-update requires cron, which this platform lacks")
 }
 
-fn cron_enable() -> anyhow::Result<()> {
+/// Run `store` on the source `named` gives, under the update lock at
+/// `lock` when it names one: an install or update running meanwhile has
+/// checked its release against the stored source, and a change under it
+/// could leave it linking a release that no longer starts. Naming none
+/// only reads the stored source, so it runs beside the auto-update job.
+fn store_locked(
+    lock: &Path,
+    named: Option<ReleaseSource>,
+    store: impl FnOnce(Option<ReleaseSource>) -> anyhow::Result<ReleaseSource>,
+) -> anyhow::Result<ReleaseSource> {
+    let _lock = match named {
+        Some(_) => Some(lock_node_updates(lock)?),
+        None => None,
+    };
+    store(named)
+}
+
+fn cron_enable(named: Option<ReleaseSource>) -> anyhow::Result<()> {
     let current = current_crontab();
     let line = cron_line()?;
+    let source = store_locked(&system::update_lock_path(), named, release_source::store)?;
+    println!("Auto-update release source: {}", source.describe());
     if current.lines().any(|l| l == line) {
         println!("Auto-update is already enabled");
         return Ok(());
@@ -364,13 +452,15 @@ fn cron_status() -> anyhow::Result<()> {
     } else {
         println!("Auto-update is DISABLED");
     }
+    let source = release_source::resolve(None, release_source::load_stored)?;
+    println!("Release source: {}", source.describe());
     Ok(())
 }
 
-async fn resolve_version(version: Option<&str>) -> anyhow::Result<String> {
+async fn resolve_version(version: Option<&str>, source: &ReleaseSource) -> anyhow::Result<String> {
     match version {
         Some(v) if !v.is_empty() => Ok(v.to_string()),
-        _ => release::get_latest_version(system::RELEASE_TYPE_NODE).await,
+        _ => release::get_latest_version(source, system::RELEASE_TYPE_NODE).await,
     }
 }
 
@@ -407,6 +497,71 @@ mod tests {
             );
         }
         require_root("enable", true).unwrap();
+    }
+
+    /// `node update --restart` (auto-update's command) goes through the
+    /// running check after a fresh install, never an unconditional
+    /// restart, which starts a node its operator stopped; without
+    /// `--restart` it does not touch the service.
+    #[test]
+    fn update_restart_goes_through_the_running_check() {
+        let mut checked = 0;
+        let stopped = restart_after_update(true, "2.1.0.26", || {
+            checked += 1;
+            Ok(false)
+        });
+        let line = "The node service is not running; node 2.1.0.26 applies at its next start";
+        assert!(
+            checked == 1 && matches!(&stopped, Ok(Some(l)) if l == line),
+            "update_restart_skips_running_check: checked {checked}, {stopped:?}"
+        );
+        assert_eq!(
+            restart_after_update(true, "2.1.0.26", || Ok(true)).unwrap(),
+            None
+        );
+        let untouched = restart_after_update(false, "2.1.0.26", || panic!("service_touched"));
+        assert_eq!(untouched.unwrap(), None);
+    }
+
+    /// `node update --restart` on a stopped node runs the service state
+    /// query alone, through the service manager itself (a `sudo` on PATH
+    /// that logs its arguments and answers "stopped"): an unconditional
+    /// restart there would start a node its operator stopped.
+    #[cfg(unix)]
+    #[test]
+    fn update_restart_leaves_a_stopped_node_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+        // Beside the test binary, which runs from there: a temporary
+        // directory may be mounted without exec.
+        let exe = std::env::current_exe().unwrap();
+        let tmp = tempfile::TempDir::new_in(exe.parent().unwrap()).unwrap();
+        let log = tmp.path().join("sudo.log");
+        let sudo = tmp.path().join("sudo");
+        std::fs::write(
+            &sudo,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1 $2\" in\n\
+                 'systemctl is-active') exit 3 ;;\n'launchctl print') exit 113 ;;\nesac\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut dirs = vec![tmp.path().to_path_buf()];
+        dirs.extend(std::env::split_paths(&path));
+        std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+        let done = finish_update(true, Path::new("/opt/node"), true, "2.1.0.26");
+        std::env::set_var("PATH", path);
+        let ran = std::fs::read_to_string(&log).unwrap_or_default();
+        let lines: Vec<&str> = ran.lines().collect();
+        assert!(
+            done.is_ok()
+                && lines.len() == 1
+                && (lines[0].starts_with("systemctl is-active ")
+                    || lines[0].starts_with("launchctl print ")),
+            "update_started_a_stopped_node: {done:?}, ran {lines:?}"
+        );
     }
 
     #[test]
@@ -545,12 +700,152 @@ mod tests {
         let held = lock_node_updates(&path).unwrap();
         let err = lock_node_updates(&path).unwrap_err().to_string();
         assert!(
-            err.contains("another qclient node install or update is running"),
+            err.contains("another qclient install, update or release source change"),
             "{err}"
         );
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         drop(held);
         lock_node_updates(&path).unwrap();
+    }
+
+    /// `auto-update enable` changes the release source only under the
+    /// update lock: while an install or update holds it, the change is
+    /// refused and nothing is stored; once it ends, the change runs.
+    #[test]
+    fn a_source_change_during_an_update_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("quilibrium").join(".auto-update.lock");
+        let held = lock_node_updates(&path).unwrap();
+        let mut stored = false;
+        let result = store_locked(&path, Some(ReleaseSource::official()), |named| {
+            stored = true;
+            Ok(named.unwrap())
+        });
+        assert!(
+            !stored,
+            "store_during_update: the source changed under a run"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("release source change is running"), "{err}");
+        drop(held);
+        let source = store_locked(&path, Some(ReleaseSource::official()), |named| {
+            Ok(named.unwrap())
+        })
+        .unwrap();
+        assert_eq!(source, ReleaseSource::official());
+    }
+
+    /// `auto-update enable` naming no source only reads the stored one, so
+    /// it runs while the auto-update job (or another install or update)
+    /// holds the update lock, as it did before release sources.
+    #[test]
+    fn enable_naming_no_source_runs_during_an_update() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("quilibrium").join(".auto-update.lock");
+        let held = lock_node_updates(&path).unwrap();
+        let result = store_locked(&path, None, |named| {
+            assert_eq!(named, None, "nothing named, nothing stored");
+            Ok(ReleaseSource::official())
+        });
+        match result {
+            Ok(source) => assert_eq!(source, ReleaseSource::official()),
+            Err(e) => panic!("keep_locked: enable naming no source failed under a run: {e}"),
+        }
+        drop(held);
+    }
+
+    /// Every path root-owned and writable only by root.
+    fn root_only(_: &Path) -> std::io::Result<(u32, u32)> {
+        Ok((0, 0o40755))
+    }
+
+    /// The node release 2.1.0.25 installed in the install root `root`, its
+    /// `.dgst` separating label and checksum with `sep`, signed as
+    /// `.dgst.sig.1` by the one key of the release source stored in `root`
+    /// and by no official signatory; returns its path. qclient's own parse
+    /// reads a space or a tab there.
+    fn custom_release_in(root: &Path, sep: &str) -> std::path::PathBuf {
+        use quil_types::crypto::Signer;
+        use sha3::{Digest, Sha3_256};
+        let seed = [7u8; 57];
+        let public = quil_crypto::Ed448Signer::derive_public(&seed).unwrap();
+        let signer = quil_crypto::Ed448Signer::from_bytes(&seed, &public).unwrap();
+        let key = hex::encode(public);
+        let url = "https://releases.example.org";
+        let source = ReleaseSource::custom(url, std::slice::from_ref(&key), None).unwrap();
+        let path = root.join(quil_config::release_source::RELEASE_SOURCE_FILE);
+        release_source::store_at(&path, Some(source), &root_only, &[]).unwrap();
+        let base = release::release_filename(system::RELEASE_TYPE_NODE, "2.1.0.25").unwrap();
+        let bin = b"node release".to_vec();
+        let digest = format!(
+            "SHA3-256({base})={sep}{}\n",
+            hex::encode(Sha3_256::digest(&bin))
+        );
+        let release = release::Release {
+            base,
+            bin,
+            sigs: vec![(1, signer.sign(digest.as_bytes()).unwrap())],
+            digest: digest.into_bytes(),
+        };
+        let dest = root.join("bin").join("node").join("2.1.0.25");
+        release.install_with(&dest, &[key.as_str()], 1).unwrap().0
+    }
+
+    /// `node link` links a release iff the node's startup check starts it:
+    /// a custom release whose `.dgst` separates label and checksum with a
+    /// tab, which qclient's own parse reads but the startup check does
+    /// not, is refused and nothing is linked; with a space it links.
+    #[cfg(unix)]
+    #[test]
+    fn link_takes_only_a_release_the_startup_check_starts() {
+        for (sep, starts) in [(" ", true), ("\t", false)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            let bin = custom_release_in(&root, sep);
+            let checked = quil_crypto::release_check::verify_release(
+                &bin,
+                &quil_config::SIGNATORIES,
+                &root_only,
+            );
+            assert_eq!(checked.is_ok(), starts, "{sep:?}: {checked:?}");
+            let link = root.join("quilibrium-node");
+            let lock = root.join(".auto-update.lock");
+            let result = link_startable(&bin, "2.1.0.25", &link, &lock, &root_only);
+            let linked = std::fs::read_link(&link).ok();
+            assert_eq!(
+                linked.is_some(),
+                starts,
+                "link_unstartable: {sep:?} linked {linked:?}: {result:?}"
+            );
+            match result {
+                Ok(()) => assert_eq!(linked, Some(bin)),
+                Err(e) => assert!(e.to_string().contains("would not start it"), "{e}"),
+            }
+        }
+    }
+
+    /// `node link` does not link while an install, update or source change
+    /// holds the update lock, so none of them changes what it checked
+    /// before it links; once the lock is free, it links.
+    #[cfg(unix)]
+    #[test]
+    fn link_during_an_update_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let bin = custom_release_in(&root, " ");
+        let link = root.join("quilibrium-node");
+        let lock = root.join(".auto-update.lock");
+        let held = lock_node_updates(&lock).unwrap();
+        let result = link_startable(&bin, "2.1.0.25", &link, &lock, &root_only);
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "link_during_update: linked under a run: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("release source change is running"), "{err}");
+        drop(held);
+        link_startable(&bin, "2.1.0.25", &link, &lock, &root_only).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), bin);
     }
 }

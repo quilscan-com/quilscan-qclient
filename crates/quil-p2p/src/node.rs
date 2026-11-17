@@ -27,7 +27,13 @@ const AUTONAT_SERVER_SUMMARY_EVERY: Duration = Duration::from_secs(60 * 60);
 pub struct ReceivedMessage {
     pub bitmask: Vec<u8>,
     pub data: Vec<u8>,
+    /// Who sent it: the gossip message's signer (any key its publisher
+    /// chose), or the direct sender.
     pub from: Vec<u8>,
+    /// The connected peer it arrived from: gossip's propagation source, or
+    /// the direct sender. Unlike a signer, a peer cannot mint these freely:
+    /// each takes a connection. Empty when it came from this node.
+    pub via: Vec<u8>,
     /// Delivered point-to-point ([`crate::direct`]) rather than by gossip.
     pub direct: bool,
 }
@@ -70,6 +76,9 @@ pub struct P2PNode {
     /// signing keypair's public key. `None` falls back to the host's
     /// own peer ID.
     pubsub_from_peer_id: Option<PeerId>,
+    /// The resolver config `start()` builds the DNS transport from: the
+    /// system's, with a bounded wait (tests inject a reader).
+    dns: crate::dns_config::DnsSource,
 }
 
 /// Parse operator-configured multiaddr strings into `(PeerId, Multiaddr)`
@@ -217,7 +226,15 @@ impl P2PNode {
             blossomsub_params: crate::BlossomsubParams::from_p2p_config(config),
             pubsub_signing_keypair: None,
             pubsub_from_peer_id: None,
+            dns: crate::dns_config::DnsSource::system(),
         })
+    }
+
+    /// Replaces the resolver config source `start()` reads.
+    #[cfg(test)]
+    pub(crate) fn with_dns_source(mut self, dns: crate::dns_config::DnsSource) -> Self {
+        self.dns = dns;
+        self
     }
 
     /// Construct a P2P node for a standalone worker process.
@@ -379,6 +396,10 @@ impl P2PNode {
             cfg.set_max_num_streams(65536);
             cfg
         };
+        // A host can start the node before its resolver config lists a
+        // nameserver (boot race): wait a bounded time, then start without
+        // DNS resolution rather than exit. See `crate::dns_config`.
+        let (dns_config, dns_opts) = self.dns.config().await;
         let mut swarm = SwarmBuilder::with_existing_identity(self.keypair)
             .with_tokio()
             .with_tcp(
@@ -394,8 +415,7 @@ impl P2PNode {
             )
             .map_err(|e| QuilError::P2p(format!("tcp: {}", e)))?
             .with_quic()
-            .with_dns()
-            .map_err(|e| QuilError::P2p(format!("dns: {}", e)))?
+            .with_dns_config(dns_config, dns_opts)
             .with_behaviour(|key| {
                 let local_peer_id = PeerId::from_public_key(&key.public());
 
@@ -943,10 +963,10 @@ impl P2PNode {
                                 debug!(error = %error, "incoming connection failed");
                             }
                             libp2p::swarm::SwarmEvent::ExternalAddrConfirmed { address } => {
-                                // AutoNAT's dial-back result. The tracker takes it
-                                // from the probe response below, which names the
-                                // confirming server.
-                                debug!(%address, "external address confirmed (AutoNAT dial-back)");
+                                // Nothing emits this: the vendored AutoNAT confirms
+                                // no address to the swarm, and `sync_swarm_external`
+                                // adds the tracker's (which raises no event).
+                                debug!(%address, "external address confirmed");
                             }
                             libp2p::swarm::SwarmEvent::ExternalAddrExpired { address } => {
                                 // Nothing emits this today; handled for completeness.
@@ -962,11 +982,26 @@ impl P2PNode {
                                     &autonat_health,
                                     &swarm.behaviour().autonat.nat_status(),
                                 );
+                                sync_swarm_external(&mut swarm, &external_tracker);
                             }
                             libp2p::swarm::SwarmEvent::Behaviour(event) => match event {
                                 NodeBehaviourEvent::Identify(
                                     libp2p::identify::Event::Received { connection_id, peer_id, info, .. }
                                 ) => {
+                                    // Which IP this peer sees us at: AutoNAT takes an
+                                    // answer at an IP no listen address has only when
+                                    // a peer other than its server saw us there. It
+                                    // keeps one observation per observer IP group, so
+                                    // the observer's remote IP goes with it.
+                                    if let Some(observer_ip) =
+                                        probe_servers.ip_of_connection(connection_id, peer_id)
+                                    {
+                                        swarm.behaviour_mut().autonat.note_observed_address(
+                                            peer_id,
+                                            observer_ip,
+                                            &info.observed_addr,
+                                        );
+                                    }
                                     let serves_autonat =
                                         info.protocols.contains(&libp2p::autonat::DEFAULT_PROTOCOL_NAME);
                                     crate::autonat_servers::apply(
@@ -1139,7 +1174,13 @@ impl P2PNode {
                                         let nat = swarm.behaviour().autonat.nat_status();
                                         let applied = external_tracker.apply(event, &nat, now);
                                         debug!(?probe, ?nat, ?applied, "AutoNAT probe finished");
+                                        // A first address waits for a second server: ask
+                                        // one now, not a retry interval later.
+                                        if external_tracker.probe_again_now(applied) {
+                                            swarm.behaviour_mut().autonat.probe_now();
+                                        }
                                         publish_external(&external_tx, &mut external_tracker, &autonat_health, &nat);
+                                        sync_swarm_external(&mut swarm, &external_tracker);
                                         let owed = autonat_health.flush_status(&nat, now);
                                         for notice in owed.iter().chain(&notice) {
                                             crate::autonat_health::log(
@@ -1167,6 +1208,7 @@ impl P2PNode {
                                         );
                                     }
                                     publish_external(&external_tx, &mut external_tracker, &autonat_health, &new);
+                                    sync_swarm_external(&mut swarm, &external_tracker);
                                 }
                                 NodeBehaviourEvent::Direct(event) => {
                                     use crate::direct::DirectOutcome;
@@ -1181,6 +1223,7 @@ impl P2PNode {
                                                     bitmask: request.bitmask,
                                                     data: request.data,
                                                     from: peer.to_bytes(),
+                                                    via: peer.to_bytes(),
                                                     direct: true,
                                                 }).is_ok();
                                             let counter = if accepted { &direct_stats.received } else { &direct_stats.received_refused };
@@ -1219,13 +1262,14 @@ impl P2PNode {
                                 }
                                 NodeBehaviourEvent::Blossomsub(bss_event) => match bss_event {
                                     BlossomSubEvent::Message {
-                                        message, ..
+                                        propagation_source, message, ..
                                     } => {
                                         // Moved, not copied: the event owns the message.
                                         let result = msg_tx.try_send(ReceivedMessage {
                                             bitmask: message.bitmask,
                                             data: message.data,
                                             from: message.from,
+                                            via: propagation_source.to_bytes(),
                                             direct: false,
                                         });
                                         direct_stats.note_gossip_receive(&result);
@@ -2221,6 +2265,31 @@ fn publish_external(
     });
 }
 
+/// Make the swarm's external addresses the tracker's accepted ones. The
+/// swarm announces them through identify, peers add them to Kademlia, and
+/// Kademlia serves while one exists, so one server's answer must not add
+/// one (the vendored AutoNAT no longer does); an address servers on two IPs
+/// confirmed goes in, and one the tracker moved off or dropped goes out.
+/// Runs after every tracker update.
+fn sync_swarm_external(swarm: &mut libp2p::Swarm<NodeBehaviour>, tracker: &ExternalAddrTracker) {
+    let (remove, add) = tracker.swarm_changes(swarm.external_addresses());
+    if remove.is_empty() && add.is_empty() {
+        return;
+    }
+    for addr in &remove {
+        swarm.remove_external_address(addr);
+    }
+    for addr in &add {
+        swarm.add_external_address(addr.clone());
+    }
+    info!(
+        added = ?add.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        removed = ?remove.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        "external addresses announced to peers changed: AutoNAT servers on two IPs confirmed \
+         the added ones; the removed ones were moved off or went unconfirmed"
+    );
+}
+
 /// AutoNAT's server and request state for an operator line.
 fn probe_context(
     autonat: &libp2p::autonat::Behaviour,
@@ -2261,6 +2330,13 @@ pub(crate) fn is_routable(addr: &Multiaddr) -> bool {
         has_ip = true;
     }
     has_ip
+}
+
+/// [`is_routable`] for a multiaddr in text form, as peers advertise their
+/// stream addresses; one that does not parse is not routable.
+pub fn is_routable_multiaddr(addr: &str) -> bool {
+    addr.parse::<Multiaddr>()
+        .is_ok_and(|addr| is_routable(&addr))
 }
 
 /// Whether `ip` is a globally routable IPv4 address.

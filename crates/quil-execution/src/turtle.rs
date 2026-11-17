@@ -28,9 +28,9 @@
 //! - No support for blank nodes, lists, or RDF reification.
 //! - No URI resolution against `BASE`.
 //! - Comments must be on their own line or at end of line; Turtle's
-//! in-statement `#` form inside literal strings is not handled.
+//!   in-statement `#` form inside literal strings is not handled.
 //! - Namespace prefixes are looked up by exact key; the trailing
-//! slash quirk Go's parser handles is replicated here.
+//!   slash quirk Go's parser handles is replicated here.
 
 use quil_types::error::{QuilError, Result};
 use std::collections::HashMap;
@@ -462,7 +462,7 @@ fn collapse_iri(iri: &str, prefixes: &HashMap<String, String>) -> String {
     for (k, v) in prefixes {
         if iri.starts_with(v.as_str()) {
             match best {
-                Some((_, ref bv)) if v.len() <= bv.len() => {}
+                Some((_, bv)) if v.len() <= bv.len() => {}
                 _ => best = Some((k, v)),
             }
         }

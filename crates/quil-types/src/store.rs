@@ -62,6 +62,16 @@ pub trait KvDb: Send + Sync {
     fn delete(&self, key: &[u8]) -> Result<()>;
     fn new_batch(&self, indexed: bool) -> Result<Box<dyn Transaction>>;
     fn new_iter(&self, lower: &[u8], upper: &[u8]) -> Result<Box<dyn Iterator>>;
+    /// The first key in `[lower, upper)`, or `None`: a probe of a range
+    /// whose values are too large to read, which RocksDB answers without
+    /// reading them out. Elsewhere through [`Self::new_iter`], which may
+    /// read the whole range.
+    fn first_key_in(&self, lower: &[u8], upper: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut iter = self.new_iter(lower, upper)?;
+        let key = iter.first().then(|| iter.key().to_vec());
+        iter.close()?;
+        Ok(key)
+    }
     fn compact(&self, start: &[u8], end: &[u8], parallelize: bool) -> Result<()>;
     /// Compact `[start, end)` through the bottommost level, without holding
     /// off automatic compactions, when a live file overlapping it is at
@@ -486,6 +496,19 @@ pub trait ClockStore: Send + Sync {
         frame_number: u64,
         truncate: bool,
     ) -> Result<proto::global::AppShardFrame>;
+    /// The header of shard `filter`'s frame `frame_number`, without decoding
+    /// its requests: an application frame can be megabytes, and a header
+    /// comparison needs none of them. `NotFound` when no frame (or no
+    /// header) is stored there.
+    fn get_shard_clock_frame_header(
+        &self,
+        filter: &[u8],
+        frame_number: u64,
+    ) -> Result<proto::global::FrameHeader> {
+        self.get_shard_clock_frame(filter, frame_number, true)?
+            .header
+            .ok_or_else(|| QuilError::NotFound("shard frame header".into()))
+    }
     fn commit_shard_clock_frame(
         &self,
         filter: &[u8],
@@ -1737,6 +1760,34 @@ pub trait SnapshotReadable: Send + Sync {
         _vertex_key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         Ok(None)
+    }
+
+    /// [`HypergraphStore::get_root_version`] at the captured sequence.
+    fn root_version(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_id: &[u8],
+        _root_hash: &[u8],
+    ) -> Result<Option<(u64, u64)>> {
+        Err(QuilError::Store(
+            "snapshot root index reads are unsupported by this backend".into(),
+        ))
+    }
+
+    /// [`HypergraphStore::load_vertex_underlying_at`] at the captured
+    /// sequence: the blob as of tree version `version`.
+    fn vertex_underlying_at(
+        &self,
+        _set_type: &str,
+        _phase_type: &str,
+        _shard_key: &ShardKey,
+        _vertex_key: &[u8],
+        _version: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        Err(QuilError::Store(
+            "snapshot versioned vertex reads are unsupported by this backend".into(),
+        ))
     }
 }
 

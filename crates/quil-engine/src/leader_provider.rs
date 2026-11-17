@@ -207,13 +207,61 @@ const MESSAGE_VALIDATION_BUDGET: std::time::Duration = std::time::Duration::from
 /// bodies executing it needs: archives materialize the shard through
 /// `frame_number` before they execute the GLOBAL frame. `empty`: the header
 /// proves that frame carried no requests, so it stands in for its own body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShardBodyNeed {
     pub address: Vec<u8>,
     pub frame_number: u64,
     pub empty: bool,
     /// The GLOBAL frame the header anchors to (0: none).
     pub anchor: u64,
+    /// Asked by a GLOBAL voter about a proposal's header, which no one has
+    /// verified yet: answered without recording anything for the ingest
+    /// ([`GlobalLeaderProvider::unheld_shard_body`]).
+    pub vote: bool,
+    /// The frame's identity, `Poseidon(output)`, which its certificate signs
+    /// (`None`: the output does not hash). Sequenced ingest materializes at
+    /// the header's number only the frame of this identity, and below it
+    /// the parents the held chain names, so a body counts as held only as
+    /// that frame ([`crate::archive_ingest::HeldBodies::held_for_vote`]).
+    pub selector: Option<[u8; 32]>,
+    /// The identity of the frame below, the header's `parent_selector`.
+    pub parent: Option<[u8; 32]>,
+}
+
+impl ShardBodyNeed {
+    /// The need of a shard header's fields; `vote` as [`Self::vote`].
+    fn of_header(
+        address: Vec<u8>,
+        frame_number: u64,
+        anchor: u64,
+        requests_root: &[u8],
+        output: &[u8],
+        parent_selector: &[u8],
+        vote: bool,
+    ) -> Self {
+        ShardBodyNeed {
+            address,
+            frame_number,
+            empty: crate::archive_ingest::requests_root_is_empty(requests_root),
+            anchor,
+            vote,
+            selector: quil_crypto::poseidon::hash_bytes_to_32(output).ok(),
+            parent: <[u8; 32]>::try_from(parent_selector).ok(),
+        }
+    }
+
+    /// A GLOBAL voter's need for the bodies of a proposal's shard `header`.
+    pub fn for_vote(header: &quil_types::proto::global::FrameHeader) -> Self {
+        Self::of_header(
+            header.address.clone(),
+            header.frame_number,
+            header.global_frame_number,
+            &header.requests_root,
+            &header.output,
+            &header.parent_selector,
+            true,
+        )
+    }
 }
 
 /// Whether this GLOBAL prover holds the application frame bodies each need
@@ -222,6 +270,86 @@ pub struct ShardBodyNeed {
 /// application frames archives materialize executing the header (those above
 /// the shard's cursor through it), `None` when a body is not held.
 pub type ShardBodyAvailability = Arc<dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>> + Send + Sync>;
+
+/// Ask at once for the application frame bodies of a shard header a GLOBAL
+/// proposal carries and this voter lacks, once GLOBAL execution of the
+/// proposed frame, whose number the second argument gives, would vouch for
+/// the header ([`GlobalLeaderProvider::with_body_fetch`]), and say what it
+/// did. Never waits: the voter asks on its vote check, which defers and
+/// checks again rather than block, and sequenced execution holds the ingest
+/// while it materializes. The voter does not hold the GLOBAL execution lease
+/// then: it read the lease free and takes it only afterwards, to execute the
+/// proposal. So the header is judged against this node's live state, which
+/// is the state execution judges it against only while this node has
+/// executed exactly the proposal's parent; a refusal found against any
+/// other state is not judged yet ([`ShardBodyAsk::Unavailable`]), so it
+/// holds the vote, as a refused header no longer does.
+pub type ShardBodyFetch =
+    Arc<dyn Fn(&quil_types::proto::global::FrameHeader, u64) -> ShardBodyAsk + Send + Sync>;
+
+/// What a GLOBAL voter's ask for a shard header's bodies did
+/// ([`ShardBodyFetch`]), named when the vote declines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardBodyAsk {
+    /// GLOBAL execution would vouch for the header: the frames this archive
+    /// lacks are asked for, or already were.
+    Asked,
+    /// GLOBAL execution refuses the header: its bodies are never asked for,
+    /// and it does not hold the vote, as sequenced ingest never waits for
+    /// them ([`first_unheld_shard_body`]).
+    Refused,
+    /// [`Self::Refused`], answered from a verdict this voter remembers:
+    /// verified nothing, so it costs no ask ([`VOTE_BODY_ASKS`]).
+    RefusedBefore,
+    /// This archive holds a body at frame `frame` of the shard, but of
+    /// another frame than the one the header names there, or the parent the
+    /// held chain below it names: sequenced ingest would drop it and wait
+    /// for the named one ([`crate::archive_ingest::HeldBodies::held_for_vote`]).
+    /// Not asked for: the gap fetch reads this archive's own copy first.
+    OtherFrame { frame: u64 },
+    /// This archive holds a body at frame `frame` of the shard whose
+    /// identity it no longer remembers, so it cannot tell whether it is the
+    /// frame the header names there.
+    UnknownFrame { frame: u64 },
+    /// The header anchors to GLOBAL frame `anchor`, which this node's clock
+    /// lacks: not judged yet, and asked for once the anchor arrives.
+    UnheldAnchor { anchor: u64 },
+    /// The header's certificate cannot be checked yet (state or prover
+    /// registry unavailable): judged again on a later check.
+    Unavailable,
+    /// This archive's application frame ingest could not take the ask (not
+    /// built yet, in use, or its store unreadable): asked again on the next
+    /// check.
+    IngestUnavailable,
+}
+
+/// The most shard headers a GLOBAL voter asks for on one check of a
+/// proposal ([`first_unheld_shard_body`]), the first ones it lacks bodies
+/// of. Asked one at a time, a voter missing several shards' bodies, after a
+/// restart or a gossip gap, waited for each before asking for the next, and
+/// declined once their summed fetch times passed the 20 s vote patience. The
+/// fetch verifies each header it has not judged once and remembers 256
+/// verdicts; a bound well below that keeps a proposal crammed with forged
+/// headers from evicting its own verdicts and making every check verify
+/// them all again. A refusal the fetch remembers ([`ShardBodyAsk::RefusedBefore`])
+/// verifies nothing and does not count, so refused headers ahead of a
+/// vouched one cannot keep it from being asked for. A header past the bound
+/// is not judged on that check, so it holds the vote as any unheld header
+/// does, also one execution would refuse.
+pub(crate) const VOTE_BODY_ASKS: usize = 16;
+
+/// The first shard header a GLOBAL proposal carries whose bodies a voter
+/// lacks and waits for ([`first_unheld_shard_body`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnheldShardBody {
+    pub need: ShardBodyNeed,
+    /// What asking for its bodies did; `None` without a fetch, or past
+    /// [`VOTE_BODY_ASKS`].
+    pub ask: Option<ShardBodyAsk>,
+    /// How many of the proposal's shard headers lack bodies the vote waits
+    /// for, this one included.
+    pub unheld: usize,
+}
 
 /// Whether this GLOBAL prover holds a shard's header back while archives
 /// verify the expensive confidential operations of the frames it would make
@@ -273,7 +401,12 @@ fn proposal_app_frame_budget() -> u64 {
     })
 }
 
-/// The bodies the shard headers a proof bundle carries need.
+/// The bodies the shard headers a proof bundle carries need. A header voting
+/// out of bounds at its anchor needs none: archives refuse its frame, and
+/// GLOBAL executes it only as the fence of its session
+/// (`quil_execution::global_intrinsic::handoff::fee_fence`), which
+/// materializes nothing. Held back for a body no archive holds, it would
+/// never ride, and the session would stall unfenced.
 pub(crate) fn shard_body_needs(raw: &[u8]) -> Vec<ShardBodyNeed> {
     use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
     use quil_execution::message_envelope::CanonicalMessageBundle;
@@ -287,13 +420,107 @@ pub(crate) fn shard_body_needs(raw: &[u8]) -> Vec<ShardBodyNeed> {
         .filter(|request| request.inner_type_prefix == TYPE_FRAME_HEADER)
         .filter_map(|request| FrameHeader::from_canonical_bytes(&request.inner_bytes).ok())
         .filter(|header| !header.address.is_empty())
-        .map(|header| ShardBodyNeed {
-            empty: crate::archive_ingest::requests_root_is_empty(&header.requests_root),
-            address: header.address,
-            frame_number: header.frame_number,
-            anchor: header.global_frame_number,
+        .filter(|header| {
+            !quil_execution::fee_vote::fee_vote_out_of_bounds_at(
+                header.global_frame_number,
+                header.fee_multiplier_vote as u64,
+            )
+        })
+        .map(|header| {
+            ShardBodyNeed::of_header(
+                header.address,
+                header.frame_number,
+                header.global_frame_number,
+                &header.requests_root,
+                &header.output,
+                &header.parent_selector,
+                false,
+            )
         })
         .collect()
+}
+
+/// The first shard header `frame` carries whose application frame bodies
+/// `available` does not report held, as a voter's need; an answer missing
+/// from a short reply counts as not held. `fetch` asks for the bodies of
+/// every such header, up to [`VOTE_BODY_ASKS`] in the proposal's order, at
+/// once, given the number of the GLOBAL frame proposed, so their fetches run
+/// together within the vote patience. A header the fetch finds GLOBAL
+/// execution refuses ([`ShardBodyAsk::Refused`], warned there) does not hold
+/// the vote: execution skips it and sequenced ingest never waits for its
+/// bodies, so declining it only cost a leader on another build each view it
+/// carried one. A header voting out of bounds at its anchor needs no body,
+/// as for a leader ([`shard_body_needs`]): GLOBAL executes it only as its
+/// session's fence, so it neither holds the vote nor is asked for.
+pub(crate) fn first_unheld_shard_body(
+    frame: &quil_types::proto::global::GlobalFrame,
+    available: &dyn Fn(&[ShardBodyNeed]) -> Vec<Option<u64>>,
+    fetch: Option<&ShardBodyFetch>,
+) -> Option<UnheldShardBody> {
+    use quil_types::proto::global::message_request::Request;
+    let headers: Vec<&quil_types::proto::global::FrameHeader> = frame
+        .requests
+        .iter()
+        .flat_map(|bundle| bundle.requests.iter())
+        .filter_map(|request| match request.request.as_ref() {
+            Some(Request::Shard(header)) if !header.address.is_empty() => Some(header),
+            _ => None,
+        })
+        .filter(|header| {
+            !quil_execution::fee_vote::fee_vote_out_of_bounds_at(
+                header.global_frame_number,
+                header.fee_multiplier_vote,
+            )
+        })
+        .collect();
+    if headers.is_empty() {
+        return None;
+    }
+    let needs: Vec<ShardBodyNeed> = headers
+        .iter()
+        .copied()
+        .map(ShardBodyNeed::for_vote)
+        .collect();
+    let answers = available(needs.as_slice());
+    let unheld: Vec<(&quil_types::proto::global::FrameHeader, ShardBodyNeed)> = headers
+        .into_iter()
+        .zip(needs)
+        .zip(answers.into_iter().map(Some).chain(std::iter::repeat(None)))
+        .filter_map(|(pair, held)| held.flatten().is_none().then_some(pair))
+        .collect();
+    let proposed = frame.header.as_ref().map_or(0, |h| h.frame_number);
+    let mut asks: Vec<ShardBodyAsk> = Vec::new();
+    if let Some(fetch) = fetch {
+        let mut counted = 0;
+        for (header, _) in &unheld {
+            if counted == VOTE_BODY_ASKS {
+                break;
+            }
+            let ask = fetch(header, proposed);
+            if ask != ShardBodyAsk::RefusedBefore {
+                counted += 1;
+            }
+            asks.push(ask);
+        }
+    }
+    let waited: Vec<(ShardBodyNeed, Option<ShardBodyAsk>)> = unheld
+        .into_iter()
+        .map(|(_, need)| need)
+        .zip(asks.into_iter().map(Some).chain(std::iter::repeat(None)))
+        .filter(|(_, ask)| {
+            !matches!(
+                ask,
+                Some(ShardBodyAsk::Refused | ShardBodyAsk::RefusedBefore)
+            )
+        })
+        .collect();
+    let count = waited.len();
+    let (need, ask) = waited.into_iter().next()?;
+    Some(UnheldShardBody {
+        need,
+        ask,
+        unheld: count,
+    })
 }
 
 /// A GLOBAL proposal's settlement check of the shard tips it may carry
@@ -540,6 +767,9 @@ pub struct GlobalLeaderProvider {
     /// headers need ([`ShardBodyAvailability`]). `None` proposes every
     /// verified proof, as a node without an archive ingest does.
     body_availability: Option<ShardBodyAvailability>,
+    /// Asks for the bodies of a header a GLOBAL proposal carries that this
+    /// voter lacks ([`ShardBodyFetch`]). `None` asks for nothing.
+    body_fetch: Option<ShardBodyFetch>,
     /// Whether a shard's header waits for archives to verify the expensive
     /// proofs it would sequence ([`ShardProofSettlement`]). `None` never
     /// waits.
@@ -627,6 +857,7 @@ impl GlobalLeaderProvider {
         );
         leader.rejected = self.rejected.clone();
         leader.body_availability = self.body_availability.clone();
+        leader.body_fetch = self.body_fetch.clone();
         leader.proof_settlement = self.proof_settlement.clone();
         leader.pool = self.message_collector.take_proposal_pool();
         Ok(leader)
@@ -659,6 +890,7 @@ impl GlobalLeaderProvider {
             rejected: Default::default(),
             hypergraph,
             body_availability: None,
+            body_fetch: None,
             proof_settlement: None,
             pool: None,
         }
@@ -672,6 +904,38 @@ impl GlobalLeaderProvider {
     pub fn with_body_availability(mut self, available: Option<ShardBodyAvailability>) -> Self {
         self.body_availability = available;
         self
+    }
+
+    /// Ask for the bodies of the shard headers a GLOBAL proposal carries that
+    /// this voter lacks ([`Self::unheld_shard_body`]) through `fetch`, which
+    /// asks only once GLOBAL execution would vouch for a header. `None` asks
+    /// for nothing.
+    pub fn with_body_fetch(mut self, fetch: Option<ShardBodyFetch>) -> Self {
+        self.body_fetch = fetch;
+        self
+    }
+
+    /// The first shard header `frame` carries whose application frame
+    /// bodies this node's availability check ([`Self::with_body_availability`])
+    /// does not report held, with what asking for them did; `None` when every
+    /// one is, or without a check. A header execution refuses does not
+    /// count ([`first_unheld_shard_body`]).
+    ///
+    /// A GLOBAL voter applies the leader's rule to the proposal: archives
+    /// execute a finalized frame only once they hold every body its headers
+    /// sequence, and wait for them without a bound, so a frame finalized
+    /// with a header whose body no archive holds halts GLOBAL on all of
+    /// them. The leader's own check binds only an honest leader running it.
+    /// The check records nothing, as no one has verified the headers yet;
+    /// the headers found go to [`Self::with_body_fetch`], which asks for
+    /// their bodies at once once execution would vouch for them, so the vote
+    /// can follow within the patience.
+    pub(crate) fn unheld_shard_body(
+        &self,
+        frame: &quil_types::proto::global::GlobalFrame,
+    ) -> Option<UnheldShardBody> {
+        let available = self.body_availability.as_ref()?;
+        first_unheld_shard_body(frame, available.as_ref(), self.body_fetch.as_ref())
     }
 
     /// Hold a shard's header back while `settlement` reports archives still
@@ -981,29 +1245,35 @@ pub(crate) struct ShardTips {
 /// forged higher header for every shard each frame: execution skipped it, and
 /// the real proofs it had displaced never rode, so no shard was rewarded.
 /// Equal frame numbers (another member's copy of the same frame) collapse to
-/// the first verified.
+/// the verified copy whose certificate names the most signers, as GLOBAL pays
+/// each signer, then the first in arrival order.
 pub(crate) fn select_shard_tips(
     shard_frame_msgs: Vec<Vec<u8>>,
     verified: impl Fn(&[u8]) -> bool + Sync,
     verify: impl Fn(&[u8]) -> TipCheck + Sync,
 ) -> ShardTips {
     let mut out = ShardTips::default();
-    let mut shards: std::collections::HashMap<Vec<u8>, Vec<(u64, Vec<u8>)>> =
+    type Candidates = Vec<(u64, usize, Vec<u8>)>;
+    let mut shards: std::collections::HashMap<Vec<u8>, Candidates> =
         std::collections::HashMap::new();
     for raw in shard_frame_msgs {
-        let mut keys = crate::message_collector::extract_shard_frame_keys(&raw);
-        if keys.len() == 1 {
-            let (address, frame) = keys.pop().unwrap();
-            shards.entry(address).or_default().push((frame, raw));
+        let mut copies = crate::message_collector::extract_shard_frame_copies(&raw);
+        if copies.len() == 1 {
+            let (address, frame, signers) = copies.pop().unwrap();
+            shards
+                .entry(address)
+                .or_default()
+                .push((frame, signers, raw));
         } else {
             out.kept.push(raw);
         }
     }
-    let select = |mut candidates: Vec<(u64, Vec<u8>)>, out: &mut ShardTips| {
-        // Highest first; a stable sort keeps arrival order within a height.
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    let select = |mut candidates: Candidates, out: &mut ShardTips| {
+        // Highest first, then most signers; a stable sort keeps arrival
+        // order within those.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
         let (mut tip, mut checked) = (false, 0);
-        for (_, raw) in candidates {
+        for (_, _, raw) in candidates {
             if tip {
                 out.superseded.push(raw);
             } else if verified(&raw) {
@@ -1281,7 +1551,9 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
         // latency-sensitive prove path. Structurally-invalid bundles were
         // already rejected at ingest.
         // ------------------------------------------------------------------
-        let collected = capacity_last(self.message_collector.collect_for_rank(rank));
+        let collected = fee_fence_copies_by_signers(capacity_last(
+            self.message_collector.collect_for_rank(rank),
+        ));
         // The VDF must commit exactly the body we can serialize. A permissive
         // engine validator can accept bytes that are not a canonical bundle;
         // hashing those and dropping them during the later decode makes our
@@ -1373,6 +1645,13 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                 // 160 s here and no leader could propose.
                 let validation_started = std::time::Instant::now();
                 let (mut deferred, mut deferred_capacity) = (0usize, 0usize);
+                // Fee vote fence headers: one copy per shard frame rides, the
+                // first that validates in `fee_fence_copies_by_signers`'
+                // order, and the others wait in the mempool. One this node
+                // cannot judge now (an anchor or state it lacks) waits too.
+                let mut fence_riding: std::collections::HashSet<(Vec<u8>, u64)> =
+                    std::collections::HashSet::new();
+                let mut fence_unavailable = 0usize;
                 // Op kinds → (messages, total ms, slowest ms), logged when
                 // validation is slow, to tell one costly op from a slow store.
                 let mut validation_ms: std::collections::HashMap<String, (usize, u64, u64)> =
@@ -1411,6 +1690,12 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     // A copy of seals that another copy already carries waits
                     // in the mempool, unvalidated.
                     if handoff.held_back(index) {
+                        continue;
+                    }
+                    let fence_keys = crate::message_collector::fee_fence_keys(&raw);
+                    if !fence_keys.is_empty()
+                        && fence_keys.iter().all(|key| fence_riding.contains(key))
+                    {
                         continue;
                     }
                     let hash: [u8; 32] = Sha256::digest(&raw).into();
@@ -1458,7 +1743,20 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                     match outcome {
                         Ok(()) => {
                             handoff.ride(index);
+                            fence_riding.extend(fence_keys);
                             valid.push((index, raw));
+                        }
+                        // Fence evidence this node cannot judge now waits for
+                        // a later frame within its anchor window, as a shard
+                        // tip does: dropped, it would leave its session's
+                        // members waiting on a frame GLOBAL never fences.
+                        Err(e) if e.is_execution_unavailable() && !fence_keys.is_empty() => {
+                            fence_unavailable += 1;
+                            tracing::debug!(
+                                frame = frame_number,
+                                error = %e,
+                                "fee vote fence header not verifiable this frame; left for a later one",
+                            );
                         }
                         Err(e) => {
                             let error = e.to_string();
@@ -1657,6 +1955,15 @@ impl LeaderProvider<GlobalState> for GlobalLeaderProvider {
                         frame = frame_number,
                         deferred = tips.deferred,
                         "shard-frame proofs not verified this frame; left for a later one",
+                    );
+                }
+                if fence_unavailable > 0 {
+                    tracing::info!(
+                        frame = frame_number,
+                        deferred = fence_unavailable,
+                        scope = "this node",
+                        until = "it holds the GLOBAL frame each header anchors to",
+                        "fee vote fence headers not verifiable this frame; left for a later one",
                     );
                 }
                 if !invalid.is_empty() {
@@ -1957,6 +2264,26 @@ pub(crate) fn capacity_last(collected: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         .into_iter()
         .partition(|raw| crate::message_collector::carries_capacity_message(raw));
     rest.into_iter().chain(capacity).collect()
+}
+
+/// `collected` with the bundles carrying fee vote fence headers
+/// ([`crate::message_collector::fee_fence_keys`]) in their own places, most
+/// signers first, read from each certificate's bitmap and not verified; every
+/// other bundle keeps its place. A proposal carries the first copy of each
+/// fence that validates.
+pub(crate) fn fee_fence_copies_by_signers(mut collected: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let places: Vec<usize> = (0..collected.len())
+        .filter(|&place| !crate::message_collector::fee_fence_keys(&collected[place]).is_empty())
+        .collect();
+    let mut copies: Vec<Vec<u8>> = places
+        .iter()
+        .map(|&place| std::mem::take(&mut collected[place]))
+        .collect();
+    crate::message_collector::order_copies_by_signers(&mut copies);
+    for (place, copy) in places.into_iter().zip(copies) {
+        collected[place] = copy;
+    }
+    collected
 }
 
 /// The committee-handoff submissions a bundle carries, when it carries
@@ -3091,6 +3418,30 @@ mod tests {
         crate::message_collector::extract_shard_frame_keys(raw)[0].1
     }
 
+    /// Of one frame's copies, the tip is the verified one naming the most
+    /// signers; a higher frame still wins, and an invalid copy gives way to
+    /// the next.
+    #[test]
+    fn equal_frames_prefer_the_copy_with_the_most_signers() {
+        use crate::message_collector::certified_shard_bundle;
+        let quorum = certified_shard_bundle(0x11, 5, 5, 0);
+        let all = certified_shard_bundle(0x11, 5, 7, 0);
+        let more = certified_shard_bundle(0x11, 5, 6, 0);
+        let (kept, superseded) = coalesce_verified(vec![quorum.clone(), all.clone(), more.clone()]);
+        assert_eq!(kept, vec![all.clone()]);
+        assert_eq!(superseded, vec![more, quorum.clone()]);
+        let higher = certified_shard_bundle(0x11, 6, 5, 0);
+        let (kept, _) = coalesce_verified(vec![all.clone(), higher.clone()]);
+        assert_eq!(kept, vec![higher]);
+        let tips = select_shard_tips(
+            vec![quorum.clone(), all.clone()],
+            |raw| raw == quorum.as_slice(),
+            |_: &[u8]| TipCheck::Invalid("certificate".into()),
+        );
+        assert_eq!(tips.kept, vec![quorum]);
+        assert_eq!(tips.invalid.len(), 1);
+    }
+
     #[test]
     fn a_forged_higher_header_cannot_displace_a_verified_tip() {
         let real = make_shard_frame(0x11, 877);
@@ -3187,6 +3538,296 @@ mod tests {
         assert_eq!(superseded.len(), 128);
     }
 
+    /// A GLOBAL voter's check names the first shard header of a proposal
+    /// whose bodies are not held, across bundles, past headers that are held
+    /// and requests that are not shard headers; an answer missing from a
+    /// short reply counts as not held. Every unheld header is asked for at
+    /// once, the check returns what the named header's ask did and how many
+    /// lack bodies, and every need is asked as a voter's, which records
+    /// nothing. A header execution refuses is neither named nor counted:
+    /// no archive waits for its bodies.
+    #[test]
+    fn a_voter_names_the_first_unheld_of_several_shard_headers() {
+        use quil_types::proto::global::{
+            message_request::Request, FrameHeader as ProtoHeader, GlobalFrame, GlobalFrameHeader,
+            MessageBundle, MessageRequest,
+        };
+        let header = |addr: u8, frame_number: u64, empty: bool| ProtoHeader {
+            address: vec![addr; 32],
+            frame_number,
+            requests_root: vec![u8::from(!empty); 32],
+            ..Default::default()
+        };
+        let shard = |header: ProtoHeader| MessageRequest {
+            request: Some(Request::Shard(header)),
+            ..Default::default()
+        };
+        let frame = GlobalFrame {
+            requests: vec![
+                MessageBundle {
+                    requests: vec![
+                        shard(header(0x11, 5, false)),
+                        MessageRequest::default(),
+                        shard(header(0x22, 7, true)),
+                    ],
+                    ..Default::default()
+                },
+                MessageBundle {
+                    requests: vec![
+                        shard(ProtoHeader::default()),
+                        shard(header(0x33, 9, false)),
+                        shard(header(0x44, 2, false)),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            header: Some(GlobalFrameHeader {
+                frame_number: 12,
+                ..Default::default()
+            }),
+        };
+        let fetched = Arc::new(std::sync::Mutex::new(Vec::<(Vec<u8>, u64, u64)>::new()));
+        let fetch: ShardBodyFetch = {
+            let fetched = fetched.clone();
+            Arc::new(move |header: &ProtoHeader, proposed: u64| {
+                fetched.lock().unwrap().push((
+                    header.address.clone(),
+                    header.frame_number,
+                    proposed,
+                ));
+                if header.address[0] == 0x33 {
+                    ShardBodyAsk::Refused
+                } else {
+                    ShardBodyAsk::Asked
+                }
+            })
+        };
+
+        // Two answers for four headers: 0x33 and 0x44 have none.
+        let asked = std::sync::Mutex::new(Vec::new());
+        let short = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
+            asked.lock().unwrap().extend(needs.iter().cloned());
+            vec![Some(1), Some(1)]
+        };
+        let unheld = first_unheld_shard_body(&frame, &short, Some(&fetch));
+        assert!(
+            unheld.is_some(),
+            "vote_short_answer: an answer missing from a short reply counts as not held"
+        );
+        assert_eq!(
+            *fetched.lock().unwrap(),
+            vec![(vec![0x33; 32], 9, 12), (vec![0x44; 32], 2, 12)],
+            "vote_no_fetch: every unheld header is asked for at once, with the proposed frame"
+        );
+        assert_eq!(
+            unheld
+                .as_ref()
+                .map(|unheld| (unheld.need.address.clone(), unheld.need.frame_number)),
+            Some((vec![0x44; 32], 2)),
+            "vote_refused_counts: the refused 0x33 is passed over for the next unheld header"
+        );
+        assert_eq!(
+            unheld.as_ref().map(|unheld| (unheld.ask, unheld.unheld)),
+            Some((Some(ShardBodyAsk::Asked), 1)),
+            "vote_refused_counts: the check returns the named header's ask and counts only \
+             headers the vote waits for"
+        );
+        let asked = asked.into_inner().unwrap();
+        assert_eq!(
+            asked
+                .iter()
+                .map(|need| (need.address[0], need.frame_number, need.empty, need.vote))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x11, 5, false, true),
+                (0x22, 7, true, true),
+                (0x33, 9, false, true),
+                (0x44, 2, false, true),
+            ]
+        );
+
+        // A full reply: the provably empty 0x22 is not held either.
+        let full = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
+            needs
+                .iter()
+                .map(|need| (need.address != vec![0x22u8; 32]).then_some(1))
+                .collect()
+        };
+        assert_eq!(
+            first_unheld_shard_body(&frame, &full, None).map(|unheld| (
+                unheld.need.frame_number,
+                unheld.ask,
+                unheld.unheld
+            )),
+            Some((7, None, 1))
+        );
+
+        // Every unheld header refused: nothing holds the vote.
+        let refuse: ShardBodyFetch = Arc::new(|_: &ProtoHeader, _| ShardBodyAsk::Refused);
+        let none = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> { vec![None; needs.len()] };
+        assert_eq!(
+            first_unheld_shard_body(&frame, &none, Some(&refuse)),
+            None,
+            "vote_refused_counts: headers execution refuses do not hold the vote"
+        );
+
+        // Every body held: nothing named, nothing asked for.
+        fetched.lock().unwrap().clear();
+        let all = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> { vec![Some(1); needs.len()] };
+        assert_eq!(first_unheld_shard_body(&frame, &all, Some(&fetch)), None);
+        assert!(fetched.lock().unwrap().is_empty());
+
+        // No shard header: the check is not asked.
+        let never =
+            |_: &[ShardBodyNeed]| -> Vec<Option<u64>> { panic!("asked without a shard header") };
+        assert_eq!(
+            first_unheld_shard_body(&GlobalFrame::default(), &never, None),
+            None
+        );
+    }
+
+    /// A voter missing several shards' bodies asks for every one on its first
+    /// check, so their fetches run together within the vote patience instead
+    /// of one after another, and for at most [`VOTE_BODY_ASKS`], the first
+    /// in the proposal's order, so a proposal crammed with headers cannot
+    /// make each check verify them all.
+    #[test]
+    fn a_voter_asks_for_every_unheld_shard_header_at_once_up_to_a_bound() {
+        use quil_types::proto::global::{
+            message_request::Request, FrameHeader as ProtoHeader, GlobalFrame, GlobalFrameHeader,
+            MessageBundle, MessageRequest,
+        };
+        let frame = |shards: u8| GlobalFrame {
+            requests: vec![MessageBundle {
+                requests: (1..=shards)
+                    .map(|addr| MessageRequest {
+                        request: Some(Request::Shard(ProtoHeader {
+                            address: vec![addr; 32],
+                            frame_number: u64::from(addr),
+                            requests_root: vec![1; 32],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            header: Some(GlobalFrameHeader {
+                frame_number: 30,
+                ..Default::default()
+            }),
+        };
+        let fetched = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let fetch: ShardBodyFetch = {
+            let fetched = fetched.clone();
+            Arc::new(move |header: &ProtoHeader, proposed: u64| {
+                assert_eq!(proposed, 30);
+                fetched.lock().unwrap().push(header.address[0]);
+                ShardBodyAsk::Asked
+            })
+        };
+        let none = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> { vec![None; needs.len()] };
+
+        let two = first_unheld_shard_body(&frame(2), &none, Some(&fetch));
+        assert_eq!(
+            *fetched.lock().unwrap(),
+            vec![1, 2],
+            "vote_fetch_first_only: both unheld headers are asked for on the first check"
+        );
+        assert_eq!(two.map(|unheld| unheld.unheld), Some(2));
+
+        fetched.lock().unwrap().clear();
+        let many = first_unheld_shard_body(&frame(40), &none, Some(&fetch));
+        assert_eq!(
+            *fetched.lock().unwrap(),
+            (1..=VOTE_BODY_ASKS as u8).collect::<Vec<_>>(),
+            "vote_fetch_unbounded: one check asks for the first {VOTE_BODY_ASKS} unheld headers only"
+        );
+        assert_eq!(
+            many.map(|unheld| (unheld.need.frame_number, unheld.ask, unheld.unheld)),
+            Some((1, Some(ShardBodyAsk::Asked), 40)),
+            "the check still counts every unheld header"
+        );
+    }
+
+    /// Refusals the fetch remembers verify nothing, so they do not count
+    /// against [`VOTE_BODY_ASKS`]: a proposal carrying that many refused
+    /// headers ahead of a vouched one still gets the vouched one asked for
+    /// and named, instead of being declined without it ever being judged.
+    /// Fresh refusals still count, so a check verifies at most the bound.
+    #[test]
+    fn remembered_refusals_do_not_use_up_a_voters_asks() {
+        use quil_types::proto::global::{
+            message_request::Request, FrameHeader as ProtoHeader, GlobalFrame, GlobalFrameHeader,
+            MessageBundle, MessageRequest,
+        };
+        let refused = VOTE_BODY_ASKS as u8;
+        let frame = GlobalFrame {
+            requests: vec![MessageBundle {
+                requests: (1..=refused + 1)
+                    .map(|addr| MessageRequest {
+                        request: Some(Request::Shard(ProtoHeader {
+                            address: vec![addr; 32],
+                            frame_number: u64::from(addr),
+                            requests_root: vec![1; 32],
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            header: Some(GlobalFrameHeader {
+                frame_number: 30,
+                ..Default::default()
+            }),
+        };
+        let none = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> { vec![None; needs.len()] };
+        let fetched = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let fetch_with = |first_refusal: ShardBodyAsk| -> ShardBodyFetch {
+            let fetched = fetched.clone();
+            Arc::new(move |header: &ProtoHeader, _| {
+                fetched.lock().unwrap().push(header.address[0]);
+                if header.address[0] <= refused {
+                    first_refusal
+                } else {
+                    ShardBodyAsk::Asked
+                }
+            })
+        };
+
+        let unheld = first_unheld_shard_body(
+            &frame,
+            &none,
+            Some(&fetch_with(ShardBodyAsk::RefusedBefore)),
+        );
+        assert_eq!(
+            fetched.lock().unwrap().last().copied(),
+            Some(refused + 1),
+            "vote_asks_refused_counted: {refused} remembered refusals kept the vouched header \
+             from being asked for"
+        );
+        assert_eq!(
+            unheld.map(|unheld| (unheld.need.address[0], unheld.ask, unheld.unheld)),
+            Some((refused + 1, Some(ShardBodyAsk::Asked), 1)),
+            "vote_asks_refused_counted: the vouched header is named, the refused ones are not"
+        );
+
+        fetched.lock().unwrap().clear();
+        let fresh =
+            first_unheld_shard_body(&frame, &none, Some(&fetch_with(ShardBodyAsk::Refused)));
+        assert_eq!(
+            fetched.lock().unwrap().len(),
+            VOTE_BODY_ASKS,
+            "fresh refusals count: one check judges at most {VOTE_BODY_ASKS} headers"
+        );
+        assert_eq!(
+            fresh.map(|unheld| (unheld.need.address[0], unheld.ask)),
+            Some((refused + 1, None)),
+            "past the bound the vouched header holds the vote unasked"
+        );
+    }
+
     /// A verified tip rides only while the bodies its headers need are held:
     /// a tip whose body was withheld stays back, a bundle stays back whole
     /// when any of its headers does, and a header with an empty requests
@@ -3222,6 +3863,9 @@ mod tests {
             frame_number,
             empty: false,
             anchor: 99,
+            vote: false,
+            selector: no_output_selector(),
+            parent: None,
         };
         // Shard 0x22's frame 9 body was never released.
         let available = |needs: &[ShardBodyNeed]| -> Vec<Option<u64>> {
@@ -3272,6 +3916,146 @@ mod tests {
             hold_back_unavailable_shard_proofs(vec![withheld], &none_held, None, u64::MAX);
         assert!(ready.is_empty());
         assert_eq!(missing, vec![need(0x22, 9)]);
+    }
+
+    /// Under the process default (mainnet's), a header voting out of bounds
+    /// and anchored at the fee vote bound frame is fence evidence: it needs no
+    /// body, rides though no body is held, and the collector holds it as no
+    /// shard frame, so its session's next frame cannot supersede it. Anchored
+    /// the frame before, or voting in bounds, it is a shard frame as before.
+    #[test]
+    fn a_header_voting_out_of_bounds_rides_as_fence_evidence_without_a_body() {
+        use quil_execution::global_intrinsic::frame_header::{FrameHeader, TYPE_FRAME_HEADER};
+        use quil_execution::message_envelope::{CanonicalMessageBundle, CanonicalMessageRequest};
+        const BOUND: u64 = 1_097_280;
+        let bundle = |anchor: u64, vote: i64| {
+            CanonicalMessageBundle {
+                requests: vec![Some(CanonicalMessageRequest {
+                    inner_type_prefix: TYPE_FRAME_HEADER,
+                    inner_bytes: FrameHeader {
+                        address: vec![0x44; 32],
+                        frame_number: 7,
+                        global_frame_number: anchor,
+                        fee_multiplier_vote: vote,
+                        ..Default::default()
+                    }
+                    .to_canonical_bytes()
+                    .unwrap(),
+                })],
+                timestamp: 0,
+            }
+            .to_canonical_bytes()
+            .unwrap()
+        };
+        let none_held = |needs: &[ShardBodyNeed]| vec![None; needs.len()];
+        for (anchor, vote) in [(BOUND - 1, 0), (BOUND, 90), (BOUND, 100), (BOUND, 110)] {
+            let frame = bundle(anchor, vote);
+            assert_eq!(shard_body_needs(&frame).len(), 1, "{anchor} {vote}");
+            assert!(crate::message_collector::bundle_has_shard_frame(&frame));
+            let selection =
+                hold_back_unavailable_shard_proofs(vec![frame], &none_held, None, u64::MAX);
+            assert!(selection.ready.is_empty(), "{anchor} {vote}");
+        }
+        for vote in [0, 89, 111, -1] {
+            let evidence = bundle(BOUND, vote);
+            assert!(
+                shard_body_needs(&evidence).is_empty(),
+                "a header voting {vote} waited for a body no archive holds"
+            );
+            assert!(
+                !crate::message_collector::bundle_has_shard_frame(&evidence),
+                "the collector held a header voting {vote} as a shard frame"
+            );
+            let selection = hold_back_unavailable_shard_proofs(
+                vec![evidence.clone()],
+                &none_held,
+                None,
+                u64::MAX,
+            );
+            assert_eq!(selection.ready, vec![evidence], "vote {vote}");
+        }
+    }
+
+    /// Under the process default (mainnet's), a voter lacking the body of a
+    /// header voting out of bounds at the fee vote bound frame votes as a
+    /// leader carries it: GLOBAL executes it only as its session's fence, so
+    /// it holds no vote, without a fetch or while the fetch cannot judge it
+    /// yet, and is never asked for, so it spends none of the voter's asks.
+    /// Anchored the frame before, it is a shard frame and holds the vote.
+    #[test]
+    fn a_voter_lacking_a_fence_headers_body_does_not_wait_for_it() {
+        use quil_types::proto::global::{
+            message_request::Request, FrameHeader as ProtoHeader, GlobalFrame, GlobalFrameHeader,
+            MessageBundle, MessageRequest,
+        };
+        const BOUND: u64 = 1_097_280;
+        let header = |addr: u8, anchor: u64, vote: u64| ProtoHeader {
+            address: vec![addr; 32],
+            frame_number: 7,
+            global_frame_number: anchor,
+            fee_multiplier_vote: vote,
+            requests_root: vec![1; 32],
+            ..Default::default()
+        };
+        let frame = |headers: Vec<ProtoHeader>| GlobalFrame {
+            requests: vec![MessageBundle {
+                requests: headers
+                    .into_iter()
+                    .map(|header| MessageRequest {
+                        request: Some(Request::Shard(header)),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            header: Some(GlobalFrameHeader {
+                frame_number: BOUND + 1,
+                ..Default::default()
+            }),
+        };
+        let none_held = |needs: &[ShardBodyNeed]| vec![None; needs.len()];
+        let fetched = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let fetch: ShardBodyFetch = {
+            let fetched = fetched.clone();
+            Arc::new(move |header: &ProtoHeader, _proposed: u64| {
+                fetched.lock().unwrap().push(header.address[0]);
+                ShardBodyAsk::Unavailable
+            })
+        };
+
+        for vote in [0, 89, 111] {
+            let fence = frame(vec![header(0x55, BOUND, vote)]);
+            let held = first_unheld_shard_body(&fence, &none_held, None);
+            assert!(
+                held.is_none(),
+                "fence_vote_held: a fence header voting {vote} held the vote without a fetch: \
+                 {held:?}"
+            );
+            let held = first_unheld_shard_body(&fence, &none_held, Some(&fetch));
+            assert!(
+                held.is_none(),
+                "fence_vote_held: a fence header voting {vote} the fetch cannot judge yet held \
+                 the vote: {held:?}"
+            );
+        }
+        assert!(
+            fetched.lock().unwrap().is_empty(),
+            "fence_asked: a fence header was asked for"
+        );
+
+        let shard = header(0x66, BOUND, 100);
+        let mixed = frame(vec![header(0x55, BOUND, 0), shard.clone()]);
+        let held = first_unheld_shard_body(&mixed, &none_held, Some(&fetch))
+            .expect("the in-bounds header holds the vote");
+        assert_eq!(held.need, ShardBodyNeed::for_vote(&shard));
+        assert_eq!(held.ask, Some(ShardBodyAsk::Unavailable));
+        assert_eq!(held.unheld, 1, "fence_vote_held: the fence header counted");
+        assert_eq!(*fetched.lock().unwrap(), vec![0x66], "fence_asked");
+
+        let before = header(0x77, BOUND - 1, 0);
+        let held = first_unheld_shard_body(&frame(vec![before.clone()]), &none_held, None)
+            .expect("a header anchored before the bound frame holds the vote");
+        assert_eq!(held.need, ShardBodyNeed::for_vote(&before));
     }
 
     /// Shard headers whose bodies are held ride smallest gap first within the
@@ -3345,6 +4129,9 @@ mod tests {
                 frame_number: 7,
                 empty: false,
                 anchor: 99,
+                vote: false,
+                selector: no_output_selector(),
+                parent: None,
             }]
         );
 
@@ -3481,6 +4268,7 @@ mod tests {
             prewarm.offer(
                 &address,
                 frame,
+                Some(global),
                 &[MessageBundle {
                     requests: Vec::new(),
                     timestamp: frame as i64,
@@ -3744,6 +4532,11 @@ mod tests {
             run.most_behind,
             run.most_deferred
         );
+    }
+
+    /// The identity of a test header without an output.
+    fn no_output_selector() -> Option<[u8; 32]> {
+        quil_crypto::poseidon::hash_bytes_to_32(&[]).ok()
     }
 
     fn make_shard_frame(addr: u8, local_frame: u64) -> Vec<u8> {
