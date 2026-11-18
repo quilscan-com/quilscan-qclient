@@ -42,9 +42,9 @@ interactive interface. `manage --render` prints one read-only TUI frame;
 mode cannot be combined with either text mode.
 
 Official source baseline: `QuilibriumNetwork/monorepo` branch `v2.1.0.25` at
-`f2496cbf851569bf8d0f8d31a12526a14017f7e6` (pinned 2026-10-29, subpatch `.111`). The Rust
-client dependency closure and protobufs follow that pinned tree, with the
-Quilscan machine interface, independent reward query and version CLI retained.
+`61eec092c1327705e66ffb6c1fe240cdc72db6b8` (`2.1.0.25.122`, 2026-11-17).
+The `.122` update brings in the upstream Rust client dependencies and retains
+the Quilscan machine interface, independent reward query and version CLI.
 See [`QCLIENT_OUTPUT_MIGRATION.md`](QCLIENT_OUTPUT_MIGRATION.md) for output
 contracts and [`docs/qclient-upstream-sync.md`](docs/qclient-upstream-sync.md)
 for source scope and verification.
