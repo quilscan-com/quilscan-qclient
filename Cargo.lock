@@ -6428,6 +6428,7 @@ dependencies = [
  "bs58",
  "ed448-rust",
  "hex 0.4.3",
+ "lru",
  "memchr",
  "metrics",
  "num-bigint 0.4.6",

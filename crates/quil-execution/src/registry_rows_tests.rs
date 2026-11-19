@@ -125,7 +125,7 @@ fn row_updates_leave_what_a_full_refresh_leaves() {
         }
         let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
         let fresh = refreshed(&store, limits);
-        if updated.update_rows(snapshot.as_ref(), &written, limits).unwrap() {
+        if updated.update_rows(snapshot.as_ref(), &written, limits, None).unwrap() {
             updates += 1;
             assert_eq!(updated.content(), fresh.content(), "round {round}");
             assert!(updated.scanned.is_none(), "an update is not a database scan");
@@ -134,6 +134,60 @@ fn row_updates_leave_what_a_full_refresh_leaves() {
         }
     }
     assert!(updates > 250, "updates applied: {updates}");
+    quil_types::consensus::set_hash_storage_proof_epoch_for_thread(None);
+}
+
+// Members find their storage seats — what to seal, what they committed —
+// through the registry, which live nodes build from rows; the rows path once
+// left the registrations awaiting a seal out, so no member ever proved one.
+#[test]
+fn rows_carry_storage_seats() {
+    use crate::global_intrinsic::storage_seat::Seat;
+    let (_tmp, store) = temp_store();
+    let limits = RegistryLimits::UNBOUNDED;
+    let (member, filter) = ([0x31u8; 32], vec![0xA1u8; 32]);
+    let mut seat = Seat::new(member, filter.clone());
+    seat.register(4, &[vec![2], vec![1]], 201);
+    let address = row_address(3);
+    put_row(&store, "adds", &address, Some(&vertex_tree_to_blob(&seat.to_tree().unwrap())));
+    let mut registry = refreshed(&store, limits);
+    assert!(registry.from_rows);
+    let slot = registry.get_storage_seat_slot(&member, &filter, 4).unwrap();
+    assert_eq!((slot.leaves.clone(), slot.registered_at, slot.sealed_at), (vec![vec![1], vec![2]], 201, None));
+    assert!(registry.get_storage_seat_slot(&member, &filter, 5).is_none());
+
+    seat.seal(4, 205);
+    put_row(&store, "adds", &address, Some(&vertex_tree_to_blob(&seat.to_tree().unwrap())));
+    let written = [(address, registry_rows::Written { adds: true, ..Default::default() })].into_iter().collect();
+    let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
+    assert!(registry.update_rows(snapshot.as_ref(), &written, limits, None).unwrap());
+    assert_eq!(registry.get_storage_seat_slot(&member, &filter, 4).unwrap().sealed_at, Some(205));
+    assert_eq!(registry.content(), refreshed(&store, limits).content());
+}
+
+#[test]
+fn rows_carry_storage_snapshots() {
+    use crate::global_intrinsic::storage_snapshot;
+    use quil_types::consensus::StorageSnapshotRoots;
+    let (_tmp, store) = temp_store();
+    let limits = RegistryLimits::UNBOUNDED;
+    let filter = vec![0xA2u8; 33];
+    let snapshot = |epoch: u64, seed: u8| StorageSnapshotRoots { epoch, frame: 50, anchor: 9, roots: [[seed; 32]; 4] };
+    let address = row_address(4);
+    put_row(&store, "adds", &address, Some(&vertex_tree_to_blob(&storage_snapshot::to_tree(&filter, &snapshot(5, 1)).unwrap())));
+    let mut registry = refreshed(&store, limits);
+    assert!(registry.from_rows);
+    assert_eq!(registry.get_storage_snapshot(&filter, 5), Some(&snapshot(5, 1)));
+    assert_eq!(registry.get_storage_snapshot(&filter, 9), None, "the ring slot holds epoch 5");
+
+    // The record reused for epoch 9.
+    put_row(&store, "adds", &address, Some(&vertex_tree_to_blob(&storage_snapshot::to_tree(&filter, &snapshot(9, 2)).unwrap())));
+    let written = [(address, registry_rows::Written { adds: true, ..Default::default() })].into_iter().collect();
+    let captured = store.capture_tree_snapshot().unwrap().unwrap();
+    assert!(registry.update_rows(captured.as_ref(), &written, limits, None).unwrap());
+    assert_eq!(registry.get_storage_snapshot(&filter, 9), Some(&snapshot(9, 2)));
+    assert_eq!(registry.get_storage_snapshot(&filter, 5), None);
+    assert_eq!(registry.content(), refreshed(&store, limits).content());
 }
 
 // An update a refresh would refuse fails the same way and changes nothing.
@@ -150,7 +204,7 @@ fn a_row_update_past_a_limit_fails_like_a_refresh_and_changes_nothing() {
     put_row(&store, "adds", &row_address(3), Some(&vec![0xEE; 8192]));
     let written = [(row_address(3), registry_rows::Written { adds: true, removes: false })].into();
     let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
-    assert!(registry.update_rows(snapshot.as_ref(), &written, limits).is_err());
+    assert!(registry.update_rows(snapshot.as_ref(), &written, limits, None).is_err());
     assert!(InMemoryProverRegistry::new().refresh_with_limits(store.as_ref(), limits).is_err());
     assert_eq!(registry.content(), before);
 }
@@ -172,10 +226,10 @@ fn a_row_update_declines_after_a_direct_edit_or_with_no_rows_left() {
     let mut edited = refreshed(&store, limits);
     assert_eq!(edited.update_prover_activity(&only, &[0xA1; 32], 50), 1);
     let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
-    assert!(!edited.update_rows(snapshot.as_ref(), &written, limits).unwrap());
+    assert!(!edited.update_rows(snapshot.as_ref(), &written, limits, None).unwrap());
 
     let mut emptied = refreshed(&store, limits);
     put_row(&store, "adds", &only, None);
     let snapshot = store.capture_tree_snapshot().unwrap().unwrap();
-    assert!(!emptied.update_rows(snapshot.as_ref(), &written, limits).unwrap(), "a refresh would read the legacy tree");
+    assert!(!emptied.update_rows(snapshot.as_ref(), &written, limits, None).unwrap(), "a refresh would read the legacy tree");
 }
