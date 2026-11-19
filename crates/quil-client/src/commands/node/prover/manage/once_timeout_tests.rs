@@ -10,6 +10,10 @@ use tonic::codegen::{http, BoxFuture, Service};
 
 use super::{actions, fetch_once_snapshot, Client};
 
+fn no_health() -> impl std::future::Future<Output = super::Msg> {
+    std::future::ready(super::Msg::HealthRefresh(super::model::HealthAnswer::NotReported))
+}
+
 struct Shards;
 
 impl ShardInfoProvider for Shards {
@@ -136,6 +140,7 @@ async fn once_snapshot_accepts_node_info_after_fast_deadline() {
         Duration::from_millis(40),
         actions::RPC_TIMEOUT,
         Duration::from_millis(500),
+        no_health(),
     )
     .await
     .unwrap_err();
@@ -145,6 +150,7 @@ async fn once_snapshot_accepts_node_info_after_fast_deadline() {
         Duration::from_millis(500),
         actions::RPC_TIMEOUT,
         Duration::from_millis(500),
+        no_health(),
     )
     .await
     .unwrap();
@@ -166,6 +172,7 @@ async fn once_snapshot_accepts_shards_after_fast_deadline() {
         Duration::from_millis(500),
         actions::RPC_TIMEOUT,
         Duration::from_millis(40),
+        no_health(),
     )
     .await
     .unwrap_err();
@@ -177,6 +184,7 @@ async fn once_snapshot_accepts_shards_after_fast_deadline() {
         Duration::from_millis(500),
         actions::RPC_TIMEOUT,
         Duration::from_millis(500),
+        no_health(),
     )
     .await
     .unwrap();
@@ -197,6 +205,7 @@ async fn once_snapshot_returns_bounded_errors_for_slow_node_or_shards() {
             Duration::from_millis(40),
             actions::RPC_TIMEOUT,
             Duration::from_millis(40),
+            no_health(),
         )
         .await
         .unwrap_err()
@@ -229,6 +238,7 @@ async fn once_snapshot_keeps_worker_timeout_optional_and_independent() {
             Duration::from_millis(500),
             worker_timeout,
             Duration::from_millis(500),
+            no_health(),
         )
         .await
         .unwrap();
@@ -245,6 +255,7 @@ async fn once_snapshot_preserves_rpc_errors_instead_of_fabricating_success() {
         Duration::from_millis(500),
         actions::RPC_TIMEOUT,
         Duration::from_millis(500),
+        no_health(),
     )
     .await
     .unwrap_err()
@@ -258,7 +269,9 @@ async fn run_once_uses_the_snapshot_fetch_path_without_terminal_initialization()
     let server = serve(Duration::ZERO, Duration::ZERO, Some(Duration::ZERO)).await;
     let directory = tempfile::tempdir().unwrap();
     let pc = super::ProverCtx {
+        epoch_waits: None,
         node_config: quil_config::Config::default(),
+        config_dir: directory.path().to_path_buf(),
         connect_opts: crate::rpc::ConnectOpts {
             listen_grpc_multiaddr: server.multiaddr.clone(),
             ..Default::default()

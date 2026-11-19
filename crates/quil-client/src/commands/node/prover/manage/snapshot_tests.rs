@@ -85,14 +85,14 @@ fn once_snapshot_uses_official_allocation_fields_and_exact_units() {
     assert_eq!(json["allocations"][0]["peer_materialized_frame"], 970);
     assert_eq!(json["allocations"][0]["peer_head"], 980);
     assert_eq!(json["allocations"][0]["peer_state"], "lag");
-    assert_eq!(json["allocations"][0]["local_execution_state"], "stale");
+    assert_eq!(json["allocations"][0]["local_execution_state"], "running");
     assert_eq!(json["allocations"][0]["global_head"]["frame"], 990);
     assert_eq!(
         json["allocations"][0]["execution"]["materialized_frame"],
         960
     );
     assert_eq!(json["allocations"][0]["reward_units_per_frame"], "3124022");
-    assert_eq!(json["allocations"][0]["reward_quil_per_day"], "269.9");
+    assert_eq!(json["allocations"][0]["reward_quil_per_day"], "3.4");
     assert_eq!(json["allocations"][0]["next_action"], "(pause|leave)");
     assert_eq!(json["allocations"][0]["default_action"], "renew@f1440");
 }
@@ -192,7 +192,7 @@ fn once_snapshot_fails_when_shard_rpc_did_not_complete() {
         err: None,
     };
     let shards = Msg::ShardRefresh(Err("Shard data timed out after 60s".into()));
-    let error = from_refresh(node, shards).unwrap_err();
+    let error = from_refresh(node, shards, None).unwrap_err();
     assert!(error
         .to_string()
         .contains("fetch shard data: Shard data timed out after 60s"));
@@ -322,6 +322,75 @@ fn telemetry_model() -> Model {
 }
 
 #[test]
+fn once_snapshot_with_no_health_observation_keeps_worker_progress_neutral() {
+    let mut model = telemetry_model();
+    model.allocations[0].execution.as_mut().unwrap().state = "serving".into();
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&format_snapshot(&mut model).unwrap()).unwrap();
+    for mode in ["compact", "expanded"] {
+        let display = &snapshot["allocations"][0]["tui"][mode];
+        assert_eq!(display["cells"]["local_mat"], "12");
+        assert_eq!(display["tones"]["local_mat"], "muted");
+        assert_eq!(display["tones"]["execution"], "muted");
+        assert!(display["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Local progress unverified"));
+    }
+}
+
+#[test]
+fn once_refresh_uses_node_reported_worker_and_global_progress_warnings() {
+    use quil_types::proto::diagnostics::{
+        AffectedShard, ConditionKind, HealthCondition, HealthConditions,
+    };
+
+    let model = telemetry_model();
+    let mut workers = model.cached_worker_info.unwrap();
+    workers.worker_info[0].execution.as_mut().unwrap().state = "serving".into();
+    let worker = &workers.worker_info[0];
+    let affected = AffectedShard {
+        filter: worker.filter.clone(),
+        core_id: worker.core_id,
+        ..Default::default()
+    };
+    let health = HealthConditions {
+        conditions: [
+            ConditionKind::LocalAppFramesUnchanged,
+            ConditionKind::GlobalAppFramesBehind,
+        ]
+        .map(|kind| HealthCondition {
+            kind: kind as i32,
+            shards: vec![affected.clone()],
+            ..Default::default()
+        })
+        .into(),
+        ..Default::default()
+    };
+    let snapshot = from_refresh(
+        Msg::DataRefresh {
+            node_info: model.cached_node_info,
+            shard_info: None,
+            worker_info: Some(workers),
+            err: None,
+        },
+        Msg::ShardRefresh(Ok(model.cached_shard_info.unwrap())),
+        Some((
+            Msg::HealthRefresh(super::model::HealthAnswer::Reported(health)),
+            std::time::Instant::now(),
+        )),
+    )
+    .unwrap();
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+    for mode in ["compact", "expanded"] {
+        let tones = &snapshot["allocations"][0]["tui"][mode]["tones"];
+        for cell in ["local_mat", "execution", "global_head"] {
+            assert_eq!(tones[cell], "warning", "{cell} in {mode}");
+        }
+    }
+}
+
+#[test]
 fn sync_requirement_snapshot_adds_node_telemetry_without_changing_schema_or_units() {
     let mut model = telemetry_model();
     let text = format_snapshot(&mut model).unwrap();
@@ -380,7 +449,7 @@ fn sync_requirement_snapshot_preserves_full_execution_phases_and_cache_freshness
         .as_str()
         .unwrap()
         .contains("Reason: awaiting successor"));
-    model.worker_snapshot_received.as_mut().unwrap().0 -= std::time::Duration::from_secs(500);
+    *model.worker_snapshot_received.as_mut().unwrap() -= std::time::Duration::from_secs(500);
     let json: serde_json::Value = serde_json::from_str(&format_snapshot(&mut model).unwrap()).unwrap();
     assert_eq!(json["allocations"][0]["local_execution_state"], "cached");
     assert_eq!(json["allocations"][0]["execution_severity"], "normal");
@@ -463,7 +532,7 @@ fn once_from_refresh_exports_successful_rpc_header_instead_of_connecting() {
         current_epoch: 1, epoch_length_frames: 720, ..Default::default() };
     let json: serde_json::Value = serde_json::from_str(&from_refresh(Msg::DataRefresh {
         node_info: Some(node), shard_info: None, worker_info: None, err: None,
-    }, Msg::ShardRefresh(Ok(GetShardInfoResponse::default()))).unwrap()).unwrap();
+    }, Msg::ShardRefresh(Ok(GetShardInfoResponse::default())), None).unwrap()).unwrap();
     assert_eq!(json["tui"]["compact"]["header"].as_array().unwrap().len(), 7);
     for (mode, rpc) in [("compact", "RPC: ✓"), ("expanded", "RPC: connected")] {
         let header = json["tui"][mode]["header"].as_array().unwrap();

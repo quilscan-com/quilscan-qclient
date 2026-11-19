@@ -212,7 +212,11 @@ pub(super) fn format_snapshot(model: &mut Model) -> serde_json::Result<String> {
     }))
 }
 
-pub(super) fn from_refresh(node_refresh: Msg, shard_refresh: Msg) -> anyhow::Result<String> {
+pub(super) fn from_refresh(
+    node_refresh: Msg,
+    shard_refresh: Msg,
+    health_refresh: Option<(Msg, std::time::Instant)>,
+) -> anyhow::Result<String> {
     let Msg::DataRefresh {
         node_info,
         worker_info,
@@ -244,5 +248,9 @@ pub(super) fn from_refresh(node_refresh: Msg, shard_refresh: Msg) -> anyhow::Res
         },
     );
     super::update::apply_msg(&mut model, Msg::ShardRefresh(Ok(shard_info)));
+    if let Some((Msg::HealthRefresh(answer), received)) = health_refresh {
+        model.health = answer;
+        model.health_received = Some(received);
+    }
     Ok(format_snapshot(&mut model)?)
 }

@@ -238,11 +238,16 @@ async fn run(pc: &ProverCtx, refresh_state: RefreshState) -> anyhow::Result<()> 
 /// Machine interface: no terminal initialization and no partial snapshot on errors.
 pub(super) async fn run_once(pc: &ProverCtx) -> anyhow::Result<()> {
     let client = pc.connect().await?;
+    let health_source = crate::commands::node::diagnostics::HealthSource::for_node(
+        &pc.node_config,
+        &pc.key_manager,
+    );
     let snapshot = fetch_once_snapshot(
         client,
         ONCE_NODE_RPC_TIMEOUT,
         actions::RPC_TIMEOUT,
         ONCE_SHARD_RPC_TIMEOUT,
+        actions::fetch_health(health_source),
     )
     .await?;
     println!("{snapshot}");
@@ -254,12 +259,20 @@ async fn fetch_once_snapshot(
     node_timeout: Duration,
     worker_timeout: Duration,
     shard_timeout: Duration,
+    health_refresh: impl std::future::Future<Output = Msg>,
 ) -> anyhow::Result<String> {
-    let (node_refresh, shard_refresh) = tokio::join!(
+    let health = async {
+        tokio::time::timeout(actions::RPC_TIMEOUT, health_refresh)
+            .await
+            .ok()
+            .map(|message| (message, std::time::Instant::now()))
+    };
+    let (node_refresh, shard_refresh, health_refresh) = tokio::join!(
         actions::fetch_data_with_timeouts(client.clone(), node_timeout, worker_timeout),
         actions::fetch_shards_with_timeout(client, shard_timeout),
+        health,
     );
-    snapshot::from_refresh(node_refresh, shard_refresh).map_err(|err| anyhow::anyhow!(
+    snapshot::from_refresh(node_refresh, shard_refresh, health_refresh).map_err(|err| anyhow::anyhow!(
         "{err} (one-shot deadlines: GetNodeInfo {node_timeout:?}, GetWorkerInfo {worker_timeout:?}, GetShardInfo {shard_timeout:?})"
     ))
 }

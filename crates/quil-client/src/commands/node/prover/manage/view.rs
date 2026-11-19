@@ -10272,8 +10272,6 @@ pub(super) fn snapshot_presentation(
     Vec<serde_json::Value>,
 ) {
     use serde_json::{json, Value};
-    // Health conditions are now judged by the node. The once read batch
-    // does not fetch that report; do not revive the retired client heuristic.
     let saved = (
         m.compact_actions,
         m.compact_units,
@@ -10294,6 +10292,7 @@ pub(super) fn snapshot_presentation(
     let mut top = json!({"schema_version": 1});
     let mut alloc_rows = vec![json!({}); allocations.len()];
     let mut avail_rows = vec![json!({}); available.len()];
+    let progress_judged = m.condition_judged(ConditionKind::LocalAppFramesUnchanged);
     for (mode, compact) in [("compact", true), ("expanded", false)] {
         m.compact_actions = compact;
         m.compact_units = compact;
@@ -10315,12 +10314,23 @@ pub(super) fn snapshot_presentation(
             "available_shards": {"heading": avail_kpis(m, available), "columns": avail_columns},
         });
         for (exported, a) in alloc_rows.iter_mut().zip(allocations) {
+            let progress_unverified = !progress_judged && local_color(m, a) == SUCCESS;
+            let mut detail = allocation_detail(m, a);
+            if progress_unverified {
+                detail.spans.push(Span::styled(" | Local progress unverified", DIM));
+            }
             exported[mode] = row_presentation(
                 ALLOC_DISPLAY_COLS,
                 &ALLOC_COLUMN_KEYS,
                 |col| alloc_display_cell(m, a, col, a.filter_hex.len()),
-                |col| alloc_cell_color(m, a, col, false),
-                allocation_detail(m, a),
+                |col| {
+                    if progress_unverified && matches!(col, 6 | 9) {
+                        Some(DIM)
+                    } else {
+                        alloc_cell_color(m, a, col, false)
+                    }
+                },
+                detail,
             );
         }
         for (exported, s) in avail_rows.iter_mut().zip(available) {
@@ -10496,6 +10506,7 @@ mod snapshot_presentation_tests {
     fn once_presentation_tracks_current_execution_and_recovery_without_reclassifying() {
         use quil_types::proto::node::{ShardRecovery, WorkerExecution};
         let mut m = Model::new();
+        super::tests::node_report(&mut m, vec![], &[ConditionKind::LocalAppFramesUnchanged]);
         let mut a = super::tests::row("abcd", 0, 0, 1, "", "");
         a.status_name = "active".into();
         for (state, observed, expected_state, expected_detail_tone, expected_cell_tone) in [
